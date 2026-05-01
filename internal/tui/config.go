@@ -81,9 +81,8 @@ type ConfigMode struct {
 	pendingKey  string // staged param key between PickKey and PickValue
 	picker      *paramPicker // active when adding a new param
 
-	saveErr       error
-	flash         string
-	exitRequested bool
+	saveErr error
+	flash   string
 
 	firstRunBanner bool // shown until user presses 'n' in Models pane
 
@@ -134,10 +133,6 @@ func (c *ConfigMode) Saved() *config.Config { return c.saved }
 // Update routes keys when no form/picker is active, and forwards to the
 // active overlay otherwise.
 func (c *ConfigMode) Update(msg tea.Msg) (*ConfigMode, tea.Cmd) {
-	if c.exitRequested {
-		c.exitRequested = false
-		return c, func() tea.Msg { return returnFromConfigMsg{} }
-	}
 	if pm, ok := msg.(paramPickerDoneMsg); ok {
 		return c.handlePickerDone(pm)
 	}
@@ -829,14 +824,21 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		case "save":
 			c.save()
 			if c.saveErr == nil && !config.Issues(config.Validate(c.work)).HasErrors() {
-				c.exitRequested = true
+				return returnFromConfigCmd, true
 			}
 		case "discard":
-			c.exitRequested = true
+			return returnFromConfigCmd, true
 		}
 	}
 	return nil, true
 }
+
+// returnFromConfigCmd is the Cmd that pops back to the previous view.
+// Returned synchronously from applyForm's exit-prompt branches so the
+// runtime dispatches the message in the same Update cycle the form
+// completes — without it the exit was deferred until the next message
+// arrived, leaving the user visually stuck in config mode.
+var returnFromConfigCmd tea.Cmd = func() tea.Msg { return returnFromConfigMsg{} }
 
 // applyModelSourceFromStaging mirrors the form's source select onto the
 // Model's Location/HF fields, clearing whichever is unused so the

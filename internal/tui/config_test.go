@@ -2,7 +2,10 @@ package tui
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 )
@@ -172,5 +175,71 @@ func TestConfigDuplicatePreset(t *testing.T) {
 	dup.Params[0].Value = json.Number("1")
 	if got := c.work.Models[0].Presets[0].Params[0].Value; got != json.Number("99") {
 		t.Errorf("source preset mutated: params[0] = %v, want 99", got)
+	}
+}
+
+// runExitChoice stages the exit-prompt form with the given choice and
+// drives applyForm. Returns the cmd applyForm produced (the caller
+// invokes it to inspect the resulting tea.Msg).
+func runExitChoice(c *ConfigMode, choice string) tea.Cmd {
+	c.formStaging = formStaging{choice: &choice}
+	c.formKind = formExitPrompt
+	cmd, _ := c.applyForm()
+	return cmd
+}
+
+// TestConfigExitPromptSaveEmitsReturn pins the regression: with a dirty
+// work copy that passes validation, picking "Save and exit" must emit a
+// returnFromConfigMsg synchronously from applyForm — the previous
+// implementation set a flag that only fired on the next message,
+// leaving the user visually stuck in config mode.
+func TestConfigExitPromptSaveEmitsReturn(t *testing.T) {
+	cfg := duplicateTestConfig()
+	cfgPath := filepath.Join(t.TempDir(), "llamaman.json")
+	c := NewConfigMode(cfgPath, cfg)
+
+	// Dirty the work copy so save() actually writes something.
+	c.work.Models[0].Alias = "alpha-renamed"
+
+	cmd := runExitChoice(&c, "save")
+	if cmd == nil {
+		t.Fatal("save-and-exit returned nil cmd; user would be stuck in config mode")
+	}
+	if _, ok := cmd().(returnFromConfigMsg); !ok {
+		t.Errorf("save-and-exit cmd produced %T, want returnFromConfigMsg", cmd())
+	}
+}
+
+// TestConfigExitPromptDiscardEmitsReturn covers the discard branch —
+// same deferred-exit bug, same fix.
+func TestConfigExitPromptDiscardEmitsReturn(t *testing.T) {
+	cfg := duplicateTestConfig()
+	c := NewConfigMode("/dev/null", cfg)
+	c.work.Models[0].Alias = "alpha-renamed"
+
+	cmd := runExitChoice(&c, "discard")
+	if cmd == nil {
+		t.Fatal("discard-and-exit returned nil cmd; user would be stuck in config mode")
+	}
+	if _, ok := cmd().(returnFromConfigMsg); !ok {
+		t.Errorf("discard-and-exit cmd produced %T, want returnFromConfigMsg", cmd())
+	}
+}
+
+// TestConfigExitPromptSaveBlockedByValidationDoesNotExit confirms that
+// when save() is blocked by validation errors (e.g. duplicate alias),
+// applyForm returns no cmd so the user stays in config mode and can
+// fix the issues.
+func TestConfigExitPromptSaveBlockedByValidationDoesNotExit(t *testing.T) {
+	cfg := duplicateTestConfig()
+	cfgPath := filepath.Join(t.TempDir(), "llamaman.json")
+	c := NewConfigMode(cfgPath, cfg)
+
+	// Force a validation error: two models sharing the same alias.
+	c.work.Models[1].Alias = c.work.Models[0].Alias
+
+	cmd := runExitChoice(&c, "save")
+	if cmd != nil {
+		t.Errorf("save with validation errors should not exit; got cmd producing %T", cmd())
 	}
 }
