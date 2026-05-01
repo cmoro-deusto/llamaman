@@ -71,6 +71,7 @@ type ConfigMode struct {
 	formKind    formKind
 	formStaging formStaging
 	pendingKey  string // staged param key between PickKey and PickValue
+	picker      *paramPicker // active when adding a new param
 
 	saveErr       error
 	flash         string
@@ -101,8 +102,15 @@ func (c *ConfigMode) SetRegistry(r flags.Registry) { c.registry = r }
 // §8 step 4. Dismissed on first 'n' in Models pane or on quit.
 func (c *ConfigMode) ShowFirstRunBanner() { c.firstRunBanner = true }
 
-// SetSize tracks terminal dimensions for layout.
-func (c *ConfigMode) SetSize(w, h int) { c.width, c.height = w, h }
+// SetSize tracks terminal dimensions for layout. Propagates to the
+// active param picker if any.
+func (c *ConfigMode) SetSize(w, h int) {
+	c.width, c.height = w, h
+	if c.picker != nil {
+		pw, ph := c.pickerSize()
+		c.picker.SetSize(pw, ph)
+	}
+}
 
 // Modified reports whether the working copy diverges from the last save.
 func (c *ConfigMode) Modified() bool {
@@ -115,12 +123,20 @@ func (c *ConfigMode) Modified() bool {
 // so subsequent run-mode/selection screens see the new config.
 func (c *ConfigMode) Saved() *config.Config { return c.saved }
 
-// Update routes keys when no form is active, and forwards to the form
-// otherwise.
+// Update routes keys when no form/picker is active, and forwards to the
+// active overlay otherwise.
 func (c *ConfigMode) Update(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 	if c.exitRequested {
 		c.exitRequested = false
 		return c, func() tea.Msg { return returnFromConfigMsg{} }
+	}
+	if pm, ok := msg.(paramPickerDoneMsg); ok {
+		return c.handlePickerDone(pm)
+	}
+	if c.picker != nil {
+		next, cmd := c.picker.Update(msg)
+		c.picker = next
+		return c, cmd
 	}
 	if c.form != nil {
 		return c.updateForm(msg)
@@ -129,6 +145,18 @@ func (c *ConfigMode) Update(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 		return c.handleKey(k)
 	}
 	return c, nil
+}
+
+// handlePickerDone consumes the picker's selection. On cancel we close
+// the picker and stay in the params pane; on selection we advance to
+// the type-aware value form for the chosen key.
+func (c *ConfigMode) handlePickerDone(msg paramPickerDoneMsg) (*ConfigMode, tea.Cmd) {
+	c.picker = nil
+	if msg.cancelled || msg.key == "" {
+		return c, nil
+	}
+	c.pendingKey = msg.key
+	return c, c.openValueFormFor(msg.key, "")
 }
 
 func (c *ConfigMode) updateForm(msg tea.Msg) (*ConfigMode, tea.Cmd) {
@@ -195,10 +223,10 @@ func (c *ConfigMode) handleKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 			return c, c.openExitPrompt()
 		}
 		return c, func() tea.Msg { return returnFromConfigMsg{} }
-	case "tab":
+	case "tab", "right", "l":
 		c.cycleFocus(+1)
 		return c, nil
-	case "shift+tab":
+	case "shift+tab", "left", "h":
 		c.cycleFocus(-1)
 		return c, nil
 	case "g":
@@ -207,7 +235,7 @@ func (c *ConfigMode) handleKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 		c.save()
 		return c, nil
 	case "?":
-		c.flash = "tab: cycle pane · e: edit · n: new · d: delete · g: globals · s: save · esc: back"
+		c.flash = "tab/← →: cycle pane · ↑↓: select · e: edit · n: new · d: delete · g: globals · s: save · esc: back"
 		return c, nil
 	}
 	switch c.focus {
@@ -455,36 +483,43 @@ func (c *ConfigMode) openDuplicatePresetForm() tea.Cmd {
 	return c.installForm(form, formDuplicatePreset)
 }
 
-// openNewParamForm starts a two-step flow: pick key (fuzzy over registry,
-// free-text accepted) → type-aware value form. Step 1 is rendered here;
-// applyForm advances to step 2 when the user submits.
+// openNewParamForm starts a two-step flow: pick key (registry picker
+// with name + parsed help description, free-text fallback) → type-aware
+// value form. Step 1 is rendered via the bubbles/list-based paramPicker
+// so each row is highlightable and shows what the flag does.
 func (c *ConfigMode) openNewParamForm() tea.Cmd {
 	c.pendingKey = ""
-	c.formStaging = formStaging{paramKey: &c.pendingKey}
-
-	var fields []huh.Field
-	if len(c.registry) > 0 {
-		opts := make([]huh.Option[string], 0, len(c.registry)+1)
-		for _, name := range c.registry.Names() {
-			fi := c.registry[name]
-			label := fmt.Sprintf("%-22s %s", fi.Form, kindLabel(fi))
-			opts = append(opts, huh.NewOption(label, name))
-		}
-		fields = append(fields,
-			huh.NewSelect[string]().
-				Title("Pick a flag (type to filter; Esc cancels)").
-				Options(opts...).
-				Filtering(true).
-				Value(&c.pendingKey),
-		)
-	} else {
-		fields = append(fields,
-			huh.NewInput().Title("flag key (without leading dashes)").
-				Value(&c.pendingKey).Validate(nonEmpty("key")),
-		)
+	if len(c.registry) == 0 {
+		// No registry: fall back to a free-text huh.Input. applyForm's
+		// formNewParamPickKey branch advances to the value form.
+		c.formStaging = formStaging{paramKey: &c.pendingKey}
+		form := huh.NewForm(huh.NewGroup(
+			huh.NewInput().
+				Title("flag key (without leading dashes)").
+				Value(&c.pendingKey).
+				Validate(nonEmpty("key")),
+		)).WithTheme(huh.ThemeBase())
+		return c.installForm(form, formNewParamPickKey)
 	}
-	form := huh.NewForm(huh.NewGroup(fields...)).WithTheme(huh.ThemeBase())
-	return c.installForm(form, formNewParamPickKey)
+	c.picker = newParamPicker(c.registry)
+	pw, ph := c.pickerSize()
+	c.picker.SetSize(pw, ph)
+	return nil
+}
+
+// pickerSize returns the inner dimensions of the picker box, matching
+// the frame allowance used in installForm so overlays look consistent.
+func (c *ConfigMode) pickerSize() (int, int) {
+	const frame = 12
+	w := c.width - frame
+	if w < 30 {
+		w = 30
+	}
+	h := c.height - 8
+	if h < 6 {
+		h = 6
+	}
+	return w, h
 }
 
 // openValueFormFor builds the value-input form for the given key.
@@ -760,14 +795,23 @@ func (c *ConfigMode) View() string {
 	if c.width == 0 {
 		return ""
 	}
-	if c.form != nil {
-		return lipgloss.Place(c.width, c.height, lipgloss.Center, lipgloss.Center,
-			lipgloss.NewStyle().
-				BorderStyle(lipgloss.RoundedBorder()).
-				BorderForeground(c.theme.Accent).
-				Padding(1, 2).
-				Render(c.form.View()))
+	bg := c.renderPanes()
+	if c.picker != nil {
+		return overlayCenter(bg, c.picker.View(c.theme), c.width, c.height)
 	}
+	if c.form != nil {
+		popup := lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(c.theme.Accent).
+			Padding(1, 2).
+			Render(c.form.View())
+		return overlayCenter(bg, popup, c.width, c.height)
+	}
+	return bg
+}
+
+// renderPanes draws the three-pane editor without any overlay.
+func (c *ConfigMode) renderPanes() string {
 	headerStyle := lipgloss.NewStyle().Foreground(c.theme.Accent).Bold(true)
 	header := headerStyle.Render("llamaman — configuration")
 	if c.Modified() {

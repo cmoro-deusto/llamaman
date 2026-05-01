@@ -367,23 +367,25 @@ func (r *RunMode) handleQuitPrompt(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 }
 
 // View renders the 3-line header, the viewport, a 1-line footer, and any
-// active overlay (quit / restart / help / search).
+// active overlay (quit / restart / help / search). Overlays float over
+// the background instead of replacing it so the user keeps context
+// (header, log) while interacting with a modal.
 func (r *RunMode) View() string {
 	if r.width == 0 {
 		return ""
 	}
-	if r.showQuit {
-		return lipgloss.Place(r.width, r.height, lipgloss.Center, lipgloss.Center, r.renderQuitPrompt())
-	}
-	if r.restartPrompt {
-		return lipgloss.Place(r.width, r.height, lipgloss.Center, lipgloss.Center, r.renderRestartPrompt())
-	}
-	if r.showHelp {
-		return lipgloss.Place(r.width, r.height, lipgloss.Center, lipgloss.Center, r.renderHelp())
-	}
 	header := r.renderHeader()
 	footer := r.renderFooter()
-	return lipgloss.JoinVertical(lipgloss.Left, header, r.viewport.View(), footer)
+	bg := lipgloss.JoinVertical(lipgloss.Left, header, r.viewport.View(), footer)
+	switch {
+	case r.showQuit:
+		return overlayCenter(bg, r.renderQuitPrompt(), r.width, r.height)
+	case r.restartPrompt:
+		return overlayCenter(bg, r.renderRestartPrompt(), r.width, r.height)
+	case r.showHelp:
+		return overlayCenter(bg, r.renderHelp(), r.width, r.height)
+	}
+	return bg
 }
 
 func (r *RunMode) renderQuitPrompt() string {

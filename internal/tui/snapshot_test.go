@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
+	"github.com/cmoro-deusto/llamaman/internal/flags"
 	"github.com/cmoro-deusto/llamaman/internal/server"
 )
 
@@ -377,6 +378,129 @@ func TestConfigFormHandlesLongLocationPath(t *testing.T) {
 	// Just reaching here without panic is the assertion. installForm
 	// drives a synthetic WindowSizeMsg into huh so its inputs size
 	// themselves.
+}
+
+// TestParamPickerShowsNamesWithoutDashesAndDescriptions covers two
+// related complaints: the new-param flag chooser should not show
+// "--threads" but "threads", and each row should display the parsed
+// help description on the right.
+func TestParamPickerShowsNamesWithoutDashesAndDescriptions(t *testing.T) {
+	reg := flags.Registry{
+		"threads":    {Name: "threads", Form: "--threads", IsBool: false, Kind: flags.KindNumeric, Description: "number of CPU threads to use"},
+		"jinja":      {Name: "jinja", Form: "--jinja", IsBool: true, Kind: flags.KindBool, Description: "use jinja templates"},
+		"flash-attn": {Name: "flash-attn", Form: "--flash-attn", Kind: flags.KindEnum, Enum: []string{"on", "off", "auto"}, Description: "set Flash Attention use"},
+	}
+	p := newParamPicker(reg)
+	p.SetSize(100, 30)
+	out := stripANSI(p.View(CurrentTheme()))
+
+	for _, want := range []string{
+		"threads",                    // bare name (no --)
+		"number of CPU threads",      // description
+		"jinja",
+		"use jinja templates",
+		"flash-attn",
+		"set Flash Attention use",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("picker output missing %q\nout:\n%s", want, out)
+		}
+	}
+	for _, dont := range []string{"--threads", "--jinja", "--flash-attn"} {
+		if strings.Contains(out, dont) {
+			t.Errorf("picker output should not contain %q\nout:\n%s", dont, out)
+		}
+	}
+}
+
+// TestParamPickerEnterEmitsKey verifies pressing Enter on a highlighted
+// row dispatches paramPickerDoneMsg with the bare key.
+func TestParamPickerEnterEmitsKey(t *testing.T) {
+	reg := flags.Registry{
+		"threads": {Name: "threads", Form: "--threads", Description: "..."},
+	}
+	p := newParamPicker(reg)
+	p.SetSize(80, 20)
+
+	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("expected a Cmd from Enter")
+	}
+	msg := cmd()
+	done, ok := msg.(paramPickerDoneMsg)
+	if !ok {
+		t.Fatalf("expected paramPickerDoneMsg, got %T", msg)
+	}
+	if done.cancelled || done.key != "threads" {
+		t.Fatalf("got %+v", done)
+	}
+}
+
+// TestQuitOverlayPreservesBackground renders a synthetic background and
+// asserts that overlayCenter keeps the background characters that lie
+// outside the popup box. Guards against regressions of the
+// "lipgloss.Place wipes the screen" UX problem. The popup IS allowed to
+// overwrite the columns it occupies — what we care about is that the
+// rest of each background row survives.
+func TestQuitOverlayPreservesBackground(t *testing.T) {
+	// 30-col-wide background; a "LL" marker sits at the far left and
+	// "RR" at the far right of every row so we can detect either side
+	// being clobbered.
+	bg := strings.Join([]string{
+		"LL........................RR",
+		"LL........................RR",
+		"LL........................RR",
+	}, "\n")
+	popup := strings.Join([]string{
+		"┌──────┐",
+		"│ MENU │",
+		"└──────┘",
+	}, "\n")
+	out := overlayCenter(bg, popup, 30, 3)
+	for _, want := range []string{"LL", "RR", "MENU"} {
+		if strings.Count(out, want) < 1 {
+			t.Errorf("overlay output missing %q; got:\n%s", want, out)
+		}
+	}
+	// Each background row's LL/RR should still survive on the same row.
+	for i, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "LL") {
+			t.Errorf("row %d lost left edge: %q", i, line)
+		}
+		if !strings.HasSuffix(line, "RR") {
+			t.Errorf("row %d lost right edge: %q", i, line)
+		}
+	}
+}
+
+// TestConfigModeArrowCyclesPanes verifies left/right (and h/l) cycle
+// pane focus the same way Tab / Shift+Tab do — the user explicitly
+// asked for arrow navigation.
+func TestConfigModeArrowCyclesPanes(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 140, Height: 40},
+		keyMsg("c"),
+	)
+	if root.configMod == nil {
+		t.Fatal("config mode not opened")
+	}
+	if root.configMod.focus != FocusModels {
+		t.Fatalf("initial focus = %d, want FocusModels", root.configMod.focus)
+	}
+	driveRoot(t, root, tea.KeyMsg{Type: tea.KeyRight})
+	if root.configMod.focus != FocusPresets {
+		t.Errorf("after Right: focus = %d, want FocusPresets", root.configMod.focus)
+	}
+	driveRoot(t, root, tea.KeyMsg{Type: tea.KeyRight})
+	if root.configMod.focus != FocusParams {
+		t.Errorf("after Right Right: focus = %d, want FocusParams", root.configMod.focus)
+	}
+	driveRoot(t, root, tea.KeyMsg{Type: tea.KeyLeft})
+	if root.configMod.focus != FocusPresets {
+		t.Errorf("after Left: focus = %d, want FocusPresets", root.configMod.focus)
+	}
 }
 
 // TestFirstRunWindowSizeDoesNotPanic guards the regression reported in

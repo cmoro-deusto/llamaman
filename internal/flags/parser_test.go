@@ -3,6 +3,7 @@ package flags
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -129,6 +130,44 @@ func TestParseHelpClassifiesValueKinds(t *testing.T) {
 						t.Errorf("Enum[%d] = %q, want %q", i, fi.Enum[i], e)
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestParseHelpCapturesDescriptions(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "llama-server-help.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := ParseHelp(string(data))
+
+	cases := []struct {
+		name, mustContain string
+	}{
+		{"threads", "number of CPU threads"},
+		{"flash-attn", "Flash Attention"},
+		{"jinja", "jinja template engine"},
+		{"ctx-size", "size of the prompt context"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fi, ok := reg.Lookup(tc.name)
+			if !ok {
+				t.Fatalf("missing %q", tc.name)
+			}
+			if fi.Description == "" {
+				t.Fatalf("Description empty for %q", tc.name)
+			}
+			if !strings.Contains(fi.Description, tc.mustContain) {
+				t.Errorf("Description for %q = %q, want substring %q",
+					tc.name, fi.Description, tc.mustContain)
+			}
+			// (env: LLAMA_ARG_X) trailers are noise — make sure they
+			// don't pollute the description.
+			if strings.Contains(fi.Description, "(env:") {
+				t.Errorf("Description for %q should drop env trailer; got %q",
+					tc.name, fi.Description)
 			}
 		})
 	}

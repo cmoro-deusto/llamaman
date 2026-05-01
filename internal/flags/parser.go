@@ -29,6 +29,7 @@ type FlagInfo struct {
 	Placeholder string    // raw placeholder text after the alias, if any
 	Enum        []string  // parsed enum values, when Placeholder is bracketed/braced
 	Kind        ValueKind // editor hint: bool / numeric / enum / string
+	Description string    // free-form description from the help text
 }
 
 // Registry maps the bare param key to its FlagInfo.
@@ -69,22 +70,77 @@ var hardcodedEnums = map[string][]string{
 }
 
 // ParseHelp consumes the output of `llama-server --help` and returns the
-// per-alias registry. Lines that don't look like flag entries are ignored.
+// per-alias registry. Continuation lines (any leading whitespace) are
+// folded into the description of the most recently seen flag entry.
 func ParseHelp(out string) Registry {
 	reg := make(Registry)
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	// pending* track the names of the most recent entry's aliases so we
+	// can attach description continuation lines to all of them.
+	var pendingAliases []string
+	var pendingDesc strings.Builder
+
+	flushPending := func() {
+		if len(pendingAliases) == 0 {
+			return
+		}
+		desc := strings.TrimSpace(pendingDesc.String())
+		if desc != "" {
+			for _, name := range pendingAliases {
+				if fi, ok := reg[name]; ok {
+					fi.Description = desc
+					reg[name] = fi
+				}
+			}
+		}
+		pendingAliases = pendingAliases[:0]
+		pendingDesc.Reset()
+	}
+
 	for scanner.Scan() {
 		line := scanner.Text()
-		if line == "" || line[0] == ' ' || line[0] == '\t' {
+		if line == "" {
+			continue
+		}
+		// Continuation: starts with whitespace. Append to the running
+		// description, dropping the indentation prefix.
+		if line[0] == ' ' || line[0] == '\t' {
+			if len(pendingAliases) == 0 {
+				continue
+			}
+			trimmed := strings.TrimLeft(line, " \t")
+			// Skip the noisy "(env: LLAMA_ARG_X)" trailers and other
+			// parenthetical metadata since they don't help the user
+			// pick a flag.
+			if strings.HasPrefix(trimmed, "(env:") {
+				continue
+			}
+			if pendingDesc.Len() > 0 {
+				pendingDesc.WriteByte(' ')
+			}
+			pendingDesc.WriteString(trimmed)
 			continue
 		}
 		if !flagLineRE.MatchString(line) {
+			// New flag-line shaped boundary, but not a flag — flush any
+			// pending entry to the registry.
+			flushPending()
 			continue
 		}
-		aliasPart, _ := splitAliasFromDesc(line)
-		ingestEntry(reg, aliasPart)
+		// Start of a new entry. Flush whatever we accumulated for the
+		// previous one.
+		flushPending()
+		aliasPart, inlineDesc := splitAliasFromDesc(line)
+		names := ingestEntry(reg, aliasPart)
+		pendingAliases = append(pendingAliases, names...)
+		if inlineDesc != "" {
+			pendingDesc.WriteString(inlineDesc)
+		}
 	}
+	flushPending()
+
 	// Apply hard-coded enums after parsing so they win over any
 	// generic-string classification.
 	for name, vals := range hardcodedEnums {
@@ -98,11 +154,13 @@ func ParseHelp(out string) Registry {
 }
 
 // ingestEntry parses one alias section like
-// "-fa,   --flash-attn [on|off|auto]" and adds each alias to the registry.
-func ingestEntry(reg Registry, aliasPart string) {
+// "-fa,   --flash-attn [on|off|auto]" and adds each alias to the
+// registry. Returns the bare names that were registered (or already
+// existed) so the caller can attach description continuation lines.
+func ingestEntry(reg Registry, aliasPart string) []string {
 	tokens := splitTopLevelCommas(aliasPart)
 	if len(tokens) == 0 {
-		return
+		return nil
 	}
 
 	type pendingAlias struct{ name, form string }
@@ -147,9 +205,11 @@ func ingestEntry(reg Registry, aliasPart string) {
 		}
 	}
 
+	names := make([]string, 0, len(pending))
 	for _, a := range pending {
 		// First-write wins so earlier sections (closer to the user-facing
 		// surface) keep their canonical form.
+		names = append(names, a.name)
 		if _, exists := reg[a.name]; exists {
 			continue
 		}
@@ -162,6 +222,7 @@ func ingestEntry(reg Registry, aliasPart string) {
 			Kind:        kind,
 		}
 	}
+	return names
 }
 
 // parseEnumPlaceholder extracts enum values from `[a|b|c]`, `{a,b,c}`,
