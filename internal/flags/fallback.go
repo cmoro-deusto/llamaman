@@ -4,7 +4,10 @@
 package flags
 
 // fallbackShort lists the keys that take a single-dash form when the
-// `llama-server --help` output cannot be parsed (DESIGN.md §6.2).
+// `llama-server --help` output cannot be parsed (DESIGN.md §6.2). The
+// `hf*` family was added when model-level Hugging Face support landed
+// — `hf` in particular is auto-emitted for HF-sourced models, so its
+// canonical form has to be correct even when llama-server is missing.
 var fallbackShort = map[string]struct{}{
 	"m":   {},
 	"n":   {},
@@ -20,6 +23,12 @@ var fallbackShort = map[string]struct{}{
 	"fa":  {},
 	"np":  {},
 	"cb":  {},
+	"hf":  {},
+	"hff": {},
+	"hft": {},
+	"hfr": {},
+	"hfd": {},
+	"hfv": {},
 }
 
 // Canonical returns the CLI form (with dashes) for a parameter key.

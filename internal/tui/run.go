@@ -534,7 +534,7 @@ func (r *RunMode) renderHeader() string {
 		statusDot, statusText, uptime)
 
 	line2 := lipgloss.NewStyle().Foreground(r.theme.Subtle).
-		Render(condensedSummary(r.model.Location, r.preset))
+		Render(condensedSummary(r.model, r.preset))
 
 	line3 := lipgloss.NewStyle().Foreground(r.theme.Muted).
 		Render(booleanSummary(r.preset))
@@ -593,8 +593,16 @@ func presetNameOrDash(p config.Preset) string {
 }
 
 // condensedSummary picks a few highlights for line 2 of the header.
-func condensedSummary(location string, preset config.Preset) string {
-	parts := []string{filepath.Base(location)}
+// Local models show the file's basename (path noise stripped); HF models
+// show the bare identifier as written.
+func condensedSummary(m config.Model, preset config.Preset) string {
+	var head string
+	if m.IsHF() {
+		head = m.HF
+	} else {
+		head = filepath.Base(m.Location)
+	}
+	parts := []string{head}
 	for _, key := range []string{"ngl", "ctx-size", "fa", "ctk", "ctv"} {
 		if v, ok := preset.Params.Get(key); ok {
 			parts = append(parts, fmt.Sprintf("%s=%v", key, v))

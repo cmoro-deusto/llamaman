@@ -22,20 +22,33 @@ type Result struct {
 //
 // Order per DESIGN.md §6.1:
 //
-//	<bin> -m <location> --alias <alias> --host <host> <preset.params...> --port <port>
+//	<bin> {-m <location> | -hf <id>} --alias <alias> --host <host> <preset.params...> --port <port>
 //
-// If a preset param's key overlaps with an auto-added flag (m, alias, host,
-// port), the preset value wins and the auto-added entry is suppressed.
+// The model source is either local (`-m <location>`, the default) or a
+// Hugging Face identifier (`-hf <id>`) when model.HF is non-empty. The
+// schema enforces exactly one (see config.Validate).
 //
-// reg is consulted first for canonical CLI form; unknown keys fall back to
-// the hard-coded short-form set (DESIGN.md §6.2). Unknown keys also produce
-// a warning in the returned Result.
+// If a preset param's key overlaps with an auto-added flag — currently
+// {m, hf, alias, host, port} — the preset value wins and the auto-added
+// entry is suppressed. This lets a preset redirect a model's source as
+// the universal escape hatch, mirroring how host/port overrides work.
+//
+// reg is consulted first for canonical CLI form; unknown keys fall back
+// to the hard-coded short-form set (DESIGN.md §6.2). Unknown keys also
+// produce a warning in the returned Result.
 func Build(globals config.Globals, model config.Model, preset config.Preset, reg flags.Registry) (Result, error) {
 	overrides := overrideSet(preset.Params)
 
 	argv := []string{globals.Bin}
-	if !overrides["m"] {
-		argv = append(argv, canonical("m", reg), model.Location)
+	switch {
+	case model.IsHF():
+		if !overrides["hf"] && !overrides["m"] {
+			argv = append(argv, canonical("hf", reg), model.HF)
+		}
+	default:
+		if !overrides["m"] && !overrides["hf"] {
+			argv = append(argv, canonical("m", reg), model.Location)
+		}
 	}
 	if !overrides["alias"] {
 		argv = append(argv, canonical("alias", reg), model.Alias)
@@ -63,10 +76,10 @@ func Build(globals config.Globals, model config.Model, preset config.Preset, reg
 }
 
 func overrideSet(params config.Params) map[string]bool {
-	o := make(map[string]bool, 4)
+	o := make(map[string]bool, 5)
 	for _, p := range params {
 		switch p.Key {
-		case "m", "alias", "host", "port":
+		case "m", "hf", "alias", "host", "port":
 			o[p.Key] = true
 		}
 	}

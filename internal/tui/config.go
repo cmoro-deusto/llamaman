@@ -48,12 +48,19 @@ type returnFromConfigMsg struct{}
 // input into these pointers; applyForm reads them on submit.
 type formStaging struct {
 	bin, host, port    *string
-	alias, location    *string
+	alias              *string
+	source             *string // "local" | "hf"; for new/edit-model forms
+	location, hf       *string // exactly one is populated based on source
 	name, desc         *string
 	paramKey, paramVal *string
 	confirm            *bool
 	choice             *string
 }
+
+const (
+	sourceLocal = "local"
+	sourceHF    = "hf"
+)
 
 // ConfigMode is the three-pane editor described in DESIGN.md §7.5.
 type ConfigMode struct {
@@ -407,24 +414,72 @@ func (c *ConfigMode) openGlobalsForm() tea.Cmd {
 }
 
 func (c *ConfigMode) openNewModelForm() tea.Cmd {
-	alias, location := "", ""
-	c.formStaging = formStaging{alias: &alias, location: &location}
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewInput().Title("alias").Value(&alias).Validate(nonEmpty("alias")),
-		huh.NewInput().Title("model location (path)").Value(&location).Validate(nonEmpty("location")).CharLimit(2048),
-	)).WithTheme(huh.ThemeBase())
-	return c.installForm(form, formNewModel)
+	alias, location, hf := "", "", ""
+	source := sourceLocal
+	c.formStaging = formStaging{alias: &alias, source: &source, location: &location, hf: &hf}
+	return c.installForm(buildModelForm(&alias, &source, &location, &hf), formNewModel)
 }
 
 func (c *ConfigMode) openEditModelForm() tea.Cmd {
 	m := c.work.Models[c.modelIdx]
-	alias, location := m.Alias, m.Location
-	c.formStaging = formStaging{alias: &alias, location: &location}
-	form := huh.NewForm(huh.NewGroup(
-		huh.NewInput().Title("alias").Value(&alias).Validate(nonEmpty("alias")),
-		huh.NewInput().Title("model location (path)").Value(&location).Validate(nonEmpty("location")).CharLimit(2048),
-	)).WithTheme(huh.ThemeBase())
-	return c.installForm(form, formEditModel)
+	alias, location, hf := m.Alias, m.Location, m.HF
+	source := sourceLocal
+	if m.IsHF() {
+		source = sourceHF
+	}
+	c.formStaging = formStaging{alias: &alias, source: &source, location: &location, hf: &hf}
+	return c.installForm(buildModelForm(&alias, &source, &location, &hf), formEditModel)
+}
+
+// buildModelForm assembles the alias + source + value form used by both
+// new-model and edit-model flows. huh only supports per-Group hide
+// functions (not per-Field), so the two value inputs live in their own
+// hidden-by-default groups gated on the source select. huh advances
+// from group 1 to whichever group 2/3 is currently visible on submit,
+// then to the next non-hidden group, etc.
+func buildModelForm(alias, source, location, hf *string) *huh.Form {
+	g1 := huh.NewGroup(
+		huh.NewInput().Title("alias").Value(alias).Validate(nonEmpty("alias")),
+		huh.NewSelect[string]().
+			Title("source").
+			Description("local file or Hugging Face repository").
+			Options(
+				huh.NewOption("local file (.gguf)", sourceLocal),
+				huh.NewOption("Hugging Face (downloaded by llama-server)", sourceHF),
+			).
+			Value(source),
+	)
+	g2Local := huh.NewGroup(
+		huh.NewInput().
+			Title("model location (path)").
+			Description("expanded ~ and $VAR at load time").
+			Value(location).
+			CharLimit(2048).
+			Validate(nonEmpty("location")),
+	).WithHideFunc(func() bool { return *source != sourceLocal })
+	g2HF := huh.NewGroup(
+		huh.NewInput().
+			Title("HF identifier").
+			Description("org/model[:quant], e.g. Qwen/Qwen3-32B-GGUF:Q4_K_M").
+			Value(hf).
+			CharLimit(256).
+			Validate(hfFormValidator),
+	).WithHideFunc(func() bool { return *source != sourceHF })
+	return huh.NewForm(g1, g2Local, g2HF).WithTheme(huh.ThemeBase())
+}
+
+// hfFormValidator combines the non-empty check with the format check
+// used by config.Validate, so the user gets immediate feedback before
+// save.
+func hfFormValidator(s string) error {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return fmt.Errorf("hf identifier is required")
+	}
+	if !config.ValidHFIdentifier(s) {
+		return fmt.Errorf("expected org/repo[:quant]")
+	}
+	return nil
 }
 
 func (c *ConfigMode) openDeleteModelPrompt() tea.Cmd {
@@ -653,15 +708,14 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		c.work.Globals.Port = port
 		c.flash = "globals updated"
 	case formNewModel:
-		c.work.Models = append(c.work.Models, config.Model{
-			Alias:    deref(c.formStaging.alias),
-			Location: deref(c.formStaging.location),
-		})
+		m := config.Model{Alias: deref(c.formStaging.alias)}
+		applyModelSourceFromStaging(&m, c.formStaging)
+		c.work.Models = append(c.work.Models, m)
 		c.modelIdx = len(c.work.Models) - 1
 		c.flash = "model added"
 	case formEditModel:
 		c.work.Models[c.modelIdx].Alias = deref(c.formStaging.alias)
-		c.work.Models[c.modelIdx].Location = deref(c.formStaging.location)
+		applyModelSourceFromStaging(&c.work.Models[c.modelIdx], c.formStaging)
 		c.flash = "model updated"
 	case formDeleteModel:
 		if c.formStaging.confirm != nil && *c.formStaging.confirm {
@@ -731,6 +785,21 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		}
 	}
 	return nil, true
+}
+
+// applyModelSourceFromStaging mirrors the form's source select onto the
+// Model's Location/HF fields, clearing whichever is unused so the
+// schema invariant (exactly one) holds even after switching source on
+// an existing model.
+func applyModelSourceFromStaging(m *config.Model, s formStaging) {
+	switch deref(s.source) {
+	case sourceHF:
+		m.Location = ""
+		m.HF = strings.TrimSpace(deref(s.hf))
+	default:
+		m.HF = ""
+		m.Location = deref(s.location)
+	}
 }
 
 // applyParamValueFromStaging interprets the form's staged value according

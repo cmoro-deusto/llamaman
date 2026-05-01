@@ -159,6 +159,75 @@ func TestValidateMissingBinaryIsWarning(t *testing.T) {
 	}
 }
 
+func TestValidateHFExclusivity(t *testing.T) {
+	cases := []struct {
+		name        string
+		location    string
+		hf          string
+		wantErr     bool
+		errContains string
+	}{
+		{"local only", "/m.gguf", "", false, ""},
+		{"hf only", "", "Qwen/Qwen3-32B-GGUF:Q4_K_M", false, ""},
+		{"both filled", "/m.gguf", "org/repo", true, "mutually exclusive"},
+		{"neither", "", "", true, "either `location`"},
+		{"hf malformed", "", "not-an-hf-id", true, "valid HF identifier"},
+		{"hf with quant", "", "org/repo:Q4_K_M", false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := sampleCfg()
+			cfg.Models[0].Location = tc.location
+			cfg.Models[0].HF = tc.hf
+			issues := Validate(cfg)
+			gotErr := issues.HasErrors()
+			if gotErr != tc.wantErr {
+				t.Fatalf("HasErrors=%v, want %v; issues=%v", gotErr, tc.wantErr, issues)
+			}
+			if tc.errContains != "" {
+				found := false
+				for _, it := range issues {
+					if it.Severity == Error && strings.Contains(it.Message, tc.errContains) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("expected error containing %q; issues=%v", tc.errContains, issues)
+				}
+			}
+		})
+	}
+}
+
+func TestValidHFIdentifier(t *testing.T) {
+	good := []string{
+		"Qwen/Qwen3-32B-GGUF",
+		"Qwen/Qwen3-32B-GGUF:Q4_K_M",
+		"meta-llama/Llama-3.3-70B-Instruct-Q4_K_M",
+		"a/b",
+		"a.b/c.d:e.f",
+	}
+	for _, s := range good {
+		if !ValidHFIdentifier(s) {
+			t.Errorf("expected valid: %q", s)
+		}
+	}
+	bad := []string{
+		"",
+		"justrepo",
+		"/leading-slash",
+		"trailing-slash/",
+		"a/b/c",
+		"path/to/file.gguf",
+	}
+	for _, s := range bad {
+		if ValidHFIdentifier(s) {
+			t.Errorf("expected invalid: %q", s)
+		}
+	}
+}
+
 func TestValidateHostFormats(t *testing.T) {
 	cases := map[string]bool{
 		"127.0.0.1":    true,

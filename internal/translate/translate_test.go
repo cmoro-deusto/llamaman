@@ -169,6 +169,72 @@ func TestBuildRejectsUnsupportedValue(t *testing.T) {
 	}
 }
 
+// HF-sourced models emit `-hf <id>` instead of `-m <location>`, in the
+// same auto-added position. `--alias`/`--host`/`--port` carry over.
+func TestBuildHFSourceUsesHFFlag(t *testing.T) {
+	got := build(t,
+		config.Globals{Bin: "/opt/llama.cpp/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		config.Model{Alias: "qwen-hf", HF: "Qwen/Qwen3-32B-GGUF:Q4_K_M"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "ngl", Value: num("99")},
+		}},
+	)
+	want := []string{
+		"/opt/llama.cpp/bin/llama-server",
+		"-hf", "Qwen/Qwen3-32B-GGUF:Q4_K_M",
+		"--alias", "qwen-hf",
+		"--host", "127.0.0.1",
+		"-ngl", "99",
+		"--port", "9080",
+	}
+	if !reflect.DeepEqual(got.Argv, want) {
+		t.Fatalf("argv mismatch:\n got: %v\nwant: %v", got.Argv, want)
+	}
+	// The local `-m` flag must not appear.
+	if contains(got.Argv, "-m") {
+		t.Errorf("HF model should not emit -m; got %v", got.Argv)
+	}
+}
+
+// A preset overriding `hf` suppresses the auto-added one and the
+// preset's value wins in its declared position.
+func TestBuildPresetCanOverrideHF(t *testing.T) {
+	got := build(t,
+		config.Globals{Bin: "x", Host: "h", Port: 1},
+		config.Model{Alias: "a", HF: "default/repo:Q4_K_M"},
+		config.Preset{Params: config.Params{
+			{Key: "hf", Value: "different/repo:Q5_K_M"},
+		}},
+	)
+	// The auto -hf should not appear with the model's value.
+	for i := 0; i < len(got.Argv); i++ {
+		if got.Argv[i] == "-hf" && i+1 < len(got.Argv) && got.Argv[i+1] == "default/repo:Q4_K_M" {
+			t.Fatalf("auto -hf with model value should be suppressed; got %v", got.Argv)
+		}
+	}
+	if !contains(got.Argv, "different/repo:Q5_K_M") {
+		t.Errorf("preset's hf value should be present; got %v", got.Argv)
+	}
+}
+
+// A preset overriding `m` on a local model still suppresses the auto
+// `-m`, matching the v0.1.x behavior we don't want to regress.
+func TestBuildPresetMOverrideStillWorks(t *testing.T) {
+	got := build(t,
+		config.Globals{Bin: "x", Host: "h", Port: 1},
+		config.Model{Alias: "a", Location: "/orig.gguf"},
+		config.Preset{Params: config.Params{
+			{Key: "m", Value: "/override.gguf"},
+		}},
+	)
+	if !contains(got.Argv, "/override.gguf") {
+		t.Errorf("preset m override should appear; got %v", got.Argv)
+	}
+	if contains(got.Argv, "/orig.gguf") {
+		t.Errorf("auto -m should be suppressed when preset overrides; got %v", got.Argv)
+	}
+}
+
 // With a real registry, ctk/ctv resolve to short form (matches fallback in
 // this case) and unknown keys produce a warning instead of a hard error.
 func TestBuildWarnsOnUnknownKey(t *testing.T) {

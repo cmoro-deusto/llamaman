@@ -57,6 +57,11 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
     {
       "alias": "qwen3.6-27B",
       "location": "~/Code/ai/models/Qwen3.6-27B-Q4_K_XL.gguf",
+      "presets": [...]
+    },
+    {
+      "alias": "qwen-hf",
+      "hf": "Qwen/Qwen3-32B-GGUF:Q4_K_M",
       "presets": [
         {
           "preset": "default",
@@ -79,6 +84,7 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
 
 - `version` is mandatory. Unknown versions → hard error (exit 2). No migrations in v1.
 - `models` is a JSON array (the spec text says "object" — that's a typo).
+- Each model has **exactly one** of `location` (a path to a local `.gguf` file, expanded with `~`/`$VAR` at load) or `hf` (a Hugging Face identifier in `org/repo[:quant]` form, passed verbatim to llama-server's `-hf`). Both empty or both filled → validation error.
 - `presets` may be empty `[]`.
 - `params` is an object; iteration order **must** be preserved (see §6.4).
 
@@ -108,6 +114,8 @@ Resolved values are used for all subsequent operations and error messages.
 - Cross-field validation runs on save:
   - Alias uniqueness across models (case-sensitive).
   - Preset name uniqueness within a model (case-sensitive).
+  - Each model has exactly one of `location` / `hf` set; both empty or both filled → error.
+  - `hf` (when set) matches `^[\w.-]+/[\w.-]+(?::[\w.-]+)?$` (i.e., `org/repo[:quant]`) → error if not. No network reachability check; llama-server surfaces unreachable repos at launch.
 - `models[].location` not existing on disk → warning, not blocking.
 - `globals.llama-server-bin` not existing or not executable → warning, not blocking.
 - Unknown param keys → warning, not blocking (consistent with §6.5).
@@ -128,7 +136,7 @@ llamaman [options] [<alias> [<preset>]]
 |---|---|---|
 | `-h` | `--help` | Print help to stdout, exit 0. |
 | | `--version` | Print `llamaman vX.Y.Z (commit, built date)` to stdout, exit 0. |
-| `-l` | `--list` | List configured models (one per line, with preset count). Plain stdout. Active session marked `(running)`. Exit 0. |
+| `-l` | `--list` | List configured models, one per line: `<alias>\t(<source>)\t<n> presets[\t(running)]`. `<source>` is `local` or `hf`. Plain stdout, exit 0. |
 | `-p` | `--presets` | With a following `<alias>`, print that model's presets to stdout. Exit 0. |
 | `-c` | `--config` | Path to alternate config file. |
 | | `--completion` | Takes `bash`, `zsh`, or `fish`; prints completion script to stdout, exit 0. |
@@ -246,19 +254,22 @@ Path: `${XDG_RUNTIME_DIR:-/tmp/llamaman-$UID}/llamaman/llama-server.log`
 In every spawn command, in this order:
 
 ```
-<bin> -m <location> --alias <alias> --host <host> <preset.params...> --port <port>
+<bin> {-m <location> | -hf <id>} --alias <alias> --host <host> <preset.params...> --port <port>
 ```
 
+- The first slot is the model source: `-m <location>` for a local model, or `-hf <id>` for a Hugging Face identifier (chosen by which field is set on the model — exactly one, see §3.2).
 - `--host` is **always** passed, even when it's `127.0.0.1` (explicit > implicit).
-- If a preset's `params` contains a key that overlaps with an auto-added flag (`m`, `alias`, `host`, `port`), the preset value wins.
+- If a preset's `params` contains a key that overlaps with an auto-added flag (`m`, `hf`, `alias`, `host`, `port`), the preset value wins and the corresponding auto-added entry is suppressed. This lets a preset redirect a model's source as the universal escape hatch.
 
 ### 6.2 Short vs long form inference
 
 On `llamaman` startup (and whenever the binary's mtime changes), parse `llama-server --help` and build a map `{name → canonical_form}`. Cache it at `$XDG_CACHE_HOME/llamaman/flags-<bin-mtime>.json`.
 
 If the binary is missing or its `--help` cannot be parsed, fall back to:
-- Single-dash for keys in this hard-coded set: `m, n, c, t, s, b, h, p, ngl, ctk, ctv, fa, np, cb`.
+- Single-dash for keys in this hard-coded set: `m, n, c, t, s, b, h, p, ngl, ctk, ctv, fa, np, cb, hf, hff, hft, hfr, hfd, hfv`.
 - Double-dash for everything else.
+
+The `hf*` family is in the hard-coded set because `hf` is auto-emitted for HF-sourced models (§6.1) — its canonical form has to be correct even when the registry isn't available.
 
 ### 6.3 Boolean handling
 
@@ -400,8 +411,8 @@ Three-pane master-detail:
 `Tab` / `Shift+Tab` cycle focus across panes. `Right` / `Left` (and `l` / `h`) do the same — the user can navigate to any pane with arrow keys without lifting from the navigation cluster.
 
 **Models pane**:
-- `e` rename alias / change location (modal form).
-- `n` new model (modal: alias + location).
+- `e` rename alias / change source (modal form: alias, source select [`local` | `huggingface`], then either a path input or a `org/repo[:quant]` input depending on the selection).
+- `n` new model (same modal as edit).
 - `d` delete (confirm with preset count).
 - `Shift+↑/↓` reorder (persisted in JSON).
 

@@ -97,10 +97,17 @@ The first invocation with no config triggers a setup flow that writes `~/.config
           }
         }
       ]
+    },
+    {
+      "alias": "qwen-hf",
+      "hf": "Qwen/Qwen3-32B-GGUF:Q4_K_M",
+      "presets": [{ "preset": "default", "description": "", "params": { "ngl": 99, "fa": "on" } }]
     }
   ]
 }
 ```
+
+A model has **exactly one** of `location` (path to a local `.gguf` file) or `hf` (a Hugging Face identifier in `org/repo[:quant]` form). Local paths are expanded for `~` and `$VAR` at load time; HF identifiers are passed verbatim to llama-server's `-hf`, which downloads and caches the model on first launch.
 
 Param iteration order is preserved on disk and in the resulting argv, so you can group related flags however you like. Numeric values stay verbatim (`0.0` won't become `0`).
 

@@ -22,11 +22,33 @@ type Globals struct {
 	Port int    `json:"port"`
 }
 
-// Model is a single named model with its launch presets.
+// Model is a single named model with its launch presets. Exactly one
+// of Location or HF is set:
+//
+//   - Location is a path to a local .gguf file (subject to ~/$VAR
+//     expansion at load time). Maps to `-m <path>` at launch.
+//   - HF is a Hugging Face identifier in `org/repo[:quant]` form. Maps
+//     to `-hf <id>` at launch — llama-server downloads on demand.
+//
+// Setting both is a validation error; setting neither is also an error.
 type Model struct {
 	Alias    string   `json:"alias"`
-	Location string   `json:"location"`
+	Location string   `json:"location,omitempty"`
+	HF       string   `json:"hf,omitempty"`
 	Presets  []Preset `json:"presets"`
+}
+
+// IsHF reports whether the model is sourced from a Hugging Face
+// repository rather than a local file.
+func (m Model) IsHF() bool { return m.HF != "" }
+
+// SourceLabel returns "local" or "hf" — used by --list, picker tags, and
+// debug logs.
+func (m Model) SourceLabel() string {
+	if m.IsHF() {
+		return "hf"
+	}
+	return "local"
 }
 
 // Preset is a named bundle of llama-server flags. The JSON key for the name

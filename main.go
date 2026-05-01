@@ -449,7 +449,8 @@ func runList(cfgOverride string) int {
 		if m.Alias == runningAlias {
 			marker = " (running)"
 		}
-		fmt.Printf("%s\t%d preset%s%s\n", m.Alias, len(m.Presets), plural(len(m.Presets)), marker)
+		fmt.Printf("%s\t(%s)\t%d preset%s%s\n",
+			m.Alias, m.SourceLabel(), len(m.Presets), plural(len(m.Presets)), marker)
 	}
 	return exitOK
 }

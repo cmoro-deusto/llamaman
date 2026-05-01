@@ -5,8 +5,22 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 )
+
+// hfIdentifierRE matches `org/repo` and `org/repo:quant` shapes. We
+// permit `[\w.-]+` on each segment so `Qwen/Qwen3-32B-GGUF:Q4_K_M`
+// passes. No network reachability check — that's llama-server's job at
+// launch time.
+var hfIdentifierRE = regexp.MustCompile(`^[\w.-]+/[\w.-]+(?::[\w.-]+)?$`)
+
+// ValidHFIdentifier reports whether s parses as a Hugging Face
+// identifier (`<user>/<model>` with an optional `:quant` suffix).
+// Exposed so the TUI's huh.Validate can reuse the same check.
+func ValidHFIdentifier(s string) bool {
+	return hfIdentifierRE.MatchString(strings.TrimSpace(s))
+}
 
 // Severity classifies a validation finding. Errors block save; warnings
 // surface in the TUI but don't prevent persisting.
@@ -76,16 +90,31 @@ func Validate(cfg *Config) Issues {
 		} else {
 			aliasSeen[m.Alias] = i
 		}
-		if m.Location == "" {
+		switch {
+		case m.Location == "" && m.HF == "":
 			out = append(out, Issue{Severity: Error,
-				Path:    fmt.Sprintf("models[%d].location", i),
-				Message: "location is required",
+				Path:    fmt.Sprintf("models[%d]", i),
+				Message: "either `location` (local file) or `hf` (Hugging Face identifier) is required",
 			})
-		} else if _, err := os.Stat(m.Location); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				out = append(out, Issue{Severity: Warning,
-					Path:    fmt.Sprintf("models[%d].location", i),
-					Message: fmt.Sprintf("file does not exist: %s", m.Location),
+		case m.Location != "" && m.HF != "":
+			out = append(out, Issue{Severity: Error,
+				Path:    fmt.Sprintf("models[%d]", i),
+				Message: "`location` and `hf` are mutually exclusive — set exactly one",
+			})
+		case m.Location != "":
+			if _, err := os.Stat(m.Location); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					out = append(out, Issue{Severity: Warning,
+						Path:    fmt.Sprintf("models[%d].location", i),
+						Message: fmt.Sprintf("file does not exist: %s", m.Location),
+					})
+				}
+			}
+		case m.HF != "":
+			if !ValidHFIdentifier(m.HF) {
+				out = append(out, Issue{Severity: Error,
+					Path:    fmt.Sprintf("models[%d].hf", i),
+					Message: fmt.Sprintf("not a valid HF identifier (expected `org/repo[:quant]`): %s", m.HF),
 				})
 			}
 		}
