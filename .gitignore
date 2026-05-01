@@ -2,4 +2,4 @@
 /dist/
 /docs/
 *.log
-.claude/settings.local.json
+.claude/
