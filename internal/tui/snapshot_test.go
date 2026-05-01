@@ -567,6 +567,80 @@ func TestParamPickerAutoFiltersOnType(t *testing.T) {
 	}
 }
 
+// TestParamPickerFilterRendersInlineNotFullWidth guards against the
+// "screen-wide filter window" regression: the list's built-in filter
+// input pads to full Width with trailing spaces. We render our own
+// compact "filter: <pat>" line and disable the list's own filter view.
+func TestParamPickerFilterRendersInlineNotFullWidth(t *testing.T) {
+	reg := flags.Registry{
+		"threads":    {Name: "threads", Form: "--threads", Description: "CPU threads"},
+		"flash-attn": {Name: "flash-attn", Form: "--flash-attn", Description: "Flash attention"},
+	}
+	p := newParamPicker(reg)
+	p.SetSize(80, 20)
+
+	// Type a few letters to enter filter mode.
+	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
+	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	view := stripANSI(p.View(CurrentTheme()))
+
+	if !strings.Contains(view, "filter: thr") {
+		t.Fatalf("expected compact 'filter: thr' line; view:\n%s", view)
+	}
+	// The list's built-in filter would render "Filter: " (capital F).
+	// Make sure we're NOT showing two filter rows.
+	if strings.Count(view, "filter") != strings.Count(strings.ToLower(view), "filter") {
+		t.Errorf("inconsistent filter casing in view:\n%s", view)
+	}
+	if strings.Contains(view, "Filter: ") {
+		t.Errorf("bubbles/list's default 'Filter: ' rendering leaked through; view:\n%s", view)
+	}
+}
+
+// TestParamPickerEscClearsFilterBeforeClosingPicker covers the layered
+// Esc behavior: in FilterApplied state, Esc resets the filter and
+// stays in the picker; from Unfiltered, Esc closes.
+func TestParamPickerEscClearsFilterBeforeClosingPicker(t *testing.T) {
+	reg := flags.Registry{
+		"threads": {Name: "threads", Form: "--threads", Description: "CPU threads"},
+	}
+	p := newParamPicker(reg)
+	p.SetSize(80, 20)
+
+	// Use SetFilterText for a synchronous transition into FilterApplied
+	// (the keypress path runs filterItems as an async Cmd that we'd
+	// have to drain through the runtime).
+	p.list.SetFilterText("t")
+	if state := p.list.FilterState(); state != list.FilterApplied {
+		t.Fatalf("after SetFilterText: state = %v, want FilterApplied", state)
+	}
+
+	// Esc should clear, not close.
+	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd != nil {
+		if msg := cmd(); msg != nil {
+			if done, ok := msg.(paramPickerDoneMsg); ok {
+				t.Fatalf("Esc in FilterApplied should not close picker; got %+v", done)
+			}
+		}
+	}
+	if state := p.list.FilterState(); state != list.Unfiltered {
+		t.Errorf("Esc should reset to Unfiltered; got %v", state)
+	}
+
+	// Second Esc closes the picker.
+	_, cmd = p.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("second Esc should close the picker")
+	}
+	msg := cmd()
+	done, ok := msg.(paramPickerDoneMsg)
+	if !ok || !done.cancelled {
+		t.Fatalf("second Esc should emit cancelled paramPickerDoneMsg; got %+v", msg)
+	}
+}
+
 // TestParamPickerEnterEmitsKey verifies pressing Enter on a highlighted
 // row dispatches paramPickerDoneMsg with the bare key.
 func TestParamPickerEnterEmitsKey(t *testing.T) {

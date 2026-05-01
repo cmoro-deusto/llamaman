@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -72,11 +71,15 @@ func newParamPicker(reg flags.Registry) *paramPicker {
 	delegate := list.NewDefaultDelegate()
 	delegate.SetSpacing(0)
 	l := list.New(items, delegate, 0, 0)
-	// Hide the title bar entirely — the bordered box + footer hint
-	// provide context. The filter input renders inline when active so
-	// the picker stays a single, unified surface (no separate "filter
-	// window" feel).
+	// Hide every chrome element bubbles/list provides — title, status
+	// bar, and crucially the filter input itself. Default filter input
+	// rendering pads to the list's full Width with trailing spaces,
+	// which reads as a "screen-wide window" appearing on top of the
+	// items. Filter logic still runs (typing updates FilterInput and
+	// filters items in real time); we render a compact filter line
+	// ourselves in View().
 	l.SetShowTitle(false)
+	l.SetShowFilter(false)
 	l.SetShowHelp(false)
 	l.SetShowStatusBar(false)
 	l.SetShowPagination(true)
@@ -107,6 +110,12 @@ func (p *paramPicker) Update(msg tea.Msg) (*paramPicker, tea.Cmd) {
 		}
 		switch k.String() {
 		case "esc":
+			// Esc in FilterApplied clears the filter and returns to
+			// the full list, instead of closing the picker outright.
+			if p.list.FilterState() == list.FilterApplied {
+				p.list.ResetFilter()
+				return p, nil
+			}
 			return p, func() tea.Msg { return paramPickerDoneMsg{cancelled: true} }
 		case "enter":
 			if it, ok := p.list.SelectedItem().(paramPickerItem); ok {
@@ -146,16 +155,45 @@ func isPrintableRune(k tea.KeyMsg) bool {
 }
 
 // View renders the picker as a bordered box. It's overlaid by ConfigMode
-// over the three-pane background.
+// over the three-pane background. A compact "filter: <pattern>" line
+// appears at the top while the user types so the filter feels like
+// part of the picker, not a separate dialog.
 func (p *paramPicker) View(theme Theme) string {
-	body := p.list.View()
-	hint := lipgloss.NewStyle().Foreground(theme.Subtle).
-		Render("type to filter · ↑↓: navigate · enter: pick · esc: cancel")
+	parts := []string{}
+	if topLine := p.renderFilterLine(theme); topLine != "" {
+		parts = append(parts, topLine)
+	}
+	parts = append(parts, p.list.View())
+
+	hintText := "type to filter · ↑↓: navigate · enter: pick · esc: cancel"
+	if p.list.FilterState() == list.FilterApplied {
+		hintText = "↑↓: navigate · enter: pick · esc: clear filter"
+	}
+	parts = append(parts, lipgloss.NewStyle().Foreground(theme.Subtle).Render(hintText))
+
 	box := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(theme.Accent).
 		Padding(1, 2)
-	return box.Render(fmt.Sprintf("%s\n%s", body, hint))
+	return box.Render(strings.Join(parts, "\n"))
+}
+
+// renderFilterLine produces the compact filter indicator. Empty when
+// the list is in Unfiltered state — no top-row noise unless the user
+// is filtering.
+func (p *paramPicker) renderFilterLine(theme Theme) string {
+	switch p.list.FilterState() {
+	case list.Filtering:
+		val := p.list.FilterInput.Value()
+		label := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true).Render("filter: ")
+		cursor := lipgloss.NewStyle().Foreground(theme.Accent).Render("▎")
+		return label + val + cursor
+	case list.FilterApplied:
+		val := p.list.FilterInput.Value()
+		label := lipgloss.NewStyle().Foreground(theme.Subtle).Render("filter: ")
+		return label + lipgloss.NewStyle().Foreground(theme.Accent).Render(val)
+	}
+	return ""
 }
 
 // renderEmpty shows a placeholder when the registry is empty (e.g.,
