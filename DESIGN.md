@@ -413,6 +413,7 @@ Three-pane master-detail:
 **Models pane**:
 - `e` rename alias / change source (modal form: alias, source select [`local` | `huggingface`], then either a path input or a `org/repo[:quant]` input depending on the selection).
 - `n` new model (same modal as edit).
+- `D` duplicate, prompt for new alias (presets and params copied; source kind and value preserved).
 - `d` delete (confirm with preset count).
 - `Shift+↑/↓` reorder (persisted in JSON).
 

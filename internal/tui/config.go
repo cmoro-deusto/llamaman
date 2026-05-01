@@ -30,6 +30,7 @@ const (
 	formGlobals
 	formNewModel
 	formEditModel
+	formDuplicateModel
 	formDeleteModel
 	formNewPreset
 	formEditPreset
@@ -242,7 +243,7 @@ func (c *ConfigMode) handleKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 		c.save()
 		return c, nil
 	case "?":
-		c.flash = "tab/← →: cycle pane · ↑↓: select · e: edit · n: new · d: delete · g: globals · s: save · esc: back"
+		c.flash = "tab/← →: cycle pane · ↑↓: select · e: edit · n: new · D: dup · d: delete · g: globals · s: save · esc: back"
 		return c, nil
 	}
 	switch c.focus {
@@ -301,6 +302,10 @@ func (c *ConfigMode) handleModelsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 	case "e":
 		if c.hasModel() {
 			return c, c.openEditModelForm()
+		}
+	case "D":
+		if c.hasModel() {
+			return c, c.openDuplicateModelForm()
 		}
 	case "d":
 		if c.hasModel() {
@@ -480,6 +485,34 @@ func hfFormValidator(s string) error {
 		return fmt.Errorf("expected org/repo[:quant]")
 	}
 	return nil
+}
+
+func (c *ConfigMode) openDuplicateModelForm() tea.Cmd {
+	src := c.work.Models[c.modelIdx]
+	alias := src.Alias + "-copy"
+	c.formStaging = formStaging{alias: &alias}
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewInput().Title("new alias").Value(&alias).Validate(uniqueAliasValidator(c.work.Models)),
+	)).WithTheme(huh.ThemeBase())
+	return c.installForm(form, formDuplicateModel)
+}
+
+// uniqueAliasValidator rejects empty input and any alias already used by
+// an existing model. Used inline by the duplicate-model form so collision
+// surfaces at submit time instead of at save-time validation.
+func uniqueAliasValidator(existing []config.Model) func(string) error {
+	return func(s string) error {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return fmt.Errorf("alias is required")
+		}
+		for _, m := range existing {
+			if m.Alias == s {
+				return fmt.Errorf("alias %q already exists", s)
+			}
+		}
+		return nil
+	}
 }
 
 func (c *ConfigMode) openDeleteModelPrompt() tea.Cmd {
@@ -717,6 +750,24 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		c.work.Models[c.modelIdx].Alias = deref(c.formStaging.alias)
 		applyModelSourceFromStaging(&c.work.Models[c.modelIdx], c.formStaging)
 		c.flash = "model updated"
+	case formDuplicateModel:
+		src := c.work.Models[c.modelIdx]
+		presets := make([]config.Preset, len(src.Presets))
+		for j, p := range src.Presets {
+			pp := p
+			pp.Params = append(config.Params(nil), p.Params...)
+			presets[j] = pp
+		}
+		dup := config.Model{
+			Alias:    deref(c.formStaging.alias),
+			Location: src.Location,
+			HF:       src.HF,
+			Presets:  presets,
+		}
+		c.work.Models = append(c.work.Models, dup)
+		c.modelIdx = len(c.work.Models) - 1
+		c.presetIdx, c.paramIdx = 0, 0
+		c.flash = "model duplicated"
 	case formDeleteModel:
 		if c.formStaging.confirm != nil && *c.formStaging.confirm {
 			c.work.Models = append(c.work.Models[:c.modelIdx], c.work.Models[c.modelIdx+1:]...)
