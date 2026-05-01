@@ -378,8 +378,9 @@ Status state machine: `starting → ready → exited|error`.
 | `k` | Direct kill shortcut (with `(y)es / (n)o` confirm). On confirm: stops llama-server, removes the log + session record, and returns to the main screen — llamaman itself stays open. |
 | `r` | Restart server (confirm if currently ready) |
 | `c` | Copy full launch command to clipboard (`wl-copy`, fallback `xclip`, fallback flash status) |
-| `/` | Search forward in output |
+| `/` | Search forward in output. Live highlights (reverse video + bold) wrap matches as you type; `Enter` applies, `Esc` cancels. |
 | `n` / `N` | Next / previous search match |
+| `Esc` | Clear active search and remove highlights (no-op when nothing is applied) |
 | `g` / `G` | Jump to top / bottom |
 | `↑` / `↓` / wheel | Scroll one line. `j`/`k` are **not** bound here so `k` is free for the kill shortcut. |
 | `Space` / `b` | Page down / up |

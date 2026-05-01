@@ -13,8 +13,10 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
+	"github.com/cmoro-deusto/llamaman/internal/flags"
 	"github.com/cmoro-deusto/llamaman/internal/paths"
 	"github.com/cmoro-deusto/llamaman/internal/server"
 )
@@ -51,6 +53,7 @@ type RunMode struct {
 	proc       *server.Process
 	tail       *server.Tailer
 	sessionMgr *server.SessionManager
+	registry   flags.Registry
 
 	viewport viewport.Model
 	buf      strings.Builder
@@ -91,6 +94,7 @@ type RunModeOpts struct {
 	Warnings   []string
 	Process    *server.Process
 	SessionMgr *server.SessionManager // optional; needed to clear session.json on kill
+	Registry   flags.Registry         // optional; used by the header to canonicalize param keys
 }
 
 // NewRunMode wires a RunMode around an already-spawned (or adopted)
@@ -128,6 +132,7 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 		proc:        opts.Process,
 		tail:        tail,
 		sessionMgr:  opts.SessionMgr,
+		registry:    opts.Registry,
 		viewport:    vp,
 		status:      StatusStarting,
 		keys:        DefaultKeymap(),
@@ -142,13 +147,19 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 	return r, cmd, nil
 }
 
-// SetSize configures viewport dimensions. The top pane is fixed at 3 lines
-// and the footer is 1 line; the viewport gets everything in between.
+// SetSize configures viewport dimensions. The top box is fixed at
+// `headerHeight` rows (border + padding + 2 content + padding + border)
+// and the footer takes 1 row; the viewport fills the remainder. Content
+// rows are truncated, so the header height is deterministic regardless
+// of terminal width — that fixes the "header shrinks while scrolling"
+// regression where the previous code reserved only 4 rows for a 5-row
+// bordered box.
 func (r *RunMode) SetSize(w, h int) {
 	r.width, r.height = w, h
 	r.viewport.Width = w
-	if h > 4 {
-		r.viewport.Height = h - 4
+	const footerHeight = 1
+	if h > headerHeight+footerHeight {
+		r.viewport.Height = h - headerHeight - footerHeight
 	} else {
 		r.viewport.Height = 1
 	}
@@ -165,7 +176,7 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			r.status = StatusReady
 		}
 		atBottom := r.viewport.AtBottom()
-		r.viewport.SetContent(r.buf.String())
+		r.viewport.SetContent(r.renderViewportContent())
 		if atBottom {
 			r.viewport.GotoBottom()
 			r.lastSeenLines = r.totalLines
@@ -205,6 +216,17 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		}
 		switch m.String() {
+		case "esc":
+			// Layered Esc: on the main run screen, clear any applied
+			// query so highlights and n/N navigation drop back to a
+			// clean log. No-op when nothing is applied.
+			if r.searchQuery != "" {
+				r.searchQuery = ""
+				r.searchMatches = nil
+				r.searchIdx = 0
+				r.refreshContent()
+			}
+			return r, nil
 		case "q", "ctrl+c":
 			r.showQuit = true
 			return r, nil
@@ -219,6 +241,7 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		case "/":
 			r.searchActive = true
 			r.searchInput.SetValue("")
+			r.refreshContent()
 			return r, r.searchInput.Focus()
 		case "n":
 			r.jumpSearch(+1)
@@ -301,11 +324,22 @@ func (r *RunMode) handleKillPrompt(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 }
 
 // handleSearchInput routes keystrokes while the search prompt is open.
+// Esc layers: with text in the input it just cancels typing; with empty
+// input AND an applied query, it also clears the applied query so a
+// single Esc from a freshly opened prompt returns the log to a clean
+// state. Every text change refreshes the viewport so live highlights
+// track typing.
 func (r *RunMode) handleSearchInput(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 	switch m.String() {
 	case "esc":
 		r.searchActive = false
 		r.searchInput.Blur()
+		if strings.TrimSpace(r.searchInput.Value()) == "" && r.searchQuery != "" {
+			r.searchQuery = ""
+			r.searchMatches = nil
+			r.searchIdx = 0
+		}
+		r.refreshContent()
 		return r, nil
 	case "enter":
 		r.searchQuery = strings.TrimSpace(r.searchInput.Value())
@@ -313,10 +347,12 @@ func (r *RunMode) handleSearchInput(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 		r.searchInput.Blur()
 		r.recomputeMatches()
 		r.jumpSearch(0)
+		r.refreshContent()
 		return r, nil
 	}
 	var cmd tea.Cmd
 	r.searchInput, cmd = r.searchInput.Update(m)
+	r.refreshContent()
 	return r, cmd
 }
 
@@ -360,6 +396,84 @@ func (r *RunMode) copyCommand() {
 		}
 	}
 	r.flash = "no clipboard tool found (install wl-copy or xclip)"
+}
+
+// effectiveQuery returns the query whose matches should be highlighted
+// in the log viewport. The live search-input value wins while the
+// prompt is open so highlights track typing in real time; otherwise the
+// last-applied query is used so they persist for n/N navigation.
+func (r *RunMode) effectiveQuery() string {
+	if r.searchActive {
+		return strings.TrimSpace(r.searchInput.Value())
+	}
+	return r.searchQuery
+}
+
+// renderViewportContent returns the log buffer with reverse+bold ANSI
+// wrapped around every case-insensitive occurrence of the effective
+// query. With no query, the buffer is returned verbatim. This is the
+// single source of truth for what the viewport displays — every state
+// transition that could change either the buffer or the highlight
+// effective query funnels through it.
+//
+// Known limitation: if llama-server's own ANSI styling spans a match,
+// our reset at the end of the highlight prematurely terminates the
+// outer span. llama-server stderr is overwhelmingly plain in practice
+// so we accept this rather than tokenizing the buffer.
+func (r *RunMode) renderViewportContent() string {
+	return highlightOccurrences(r.buf.String(), r.effectiveQuery())
+}
+
+// refreshContent re-renders the viewport, preserving auto-follow when
+// the user was already at the bottom.
+func (r *RunMode) refreshContent() {
+	atBottom := r.viewport.AtBottom()
+	r.viewport.SetContent(r.renderViewportContent())
+	if atBottom {
+		r.viewport.GotoBottom()
+	}
+}
+
+// highlightOpen / highlightClose are the SGR sequences used to wrap
+// matches: bold + reverse video (1;7) opens, full reset (0) closes.
+// Emitted as literals rather than via lipgloss so the highlight is
+// terminal-independent and deterministic in tests, where lipgloss
+// would otherwise suppress codes when no TTY is detected.
+const (
+	highlightOpen  = "\x1b[1;7m"
+	highlightClose = "\x1b[0m"
+)
+
+// highlightOccurrences wraps every non-overlapping case-insensitive
+// match of q in raw with bold+reverse ANSI. Position-stable: matched
+// bytes are taken from raw so original case is preserved. Advances by
+// len(q) after each match to avoid overlap on inputs like "aaa"/"aa".
+func highlightOccurrences(raw, q string) string {
+	if q == "" || raw == "" {
+		return raw
+	}
+	lower := strings.ToLower(raw)
+	qLower := strings.ToLower(q)
+	if len(qLower) == 0 || len(qLower) > len(lower) {
+		return raw
+	}
+	var b strings.Builder
+	b.Grow(len(raw) + 16)
+	i := 0
+	for {
+		rel := strings.Index(lower[i:], qLower)
+		if rel < 0 {
+			b.WriteString(raw[i:])
+			return b.String()
+		}
+		start := i + rel
+		end := start + len(qLower)
+		b.WriteString(raw[i:start])
+		b.WriteString(highlightOpen)
+		b.WriteString(raw[start:end])
+		b.WriteString(highlightClose)
+		i = end
+	}
 }
 
 // recomputeMatches finds line indices in buf containing the search query
@@ -472,8 +586,9 @@ func (r *RunMode) renderHelp() string {
 		"k           kill server and return to main",
 		"r           restart server (confirm if ready)",
 		"c           copy launch command to clipboard",
-		"/           search forward",
+		"/           search (live highlights; Enter applies, Esc cancels)",
 		"n / N       next / previous match",
+		"Esc         clear active search and highlights",
 		"g / G       jump to top / bottom",
 		"space / b   page down / up",
 		"↑ / ↓       scroll one line",
@@ -519,44 +634,113 @@ func pluralN(n int) string {
 	return "s"
 }
 
-func (r *RunMode) renderHeader() string {
-	statusDot := lipgloss.NewStyle().Foreground(r.statusColor()).Render("●")
-	statusText := lipgloss.NewStyle().Foreground(r.theme.Subtle).Render(r.statusLabel())
-	uptime := lipgloss.NewStyle().Foreground(r.theme.Subtle).
-		Render(formatUptime(time.Since(r.proc.Started)))
+// shortToLong maps the short-form llama-server flags whose canonical
+// long forms appear in the run-mode header. The parsed Registry stores
+// one entry per alias and does not link aliases together, so this small
+// curated map is the source of truth for short→long translation. Add
+// here when the header surfaces a new key that has a common short form.
+var shortToLong = map[string]string{
+	"c": "ctx-size",
+}
 
-	identity := lipgloss.NewStyle().Bold(true).Foreground(r.theme.Accent).
-		Render(fmt.Sprintf("%s / %s", r.model.Alias, presetNameOrDash(r.preset)))
-	hostport := fmt.Sprintf("%s:%d", r.cfg.Globals.Host, r.cfg.Globals.Port)
-
-	line1 := fmt.Sprintf("%s  %s  %s %s  uptime %s",
-		identity, lipgloss.NewStyle().Foreground(r.theme.Subtle).Render(hostport),
-		statusDot, statusText, uptime)
-
-	line2 := lipgloss.NewStyle().Foreground(r.theme.Subtle).
-		Render(condensedSummary(r.model, r.preset))
-
-	line3 := lipgloss.NewStyle().Foreground(r.theme.Muted).
-		Render(booleanSummary(r.preset))
-	if len(r.warnings) > 0 {
-		warn := lipgloss.NewStyle().Foreground(r.theme.StatusStart).
-			Render("warn: " + strings.Join(r.warnings, "; "))
-		if line3 == "" {
-			line3 = warn
-		} else {
-			line3 = line3 + "  " + warn
+// canonicalParams indexes a preset's params by canonical long-form
+// flag name. A user who wrote `-c 8192` (the short form) gets the same
+// lookup as one who wrote `ctx-size: 8192`. Unknown keys (those the
+// Registry has never seen and that aren't in shortToLong) are stored
+// under their literal key — the renderer falls back to the verbatim
+// key for display, but the value is still surfaced.
+func canonicalParams(preset config.Preset, reg flags.Registry) map[string]any {
+	out := make(map[string]any, len(preset.Params))
+	for _, p := range preset.Params {
+		key := p.Key
+		if long, ok := shortToLong[key]; ok {
+			key = long
+		} else if reg != nil {
+			if _, ok := reg.Lookup(key); !ok {
+				// Unknown to registry; keep the literal key.
+			}
 		}
+		out[key] = p.Value
 	}
-	if r.startErr != nil {
-		line3 = lipgloss.NewStyle().Foreground(r.theme.StatusErr).
-			Render(fmt.Sprintf("error: %v", r.startErr))
+	return out
+}
+
+// headerHeight is the fixed visible row count of the run-mode top box:
+// 1 top border + 1 empty padding row + 2 content rows + 1 empty padding
+// row + 1 bottom border. SetSize uses this constant to reserve space
+// for the viewport so the header never gets clipped or shrinks when
+// log content scrolls.
+const headerHeight = 6
+
+func (r *RunMode) renderHeader() string {
+	params := canonicalParams(r.preset, r.registry)
+
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	accent := lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true)
+	uptimeStyle := lipgloss.NewStyle().Foreground(r.statusColor())
+
+	row1 := strings.Join([]string{
+		subtle.Render("Alias:") + " " + accent.Render(r.model.Alias),
+		subtle.Render("Context Size:") + " " + paramOrNA(params, "ctx-size"),
+		subtle.Render("Uptime:") + " " + uptimeStyle.Render(formatUptime(time.Since(r.proc.Started))),
+		metricsIndicator(params, r.theme),
+	}, "   ")
+
+	row2 := strings.Join([]string{
+		subtle.Render("Preset:") + " " + accent.Render(presetNameOrDash(r.preset)),
+		subtle.Render("Temp:") + " " + paramOrNA(params, "temp"),
+		subtle.Render("Top_P:") + " " + paramOrNA(params, "top-p"),
+		subtle.Render("Top_K:") + " " + paramOrNA(params, "top-k"),
+		subtle.Render("Min_P:") + " " + paramOrNA(params, "min-p"),
+	}, "   ")
+
+	// Truncate each content row to the inner width so it never wraps.
+	// The box renders with a 1-col border on each side plus 1 col of
+	// padding, leaving width-4 for content. ansi.Truncate is
+	// SGR-aware so styled spans survive clipping cleanly.
+	innerWidth := r.width - 4
+	if innerWidth < 1 {
+		innerWidth = 1
 	}
+	row1 = ansi.Truncate(row1, innerWidth, "")
+	row2 = ansi.Truncate(row2, innerWidth, "")
+
+	body := strings.Join([]string{"", row1, row2, ""}, "\n")
 
 	box := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(r.theme.Border).
+		Padding(0, 1).
 		Width(r.width - 2)
-	return box.Render(strings.Join([]string{line1, line2, line3}, "\n"))
+	return box.Render(body)
+}
+
+// paramOrNA returns the rendered value of a canonical-keyed param, or
+// "n/a" when the key isn't present in the active preset.
+func paramOrNA(params map[string]any, key string) string {
+	v, ok := params[key]
+	if !ok {
+		return "n/a"
+	}
+	return paramValueAsString(v)
+}
+
+// metricsIndicator renders the [Metrics] tag at the end of row 1.
+// Reverse+bold when the preset has `metrics: true`; subtle otherwise.
+// The on-state uses literal ANSI rather than lipgloss because lipgloss
+// suppresses styling when it can't detect a TTY (e.g. in tests), and
+// we want a deterministic visual signal regardless of detection.
+func metricsIndicator(params map[string]any, theme Theme) string {
+	on := false
+	if v, ok := params["metrics"]; ok {
+		if b, isBool := v.(bool); isBool && b {
+			on = true
+		}
+	}
+	if on {
+		return highlightOpen + "[Metrics]" + highlightClose
+	}
+	return lipgloss.NewStyle().Foreground(theme.Muted).Render("[Metrics]")
 }
 
 func (r *RunMode) statusColor() lipgloss.Color {
@@ -590,39 +774,6 @@ func presetNameOrDash(p config.Preset) string {
 		return "—"
 	}
 	return p.Name
-}
-
-// condensedSummary picks a few highlights for line 2 of the header.
-// Local models show the file's basename (path noise stripped); HF models
-// show the bare identifier as written.
-func condensedSummary(m config.Model, preset config.Preset) string {
-	var head string
-	if m.IsHF() {
-		head = m.HF
-	} else {
-		head = filepath.Base(m.Location)
-	}
-	parts := []string{head}
-	for _, key := range []string{"ngl", "ctx-size", "fa", "ctk", "ctv"} {
-		if v, ok := preset.Params.Get(key); ok {
-			parts = append(parts, fmt.Sprintf("%s=%v", key, v))
-		}
-	}
-	return strings.Join(parts, "  ")
-}
-
-// booleanSummary lists the param keys whose value is `true`.
-func booleanSummary(preset config.Preset) string {
-	var bools []string
-	for _, p := range preset.Params {
-		if v, ok := p.Value.(bool); ok && v {
-			bools = append(bools, p.Key)
-		}
-	}
-	if len(bools) == 0 {
-		return ""
-	}
-	return strings.Join(bools, " ")
 }
 
 func formatUptime(d time.Duration) string {

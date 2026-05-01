@@ -138,7 +138,7 @@ func decideEntry(cfg *config.Config, registry flags.Registry, sessMgr *server.Se
 		if alias != "" {
 			slog.Info("session already running; ignoring positional args", "alias", alias, "preset", preset)
 		}
-		opts, err := buildReattachOpts(cfg, *existing, sessMgr)
+		opts, err := buildReattachOpts(cfg, registry, *existing, sessMgr)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "reattach:", err)
 			return nil, exitGeneric
@@ -211,7 +211,7 @@ func (l *liveSpawner) Reattach() (*tui.RunModeOpts, error) {
 	if err != nil || sess == nil {
 		return nil, err
 	}
-	return buildReattachOpts(l.cfg, *sess, l.sessMgr)
+	return buildReattachOpts(l.cfg, l.registry, *sess, l.sessMgr)
 }
 
 func (l *liveSpawner) RunningAlias() (string, string, int) {
@@ -235,7 +235,7 @@ func acquireAndSpawn(cfg *config.Config, registry flags.Registry, sessMgr *serve
 		// Another starter wrote session.json between our pre-check and
 		// lock acquisition. Drop the lock and reattach.
 		sessMgr.Unlock()
-		return buildReattachOpts(cfg, *existing, sessMgr)
+		return buildReattachOpts(cfg, registry, *existing, sessMgr)
 	}
 
 	res, err := translate.Build(cfg.Globals, model, preset, registry)
@@ -282,6 +282,7 @@ func acquireAndSpawn(cfg *config.Config, registry flags.Registry, sessMgr *serve
 		Warnings:   res.Warnings,
 		Process:    proc,
 		SessionMgr: sessMgr,
+		Registry:   registry,
 	}, nil
 }
 
@@ -290,7 +291,7 @@ func acquireAndSpawn(cfg *config.Config, registry flags.Registry, sessMgr *serve
 // renders condensed param info; if the user has edited the config since
 // the session started, the header shows the current preset definition,
 // which is acceptable for v1.
-func buildReattachOpts(cfg *config.Config, sess server.Session, sessMgr *server.SessionManager) (*tui.RunModeOpts, error) {
+func buildReattachOpts(cfg *config.Config, registry flags.Registry, sess server.Session, sessMgr *server.SessionManager) (*tui.RunModeOpts, error) {
 	model, _ := findModel(cfg, sess.Alias)
 	if model.Alias == "" {
 		// Config no longer has this alias. Fall back to a stub model so
@@ -312,6 +313,7 @@ func buildReattachOpts(cfg *config.Config, sess server.Session, sessMgr *server.
 		Argv:       sess.Command,
 		Process:    server.Adopt(sess),
 		SessionMgr: sessMgr,
+		Registry:   registry,
 	}, nil
 }
 
