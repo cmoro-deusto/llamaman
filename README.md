@@ -4,7 +4,7 @@ A modern TUI manager for `llama-server` (llama.cpp). Define models and presets o
 
 ## Status
 
-v0.1.0 — first release. Linux only.
+v0.3.0. Linux only.
 
 ## Install
 
@@ -54,20 +54,22 @@ The first invocation with no config triggers a setup flow that writes `~/.config
 
 ## TUI keys
 
-**Main mode** — `s`/`Enter` selection · `c` configure · `a` attach to running session · `?` help · `q` quit
-
-**Selection mode** — `↑↓` navigate · `Enter` run · `e` edit model · `n` new model · `d` delete model · `/` filter · `Esc` back. Multi-preset models open a sub-list with the same keys.
+**Main mode** — model selection is embedded directly in the landing screen (no separate selection mode). `↑`/`↓` navigate the inline list · `Enter` run the highlighted model (pivots to a preset sub-list when the model has 2+ presets, `Esc` backs out) · `c` configure · `a` attach to running session · `?` help · `q` quit. When no models are configured, the list is hidden and only the configure/help/quit shortcuts are shown.
 
 **Run mode** —
 - `q`/`Ctrl+C` quit prompt (`(k)ill` returns to main, `(d)etach` exits llamaman, `(c)ancel`)
 - `k` kill server (with confirm) and return to main without exiting llamaman
 - `r` restart server (confirm if status is `ready`)
 - `c` copy launch command to clipboard (`wl-copy` → `xclip` fallback)
-- `/` search forward · `n`/`N` next/prev match
+- `/` search forward — matches are live-highlighted with reverse video as you type, persist after Enter for `n`/`N` navigation
+- `Esc` clear the active search and remove highlights
+- `n`/`N` next/prev match
 - `g`/`G` top/bottom · `space`/`b` page down/up · `↑`/`↓` scroll one line
 - `?` help overlay
 
-**Configuration mode** — `Tab`/`Shift+Tab` (or `←`/`→`, `h`/`l`) cycle panes · `↑`/`↓` navigate within a pane · `e` edit · `n` new · `d` delete · `D` duplicate (presets) · `Shift+↑/↓` reorder · `g` globals · `s` save · `Esc` back. The new-param picker shows each flag's bare name + parsed help description; just start typing to filter.
+The top box shows alias / context size / uptime / `[Metrics]` indicator on row 1, and preset / temp / top_p / top_k / min_p on row 2. `[Metrics]` reverses when the active preset has `metrics: true`. Param keys are looked up canonically so a preset that uses the short form `c` for `ctx-size` still surfaces the value.
+
+**Configuration mode** — `Tab`/`Shift+Tab` (or `←`/`→`, `h`/`l`) cycle panes · `↑`/`↓` navigate within a pane · `e` edit · `n` new · `d` delete · `D` duplicate (models and presets) · `Shift+↑/↓` reorder · `g` globals · `s` save · `Esc` back (with save/discard prompt when there are unsaved changes). The new-param picker shows each flag's bare name + parsed help description; just start typing to filter.
 
 ## Config layout
 
