@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
@@ -495,6 +496,32 @@ func TestParamPickerShowsNamesWithoutDashesAndDescriptions(t *testing.T) {
 		if strings.Contains(out, dont) {
 			t.Errorf("picker output should not contain %q\nout:\n%s", dont, out)
 		}
+	}
+}
+
+// TestParamPickerAutoFiltersOnType verifies the user can just start
+// typing a flag name without first pressing `/` — a printable rune in
+// non-filter state should switch the list into Filtering and forward
+// the rune.
+func TestParamPickerAutoFiltersOnType(t *testing.T) {
+	reg := flags.Registry{
+		"threads":    {Name: "threads", Form: "--threads", Description: "CPU threads"},
+		"flash-attn": {Name: "flash-attn", Form: "--flash-attn", Description: "FA"},
+		"jinja":      {Name: "jinja", Form: "--jinja", Description: "jinja templates"},
+	}
+	p := newParamPicker(reg)
+	p.SetSize(80, 20)
+	if state := p.list.FilterState(); state != list.Unfiltered {
+		t.Fatalf("initial filter state = %v, want Unfiltered", state)
+	}
+	// Press 't' — picker should drop into filtering mode and the input
+	// should contain "t" (or be in the process of accepting it).
+	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	if state := p.list.FilterState(); state != list.Filtering {
+		t.Fatalf("after 't': filter state = %v, want Filtering", state)
+	}
+	if got := p.list.FilterInput.Value(); got != "t" {
+		t.Errorf("FilterInput.Value() = %q, want %q", got, "t")
 	}
 }
 

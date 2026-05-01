@@ -72,9 +72,14 @@ func newParamPicker(reg flags.Registry) *paramPicker {
 	delegate := list.NewDefaultDelegate()
 	delegate.SetSpacing(0)
 	l := list.New(items, delegate, 0, 0)
-	l.Title = "Add parameter — pick a flag"
+	// Hide the title bar entirely — the bordered box + footer hint
+	// provide context. The filter input renders inline when active so
+	// the picker stays a single, unified surface (no separate "filter
+	// window" feel).
+	l.SetShowTitle(false)
 	l.SetShowHelp(false)
 	l.SetShowStatusBar(false)
+	l.SetShowPagination(true)
 	l.SetFilteringEnabled(true)
 	return &paramPicker{list: l}
 }
@@ -85,11 +90,16 @@ func (p *paramPicker) SetSize(w, h int) {
 	p.list.SetSize(w, h)
 }
 
-// Update routes keys for the picker. Enter selects, Esc cancels.
+// Update routes keys for the picker.
+//
+// When the list is in Filtering mode, every key (including Enter, which
+// confirms the filter) goes to the list. In Unfiltered mode, pressing a
+// printable rune transparently switches the list into Filtering mode
+// and forwards the rune — so the user can just start typing instead of
+// having to press `/` first. Enter without filter activity selects the
+// current row; Esc cancels the picker.
 func (p *paramPicker) Update(msg tea.Msg) (*paramPicker, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok {
-		// While the underlying list is in filter mode, let it handle
-		// every key (including Enter, which confirms the filter).
 		if p.list.FilterState() == list.Filtering {
 			var cmd tea.Cmd
 			p.list, cmd = p.list.Update(msg)
@@ -103,6 +113,13 @@ func (p *paramPicker) Update(msg tea.Msg) (*paramPicker, tea.Cmd) {
 				key := it.name
 				return p, func() tea.Msg { return paramPickerDoneMsg{key: key} }
 			}
+			return p, nil
+		}
+		if isPrintableRune(k) {
+			p.list.SetFilterState(list.Filtering)
+			var cmd tea.Cmd
+			p.list, cmd = p.list.Update(msg)
+			return p, cmd
 		}
 	}
 	var cmd tea.Cmd
@@ -110,12 +127,30 @@ func (p *paramPicker) Update(msg tea.Msg) (*paramPicker, tea.Cmd) {
 	return p, cmd
 }
 
+// isPrintableRune reports whether a key event represents a single
+// printable character — i.e., the kind of key that should kick off
+// filter mode in the picker. Excludes navigation keys (arrows, tab,
+// enter, esc, etc.) which are routed by the switch above.
+func isPrintableRune(k tea.KeyMsg) bool {
+	if k.Type != tea.KeyRunes {
+		return false
+	}
+	if len(k.Runes) != 1 {
+		return false
+	}
+	r := k.Runes[0]
+	if r < 0x20 || r == 0x7f {
+		return false
+	}
+	return true
+}
+
 // View renders the picker as a bordered box. It's overlaid by ConfigMode
 // over the three-pane background.
 func (p *paramPicker) View(theme Theme) string {
 	body := p.list.View()
 	hint := lipgloss.NewStyle().Foreground(theme.Subtle).
-		Render("↑↓: navigate · /: filter · enter: pick · esc: cancel")
+		Render("type to filter · ↑↓: navigate · enter: pick · esc: cancel")
 	box := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(theme.Accent).
