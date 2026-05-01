@@ -245,6 +245,27 @@ func TestSnapshotRunMode(t *testing.T) {
 	}
 }
 
+// TestFirstRunWindowSizeDoesNotPanic guards the regression reported in
+// v0.1.0: when llamaman launched without a config, the first WindowSize
+// message reached an uninitialized SelectionMode and crashed inside
+// bubbles/list.updatePagination on a zero-value list.Model.
+func TestFirstRunWindowSizeDoesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("first-run WindowSizeMsg panicked: %v", r)
+		}
+	}()
+	fr := NewFirstRunMode("/tmp/nonexistent/config.json")
+	root := NewRootForFirstRun("/tmp/nonexistent/config.json", "v0.0.0-test", fr)
+	// Send a sequence of messages that exercise every uninitialized
+	// sub-model path: window size, session tick, then more sizing.
+	driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		sessionTickMsg{},
+		tea.WindowSizeMsg{Width: 80, Height: 24},
+	)
+}
+
 // repoRoot walks up from CWD until it finds go.mod.
 func repoRoot(t *testing.T) string {
 	t.Helper()

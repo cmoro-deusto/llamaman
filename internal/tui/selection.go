@@ -86,9 +86,12 @@ func NewSelectionMode(cfg *config.Config) SelectionMode {
 func (s *SelectionMode) SetCfgPath(p string) { s.cfgPath = p }
 
 // SetRunningAlias updates the (running) marker. Called by Root whenever
-// session state may have changed.
+// session state may have changed. No-op on a zero-value SelectionMode.
 func (s *SelectionMode) SetRunningAlias(alias string) {
 	s.runningAlias = alias
+	if !s.initialized() {
+		return
+	}
 	s.rebuildModels()
 }
 
@@ -134,14 +137,23 @@ func (s *SelectionMode) rebuildPresets(model config.Model) {
 	s.presets = l
 }
 
-// SetSize tracks terminal dimensions for layout.
+// SetSize tracks terminal dimensions for layout. Safe to call on a
+// zero-value SelectionMode (e.g., when Root is in first-run mode and
+// selection was never constructed).
 func (s *SelectionMode) SetSize(w, h int) {
 	s.width, s.height = w, h
+	if !s.initialized() {
+		return
+	}
 	s.models.SetSize(w, max(0, h-2))
 	if s.showPresets {
 		s.presets.SetSize(w, max(0, h-2))
 	}
 }
+
+// initialized reports whether NewSelectionMode (or SetCfg) has wired up
+// the underlying lists. Zero-value SelectionMode returns false.
+func (s *SelectionMode) initialized() bool { return s.cfg != nil }
 
 // Update routes selection-mode messages.
 func (s SelectionMode) Update(msg tea.Msg) (SelectionMode, tea.Cmd) {
