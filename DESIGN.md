@@ -82,7 +82,7 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
 }
 ```
 
-- `version` is mandatory. Unknown versions → hard error (exit 2). No migrations in v1.
+- `version` is mandatory. Unknown versions → hard error (exit 2). No migration step exists today because only `version: 1` has ever shipped; when `version: 2` or higher is introduced, an automatic in-place migration runs at config-load time (see §12).
 - `models` is a JSON array (the spec text says "object" — that's a typo).
 - Each model has **exactly one** of `location` (a path to a local `.gguf` file, expanded with `~`/`$VAR` at load) or `hf` (a Hugging Face identifier in `org/repo[:quant]` form, passed verbatim to llama-server's `-hf`). Both empty or both filled → validation error.
 - `presets` may be empty `[]`.
@@ -214,7 +214,7 @@ Path: `${XDG_RUNTIME_DIR:-/tmp/llamaman-$UID}/llamaman/llama-server.log`
 - Removed when the user explicitly kills the server (quit → kill).
 - Cleaned by the OS at reboot (since `XDG_RUNTIME_DIR` is wiped).
 - Tailed via `fsnotify` (no polling).
-- The TUI viewport reads the entire file on attach/reattach and follows new writes; in v1 the whole file is held in memory (acceptable for realistic session sizes).
+- The TUI viewport reads the entire file on attach/reattach and follows new writes; the current implementation holds the whole file in memory (acceptable for realistic session sizes).
 
 ### 5.4 Session lifecycle
 
@@ -534,7 +534,7 @@ llamaman/
 ### 10.4 Theme
 
 - `lipgloss.HasDarkBackground()` chooses palette (light / dark).
-- Two built-in palettes, no user customization in v1.
+- Two built-in palettes, no user customization currently.
 - Accent: soft orange (`#E8A33D`-ish).
 - Status indicators: green ready, yellow starting, red error, gray exited.
 - `NO_COLOR` env var honored (Lip Gloss handles automatically).
@@ -560,7 +560,7 @@ llamaman/
 
 ---
 
-## 11. Out of scope for v1
+## 11. Out of current scope
 
 Explicitly deferred:
 
@@ -575,4 +575,42 @@ Explicitly deferred:
 - Recently-used sort.
 - Disk-backed log paging (sessions are buffered fully in memory).
 - Live editing of llama-server while running.
-- Config schema migrations.
+
+---
+
+## 12. Future work
+
+Items that are not in the current scope but are planned for a future release. Listed here (rather than under §11) because there is concrete intent to ship them; the design notes below capture decisions already taken so we don't relitigate them later.
+
+### 12.1 Config schema migrations
+
+**Goal**: when a future release introduces `version: 2` (or higher), older configs are migrated automatically at load time without user intervention.
+
+**Trigger**: `Load` reads `version` first. If the value is below the binary's current schema version, the loader runs a chain of migration steps `v1→v2→v3→…→current`, each implemented as a function `(map[string]any) → map[string]any` operating on the parsed-but-not-typed JSON. Unknown future versions still error out (forward compatibility is not promised — older binaries reject newer configs, see §3.2).
+
+**Safety**:
+- Before writing the migrated file, save the original to `config.json.pre-vN.bak` (separate from the rolling `.bak` produced by configuration-mode saves, so a migration backup is never overwritten by a subsequent edit).
+- Atomic write of the migrated config follows §3.4 (tmp → fsync → rename).
+- A one-line INFO log entry per migration step records source/target version and any field renames applied.
+
+**Surfacing**: on first launch after an upgrade that performs migration, the TUI shows a single non-blocking status-line notice ("Config migrated from v1 to v2 — backup at config.json.pre-v2.bak") that dismisses on the next keypress. CLI invocations (`-l`, `-p`) print the same notice to stderr.
+
+**Out of scope for the migration system itself**: downgrade migrations (`v2→v1`). If the user downgrades, the older binary errors out as today (`json: unknown field`); they keep the `.pre-v2.bak` to recover from.
+
+### 12.2 Main mode information density
+
+**Goal**: rework how the centred Main mode window presents model and session information. The current layout (figlet wordmark + version line + single-row-per-model inline list with `(running)` marker and preset count) is functional but underuses the available space and surfaces only a fraction of what the user might want at a glance.
+
+**What's likely to change** (not yet committed; recorded so the current layout isn't mistaken for the target):
+- Per-row affordance for source kind (local `.gguf` vs HF identifier), so users can tell at a glance which models will hit the network on first launch.
+- A more legible representation of the detached-session indicator than the current "extra line above the list" pattern — possibly a sticky header strip with attach affordance.
+- Optional preset preview (e.g. expand the highlighted row to show preset names) instead of the current numeric `<n> presets` summary.
+- Better use of horizontal space on wide terminals — today the centred window has fixed inner width regardless of terminal columns.
+
+**Constraints to preserve**:
+- The "no models configured" state stays minimal (wordmark + shortcuts, no empty list box) so first-run users aren't confronted with a hollow frame.
+- Configuration-file row order remains the visible order — no implicit sort.
+- All existing keybindings (§7.2) keep their meaning; new affordances are additive.
+- `?` help overlay stays the canonical keybinding reference.
+
+**Non-goals**: no server-side state changes (this is purely a presentation rework), no new TUI mode (Main remains the model-selection mode), no persistent per-user UI preferences as part of this rework.
