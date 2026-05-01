@@ -74,9 +74,9 @@ aurs:
     maintainers:
       - "Carlos Moro <carlos@gondor.es>"
     license: "MIT"
-    private_key: "{{ .Env.AUR_STAGING_KEY }}"
-    git_url: "git@github.com:cmoro-deusto/llamaman-aur-staging.git"
-    skip_upload: false
+    private_key: "{{ .Env.AUR_KEY }}"
+    git_url: "ssh://aur@aur.archlinux.org/llamaman-bin.git"
+    skip_upload: auto
     provides: ["llamaman"]
     conflicts: ["llamaman"]
     optdepends:
