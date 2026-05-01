@@ -29,3 +29,5 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUR_STAGING_KEY: ${{ secrets.AUR_STAGING_KEY }}
+          AUR_KEY: ${{ secrets.AUR_KEY }}
