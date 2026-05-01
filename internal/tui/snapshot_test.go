@@ -54,20 +54,30 @@ func sampleSnapshotConfig() *config.Config {
 	}
 }
 
-// driveRoot calls Update with each message and drains the resulting
-// tea.Cmds (one level deep) so dispatched messages like SpawnRequestMsg
-// actually reach Root.Update on the next round-trip. Returns the View
-// after the final message has been processed.
+// driveRoot calls Init then Update with each message, draining the
+// resulting tea.Cmds (one level deep) so dispatched messages like
+// SpawnRequestMsg actually reach Root.Update on the next round-trip.
+// Returns the View after the final message has been processed.
+//
+// Init is only invoked if root.initialRun was set at construction (or
+// will produce a non-nil Cmd) — without that, driving from a fresh
+// Root would skip the initial run-mode wiring.
 func driveRoot(t *testing.T, root *Root, msgs ...tea.Msg) string {
 	t.Helper()
 	var m tea.Model = root
+	if cmd := root.Init(); cmd != nil {
+		for _, sub := range collectCmds(cmd) {
+			out := safeCmd(sub)
+			if out == nil {
+				continue
+			}
+			next, _ := m.Update(out)
+			m = next
+		}
+	}
 	for _, msg := range msgs {
 		next, cmd := m.Update(msg)
 		m = next
-		// Drain a single round of synchronous tea.Cmds. Each Cmd is a
-		// function returning a tea.Msg; feed each result back through
-		// Update. We don't recurse — long Cmd chains aren't expected
-		// in these tests and would risk hangs on tickers.
 		for _, sub := range collectCmds(cmd) {
 			out := safeCmd(sub)
 			if out == nil {
@@ -378,6 +388,81 @@ func TestConfigFormHandlesLongLocationPath(t *testing.T) {
 	// Just reaching here without panic is the assertion. installForm
 	// drives a synthetic WindowSizeMsg into huh so its inputs size
 	// themselves.
+}
+
+// TestRunModeDirectKillReturnsToMain verifies the new direct `k`
+// shortcut: stops the child, frees the session, and pops back to main
+// without exiting llamaman. (Pressing `k` previously bubbled to the
+// viewport's vi-style up-scroll; we now intercept it.)
+func TestRunModeDirectKillReturnsToMain(t *testing.T) {
+	bin := filepath.Join(repoRoot(t), "bin", "llamaman-fakeserver")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("fakeserver not built: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "llama.log")
+	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+	cfg := sampleSnapshotConfig()
+	opts := RunModeOpts{
+		Cfg: cfg, Model: cfg.Models[0], Preset: cfg.Models[0].Presets[0],
+		Argv: proc.Argv, Process: proc,
+	}
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 140, Height: 40})
+
+	// Press `k` directly (no quit prompt). Expect transition to main.
+	driveRoot(t, root, keyMsg("k"))
+	if root.view != ViewMain {
+		t.Fatalf("after k: view = %d, want ViewMain (%d)", root.view, ViewMain)
+	}
+	// Process should have been signaled.
+	select {
+	case <-proc.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("k did not stop the child")
+	}
+}
+
+// TestRunModeKDoesNotScrollViewport sanity-checks that the viewport's
+// j/k vi-style bindings are gone — pressing j or k should not move the
+// cursor inside the log viewport. We can't directly inspect viewport
+// internals, but we can verify the keymap was overridden.
+func TestRunModeKDoesNotScrollViewport(t *testing.T) {
+	bin := filepath.Join(repoRoot(t), "bin", "llamaman-fakeserver")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("fakeserver not built: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "llama.log")
+	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+	cfg := sampleSnapshotConfig()
+	opts := RunModeOpts{
+		Cfg: cfg, Model: cfg.Models[0], Preset: cfg.Models[0].Presets[0],
+		Argv: proc.Argv, Process: proc,
+	}
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 140, Height: 40})
+	if root.run == nil {
+		t.Fatal("run mode not initialized")
+	}
+	// Up/Down should have only the arrow keys; j/k must be unbound.
+	upKeys := root.run.viewport.KeyMap.Up.Keys()
+	downKeys := root.run.viewport.KeyMap.Down.Keys()
+	for _, k := range append(upKeys, downKeys...) {
+		if k == "j" || k == "k" {
+			t.Errorf("viewport.KeyMap still binds %q", k)
+		}
+	}
+	// Cleanup to not leave a child running.
+	root.run.killAndReturn()
 }
 
 // TestParamPickerShowsNamesWithoutDashesAndDescriptions covers two

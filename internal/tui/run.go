@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -107,6 +108,16 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 	ti.Prompt = "/"
 	ti.CharLimit = 256
 
+	// Strip the viewport's default vi-style and double-bound keys: the
+	// user wants only arrow keys for line scrolling (no j/k), and we
+	// want exclusive control over space/b/u/d so RunMode's own paging
+	// handlers are the single source of truth.
+	vp := viewport.New(0, 0)
+	vp.KeyMap = viewport.KeyMap{
+		Up:   key.NewBinding(key.WithKeys("up")),
+		Down: key.NewBinding(key.WithKeys("down")),
+	}
+
 	r := &RunMode{
 		cfg:         opts.Cfg,
 		model:       opts.Model,
@@ -116,7 +127,7 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 		proc:        opts.Process,
 		tail:        tail,
 		sessionMgr:  opts.SessionMgr,
-		viewport:    viewport.New(0, 0),
+		viewport:    vp,
 		status:      StatusStarting,
 		keys:        DefaultKeymap(),
 		theme:       CurrentTheme(),
@@ -193,6 +204,10 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		case "q", "ctrl+c":
 			r.showQuit = true
 			return r, nil
+		case "k":
+			// Direct kill: stop llama-server, clean up, and return to
+			// the main screen — llamaman itself stays open.
+			return r, r.killAndReturn()
 		case "?":
 			r.showHelp = true
 			return r, nil
@@ -208,16 +223,20 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		case "g":
 			r.viewport.GotoTop()
+			return r, nil
 		case "G":
 			r.viewport.GotoBottom()
 			r.lastSeenLines = r.totalLines
+			return r, nil
 		case " ", "space":
 			r.viewport.HalfPageDown()
 			if r.viewport.AtBottom() {
 				r.lastSeenLines = r.totalLines
 			}
+			return r, nil
 		case "b":
 			r.viewport.HalfPageUp()
+			return r, nil
 		case "c":
 			r.copyCommand()
 			return r, nil
@@ -233,6 +252,20 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	var cmd tea.Cmd
 	r.viewport, cmd = r.viewport.Update(msg)
 	return r, cmd
+}
+
+// killAndReturn stops llama-server, cleans up the log + session, and
+// returns to the main screen (without exiting llamaman). Used by both
+// the direct `k` shortcut and the (k)ill option in the quit prompt so
+// kill is consistently a "back to main" action.
+func (r *RunMode) killAndReturn() tea.Cmd {
+	r.proc.Stop(5 * time.Second)
+	r.tail.Close()
+	_ = r.proc.RemoveLog()
+	if r.sessionMgr != nil {
+		_ = r.sessionMgr.Clear()
+	}
+	return func() tea.Msg { return returnToMainMsg{} }
 }
 
 // handleRestartPrompt reads a single confirmation key.
@@ -345,16 +378,13 @@ func (r *RunMode) jumpSearch(delta int) {
 }
 
 // handleQuitPrompt runs the (k)ill / (d)etach / (c)ancel decision tree.
+// (k)ill returns to the main screen — symmetric with the direct `k`
+// shortcut. (d)etach exits llamaman and leaves llama-server running.
 func (r *RunMode) handleQuitPrompt(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 	switch m.String() {
 	case "k":
-		r.proc.Stop(5 * time.Second)
-		r.tail.Close()
-		_ = r.proc.RemoveLog()
-		if r.sessionMgr != nil {
-			_ = r.sessionMgr.Clear()
-		}
-		return r, tea.Quit
+		r.showQuit = false
+		return r, r.killAndReturn()
 	case "d":
 		// Leave the process and session.json intact; just unwind the TUI.
 		r.tail.Close()
@@ -407,12 +437,14 @@ func (r *RunMode) renderRestartPrompt() string {
 func (r *RunMode) renderHelp() string {
 	keys := []string{
 		"q / Ctrl+C  open quit prompt (k)ill / (d)etach / (c)ancel",
+		"k           kill server and return to main",
 		"r           restart server (confirm if ready)",
 		"c           copy launch command to clipboard",
 		"/           search forward",
 		"n / N       next / previous match",
 		"g / G       jump to top / bottom",
-		"↑↓ / jk     scroll line",
+		"space / b   page down / up",
+		"↑ / ↓       scroll one line",
 		"?           toggle this help",
 	}
 	box := lipgloss.NewStyle().
@@ -426,7 +458,7 @@ func (r *RunMode) renderFooter() string {
 	if r.searchActive {
 		return r.searchInput.View()
 	}
-	parts := []string{"q: quit  r: restart  c: copy  /: search  ?: help  g/G: top/bottom  space/b: page  ↑/↓: scroll"}
+	parts := []string{"q: quit  k: kill  r: restart  c: copy  /: search  ?: help  g/G: top/bottom  space/b: page  ↑/↓: scroll"}
 	if !r.proc.IsOwner() {
 		parts = append([]string{"[adopted]"}, parts...)
 	}
