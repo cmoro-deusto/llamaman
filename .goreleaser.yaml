@@ -1,0 +1,67 @@
+version: 2
+
+project_name: llamaman
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: llamaman
+    main: .
+    binary: llamaman
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.Date}}
+
+  - id: llamaman-fakeserver
+    main: ./cmd/llamaman-fakeserver
+    binary: llamaman-fakeserver
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - id: llamaman
+    builds: [llamaman]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE*
+      - README*
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: cmoro-deusto
+    name: llamaman
+  draft: false
+  prerelease: auto
