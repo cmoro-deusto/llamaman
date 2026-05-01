@@ -50,10 +50,11 @@ type RunMode struct {
 	argv     []string
 	warnings []string
 
-	proc       *server.Process
-	tail       *server.Tailer
-	sessionMgr *server.SessionManager
-	registry   flags.Registry
+	proc          *server.Process
+	tail          *server.Tailer
+	sessionMgr    *server.SessionManager
+	registry      flags.Registry
+	serverVersion string // parsed from `<bin> --version`; "" on failure
 
 	viewport viewport.Model
 	buf      strings.Builder
@@ -77,10 +78,6 @@ type RunMode struct {
 	searchMatches []int
 	searchIdx     int
 
-	// totalLines counts newlines we've ever rendered so we can display
-	// "↓ N new lines" while the user is scrolled away from the bottom.
-	totalLines      int
-	lastSeenLines   int
 }
 
 // RunModeOpts bundles the inputs to NewRunMode. Spawn is the responsibility
@@ -124,20 +121,21 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 	}
 
 	r := &RunMode{
-		cfg:         opts.Cfg,
-		model:       opts.Model,
-		preset:      opts.Preset,
-		argv:        opts.Argv,
-		warnings:    opts.Warnings,
-		proc:        opts.Process,
-		tail:        tail,
-		sessionMgr:  opts.SessionMgr,
-		registry:    opts.Registry,
-		viewport:    vp,
-		status:      StatusStarting,
-		keys:        DefaultKeymap(),
-		theme:       CurrentTheme(),
-		searchInput: ti,
+		cfg:           opts.Cfg,
+		model:         opts.Model,
+		preset:        opts.Preset,
+		argv:          opts.Argv,
+		warnings:      opts.Warnings,
+		proc:          opts.Process,
+		tail:          tail,
+		sessionMgr:    opts.SessionMgr,
+		registry:      opts.Registry,
+		viewport:      vp,
+		status:        StatusStarting,
+		keys:          DefaultKeymap(),
+		theme:         CurrentTheme(),
+		searchInput:   ti,
+		serverVersion: loadServerVersion(opts.Cfg.Globals.Bin),
 	}
 	cmd := tea.Batch(
 		waitForChunk(tail.Chunks()),
@@ -147,22 +145,46 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 	return r, cmd, nil
 }
 
-// SetSize configures viewport dimensions. The top box is fixed at
-// `headerHeight` rows (border + padding + 2 content + padding + border)
-// and the footer takes 1 row; the viewport fills the remainder. Content
-// rows are truncated, so the header height is deterministic regardless
-// of terminal width — that fixes the "header shrinks while scrolling"
-// regression where the previous code reserved only 4 rows for a 5-row
-// bordered box.
+// wordmarkMinWidth is the minimum terminal width at which the
+// run-mode header shows the llamaman wordmark on the left side. Below
+// this threshold the wordmark would be truncated mid-letter, so we
+// fall back to the compact info-only layout instead.
+const wordmarkMinWidth = 110
+
+// SetSize configures viewport dimensions. Chrome above the viewport
+// is the bordered top box (10 or 6 rows depending on whether the
+// wordmark is shown); chrome below is the bordered log frame (2
+// rows: top + bottom border) plus the 1-row footer. The viewport
+// itself fills the inner area of the log box, with horizontal
+// padding mirrored from the top box so the two boxes align visually.
 func (r *RunMode) SetSize(w, h int) {
 	r.width, r.height = w, h
-	r.viewport.Width = w
-	const footerHeight = 1
-	if h > headerHeight+footerHeight {
-		r.viewport.Height = h - headerHeight - footerHeight
+	chrome := r.chromeHeight()
+	if h > chrome {
+		r.viewport.Height = h - chrome
 	} else {
 		r.viewport.Height = 1
 	}
+	// Inner viewport width = box width (r.width - 2 for outer border)
+	// minus 2 for left+right horizontal padding inside the border.
+	innerWidth := r.width - 4
+	if innerWidth < 1 {
+		innerWidth = 1
+	}
+	r.viewport.Width = innerWidth
+}
+
+// chromeHeight returns the total rows reserved above and below the
+// viewport content: top box (10 with wordmark / 6 without) + log
+// box's 2 borders + 1 footer.
+func (r *RunMode) chromeHeight() int {
+	const logBoxBorders = 2
+	const footerHeight = 1
+	top := headerHeight
+	if r.width >= wordmarkMinWidth {
+		top = headerHeightWithWordmark
+	}
+	return top + logBoxBorders + footerHeight
 }
 
 // Update routes messages: log chunks, process exit, uptime tick, and key
@@ -171,7 +193,6 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	switch m := msg.(type) {
 	case logChunkMsg:
 		r.buf.WriteString(string(m))
-		r.totalLines = strings.Count(r.buf.String(), "\n")
 		if r.status == StatusStarting && strings.Contains(r.buf.String(), readyMarker) {
 			r.status = StatusReady
 		}
@@ -179,7 +200,6 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		r.viewport.SetContent(r.renderViewportContent())
 		if atBottom {
 			r.viewport.GotoBottom()
-			r.lastSeenLines = r.totalLines
 		}
 		return r, waitForChunk(r.tail.Chunks())
 
@@ -254,13 +274,9 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		case "G":
 			r.viewport.GotoBottom()
-			r.lastSeenLines = r.totalLines
 			return r, nil
 		case " ", "space":
 			r.viewport.HalfPageDown()
-			if r.viewport.AtBottom() {
-				r.lastSeenLines = r.totalLines
-			}
 			return r, nil
 		case "b":
 			r.viewport.HalfPageUp()
@@ -282,18 +298,33 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	return r, cmd
 }
 
-// killAndReturn stops llama-server, cleans up the log + session, and
-// returns to the main screen (without exiting llamaman). Used by both
-// the direct `k` shortcut and the (k)ill option in the quit prompt so
-// kill is consistently a "back to main" action.
-func (r *RunMode) killAndReturn() tea.Cmd {
+// killServer performs the cleanup shared by every kill path: stop the
+// child, close the tailer, remove its log, and clear the session
+// record. Callers decide whether to return to main mode or quit
+// llamaman by chaining the appropriate tea.Cmd.
+func (r *RunMode) killServer() {
 	r.proc.Stop(5 * time.Second)
 	r.tail.Close()
 	_ = r.proc.RemoveLog()
 	if r.sessionMgr != nil {
 		_ = r.sessionMgr.Clear()
 	}
+}
+
+// killAndReturn kills the server and goes back to the main screen
+// without exiting llamaman. Used by the direct `k` shortcut.
+func (r *RunMode) killAndReturn() tea.Cmd {
+	r.killServer()
 	return func() tea.Msg { return returnToMainMsg{} }
+}
+
+// killAndQuit kills the server and quits llamaman. Used by the (k)ill
+// option inside the quit prompt — that prompt was triggered by `q`
+// (quit llamaman) so its kill option must actually exit, not bounce
+// back to main mode the way the standalone `k` shortcut does.
+func (r *RunMode) killAndQuit() tea.Cmd {
+	r.killServer()
+	return tea.Quit
 }
 
 // handleRestartPrompt reads a single confirmation key.
@@ -510,14 +541,15 @@ func (r *RunMode) jumpSearch(delta int) {
 	r.flash = fmt.Sprintf("match %d/%d", r.searchIdx+1, len(r.searchMatches))
 }
 
-// handleQuitPrompt runs the (k)ill / (d)etach / (c)ancel decision tree.
-// (k)ill returns to the main screen — symmetric with the direct `k`
-// shortcut. (d)etach exits llamaman and leaves llama-server running.
+// handleQuitPrompt runs the (k)ill / (d)etach / (c)ancel decision tree
+// for the q-triggered quit prompt. Both (k)ill and (d)etach exit
+// llamaman — they differ on whether llama-server lives on. The direct
+// `k` shortcut takes a separate path (back to main, llamaman stays).
 func (r *RunMode) handleQuitPrompt(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 	switch m.String() {
 	case "k":
 		r.showQuit = false
-		return r, r.killAndReturn()
+		return r, r.killAndQuit()
 	case "d":
 		// Leave the process and session.json intact; just unwind the TUI.
 		r.tail.Close()
@@ -539,7 +571,13 @@ func (r *RunMode) View() string {
 	}
 	header := r.renderHeader()
 	footer := r.renderFooter()
-	bg := lipgloss.JoinVertical(lipgloss.Left, header, r.viewport.View(), footer)
+	logFrame := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(r.theme.Border).
+		Padding(0, 1).
+		Width(r.width - 2).
+		Render(r.viewport.View())
+	bg := lipgloss.JoinVertical(lipgloss.Left, header, logFrame, footer)
 	switch {
 	case r.showQuit:
 		return overlayCenter(bg, r.renderQuitPrompt(), r.width, r.height)
@@ -610,28 +648,12 @@ func (r *RunMode) renderFooter() string {
 		parts = append([]string{"[adopted]"}, parts...)
 	}
 	hint := lipgloss.NewStyle().Foreground(r.theme.Subtle).Render(strings.Join(parts, " "))
-	indicator := ""
-	if !r.viewport.AtBottom() && r.totalLines > r.lastSeenLines {
-		n := r.totalLines - r.lastSeenLines
-		indicator = lipgloss.NewStyle().Foreground(r.theme.Accent).
-			Render(fmt.Sprintf("↓ %d new line%s — G to follow", n, pluralN(n)))
-	}
 	stack := []string{}
-	if indicator != "" {
-		stack = append(stack, indicator)
-	}
 	if r.flash != "" {
 		stack = append(stack, lipgloss.NewStyle().Foreground(r.theme.StatusStart).Render(r.flash))
 	}
 	stack = append(stack, hint)
 	return lipgloss.JoinVertical(lipgloss.Left, stack...)
-}
-
-func pluralN(n int) string {
-	if n == 1 {
-		return ""
-	}
-	return "s"
 }
 
 // shortToLong maps the short-form llama-server flags whose canonical
@@ -665,12 +687,22 @@ func canonicalParams(preset config.Preset, reg flags.Registry) map[string]any {
 	return out
 }
 
-// headerHeight is the fixed visible row count of the run-mode top box:
-// 1 top border + 1 empty padding row + 2 content rows + 1 empty padding
-// row + 1 bottom border. SetSize uses this constant to reserve space
-// for the viewport so the header never gets clipped or shrinks when
-// log content scrolls.
+// headerHeight is the row count of the compact (no-wordmark) run-mode
+// top box: 1 top border + 1 empty padding + 2 content rows + 1 empty
+// padding + 1 bottom border = 6 rows. Used on terminals narrower than
+// wordmarkMinWidth.
 const headerHeight = 6
+
+// headerHeightWithWordmark is the row count when the llamaman ASCII
+// wordmark is shown on the left side: 1 top border + 1 empty padding
+// + 6 wordmark rows + 1 empty padding + 1 bottom border = 10 rows.
+const headerHeightWithWordmark = 10
+
+// wordmarkLines is the number of lines in the embedded Wordmark asset
+// (72×6). Exposed as a constant so layout math is explicit; the
+// renderer also vertically centers the 2 info content rows inside
+// this many rows on the right side of the box.
+const wordmarkLines = 6
 
 func (r *RunMode) renderHeader() string {
 	params := canonicalParams(r.preset, r.registry)
@@ -681,6 +713,7 @@ func (r *RunMode) renderHeader() string {
 
 	row1 := strings.Join([]string{
 		subtle.Render("Alias:") + " " + accent.Render(r.model.Alias),
+		subtle.Render("Server:") + " " + serverVersionOrNA(r.serverVersion),
 		subtle.Render("Context Size:") + " " + paramOrNA(params, "ctx-size"),
 		subtle.Render("Uptime:") + " " + uptimeStyle.Render(formatUptime(time.Since(r.proc.Started))),
 		metricsIndicator(params, r.theme),
@@ -694,25 +727,62 @@ func (r *RunMode) renderHeader() string {
 		subtle.Render("Min_P:") + " " + paramOrNA(params, "min-p"),
 	}, "   ")
 
-	// Truncate each content row to the inner width so it never wraps.
-	// The box renders with a 1-col border on each side plus 1 col of
-	// padding, leaving width-4 for content. ansi.Truncate is
-	// SGR-aware so styled spans survive clipping cleanly.
-	innerWidth := r.width - 4
-	if innerWidth < 1 {
-		innerWidth = 1
-	}
-	row1 = ansi.Truncate(row1, innerWidth, "")
-	row2 = ansi.Truncate(row2, innerWidth, "")
-
-	body := strings.Join([]string{"", row1, row2, ""}, "\n")
-
 	box := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(r.theme.Border).
 		Padding(0, 1).
 		Width(r.width - 2)
+
+	if r.width < wordmarkMinWidth {
+		// Compact 6-row layout: rows truncated to inner width, sandwiched
+		// by empty padding rows. Same as v0.3.0.
+		innerWidth := r.width - 4
+		if innerWidth < 1 {
+			innerWidth = 1
+		}
+		body := strings.Join([]string{
+			"",
+			ansi.Truncate(row1, innerWidth, ""),
+			ansi.Truncate(row2, innerWidth, ""),
+			"",
+		}, "\n")
+		return box.Render(body)
+	}
+
+	// Wide layout: wordmark column on the left (subtle) + vertically
+	// centered info rows on the right. The right column matches the
+	// wordmark's height so JoinHorizontal lines them up cleanly.
+	wordmark := lipgloss.NewStyle().
+		Foreground(r.theme.Subtle).
+		Render(strings.TrimRight(Wordmark, "\n"))
+	wordmarkWidth := lipgloss.Width(wordmark)
+
+	// Reserve: borders (2) + padding (2) + 2-col gap between columns
+	// + wordmark width = chrome around the right column.
+	rightWidth := r.width - 2 - 2 - 2 - wordmarkWidth
+	if rightWidth < 10 {
+		rightWidth = 10
+	}
+	row1 = ansi.Truncate(row1, rightWidth, "")
+	row2 = ansi.Truncate(row2, rightWidth, "")
+
+	// Vertically center the 2 content rows inside `wordmarkLines`
+	// rows: 2 blank top + row1 + row2 + 2 blank bottom = 6 rows.
+	rightCol := strings.Join([]string{"", "", row1, row2, "", ""}, "\n")
+
+	twoColumn := lipgloss.JoinHorizontal(lipgloss.Top, wordmark, "  ", rightCol)
+	body := strings.Join([]string{"", twoColumn, ""}, "\n")
 	return box.Render(body)
+}
+
+// serverVersionOrNA renders the parsed llama-server version, falling
+// back to "n/a" when --version produced nothing usable. Matches the
+// param-row convention so missing-value cells read consistently.
+func serverVersionOrNA(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "n/a"
+	}
+	return v
 }
 
 // paramOrNA returns the rendered value of a canonical-keyed param, or
@@ -725,11 +795,23 @@ func paramOrNA(params map[string]any, key string) string {
 	return paramValueAsString(v)
 }
 
+// metricsOn / metricsOff are the SGR sequences used by the
+// [Metrics] indicator: black foreground on green background when the
+// preset has `metrics: true` (the "lit-button" look the user asked
+// for); a full reset closes the run. The bold modifier was dropped
+// because terminals tend to render bold-black as gray, washing out
+// the text against the green background — pure-black sticks. Literal
+// SGR rather than lipgloss so the styling is deterministic in tests
+// where lipgloss suppresses styling without a TTY.
+const (
+	metricsOnOpen  = "\x1b[30;42m"
+	metricsOnClose = "\x1b[0m"
+)
+
 // metricsIndicator renders the [Metrics] tag at the end of row 1.
-// Reverse+bold when the preset has `metrics: true`; subtle otherwise.
-// The on-state uses literal ANSI rather than lipgloss because lipgloss
-// suppresses styling when it can't detect a TTY (e.g. in tests), and
-// we want a deterministic visual signal regardless of detection.
+// Bold black-on-green when the preset has `metrics: true`; subtle/dim
+// otherwise. Always shown so the indicator's spot is stable across
+// state changes.
 func metricsIndicator(params map[string]any, theme Theme) string {
 	on := false
 	if v, ok := params["metrics"]; ok {
@@ -738,7 +820,7 @@ func metricsIndicator(params map[string]any, theme Theme) string {
 		}
 	}
 	if on {
-		return highlightOpen + "[Metrics]" + highlightClose
+		return metricsOnOpen + "[Metrics]" + metricsOnClose
 	}
 	return lipgloss.NewStyle().Foreground(theme.Muted).Render("[Metrics]")
 }
@@ -774,6 +856,34 @@ func presetNameOrDash(p config.Preset) string {
 		return "—"
 	}
 	return p.Name
+}
+
+// loadServerVersion runs `<bin> --version` and parses its output for
+// the line beginning with "version:" (llama.cpp's --version writes a
+// few setup lines plus a single `version: <build> (<hash>)` line).
+// Combined output is captured because some llama.cpp builds emit the
+// version line on stderr while CUDA init noise lands on stdout (or
+// vice versa). Returns "" when the binary doesn't exist, exits
+// non-zero, or doesn't include the expected line — the renderer shows
+// "n/a" in that case rather than blocking startup.
+//
+// Called once per RunMode lifecycle (not at llamaman startup) so a
+// llama-server upgrade between spawns is reflected on the next run.
+func loadServerVersion(bin string) string {
+	if strings.TrimSpace(bin) == "" {
+		return ""
+	}
+	out, err := exec.Command(bin, "--version").CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "version:") {
+			return strings.TrimSpace(strings.TrimPrefix(trimmed, "version:"))
+		}
+	}
+	return ""
 }
 
 func formatUptime(d time.Duration) string {

@@ -282,8 +282,10 @@ func TestSnapshotRunMode(t *testing.T) {
 		break
 	}
 
-	// Send WindowSizeMsg so SetSize wires up the viewport.
-	root.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	// Send WindowSizeMsg so SetSize wires up the viewport. Width 200
+	// is wide enough that the wordmark + full right-column content
+	// (including the [Metrics] indicator) all fit without truncation.
+	root.Update(tea.WindowSizeMsg{Width: 200, Height: 40})
 
 	// Wait for the fakeserver to print the readiness line and feed it
 	// into our buffer.
@@ -438,6 +440,55 @@ func TestRunModeDirectKillReturnsToMain(t *testing.T) {
 	case <-proc.Done():
 	case <-time.After(3 * time.Second):
 		t.Fatal("y did not stop the child")
+	}
+}
+
+// TestRunModeQuitPromptKillQuitsLlamaman verifies the q→k path: the
+// quit prompt's (k)ill option must kill the server AND quit llamaman,
+// not just return to main mode (the direct `k` shortcut handles
+// that). A regression here would trick users into thinking they quit
+// when llamaman is actually still up on the main screen.
+func TestRunModeQuitPromptKillQuitsLlamaman(t *testing.T) {
+	bin := filepath.Join(repoRoot(t), "bin", "llamaman-fakeserver")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("fakeserver not built: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "llama.log")
+	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+	cfg := sampleSnapshotConfig()
+	opts := RunModeOpts{
+		Cfg: cfg, Model: cfg.Models[0], Preset: cfg.Models[0].Presets[0],
+		Argv: proc.Argv, Process: proc,
+	}
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 140, Height: 40})
+
+	// q opens the quit prompt; k inside the prompt kills + quits.
+	driveRoot(t, root, keyMsg("q"))
+	if root.run == nil || !root.run.showQuit {
+		t.Fatal("q should open the quit prompt")
+	}
+	driveRoot(t, root, keyMsg("k"))
+
+	// Run mode should still hold the model — we're quitting the whole
+	// program, not bouncing back to main.
+	if root.view != ViewRun {
+		t.Errorf("after q+k the view should not have switched to main (it should be exiting); got view=%d", root.view)
+	}
+	if !root.quitting {
+		// `quitting` is set by Root when it receives tea.Quit. Without
+		// the tea.Program runtime in the test we drive only the model
+		// layer; check that the kill cleanup ran instead.
+		select {
+		case <-proc.Done():
+		case <-time.After(3 * time.Second):
+			t.Fatal("q+k did not stop the child — quit prompt's kill is wired to the wrong cmd")
+		}
 	}
 }
 

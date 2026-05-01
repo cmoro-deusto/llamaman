@@ -4,7 +4,7 @@ A modern TUI manager for `llama-server` (llama.cpp). Define models and presets o
 
 ## Status
 
-v0.3.0. Linux only.
+v0.4.0. Linux only.
 
 ## Install
 
@@ -67,7 +67,7 @@ The first invocation with no config triggers a setup flow that writes `~/.config
 - `g`/`G` top/bottom · `space`/`b` page down/up · `↑`/`↓` scroll one line
 - `?` help overlay
 
-The top box shows alias / context size / uptime / `[Metrics]` indicator on row 1, and preset / temp / top_p / top_k / min_p on row 2. `[Metrics]` reverses when the active preset has `metrics: true`. Param keys are looked up canonically so a preset that uses the short form `c` for `ctx-size` still surfaces the value.
+The top box shows the llamaman wordmark on the left (on terminals ≥110 cols) plus alias / `llama-server` version / context size / uptime / `[Metrics]` on row 1 and preset / temp / top_p / top_k / min_p on row 2. `[Metrics]` lights up black-on-green when the active preset has `metrics: true`. Param keys are looked up canonically, so a preset that uses the short form `c` for `ctx-size` still surfaces the value. The log area below sits in its own bordered frame and fills the remaining screen space.
 
 **Configuration mode** — `Tab`/`Shift+Tab` (or `←`/`→`, `h`/`l`) cycle panes · `↑`/`↓` navigate within a pane · `e` edit · `n` new · `d` delete · `D` duplicate (models and presets) · `Shift+↑/↓` reorder · `g` globals · `s` save · `Esc` back (with save/discard prompt when there are unsaved changes). The new-param picker shows each flag's bare name + parsed help description; just start typing to filter.
 
