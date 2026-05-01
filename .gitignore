@@ -1,4 +1,5 @@
 /bin/
 /dist/
+/docs/
 *.log
 .claude/settings.local.json
