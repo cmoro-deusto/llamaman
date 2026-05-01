@@ -53,17 +53,72 @@ func sampleSnapshotConfig() *config.Config {
 	}
 }
 
-// driveRoot calls Update with each message and returns the rendered View.
-// Skips Init's tea.Cmds — we only care about the rendered state after a
-// known sequence of inputs.
+// driveRoot calls Update with each message and drains the resulting
+// tea.Cmds (one level deep) so dispatched messages like SpawnRequestMsg
+// actually reach Root.Update on the next round-trip. Returns the View
+// after the final message has been processed.
 func driveRoot(t *testing.T, root *Root, msgs ...tea.Msg) string {
 	t.Helper()
 	var m tea.Model = root
 	for _, msg := range msgs {
-		next, _ := m.Update(msg)
+		next, cmd := m.Update(msg)
 		m = next
+		// Drain a single round of synchronous tea.Cmds. Each Cmd is a
+		// function returning a tea.Msg; feed each result back through
+		// Update. We don't recurse — long Cmd chains aren't expected
+		// in these tests and would risk hangs on tickers.
+		for _, sub := range collectCmds(cmd) {
+			out := safeCmd(sub)
+			if out == nil {
+				continue
+			}
+			next, _ = m.Update(out)
+			m = next
+		}
 	}
 	return stripANSI(m.View())
+}
+
+// collectCmds flattens a tea.Cmd batch into its constituent Cmds. tea
+// represents batches as opaque functions, so we have to call the Cmd
+// once and inspect its return value.
+func collectCmds(cmd tea.Cmd) []tea.Cmd {
+	if cmd == nil {
+		return nil
+	}
+	msg := safeCmd(cmd)
+	switch v := msg.(type) {
+	case tea.BatchMsg:
+		return v
+	case nil:
+		return nil
+	default:
+		return []tea.Cmd{func() tea.Msg { return msg }}
+	}
+}
+
+// safeCmd executes a tea.Cmd and recovers from panics. Bounded by a
+// short timeout so blocking Cmds (tea.Tick) don't slow down tests.
+func safeCmd(cmd tea.Cmd) tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	done := make(chan tea.Msg, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- nil
+				return
+			}
+		}()
+		done <- cmd()
+	}()
+	select {
+	case msg := <-done:
+		return msg
+	case <-time.After(50 * time.Millisecond):
+		return nil
+	}
 }
 
 // keyMsg builds a single-character key message.
@@ -243,6 +298,85 @@ func TestSnapshotRunMode(t *testing.T) {
 			t.Errorf("run mode output missing %q\nout:\n%s", want, out)
 		}
 	}
+}
+
+// failingSpawner satisfies Spawner but always errors on Spawn. Used to
+// verify that the user actually sees an error message instead of Enter
+// feeling like a no-op.
+type failingSpawner struct{ msg string }
+
+func (f failingSpawner) Spawn(config.Model, config.Preset) (RunModeOpts, error) {
+	return RunModeOpts{}, failingSpawnError{f.msg}
+}
+func (failingSpawner) Reattach() (*RunModeOpts, error)     { return nil, nil }
+func (failingSpawner) RunningAlias() (string, string, int) { return "", "", 0 }
+
+type failingSpawnError struct{ msg string }
+
+func (e failingSpawnError) Error() string { return e.msg }
+
+// TestSpawnFailureFlashesInSelectionMode reproduces "I press Enter on my
+// model and nothing happens" when llama-server isn't installed — every
+// failure now lands in the selection-mode flash so the user sees the
+// underlying message.
+func TestSpawnFailureFlashesInSelectionMode(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", failingSpawner{msg: "fork/exec /usr/bin/llama-server: no such file or directory"}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		keyMsg("s"),
+		tea.KeyMsg{Type: tea.KeyEnter},
+	)
+
+	for _, want := range []string{
+		"spawn failed",
+		"no such file or directory",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected flash to contain %q; out:\n%s", want, out)
+		}
+	}
+}
+
+// TestSpawnFailureFlashesInMainMode covers the spawn-from-main path.
+// flashSpawnError reads r.view to decide which sub-mode receives the
+// flash, so we have to make MainMode visible first via a WindowSize.
+func TestSpawnFailureFlashesInMainMode(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
+	root.flashSpawnError(failingSpawnError{msg: "port 9080 in use"})
+	out := stripANSI(root.View())
+	if !strings.Contains(out, "spawn failed: port 9080 in use") {
+		t.Errorf("expected flash on main view; got:\n%s", out)
+	}
+}
+
+// TestConfigFormHandlesLongLocationPath covers the original bug: a long
+// model location should not break opening the new-model form. We can't
+// easily assert the visible scroll behavior without a real terminal, but
+// we can verify the form opens cleanly with a long initial value and
+// that ConfigMode doesn't panic on the WindowSizeMsg-passthrough path.
+func TestConfigFormHandlesLongLocationPath(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("config form with long path panicked: %v", r)
+		}
+	}()
+	cfg := sampleSnapshotConfig()
+	// Replace alpha's location with an obnoxiously long path.
+	cfg.Models[0].Location = strings.Repeat("/very-long-segment", 30) + ".gguf"
+
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 100, Height: 30},
+		keyMsg("c"),
+		keyMsg("e"), // edit selected (alpha) model
+	)
+	// Just reaching here without panic is the assertion. installForm
+	// drives a synthetic WindowSizeMsg into huh so its inputs size
+	// themselves.
 }
 
 // TestFirstRunWindowSizeDoesNotPanic guards the regression reported in

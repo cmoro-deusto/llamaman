@@ -23,6 +23,7 @@ type MainMode struct {
 	runningPreset string
 	runningPort   int
 
+	flash    string
 	showHelp bool
 }
 
@@ -52,6 +53,11 @@ func (m *MainMode) SetRunning(alias, preset string, port int) {
 // IsSessionRunning reports whether main mode currently shows the detached
 // line / accepts the `a` shortcut. Used by Root to gate `a`.
 func (m MainMode) IsSessionRunning() bool { return m.runningAlias != "" }
+
+// SetFlash sets a short status message shown beneath the shortcuts. Used
+// by Root to surface spawn errors when the user pressed `a` or arrived
+// from an attempted launch.
+func (m *MainMode) SetFlash(msg string) { m.flash = msg }
 
 // View renders the main screen, centered in the current terminal window.
 func (m MainMode) View() string {
@@ -86,6 +92,14 @@ func (m MainMode) View() string {
 		parts = append(parts, "", m.renderDetached())
 	}
 	parts = append(parts, "", hint)
+	if m.flash != "" {
+		col := m.theme.StatusErr
+		if !strings.Contains(strings.ToLower(m.flash), "fail") &&
+			!strings.Contains(strings.ToLower(m.flash), "error") {
+			col = m.theme.StatusReady
+		}
+		parts = append(parts, "", lipgloss.NewStyle().Foreground(col).Render(m.flash))
+	}
 
 	body := lipgloss.JoinVertical(lipgloss.Center, parts...)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, body)

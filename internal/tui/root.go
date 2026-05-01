@@ -320,23 +320,38 @@ func (r *Root) forward(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (r *Root) handleSpawn(msg SpawnRequestMsg) (tea.Model, tea.Cmd) {
 	if r.spawner == nil {
-		r.startErr = errSpawnerMissing
+		r.flashSpawnError(errSpawnerMissing)
 		return r, nil
 	}
 	opts, err := r.spawner.Spawn(msg.Model, msg.Preset)
 	if err != nil {
-		r.startErr = err
+		r.flashSpawnError(err)
 		return r, nil
 	}
 	run, cmd, err := NewRunMode(opts)
 	if err != nil {
-		r.startErr = err
+		r.flashSpawnError(err)
 		return r, nil
 	}
 	run.SetSize(r.width, r.height)
 	r.run = run
 	r.view = ViewRun
 	return r, cmd
+}
+
+// flashSpawnError records the error and forwards it to the visible
+// sub-mode so the user actually sees what went wrong instead of the
+// keypress feeling like a no-op (e.g. when llama-server isn't installed
+// at the configured path, or the port is already bound).
+func (r *Root) flashSpawnError(err error) {
+	r.startErr = err
+	msg := "spawn failed: " + err.Error()
+	switch r.view {
+	case ViewSelection:
+		r.selection.SetFlash(msg)
+	case ViewMain:
+		r.mainMode.SetFlash(msg)
+	}
 }
 
 // configEntry bundles the optional state for openConfig. The fields are

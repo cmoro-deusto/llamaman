@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
@@ -99,6 +100,12 @@ func (s *SelectionMode) SetRunningAlias(alias string) {
 func (s *SelectionMode) SetCfg(cfg *config.Config) {
 	s.cfg = cfg
 	s.rebuildModels()
+}
+
+// SetFlash sets the bottom-of-pane status message (red on errors). Used
+// by Root to surface spawn failures so Enter never fails silently.
+func (s *SelectionMode) SetFlash(msg string) {
+	s.flash = msg
 }
 
 func (s *SelectionMode) rebuildModels() {
@@ -325,9 +332,18 @@ func (s SelectionMode) View() string {
 	body := s.models.View()
 	if s.flash != "" {
 		body = lipgloss.JoinVertical(lipgloss.Left,
-			lipgloss.NewStyle().Foreground(s.theme.StatusReady).Render(s.flash), body)
+			lipgloss.NewStyle().Foreground(s.flashColor()).Render(s.flash), body)
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, body, footer)
+}
+
+// flashColor picks red for failures, green for confirmations.
+func (s SelectionMode) flashColor() lipgloss.Color {
+	low := strings.ToLower(s.flash)
+	if strings.HasPrefix(low, "fail") || strings.Contains(low, "error") || strings.HasPrefix(low, "spawn failed") {
+		return s.theme.StatusErr
+	}
+	return s.theme.StatusReady
 }
 
 func pluralS(n int) string {

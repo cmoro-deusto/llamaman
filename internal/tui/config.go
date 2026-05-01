@@ -158,6 +158,36 @@ func (c *ConfigMode) dismissForm() {
 	c.formStaging = formStaging{}
 }
 
+// installForm wires a freshly constructed huh.Form into ConfigMode and
+// drives a WindowSizeMsg through it so its inputs size to the available
+// width. Without this, huh defaults to a tiny width and long values
+// (e.g. model paths) scroll off the right edge invisibly.
+//
+// The form is rendered inside a centered, bordered, padded box; we
+// subtract a generous frame allowance to keep the inputs comfortably
+// inside the box.
+func (c *ConfigMode) installForm(form *huh.Form, kind formKind) tea.Cmd {
+	c.form = form
+	c.formKind = kind
+	cmds := []tea.Cmd{form.Init()}
+	if c.width > 0 && c.height > 0 {
+		const frame = 12 // border + padding + breathing room
+		w := c.width - frame
+		if w < 20 {
+			w = 20
+		}
+		h := c.height - 6
+		if h < 5 {
+			h = 5
+		}
+		_, cmd := form.Update(tea.WindowSizeMsg{Width: w, Height: h})
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
+	return tea.Batch(cmds...)
+}
+
 func (c *ConfigMode) handleKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 	switch k.String() {
 	case "esc":
@@ -340,36 +370,33 @@ func (c *ConfigMode) openGlobalsForm() tea.Cmd {
 	host := c.work.Globals.Host
 	port := strconv.Itoa(c.work.Globals.Port)
 	c.formStaging = formStaging{bin: &bin, host: &host, port: &port}
-	c.form = huh.NewForm(huh.NewGroup(
+	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("llama-server binary").Value(&bin).Validate(nonEmpty("binary")),
 		huh.NewInput().Title("host (IPv4 / [::IPv6] / hostname)").Value(&host).Validate(hostValidator),
 		huh.NewInput().Title("port").Value(&port).Validate(numericRange(1, 65535)),
 	)).WithTheme(huh.ThemeBase())
-	c.formKind = formGlobals
-	return c.form.Init()
+	return c.installForm(form, formGlobals)
 }
 
 func (c *ConfigMode) openNewModelForm() tea.Cmd {
 	alias, location := "", ""
 	c.formStaging = formStaging{alias: &alias, location: &location}
-	c.form = huh.NewForm(huh.NewGroup(
+	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("alias").Value(&alias).Validate(nonEmpty("alias")),
-		huh.NewInput().Title("model location (path)").Value(&location).Validate(nonEmpty("location")),
+		huh.NewInput().Title("model location (path)").Value(&location).Validate(nonEmpty("location")).CharLimit(2048),
 	)).WithTheme(huh.ThemeBase())
-	c.formKind = formNewModel
-	return c.form.Init()
+	return c.installForm(form, formNewModel)
 }
 
 func (c *ConfigMode) openEditModelForm() tea.Cmd {
 	m := c.work.Models[c.modelIdx]
 	alias, location := m.Alias, m.Location
 	c.formStaging = formStaging{alias: &alias, location: &location}
-	c.form = huh.NewForm(huh.NewGroup(
+	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("alias").Value(&alias).Validate(nonEmpty("alias")),
-		huh.NewInput().Title("model location (path)").Value(&location).Validate(nonEmpty("location")),
+		huh.NewInput().Title("model location (path)").Value(&location).Validate(nonEmpty("location")).CharLimit(2048),
 	)).WithTheme(huh.ThemeBase())
-	c.formKind = formEditModel
-	return c.form.Init()
+	return c.installForm(form, formEditModel)
 }
 
 func (c *ConfigMode) openDeleteModelPrompt() tea.Cmd {
@@ -378,34 +405,31 @@ func (c *ConfigMode) openDeleteModelPrompt() tea.Cmd {
 	m := c.work.Models[c.modelIdx]
 	prompt := fmt.Sprintf("Delete model %q (%d preset%s)? Cannot be undone.",
 		m.Alias, len(m.Presets), plural(len(m.Presets)))
-	c.form = huh.NewForm(huh.NewGroup(
+	form := huh.NewForm(huh.NewGroup(
 		huh.NewConfirm().Title(prompt).Affirmative("Delete").Negative("Cancel").Value(&confirm),
 	)).WithTheme(huh.ThemeBase())
-	c.formKind = formDeleteModel
-	return c.form.Init()
+	return c.installForm(form, formDeleteModel)
 }
 
 func (c *ConfigMode) openNewPresetForm() tea.Cmd {
 	name, desc := "", ""
 	c.formStaging = formStaging{name: &name, desc: &desc}
-	c.form = huh.NewForm(huh.NewGroup(
+	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("preset name").Value(&name).Validate(nonEmpty("name")),
 		huh.NewInput().Title("description").Value(&desc),
 	)).WithTheme(huh.ThemeBase())
-	c.formKind = formNewPreset
-	return c.form.Init()
+	return c.installForm(form, formNewPreset)
 }
 
 func (c *ConfigMode) openEditPresetForm() tea.Cmd {
 	p := c.work.Models[c.modelIdx].Presets[c.presetIdx]
 	name, desc := p.Name, p.Description
 	c.formStaging = formStaging{name: &name, desc: &desc}
-	c.form = huh.NewForm(huh.NewGroup(
+	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("preset name").Value(&name).Validate(nonEmpty("name")),
 		huh.NewInput().Title("description").Value(&desc),
 	)).WithTheme(huh.ThemeBase())
-	c.formKind = formEditPreset
-	return c.form.Init()
+	return c.installForm(form, formEditPreset)
 }
 
 func (c *ConfigMode) openDeletePresetPrompt() tea.Cmd {
@@ -413,24 +437,22 @@ func (c *ConfigMode) openDeletePresetPrompt() tea.Cmd {
 	c.formStaging = formStaging{confirm: &confirm}
 	p := c.work.Models[c.modelIdx].Presets[c.presetIdx]
 	prompt := fmt.Sprintf("Delete preset %q?", p.Name)
-	c.form = huh.NewForm(huh.NewGroup(
+	form := huh.NewForm(huh.NewGroup(
 		huh.NewConfirm().Title(prompt).
 			Affirmative("Delete").Negative("Cancel").
 			Value(&confirm),
 	)).WithTheme(huh.ThemeBase())
-	c.formKind = formDeletePreset
-	return c.form.Init()
+	return c.installForm(form, formDeletePreset)
 }
 
 func (c *ConfigMode) openDuplicatePresetForm() tea.Cmd {
 	src := c.work.Models[c.modelIdx].Presets[c.presetIdx]
 	name := src.Name + "-copy"
 	c.formStaging = formStaging{name: &name}
-	c.form = huh.NewForm(huh.NewGroup(
+	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("new preset name").Value(&name).Validate(nonEmpty("name")),
 	)).WithTheme(huh.ThemeBase())
-	c.formKind = formDuplicatePreset
-	return c.form.Init()
+	return c.installForm(form, formDuplicatePreset)
 }
 
 // openNewParamForm starts a two-step flow: pick key (fuzzy over registry,
@@ -461,9 +483,8 @@ func (c *ConfigMode) openNewParamForm() tea.Cmd {
 				Value(&c.pendingKey).Validate(nonEmpty("key")),
 		)
 	}
-	c.form = huh.NewForm(huh.NewGroup(fields...)).WithTheme(huh.ThemeBase())
-	c.formKind = formNewParamPickKey
-	return c.form.Init()
+	form := huh.NewForm(huh.NewGroup(fields...)).WithTheme(huh.ThemeBase())
+	return c.installForm(form, formNewParamPickKey)
 }
 
 // openValueFormFor builds the value-input form for the given key.
@@ -512,9 +533,8 @@ func (c *ConfigMode) openValueFormFor(key, initial string) tea.Cmd {
 			Title(title).
 			Value(&val)
 	}
-	c.form = huh.NewForm(huh.NewGroup(field)).WithTheme(huh.ThemeBase())
-	c.formKind = formNewParamPickValue
-	return c.form.Init()
+	form := huh.NewForm(huh.NewGroup(field)).WithTheme(huh.ThemeBase())
+	return c.installForm(form, formNewParamPickValue)
 }
 
 // openEditParamForm reuses openValueFormFor with the existing key+value.
@@ -525,6 +545,9 @@ func (c *ConfigMode) openEditParamForm() tea.Cmd {
 	p := c.work.Models[c.modelIdx].Presets[c.presetIdx].Params[c.paramIdx]
 	c.pendingKey = p.Key
 	cmd := c.openValueFormFor(p.Key, paramValueAsString(p.Value))
+	// openValueFormFor stamped the formKind as formNewParamPickValue;
+	// override to formEditParam so applyForm dispatches to the edit
+	// branch instead of the new-param branch.
 	c.formKind = formEditParam
 	return cmd
 }
@@ -565,7 +588,7 @@ func numericValueValidator(s string) error {
 func (c *ConfigMode) openExitPrompt() tea.Cmd {
 	choice := "save"
 	c.formStaging = formStaging{choice: &choice}
-	c.form = huh.NewForm(huh.NewGroup(
+	form := huh.NewForm(huh.NewGroup(
 		huh.NewSelect[string]().
 			Title("Unsaved changes").
 			Options(
@@ -575,8 +598,7 @@ func (c *ConfigMode) openExitPrompt() tea.Cmd {
 			).
 			Value(&choice),
 	)).WithTheme(huh.ThemeBase())
-	c.formKind = formExitPrompt
-	return c.form.Init()
+	return c.installForm(form, formExitPrompt)
 }
 
 // applyForm consumes the just-completed form. The bool return tells the
