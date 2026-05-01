@@ -14,14 +14,13 @@ type View int
 
 const (
 	ViewMain View = iota
-	ViewSelection
 	ViewRun
 	ViewConfig
 	ViewFirstRun
 )
 
 // SpawnRequestMsg asks the root to spawn llama-server for (Model, Preset)
-// and transition to run mode. Selection mode emits this on Enter.
+// and transition to run mode. Main mode emits this on Enter.
 type SpawnRequestMsg struct {
 	Model  config.Model
 	Preset config.Preset
@@ -29,24 +28,6 @@ type SpawnRequestMsg struct {
 
 // returnToMainMsg is dispatched when the user backs out of run mode.
 type returnToMainMsg struct{}
-
-// editFromSelectionMsg requests opening config mode focused on the chosen
-// model (Presets pane). Selection mode emits this on `e`.
-type editFromSelectionMsg struct {
-	Alias string
-}
-
-// editPresetFromSelectionMsg requests opening config mode focused on a
-// specific preset's parameter editor (Params pane). The preset sub-list
-// emits this on `e`.
-type editPresetFromSelectionMsg struct {
-	Alias  string
-	Preset string
-}
-
-// newModelFromSelectionMsg requests opening config mode in the new-model
-// flow. Selection mode emits this on `n`.
-type newModelFromSelectionMsg struct{}
 
 // reattachRequestMsg asks the root to drop into run mode by adopting the
 // currently-running session (if any). Main mode emits this on `a`.
@@ -62,8 +43,8 @@ type Spawner interface {
 	// running. Errors propagate to the caller's error path.
 	Reattach() (*RunModeOpts, error)
 	// RunningAlias returns the alias of the currently running session
-	// (if any), used by selection mode for the `(running)` marker and by
-	// main mode for the "▶ Detached" line. Empty string when no session.
+	// (if any), used by main mode for the inline list's `(running)`
+	// marker and the "▶ Detached" line. Empty string when no session.
 	RunningAlias() (alias, preset string, port int)
 }
 
@@ -81,7 +62,6 @@ type Root struct {
 	width     int
 	height    int
 	mainMode  MainMode
-	selection SelectionMode
 	run       *RunMode
 	configMod *ConfigMode
 	firstRun  *FirstRunMode
@@ -119,10 +99,8 @@ func NewRoot(cfg *config.Config, cfgPath string, spawner Spawner, registry flags
 		version:    version,
 		keys:       DefaultKeymap(),
 		mainMode:   NewMainMode(cfg, version),
-		selection:  NewSelectionMode(cfg),
 		initialRun: initialRun,
 	}
-	r.selection.SetCfgPath(cfgPath)
 	if initialRun != nil {
 		r.view = ViewRun
 	}
@@ -159,7 +137,6 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		r.width, r.height = msg.Width, msg.Height
 		r.mainMode.SetSize(msg.Width, msg.Height)
-		r.selection.SetSize(msg.Width, msg.Height)
 		if r.run != nil {
 			r.run.SetSize(msg.Width, msg.Height)
 		}
@@ -183,15 +160,6 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case SpawnRequestMsg:
 		return r.handleSpawn(msg)
-
-	case editFromSelectionMsg:
-		return r.openConfig(configEntry{focusAlias: msg.Alias, focus: FocusPresets})
-
-	case editPresetFromSelectionMsg:
-		return r.openConfig(configEntry{focusAlias: msg.Alias, focusPreset: msg.Preset, focus: FocusParams})
-
-	case newModelFromSelectionMsg:
-		return r.openConfig(configEntry{focus: FocusModels, openNewModel: true})
 
 	case reattachRequestMsg:
 		return r.handleReattach()
@@ -224,9 +192,6 @@ func (r *Root) handleFirstRunCompleted(msg FirstRunCompletedMsg) (tea.Model, tea
 	r.firstRun = nil
 	r.mainMode = NewMainMode(msg.Cfg, r.version)
 	r.mainMode.SetSize(r.width, r.height)
-	r.selection = NewSelectionMode(msg.Cfg)
-	r.selection.SetCfgPath(msg.CfgPath)
-	r.selection.SetSize(r.width, r.height)
 	cm := NewConfigMode(msg.CfgPath, msg.Cfg)
 	cm.SetRegistry(r.registry)
 	cm.ShowFirstRunBanner()
@@ -243,9 +208,6 @@ func (r *Root) routeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "q":
 			r.quitting = true
 			return r, tea.Quit
-		case "s", "enter":
-			r.view = ViewSelection
-			return r, nil
 		case "c":
 			return r.openConfig(configEntry{focus: FocusModels})
 		case "a":
@@ -254,13 +216,11 @@ func (r *Root) routeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			return r, nil
 		}
-		// Forward ? and any other unclaimed keys to MainMode (help toggle).
+		// Everything else (Enter, ↑/↓, Esc, ?) is owned by MainMode now
+		// that the model selection list is embedded in the landing
+		// screen.
 		next, cmd := r.mainMode.Update(msg)
 		r.mainMode = next
-		return r, cmd
-	case ViewSelection:
-		next, cmd := r.selection.Update(msg)
-		r.selection = next
 		return r, cmd
 	case ViewRun:
 		if r.run == nil {
@@ -289,10 +249,6 @@ func (r *Root) routeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (r *Root) forward(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch r.view {
-	case ViewSelection:
-		next, cmd := r.selection.Update(msg)
-		r.selection = next
-		return r, cmd
 	case ViewRun:
 		if r.run == nil {
 			return r, nil
@@ -346,10 +302,7 @@ func (r *Root) handleSpawn(msg SpawnRequestMsg) (tea.Model, tea.Cmd) {
 func (r *Root) flashSpawnError(err error) {
 	r.startErr = err
 	msg := "spawn failed: " + err.Error()
-	switch r.view {
-	case ViewSelection:
-		r.selection.SetFlash(msg)
-	case ViewMain:
+	if r.view == ViewMain {
 		r.mainMode.SetFlash(msg)
 	}
 }
@@ -415,20 +368,21 @@ func (r *Root) handleReattach() (tea.Model, tea.Cmd) {
 	return r, cmd
 }
 
-// refreshSessionState polls session.json via the spawner so main and
-// selection modes can show the (running) marker and the "▶ Detached" line.
+// refreshSessionState polls session.json via the spawner so main mode
+// can show the (running) marker on the inline list and the "▶ Detached"
+// line.
 func (r *Root) refreshSessionState() {
 	if r.spawner == nil {
 		return
 	}
 	alias, preset, port := r.spawner.RunningAlias()
 	r.mainMode.SetRunning(alias, preset, port)
-	r.selection.SetRunningAlias(alias)
 }
 
 // applyConfigChanges replaces the in-memory config with the saved
-// snapshot from the editor and refreshes downstream sub-models that hold
-// derived state (selection list, etc.).
+// snapshot from the editor and rebuilds main mode so the embedded
+// selection list reflects the new config without losing per-mode state
+// (running session, flash) that lives on the existing MainMode.
 func (r *Root) applyConfigChanges() {
 	if r.configMod == nil {
 		return
@@ -436,9 +390,7 @@ func (r *Root) applyConfigChanges() {
 	saved := r.configMod.Saved()
 	if saved != nil {
 		r.cfg = saved
-		r.selection = NewSelectionMode(saved)
-		r.selection.SetSize(r.width, r.height)
-		r.mainMode = NewMainMode(saved, r.version)
+		r.mainMode.SetCfg(saved)
 		r.mainMode.SetSize(r.width, r.height)
 	}
 }
@@ -450,8 +402,6 @@ func (r *Root) View() string {
 	switch r.view {
 	case ViewMain:
 		return r.mainMode.View()
-	case ViewSelection:
-		return r.selection.View()
 	case ViewRun:
 		if r.run == nil {
 			return ""
@@ -479,7 +429,7 @@ type spawnerMissingError struct{}
 
 func (spawnerMissingError) Error() string { return "TUI: Spawner not configured" }
 
-// sessionTickMsg fires every few seconds so main/selection can refresh
+// sessionTickMsg fires every few seconds so main mode can refresh
 // the (running) marker and the "▶ Detached" line if another process
 // changes the session state out-of-band.
 type sessionTickMsg struct{}

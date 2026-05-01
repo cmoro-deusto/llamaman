@@ -1041,7 +1041,7 @@ func (c *ConfigMode) renderParams() string {
 	if len(unknownFlags) > 0 {
 		lines = append(lines, "")
 		lines = append(lines, lipgloss.NewStyle().Foreground(c.theme.StatusStart).
-			Render("warn: unknown flag"+pluralS(len(unknownFlags))+": "+strings.Join(unknownFlags, ", ")))
+			Render("warn: unknown flag"+plural(len(unknownFlags))+": "+strings.Join(unknownFlags, ", ")))
 	}
 	return strings.Join(lines, "\n")
 }

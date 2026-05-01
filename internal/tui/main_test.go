@@ -8,7 +8,8 @@ import (
 )
 
 // TestMainViewRendersWordmarkAndShortcuts is a lightweight render check
-// that doesn't require a PTY — full teatest snapshots come in Phase 11.
+// for the empty-config landing screen: no inline list, just wordmark +
+// configure/help/quit shortcuts.
 func TestMainViewRendersWordmarkAndShortcuts(t *testing.T) {
 	cfg := &config.Config{Version: 1}
 	m := NewMainMode(cfg, "v0.0.1-test")
@@ -17,13 +18,17 @@ func TestMainViewRendersWordmarkAndShortcuts(t *testing.T) {
 	out := m.View()
 	for _, want := range []string{
 		"llamaman v0.0.1-test", // tagline
-		"select model",        // shortcut label
-		"configure",           // shortcut label
-		"quit",                // shortcut label
+		"configure",            // shortcut label
+		"quit",                 // shortcut label
 	} {
 		if !strings.Contains(stripANSI(out), want) {
 			t.Errorf("View() missing %q in:\n%s", want, out)
 		}
+	}
+	// With zero models configured, the inline list and its keys must
+	// be absent — that's the no-models fallback.
+	if strings.Contains(stripANSI(out), "navigate") {
+		t.Errorf("View() should not show navigate shortcut when no models configured:\n%s", out)
 	}
 }
 

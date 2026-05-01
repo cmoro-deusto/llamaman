@@ -317,36 +317,29 @@ Modal dialogs (quit prompt, kill confirm, restart confirm, help, config-mode for
 
 ### 7.2 Main mode
 
-Centered window. Top: stylized "llamaman" wordmark (figlet-style, baked-in font, no runtime dependency). Below: version + tagline. Below that: shortcuts.
+Centered window. Top: stylized "llamaman" wordmark (figlet-style, baked-in font, no runtime dependency). Below: version + tagline.
+
+When at least one model is configured, a bordered single-line-per-row selection list is embedded directly in the landing screen between the version line and the shortcuts. The first model is pre-selected; the row is reverse-video. Each row shows the alias, an optional `(running)` marker, and a subtle preset-count summary.
+
+When **no** models are configured, the list is hidden and the screen reverts to its bare wordmark + shortcuts form so first-run users aren't confronted with an empty box.
 
 | Key | Action |
 |---|---|
-| `s` or `Enter` | Selection mode |
+| `↑` / `↓` | Move selection in the inline list (only when models exist) |
+| `Enter` | Run the selected model. If the model has 0 or 1 presets it spawns directly; with 2+ presets the box pivots to a preset sub-list with the same Enter/Esc semantics |
+| `Esc` | Back out of the preset sub-list to the model list |
 | `c` | Configuration mode |
 | `?` | Help overlay |
 | `q` | Quit |
 | `a` | Attach to running session (only shown when a session is running) |
 
-If a session is running, an additional line appears: `▶ Detached: <alias>/<preset> listening on :<port> — press a to attach`.
+If a session is running, an additional line appears above the list: `▶ Detached: <alias>/<preset> listening on :<port> — press a to attach`.
 
-### 7.3 Selection mode
+Order: rows follow the configuration order (`models[]` in the JSON). No alphabetical sort — users who reorder via Shift+↑/↓ in configuration mode see the change reflected here.
 
-Full-width list of models. Each row: alias, preset count, optional `(running)` marker.
+A model alias with **zero** presets selected via Enter → run mode using only auto-added flags (`-m`, `--alias`, `--host`, `--port`).
 
-| Key | Action |
-|---|---|
-| `Enter` | If 0 or 1 presets → run mode immediately; if ≥2 presets → preset sub-list |
-| `e` | Configuration mode focused on this model |
-| `n` | Configuration mode in "new model" flow |
-| `d` | Delete model (confirm modal lists preset count) |
-| `/` | Inline fuzzy filter on alias |
-| `Esc` | Back to main mode |
-
-Sort: alphabetical by alias.
-
-Selecting an alias with **zero** presets → run mode using only auto-added flags (`-m`, `--alias`, `--host`, `--port`).
-
-When a multi-preset alias is selected, a sub-list of presets appears with the same `Enter`/`e`/`Esc` semantics.
+There is no separate "selection mode" — model selection is the main mode.
 
 ### 7.4 Run mode
 

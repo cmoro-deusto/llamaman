@@ -142,15 +142,39 @@ func TestSnapshotMainMode(t *testing.T) {
 
 	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
 
+	// Main mode now embeds the model selection list, so the alias rows
+	// must be visible alongside the version/shortcut chrome.
 	for _, want := range []string{
 		"llamaman v0.0.0-test",
-		"select model",
+		"alpha",
+		"beta",
+		"navigate",
+		"select",
 		"configure",
 		"help",
 		"quit",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("main mode output missing %q\nout:\n%s", want, out)
+		}
+	}
+}
+
+// TestSnapshotMainModeNoModelsHidesList covers the empty-config case:
+// when no models are configured, the inline list is not rendered and
+// the landing screen reverts to its bare "configure to begin" form.
+func TestSnapshotMainModeNoModelsHidesList(t *testing.T) {
+	cfg := &config.Config{Version: 1, Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	if strings.Contains(out, "navigate") {
+		t.Errorf("expected no list-related shortcut when no models configured; out:\n%s", out)
+	}
+	for _, want := range []string{"llamaman v0.0.0-test", "configure", "quit"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("main mode missing %q in zero-models layout\nout:\n%s", want, out)
 		}
 	}
 }
@@ -169,54 +193,36 @@ func TestSnapshotMainModeShowsDetachedLineWhenSessionRunning(t *testing.T) {
 	}
 }
 
-func TestSnapshotSelectionMode(t *testing.T) {
-	cfg := sampleSnapshotConfig()
-	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
-
-	out := driveRoot(t, root,
-		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
-	)
-
-	for _, want := range []string{"alpha", "beta", "preset"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("selection output missing %q\nout:\n%s", want, out)
-		}
-	}
-}
-
-func TestSnapshotSelectionShowsRunningMarker(t *testing.T) {
+// TestSnapshotMainModeShowsRunningMarker verifies the inline list's
+// per-row `(running)` suffix when a session for that alias is live.
+func TestSnapshotMainModeShowsRunningMarker(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	root := NewRoot(cfg, "/dev/null", stubSpawner{runningAlias: "alpha"}, nil, "v0.0.0-test", nil)
 	root.refreshSessionState()
 
-	out := driveRoot(t, root,
-		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
-	)
+	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
 	if !strings.Contains(out, "(running)") {
-		t.Errorf("expected (running) marker; out:\n%s", out)
+		t.Errorf("expected (running) marker on alpha row; out:\n%s", out)
 	}
 }
 
-func TestSnapshotSelectionPivotsToPresetSubList(t *testing.T) {
+// TestSnapshotMainModePivotsToPresetSubList exercises the multi-preset
+// pivot: navigating to `beta` (2 presets) and pressing Enter swaps the
+// inline list to show the preset names.
+func TestSnapshotMainModePivotsToPresetSubList(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
 
-	// 'beta' has 2 presets; navigate to it then Enter to open sub-list.
 	out := driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
-		tea.KeyMsg{Type: tea.KeyDown},
+		tea.KeyMsg{Type: tea.KeyDown}, // move to beta
 		tea.KeyMsg{Type: tea.KeyEnter},
 	)
-
-	// Sub-list shows preset names, including the second one ("smallctx").
 	if !strings.Contains(out, "smallctx") {
 		t.Errorf("preset sub-list should show smallctx; out:\n%s", out)
 	}
-	if !strings.Contains(out, "Presets — beta") {
-		t.Errorf("preset sub-list should mention parent alias; out:\n%s", out)
+	if !strings.Contains(out, "default") {
+		t.Errorf("preset sub-list should show default; out:\n%s", out)
 	}
 }
 
@@ -327,18 +333,18 @@ type failingSpawnError struct{ msg string }
 
 func (e failingSpawnError) Error() string { return e.msg }
 
-// TestSpawnFailureFlashesInSelectionMode reproduces "I press Enter on my
-// model and nothing happens" when llama-server isn't installed — every
-// failure now lands in the selection-mode flash so the user sees the
-// underlying message.
-func TestSpawnFailureFlashesInSelectionMode(t *testing.T) {
+// TestSpawnFailureFlashesInMainModeFromInlineList reproduces the
+// "I press Enter on my model and nothing happens" scenario when
+// llama-server isn't installed — the spawn failure now lands as a
+// flash on the main-mode screen (where the inline list lives), so
+// users see the underlying error rather than a silent no-op.
+func TestSpawnFailureFlashesInMainModeFromInlineList(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	root := NewRoot(cfg, "/dev/null", failingSpawner{msg: "fork/exec /usr/bin/llama-server: no such file or directory"}, nil, "v0.0.0-test", nil)
 
 	out := driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
-		tea.KeyMsg{Type: tea.KeyEnter},
+		tea.KeyMsg{Type: tea.KeyEnter}, // Enter on first row of the inline list
 	)
 
 	for _, want := range []string{
