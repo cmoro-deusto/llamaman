@@ -415,17 +415,59 @@ func TestRunModeDirectKillReturnsToMain(t *testing.T) {
 	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
 	driveRoot(t, root, tea.WindowSizeMsg{Width: 140, Height: 40})
 
-	// Press `k` directly (no quit prompt). Expect transition to main.
+	// Press `k` to open the confirm dialog (no immediate kill).
 	driveRoot(t, root, keyMsg("k"))
-	if root.view != ViewMain {
-		t.Fatalf("after k: view = %d, want ViewMain (%d)", root.view, ViewMain)
+	if root.run == nil || !root.run.killPrompt {
+		t.Fatal("k should open the kill confirm prompt")
 	}
-	// Process should have been signaled.
+	if root.view != ViewRun {
+		t.Fatalf("k should not transition before confirm; view = %d", root.view)
+	}
+	// Confirm with y → kill + return to main.
+	driveRoot(t, root, keyMsg("y"))
+	if root.view != ViewMain {
+		t.Fatalf("after k+y: view = %d, want ViewMain (%d)", root.view, ViewMain)
+	}
 	select {
 	case <-proc.Done():
 	case <-time.After(3 * time.Second):
-		t.Fatal("k did not stop the child")
+		t.Fatal("y did not stop the child")
 	}
+}
+
+// TestRunModeKillPromptCancel covers the n/esc paths — the user can
+// dismiss the confirm dialog and stay in run mode without affecting
+// the child.
+func TestRunModeKillPromptCancel(t *testing.T) {
+	bin := filepath.Join(repoRoot(t), "bin", "llamaman-fakeserver")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("fakeserver not built: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "llama.log")
+	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+	cfg := sampleSnapshotConfig()
+	opts := RunModeOpts{
+		Cfg: cfg, Model: cfg.Models[0], Preset: cfg.Models[0].Presets[0],
+		Argv: proc.Argv, Process: proc,
+	}
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 140, Height: 40})
+	driveRoot(t, root, keyMsg("k"), keyMsg("n"))
+	if root.run == nil || root.run.killPrompt {
+		t.Fatal("n should dismiss the kill prompt")
+	}
+	if root.view != ViewRun {
+		t.Fatalf("after k+n: view = %d, want ViewRun", root.view)
+	}
+	if !server.IsLive(proc.Pid) {
+		t.Fatal("cancel should not have killed the child")
+	}
+	root.run.killAndReturn()
 }
 
 // TestRunModeKDoesNotScrollViewport sanity-checks that the viewport's

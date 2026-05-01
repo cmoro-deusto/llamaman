@@ -65,6 +65,7 @@ type RunMode struct {
 	showQuit      bool // quit prompt overlay active
 	showHelp      bool // help overlay active
 	restartPrompt bool // r-confirm overlay
+	killPrompt    bool // k-confirm overlay
 	flash         string
 
 	searchInput   textinput.Model
@@ -193,6 +194,9 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if r.restartPrompt {
 			return r.handleRestartPrompt(m)
 		}
+		if r.killPrompt {
+			return r.handleKillPrompt(m)
+		}
 		if r.searchActive {
 			return r.handleSearchInput(m)
 		}
@@ -205,9 +209,10 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			r.showQuit = true
 			return r, nil
 		case "k":
-			// Direct kill: stop llama-server, clean up, and return to
-			// the main screen — llamaman itself stays open.
-			return r, r.killAndReturn()
+			// Direct kill — gated on a confirm dialog so an accidental
+			// keypress doesn't murder a running session.
+			r.killPrompt = true
+			return r, nil
 		case "?":
 			r.showHelp = true
 			return r, nil
@@ -276,6 +281,20 @@ func (r *RunMode) handleRestartPrompt(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 		return r, r.requestRestart()
 	case "n", "esc", "c":
 		r.restartPrompt = false
+		return r, nil
+	}
+	return r, nil
+}
+
+// handleKillPrompt reads the confirm/cancel keys for the direct `k`
+// shortcut. Symmetric with handleRestartPrompt.
+func (r *RunMode) handleKillPrompt(m tea.KeyMsg) (*RunMode, tea.Cmd) {
+	switch m.String() {
+	case "y", "enter", "k":
+		r.killPrompt = false
+		return r, r.killAndReturn()
+	case "n", "esc", "c":
+		r.killPrompt = false
 		return r, nil
 	}
 	return r, nil
@@ -412,6 +431,8 @@ func (r *RunMode) View() string {
 		return overlayCenter(bg, r.renderQuitPrompt(), r.width, r.height)
 	case r.restartPrompt:
 		return overlayCenter(bg, r.renderRestartPrompt(), r.width, r.height)
+	case r.killPrompt:
+		return overlayCenter(bg, r.renderKillPrompt(), r.width, r.height)
 	case r.showHelp:
 		return overlayCenter(bg, r.renderHelp(), r.width, r.height)
 	}
@@ -432,6 +453,17 @@ func (r *RunMode) renderRestartPrompt() string {
 		BorderForeground(r.theme.Accent).
 		Padding(1, 3)
 	return box.Render("Server is ready. Restart anyway?\n\n  (y) yes   (n) no")
+}
+
+func (r *RunMode) renderKillPrompt() string {
+	box := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(r.theme.Accent).
+		Padding(1, 3)
+	return box.Render(fmt.Sprintf(
+		"Kill llama-server (%s/%s)?\n\n  (y) yes   (n) no",
+		r.model.Alias, presetNameOrDash(r.preset),
+	))
 }
 
 func (r *RunMode) renderHelp() string {

@@ -296,11 +296,13 @@ This keeps `llamaman` forward-compatible with new llama-server flags without req
 | `?` | Toggle help overlay (lists current mode's keys) |
 | `Esc` | Back / cancel modal |
 | `Ctrl+C` | Same as `q` (with prompt in run mode) |
-| `↑` / `↓` / `j` / `k` | Navigate lists |
+| `↑` / `↓` / `j` / `k` | Navigate lists (run mode is arrow-only — see §7.4) |
 | `Enter` | Select / confirm |
-| `/` | Filter (where applicable) |
+| `/` | Filter (where applicable; the new-param picker also auto-enters filter mode on the first printable rune) |
 
 Mouse: cell-motion mode. Wheel scrolls the focused viewport. Native click-drag selection requires Shift+drag (a known Bubble Tea trade-off).
+
+Modal dialogs (quit prompt, kill confirm, restart confirm, help, config-mode forms) overlay the existing screen content using an ANSI-aware paste — the underlying view stays visible around the popup instead of being blanked.
 
 ### 7.2 Main mode
 
@@ -346,7 +348,7 @@ When a multi-preset alias is selected, a sub-list of presets appears with the sa
 │ ...                                                                     │
 │ main: HTTP server is listening, hostname: 127.0.0.1, port: 9080         │
 │ ▼                                                                       │
-└─ q: quit  r: restart  c: copy command ──────────────────────────────────┘
+└─ q: quit  k: kill  r: restart  c: copy  /: search  ↑/↓: scroll ─────────┘
 ```
 
 Top pane: 3 lines.
@@ -361,13 +363,14 @@ Status state machine: `starting → ready → exited|error`.
 
 | Key | Action |
 |---|---|
-| `q` / `Ctrl+C` | Quit prompt: `(k)ill / (d)etach / (c)ancel` |
+| `q` / `Ctrl+C` | Quit prompt: `(k)ill / (d)etach / (c)ancel`. `(k)ill` returns to the main screen; `(d)etach` exits llamaman and leaves llama-server running. |
+| `k` | Direct kill shortcut (with `(y)es / (n)o` confirm). On confirm: stops llama-server, removes the log + session record, and returns to the main screen — llamaman itself stays open. |
 | `r` | Restart server (confirm if currently ready) |
 | `c` | Copy full launch command to clipboard (`wl-copy`, fallback `xclip`, fallback flash status) |
 | `/` | Search forward in output |
 | `n` / `N` | Next / previous search match |
 | `g` / `G` | Jump to top / bottom |
-| `↑↓` / `jk` / wheel | Scroll one line |
+| `↑` / `↓` / wheel | Scroll one line. `j`/`k` are **not** bound here so `k` is free for the kill shortcut. |
 | `Space` / `b` | Page down / up |
 | `?` | Help overlay |
 
@@ -394,7 +397,7 @@ Three-pane master-detail:
 └── Tab: pane ─ e: edit ─ D: dup ─ d: del ─ s: save ─ Esc: back ─────────────────┘
 ```
 
-`Tab` cycles focus across panes.
+`Tab` / `Shift+Tab` cycle focus across panes. `Right` / `Left` (and `l` / `h`) do the same — the user can navigate to any pane with arrow keys without lifting from the navigation cluster.
 
 **Models pane**:
 - `e` rename alias / change location (modal form).
@@ -410,15 +413,17 @@ Three-pane master-detail:
 - `Shift+↑/↓` reorder.
 
 **Param editor (right pane)**:
-- `e` or `Enter` on a row: inline edit value.
+- `e` or `Enter` on a row: inline edit value (type-aware, see below).
 - `d` remove that param.
-- `n` add new param. Opens a fuzzy picker over the cached `--help` flag list. Free-text accepted (unknown → warning, not blocked).
+- `n` add new param. Opens a `bubbles/list`-based picker that shows each flag's bare key (no `-`/`--` prefix), kind hint (`(bool)`, `(numeric)`, `(enum: …)`, `(string)`), and the parsed help description on the right. Highlightable rows; `↑`/`↓` to navigate; **the user can just start typing** to enter filter mode (no separate `/`-then-prompt step). `Enter` picks; `Esc` cancels. When the binary registry is empty, falls back to a plain free-text input.
 - After picking the name, the value input is type-aware:
   - boolean flag → yes/no toggle
   - numeric → numeric text input
-  - enum (e.g., `ctk`/`ctv` against a known set: `f16, q8_0, q4_0, q4_1, q5_0, q5_1, ...`) → picker
+  - enum (e.g., `ctk`/`ctv` against a known set: `f16, q8_0, q4_0, q4_1, q5_0, q5_1, ...`; or any `[a|b|c]` / `{a,b,c}` placeholder parsed from `--help`) → picker
   - other → text input
 - `Shift+↑/↓` reorder.
+
+Unknown-flag warnings (keys not in the parsed registry) appear in the right pane below the params, in addition to the run-mode top-pane warning surface.
 
 **Globals form** (`g` from anywhere):
 
