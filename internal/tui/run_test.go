@@ -1,7 +1,10 @@
 package tui
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -472,4 +475,134 @@ func TestRunHeaderShowsCanonicalCtxSizeFromShortForm(t *testing.T) {
 	if !strings.Contains(plain, "Context Size: 16384") {
 		t.Errorf("expected ctx-size value from short-form `c`; got header:\n%s", plain)
 	}
+}
+
+// ---- propsFetchedMsg handler tests ----
+
+// TestRunHeaderLiveCtxSizeWins confirms the live value from /props is
+// rendered as `Context Size:` once propsFetchedMsg lands, even when the
+// preset declared no ctx-size at all.
+func TestRunHeaderLiveCtxSizeWins(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"}, // no ctx-size
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{nctx: 4096})
+	plain := stripANSI(r.renderHeader())
+	if !strings.Contains(plain, "Context Size: 4096") {
+		t.Errorf("expected Context Size: 4096; got header:\n%s", plain)
+	}
+}
+
+// TestRunHeaderLiveCtxSizeOverridesPreset confirms that the live value
+// wins over a preset's declared ctx-size when they disagree (typical
+// case: llama-server clamped a too-large request). captureSlog absorbs
+// the disagreement-INFO line that the handler emits — its content is
+// covered by TestRunHeaderDisagreementLogsInfo and we don't want a
+// noisy stderr trail from this test.
+func TestRunHeaderLiveCtxSizeOverridesPreset(t *testing.T) {
+	_ = captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "ctx-size", Value: json.Number("8192")},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{nctx: 4096})
+	plain := stripANSI(r.renderHeader())
+	if !strings.Contains(plain, "Context Size: 4096") {
+		t.Errorf("expected live value 4096 to win over preset 8192; got header:\n%s", plain)
+	}
+	if strings.Contains(plain, "Context Size: 8192") {
+		t.Errorf("preset value 8192 leaked into header:\n%s", plain)
+	}
+}
+
+// TestRunHeaderFetchFailureFallsBackAndLogsWarn pins the rule that a
+// hard /props failure does NOT flash to the TUI (header stays at the
+// preset value or n/a) but DOES land a slog.Warn record so the user
+// has a paper trail.
+func TestRunHeaderFetchFailureFallsBackAndLogsWarn(t *testing.T) {
+	logs := captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"}, // no ctx-size — fallback should be n/a
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{err: errors.New("connection refused")})
+	plain := stripANSI(r.renderHeader())
+	if !strings.Contains(plain, "Context Size: n/a") {
+		t.Errorf("expected Context Size: n/a fallback; got header:\n%s", plain)
+	}
+	assertLogged(t, logs, slog.LevelWarn, "/props fetch failed")
+}
+
+// TestRunHeaderFetchCancelledNoWarn covers the kill-during-fetch path:
+// a context.Canceled error is the user closing the run mode, not an
+// actionable failure, so the handler must suppress the WARN line.
+func TestRunHeaderFetchCancelledNoWarn(t *testing.T) {
+	logs := captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{err: context.Canceled})
+	assertNotLogged(t, logs, slog.LevelWarn, "/props fetch failed")
+}
+
+// TestRunHeaderDisagreementLogsInfo confirms the diagnostic path:
+// when preset and live disagree, slog.Info is emitted with the
+// "ctx-size mismatch" message so users can correlate later.
+func TestRunHeaderDisagreementLogsInfo(t *testing.T) {
+	logs := captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "ctx-size", Value: json.Number("8192")},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{nctx: 4096})
+	assertLogged(t, logs, slog.LevelInfo, "ctx-size mismatch")
+}
+
+// TestRunHeaderAgreementNoInfo: when preset and live match, the
+// disagreement diagnostic must NOT fire. This guards against the
+// log-spam regression risk: every successful fetch with a declared
+// preset value would otherwise emit a record.
+func TestRunHeaderAgreementNoInfo(t *testing.T) {
+	logs := captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "ctx-size", Value: json.Number("4096")},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{nctx: 4096})
+	assertNotLogged(t, logs, slog.LevelInfo, "ctx-size mismatch")
+}
+
+// TestRunHeaderNCtxZeroIgnored covers the "/props returned 0" path
+// (server speaks /props but hasn't populated n_ctx yet): treat as
+// unavailable, fall back to the preset value, do NOT log.
+func TestRunHeaderNCtxZeroIgnored(t *testing.T) {
+	logs := captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "ctx-size", Value: json.Number("16384")},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{nctx: 0})
+	plain := stripANSI(r.renderHeader())
+	if !strings.Contains(plain, "Context Size: 16384") {
+		t.Errorf("expected fall-back to preset value 16384 when n_ctx is 0; got:\n%s", plain)
+	}
+	assertNotLogged(t, logs, slog.LevelWarn, "/props fetch failed")
+	assertNotLogged(t, logs, slog.LevelInfo, "ctx-size mismatch")
 }
