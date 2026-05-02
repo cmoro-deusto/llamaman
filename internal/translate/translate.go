@@ -43,18 +43,18 @@ func Build(globals config.Globals, model config.Model, preset config.Preset, reg
 	switch {
 	case model.IsHF():
 		if !overrides["hf"] && !overrides["m"] {
-			argv = append(argv, canonical("hf", reg), model.HF)
+			argv = append(argv, flags.CanonicalForm("hf", reg), model.HF)
 		}
 	default:
 		if !overrides["m"] && !overrides["hf"] {
-			argv = append(argv, canonical("m", reg), model.Location)
+			argv = append(argv, flags.CanonicalForm("m", reg), model.Location)
 		}
 	}
 	if !overrides["alias"] {
-		argv = append(argv, canonical("alias", reg), model.Alias)
+		argv = append(argv, flags.CanonicalForm("alias", reg), model.Alias)
 	}
 	if !overrides["host"] {
-		argv = append(argv, canonical("host", reg), globals.Host)
+		argv = append(argv, flags.CanonicalForm("host", reg), globals.Host)
 	}
 
 	var warnings []string
@@ -70,7 +70,7 @@ func Build(globals config.Globals, model config.Model, preset config.Preset, reg
 	}
 
 	if !overrides["port"] {
-		argv = append(argv, canonical("port", reg), strconv.Itoa(globals.Port))
+		argv = append(argv, flags.CanonicalForm("port", reg), strconv.Itoa(globals.Port))
 	}
 	return Result{Argv: argv, Warnings: warnings}, nil
 }
@@ -86,17 +86,8 @@ func overrideSet(params config.Params) map[string]bool {
 	return o
 }
 
-func canonical(name string, reg flags.Registry) string {
-	if reg != nil {
-		if fi, ok := reg.Lookup(name); ok {
-			return fi.Form
-		}
-	}
-	return flags.Canonical(name)
-}
-
 func renderParam(p config.Param, reg flags.Registry) (entry []string, warning string, err error) {
-	flag := canonical(p.Key, reg)
+	flag := flags.CanonicalForm(p.Key, reg)
 	if reg != nil {
 		if _, ok := reg.Lookup(p.Key); !ok {
 			warning = fmt.Sprintf("unknown flag %q (passed through as %s)", p.Key, flag)
