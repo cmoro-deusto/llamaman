@@ -2,9 +2,13 @@ package tui
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -78,6 +82,15 @@ type RunMode struct {
 	searchMatches []int
 	searchIdx     int
 
+	// Live /props integration. fetcher is nil when main.go couldn't
+	// recover host:port from argv (an internal invariant violation —
+	// the feature degrades silently to the preset-only display).
+	// liveCtxSize == 0 means "not fetched / unavailable"; any
+	// positive value is the n_ctx llama-server reported.
+	fetcher     Fetcher
+	liveCtxSize int
+	fetchCtx    context.Context
+	fetchCancel context.CancelFunc
 }
 
 // RunModeOpts bundles the inputs to NewRunMode. Spawn is the responsibility
@@ -92,6 +105,7 @@ type RunModeOpts struct {
 	Process    *server.Process
 	SessionMgr *server.SessionManager // optional; needed to clear session.json on kill
 	Registry   flags.Registry         // optional; used by the header to canonicalize param keys
+	Fetcher    Fetcher                // optional; nil disables the live ctx-size /props fetch
 }
 
 // NewRunMode wires a RunMode around an already-spawned (or adopted)
@@ -136,13 +150,25 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 		theme:         CurrentTheme(),
 		searchInput:   ti,
 		serverVersion: loadServerVersion(opts.Cfg.Globals.Bin),
+		fetcher:       opts.Fetcher,
 	}
-	cmd := tea.Batch(
+	r.fetchCtx, r.fetchCancel = context.WithCancel(context.Background())
+	cmds := []tea.Cmd{
 		waitForChunk(tail.Chunks()),
 		waitForProc(opts.Process),
 		tickUptime(),
-	)
-	return r, cmd, nil
+	}
+	// Reattach: the process is already running, so the readyMarker log
+	// line happened before we started tailing and we won't see a
+	// StatusStarting → StatusReady transition. Fire the fetch
+	// immediately. The owner-mode path waits for the transition (handled
+	// in the logChunkMsg case in Update) because at construction the
+	// server is still booting and /props would dial a port nothing is
+	// listening on yet.
+	if r.fetcher != nil && opts.Process != nil && !opts.Process.IsOwner() {
+		cmds = append(cmds, fetchPropsCmd(r.fetchCtx, r.fetcher))
+	}
+	return r, tea.Batch(cmds...), nil
 }
 
 // wordmarkMinWidth is the minimum terminal width at which the
@@ -193,7 +219,8 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	switch m := msg.(type) {
 	case logChunkMsg:
 		r.buf.WriteString(string(m))
-		if r.status == StatusStarting && strings.Contains(r.buf.String(), readyMarker) {
+		wasStarting := r.status == StatusStarting
+		if wasStarting && strings.Contains(r.buf.String(), readyMarker) {
 			r.status = StatusReady
 		}
 		atBottom := r.viewport.AtBottom()
@@ -201,17 +228,65 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if atBottom {
 			r.viewport.GotoBottom()
 		}
-		return r, waitForChunk(r.tail.Chunks())
+		cmds := []tea.Cmd{waitForChunk(r.tail.Chunks())}
+		// Owner-mode kickoff: the moment we see the ready marker, /props
+		// is reachable. Fire the fetch alongside the next chunk wait. The
+		// reattach path already kicked off in NewRunMode.
+		if wasStarting && r.status == StatusReady && r.fetcher != nil && r.liveCtxSize == 0 {
+			cmds = append(cmds, fetchPropsCmd(r.fetchCtx, r.fetcher))
+		}
+		return r, tea.Batch(cmds...)
 
 	case tailerClosedMsg:
 		return r, nil
 
 	case procDoneMsg:
+		if r.fetchCancel != nil {
+			r.fetchCancel()
+		}
 		if m.err == nil {
 			r.status = StatusExited
 		} else {
 			r.status = StatusErrored
 			r.startErr = m.err
+		}
+		return r, nil
+
+	case propsFetchedMsg:
+		if m.err != nil {
+			// fetchPropsCmd already retried once. Permanent failure: log
+			// for the user's troubleshooting, no TUI flash. liveCtxSize
+			// stays 0 so the header keeps showing the preset value (or
+			// n/a). Suppress the warn for context cancellation — that's
+			// a kill-during-fetch and not actionable.
+			if !errors.Is(m.err, context.Canceled) {
+				slog.Warn("/props fetch failed",
+					"err", m.err,
+					"alias", r.model.Alias,
+					"preset", presetNameOrDash(r.preset),
+				)
+			}
+			return r, nil
+		}
+		if m.nctx <= 0 {
+			// Server returned a valid /props but n_ctx wasn't populated.
+			// Treat as unavailable; do not log (no actionable signal).
+			return r, nil
+		}
+		r.liveCtxSize = m.nctx
+		// Disagreement diagnostic: the preset declared a value, the
+		// live server reports a different one. Most common cause is
+		// llama-server clamping a too-large request to the model's max.
+		params := canonicalParams(r.preset, r.registry)
+		if presetVal, ok := params["ctx-size"]; ok {
+			if pv, err := strconv.Atoi(paramValueAsString(presetVal)); err == nil && pv != m.nctx {
+				slog.Info("ctx-size mismatch",
+					"alias", r.model.Alias,
+					"preset", presetNameOrDash(r.preset),
+					"preset_value", pv,
+					"live_value", m.nctx,
+				)
+			}
 		}
 		return r, nil
 
@@ -303,6 +378,9 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 // record. Callers decide whether to return to main mode or quit
 // llamaman by chaining the appropriate tea.Cmd.
 func (r *RunMode) killServer() {
+	if r.fetchCancel != nil {
+		r.fetchCancel()
+	}
 	r.proc.Stop(5 * time.Second)
 	r.tail.Close()
 	_ = r.proc.RemoveLog()
@@ -391,6 +469,9 @@ func (r *RunMode) handleSearchInput(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 // for the same (model, preset). The root will route it back through the
 // spawner to start fresh.
 func (r *RunMode) requestRestart() tea.Cmd {
+	if r.fetchCancel != nil {
+		r.fetchCancel()
+	}
 	r.proc.Stop(5 * time.Second)
 	r.tail.Close()
 	_ = r.proc.RemoveLog()
@@ -552,6 +633,9 @@ func (r *RunMode) handleQuitPrompt(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 		return r, r.killAndQuit()
 	case "d":
 		// Leave the process and session.json intact; just unwind the TUI.
+		if r.fetchCancel != nil {
+			r.fetchCancel()
+		}
 		r.tail.Close()
 		return r, tea.Quit
 	case "c", "esc":
