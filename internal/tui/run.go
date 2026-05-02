@@ -21,6 +21,7 @@ import (
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
+	"github.com/cmoro-deusto/llamaman/internal/llamaapi"
 	"github.com/cmoro-deusto/llamaman/internal/paths"
 	"github.com/cmoro-deusto/llamaman/internal/server"
 )
@@ -92,6 +93,26 @@ type RunMode struct {
 	liveCtxSize int
 	fetchCtx    context.Context
 	fetchCancel context.CancelFunc
+
+	// Live /metrics + /slots integration drives the run-mode header's
+	// llama-server panel. Counters are sampled across two ticks so we
+	// can report instantaneous tokens/s; gauges are taken straight
+	// from the server. metricsAvailable starts true and flips to
+	// false on the first ErrMetricsNotEnabled response so subsequent
+	// ticks stop polling /metrics. /slots is independent — it works
+	// even when --metrics is off.
+	livePollStarted     bool
+	metricsAvailable    bool
+	prevMetrics         *llamaapi.Metrics
+	currentTokensPerSec float64
+	currentPromptPerSec float64
+	avgTokensPerSec     float64
+	avgPromptPerSec     float64
+	busyCount           int
+	totalSlots          int
+	queuedCount         int
+	tokensIdle          bool // last tick saw zero predicted-tokens delta
+	promptIdle          bool // last tick saw zero prompt-tokens delta
 }
 
 // RunModeOpts bundles the inputs to NewRunMode. Spawn is the responsibility
@@ -150,8 +171,9 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 		keys:          DefaultKeymap(),
 		theme:         CurrentTheme(),
 		searchInput:   ti,
-		serverVersion: loadServerVersion(opts.Cfg.Globals.Bin),
-		fetcher:       opts.Fetcher,
+		serverVersion:    loadServerVersion(opts.Cfg.Globals.Bin),
+		fetcher:          opts.Fetcher,
+		metricsAvailable: true,
 	}
 	r.fetchCtx, r.fetchCancel = context.WithCancel(context.Background())
 	cmds := []tea.Cmd{
@@ -168,8 +190,28 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 	// listening on yet.
 	if r.fetcher != nil && opts.Process != nil && !opts.Process.IsOwner() {
 		cmds = append(cmds, fetchPropsCmd(r.fetchCtx, r.fetcher))
+		cmds = append(cmds, r.startLivePoll()...)
 	}
 	return r, tea.Batch(cmds...), nil
+}
+
+// startLivePoll fires the first /metrics + /slots fetch and schedules
+// the recurring tick. Returns the Cmds the caller should batch.
+// Idempotent: livePollStarted guards against double-arming when both
+// the reattach and ready-marker paths reach this code.
+func (r *RunMode) startLivePoll() []tea.Cmd {
+	if r.fetcher == nil || r.livePollStarted {
+		return nil
+	}
+	r.livePollStarted = true
+	out := []tea.Cmd{
+		fetchSlotsCmd(r.fetchCtx, r.fetcher),
+		tickLivePoll(),
+	}
+	if r.metricsAvailable {
+		out = append(out, fetchMetricsCmd(r.fetchCtx, r.fetcher))
+	}
+	return out
 }
 
 // wordmarkMinWidth is the minimum terminal width at which the
@@ -239,10 +281,14 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		}
 		cmds := []tea.Cmd{waitForChunk(r.tail.Chunks())}
 		// Owner-mode kickoff: the moment we see the ready marker, /props
-		// is reachable. Fire the fetch alongside the next chunk wait. The
-		// reattach path already kicked off in NewRunMode.
-		if wasStarting && r.status == StatusReady && r.fetcher != nil && r.liveCtxSize == 0 {
-			cmds = append(cmds, fetchPropsCmd(r.fetchCtx, r.fetcher))
+		// + /metrics + /slots are reachable. Fire the one-shot props
+		// fetch and arm the recurring live poll alongside the next chunk
+		// wait. The reattach path already kicked off in NewRunMode.
+		if wasStarting && r.status == StatusReady && r.fetcher != nil {
+			if r.liveCtxSize == 0 {
+				cmds = append(cmds, fetchPropsCmd(r.fetchCtx, r.fetcher))
+			}
+			cmds = append(cmds, r.startLivePoll()...)
 		}
 		return r, tea.Batch(cmds...)
 
@@ -301,6 +347,65 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 
 	case uptimeTickMsg:
 		return r, tickUptime()
+
+	case livePollTickMsg:
+		// Drive the next round of fetches. /metrics is suppressed once
+		// we've learned the server was launched without --metrics; the
+		// Hardware-panel poll lands here in Phase 4.
+		if r.fetcher == nil {
+			return r, nil
+		}
+		cmds := []tea.Cmd{
+			fetchSlotsCmd(r.fetchCtx, r.fetcher),
+			tickLivePoll(),
+		}
+		if r.metricsAvailable {
+			cmds = append(cmds, fetchMetricsCmd(r.fetchCtx, r.fetcher))
+		}
+		return r, tea.Batch(cmds...)
+
+	case metricsFetchedMsg:
+		if m.err != nil {
+			if errors.Is(m.err, llamaapi.ErrMetricsNotEnabled) {
+				// Server was launched without --metrics. Stop polling
+				// /metrics; /slots still works and Busy will keep
+				// updating. Logged once at INFO so the user knows why
+				// tokens/s is n/a.
+				if r.metricsAvailable {
+					slog.Info("/metrics endpoint disabled — preset lacks metrics: true",
+						"alias", r.model.Alias,
+						"preset", presetNameOrDash(r.preset),
+					)
+				}
+				r.metricsAvailable = false
+				return r, nil
+			}
+			if !errors.Is(m.err, context.Canceled) {
+				slog.Warn("/metrics fetch failed",
+					"err", m.err,
+					"alias", r.model.Alias,
+					"preset", presetNameOrDash(r.preset),
+				)
+			}
+			return r, nil
+		}
+		r.applyMetrics(m.m)
+		return r, nil
+
+	case slotsFetchedMsg:
+		if m.err != nil {
+			if !errors.Is(m.err, context.Canceled) {
+				slog.Warn("/slots fetch failed",
+					"err", m.err,
+					"alias", r.model.Alias,
+					"preset", presetNameOrDash(r.preset),
+				)
+			}
+			return r, nil
+		}
+		r.busyCount = m.s.BusyCount
+		r.totalSlots = m.s.Total
+		return r, nil
 
 	case tea.KeyMsg:
 		if r.showQuit {
@@ -387,6 +492,45 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	var cmd tea.Cmd
 	r.viewport, cmd = r.viewport.Update(msg)
 	return r, cmd
+}
+
+// applyMetrics computes instantaneous tokens/s by differencing the
+// counter values against the previous tick. The first tick after
+// startup has no prev so we publish only the gauges (lifetime
+// averages); subsequent ticks update both. tokensIdle/promptIdle
+// flags let the renderer show "—" instead of "0.0" when nothing
+// happened in the window — easier to read than rolling zeros.
+func (r *RunMode) applyMetrics(m *llamaapi.Metrics) {
+	r.avgTokensPerSec = m.PredictedTokensSecondsAvg
+	r.avgPromptPerSec = m.PromptTokensSecondsAvg
+	r.queuedCount = int(m.RequestsDeferred)
+
+	if r.prevMetrics == nil {
+		r.prevMetrics = m
+		// First-tick: no delta to compute. Mark as idle so the
+		// renderer shows "—" rather than a stale zero.
+		r.tokensIdle = true
+		r.promptIdle = true
+		return
+	}
+	prev := r.prevMetrics
+	dTokens := m.TokensPredictedTotal - prev.TokensPredictedTotal
+	dTokenSecs := m.TokensPredictedSecondsTotal - prev.TokensPredictedSecondsTotal
+	if dTokens > 0 && dTokenSecs > 0 {
+		r.currentTokensPerSec = dTokens / dTokenSecs
+		r.tokensIdle = false
+	} else {
+		r.tokensIdle = true
+	}
+	dPrompt := m.PromptTokensTotal - prev.PromptTokensTotal
+	dPromptSecs := m.PromptSecondsTotal - prev.PromptSecondsTotal
+	if dPrompt > 0 && dPromptSecs > 0 {
+		r.currentPromptPerSec = dPrompt / dPromptSecs
+		r.promptIdle = false
+	} else {
+		r.promptIdle = true
+	}
+	r.prevMetrics = m
 }
 
 // killServer performs the cleanup shared by every kill path: stop the
@@ -974,16 +1118,58 @@ func (r *RunMode) renderLiveBand() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 }
 
-// renderServerPanel renders the llama-server live data box. Phase 2
-// shape: titled border + two content rows of n/a placeholders. Phase 3
-// fills in the slots with sampled tokens/s + busy/queued counters.
+// renderServerPanel renders the llama-server live data box. Tokens/s
+// and Prompt eval are formatted into fixed-width slots so column
+// alignment stays stable as values transition (e.g. 99.9 → 100.0).
+// `now` shows "—" while idle (no token delta last tick); avg is the
+// lifetime gauge llama-server already maintains.
 func (r *RunMode) renderServerPanel(width int) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
-	row1 := subtle.Render("Tokens/s:") + "   n/a /   n/a avg     " +
-		subtle.Render("Prompt eval:") + "   n/a /   n/a avg"
-	row2 := subtle.Render("Busy:") + " n/a              " +
-		subtle.Render("Queued:") + " n/a"
+
+	tokensCell := fmtRatePair(r.currentTokensPerSec, r.avgTokensPerSec, r.tokensIdle, r.metricsAvailable)
+	promptCell := fmtRatePair(r.currentPromptPerSec, r.avgPromptPerSec, r.promptIdle, r.metricsAvailable)
+	busyCell := fmtBusy(r.busyCount, r.totalSlots)
+	queuedCell := fmtQueued(r.queuedCount, r.metricsAvailable)
+
+	row1 := subtle.Render("Tokens/s:") + " " + tokensCell + "     " +
+		subtle.Render("Prompt eval:") + " " + promptCell
+	row2 := subtle.Render("Busy:") + " " + busyCell + "                 " +
+		subtle.Render("Queued:") + " " + queuedCell
 	return r.renderTitledPanel("llama-server", width, []string{row1, row2})
+}
+
+// fmtRatePair renders the "now / avg avg" cell. Slot widths are fixed
+// (5.1 → 7 chars) so transitions don't shift columns. When metrics
+// are unavailable, both halves show fixed-width "  n/a"; when idle,
+// `now` shows "  —" while avg keeps its lifetime value.
+func fmtRatePair(now, avg float64, idle, available bool) string {
+	const slot = "%7.1f"
+	if !available {
+		return "    n/a /     n/a avg"
+	}
+	nowStr := fmt.Sprintf(slot, now)
+	if idle {
+		nowStr = "      —"
+	}
+	return nowStr + " / " + fmt.Sprintf(slot, avg) + " avg"
+}
+
+// fmtBusy renders "<busy>/<total> slots". Total is small (typically
+// 1–8); no padding needed beyond the natural width.
+func fmtBusy(busy, total int) string {
+	if total == 0 {
+		return "n/a"
+	}
+	return fmt.Sprintf("%d/%d slots", busy, total)
+}
+
+// fmtQueued renders the queued-requests cell. Falls back to n/a when
+// /metrics is disabled (queued counter only ships via /metrics).
+func fmtQueued(queued int, available bool) string {
+	if !available {
+		return "n/a"
+	}
+	return strconv.Itoa(queued)
 }
 
 // renderHardwarePanel renders the Hardware live data box. Phase 2

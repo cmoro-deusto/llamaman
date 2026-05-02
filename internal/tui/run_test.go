@@ -15,6 +15,7 @@ import (
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
+	"github.com/cmoro-deusto/llamaman/internal/llamaapi"
 	"github.com/cmoro-deusto/llamaman/internal/server"
 )
 
@@ -535,6 +536,176 @@ func TestRunHeaderShowsCanonicalCtxSizeFromShortForm(t *testing.T) {
 	plain := stripANSI(r.renderHeader())
 	if !strings.Contains(plain, "Context Size: 16384") {
 		t.Errorf("expected ctx-size value from short-form `c`; got header:\n%s", plain)
+	}
+}
+
+// ---- Phase 3: live server-panel tests ----
+
+// TestApplyMetricsFirstTickPublishesGaugesOnly pins the rule that the
+// first /metrics fetch after startup has no prev to delta against, so
+// we publish only the lifetime gauges and mark the now-cell as idle
+// (renderer will show "—" instead of a stale 0.0).
+func TestApplyMetricsFirstTickPublishesGaugesOnly(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	r.applyMetrics(&llamaapi.Metrics{
+		TokensPredictedTotal:        100,
+		TokensPredictedSecondsTotal: 2,
+		PredictedTokensSecondsAvg:   60,
+		PromptTokensSecondsAvg:      2300,
+		RequestsDeferred:            3,
+	})
+	if !r.tokensIdle {
+		t.Error("tokensIdle = false after first tick; want true (no delta yet)")
+	}
+	if r.avgTokensPerSec != 60 {
+		t.Errorf("avgTokensPerSec = %v, want 60", r.avgTokensPerSec)
+	}
+	if r.queuedCount != 3 {
+		t.Errorf("queuedCount = %d, want 3", r.queuedCount)
+	}
+}
+
+// TestApplyMetricsSecondTickComputesRate is the core delta math: the
+// second tick should produce currentTokensPerSec = ΔTokens / ΔSeconds
+// based on the prev counters, not the cumulative absolutes.
+func TestApplyMetricsSecondTickComputesRate(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	r.applyMetrics(&llamaapi.Metrics{
+		TokensPredictedTotal:        100,
+		TokensPredictedSecondsTotal: 2,
+	})
+	r.applyMetrics(&llamaapi.Metrics{
+		TokensPredictedTotal:        180,
+		TokensPredictedSecondsTotal: 3,
+	})
+	// Δtokens = 80, Δsecs = 1 → 80 tokens/s
+	if r.currentTokensPerSec != 80 {
+		t.Errorf("currentTokensPerSec = %v, want 80", r.currentTokensPerSec)
+	}
+	if r.tokensIdle {
+		t.Error("tokensIdle = true; want false after non-zero delta")
+	}
+}
+
+// TestApplyMetricsIdleTickShowsDash covers the "no work happened in
+// the last second" branch: the delta computes to zero, so we mark the
+// now-cell idle so the renderer shows "—" rather than 0.0.
+func TestApplyMetricsIdleTickShowsDash(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	r.applyMetrics(&llamaapi.Metrics{TokensPredictedTotal: 100, TokensPredictedSecondsTotal: 2})
+	r.applyMetrics(&llamaapi.Metrics{TokensPredictedTotal: 100, TokensPredictedSecondsTotal: 2})
+	if !r.tokensIdle {
+		t.Error("tokensIdle = false on zero-delta tick; want true")
+	}
+}
+
+// TestServerPanelRendersLiveData covers the integration: simulated
+// live values surface in the rendered panel.
+func TestServerPanelRendersLiveData(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	r.currentTokensPerSec = 80
+	r.avgTokensPerSec = 60
+	r.busyCount = 2
+	r.totalSlots = 4
+	r.queuedCount = 1
+	plain := stripANSI(r.renderServerPanel(80))
+	for _, want := range []string{"Tokens/s:", "80.0", "60.0", "Busy:", "2/4 slots", "Queued:", "1"} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("server panel missing %q\nout:\n%s", want, plain)
+		}
+	}
+}
+
+// TestServerPanelMetricsDisabledShowsNA covers the --metrics-off
+// fallback: tokens/s and queued read n/a; busy still works (it comes
+// from /slots).
+func TestServerPanelMetricsDisabledShowsNA(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = false
+	r.busyCount = 1
+	r.totalSlots = 2
+	plain := stripANSI(r.renderServerPanel(80))
+	if !strings.Contains(plain, "n/a") {
+		t.Errorf("expected n/a for tokens/s when --metrics off; out:\n%s", plain)
+	}
+	if !strings.Contains(plain, "1/2 slots") {
+		t.Errorf("Busy slots should still render from /slots; out:\n%s", plain)
+	}
+}
+
+// TestServerPanelIdleShowsDash verifies the idle marker for the now
+// half of the rate cell while keeping avg visible.
+func TestServerPanelIdleShowsDash(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	r.tokensIdle = true
+	r.avgTokensPerSec = 60
+	plain := stripANSI(r.renderServerPanel(80))
+	if !strings.Contains(plain, "—") {
+		t.Errorf("expected idle dash in rate cell; out:\n%s", plain)
+	}
+	if !strings.Contains(plain, "60.0") {
+		t.Errorf("avg should still render alongside idle now; out:\n%s", plain)
+	}
+}
+
+// TestRunModeMetricsNotEnabledFlipsFlag confirms the
+// metricsFetchedMsg handler stops polling /metrics on the sentinel
+// error and emits the one-time INFO log.
+func TestRunModeMetricsNotEnabledFlipsFlag(t *testing.T) {
+	logs := captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	r.Update(metricsFetchedMsg{err: llamaapi.ErrMetricsNotEnabled})
+	if r.metricsAvailable {
+		t.Error("metricsAvailable still true after ErrMetricsNotEnabled")
+	}
+	assertLogged(t, logs, slog.LevelInfo, "/metrics endpoint disabled — preset lacks metrics: true")
+}
+
+// TestRunModeSlotsFetchedUpdatesCounts pins the slotsFetchedMsg
+// handler: busy/total land on the run-mode struct.
+func TestRunModeSlotsFetchedUpdatesCounts(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(slotsFetchedMsg{s: &llamaapi.Slots{Total: 4, BusyCount: 3}})
+	if r.busyCount != 3 || r.totalSlots != 4 {
+		t.Errorf("busy/total = %d/%d, want 3/4", r.busyCount, r.totalSlots)
 	}
 }
 
