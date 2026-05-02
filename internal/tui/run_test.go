@@ -15,6 +15,7 @@ import (
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
+	"github.com/cmoro-deusto/llamaman/internal/hwinfo"
 	"github.com/cmoro-deusto/llamaman/internal/llamaapi"
 	"github.com/cmoro-deusto/llamaman/internal/server"
 )
@@ -536,6 +537,114 @@ func TestRunHeaderShowsCanonicalCtxSizeFromShortForm(t *testing.T) {
 	plain := stripANSI(r.renderHeader())
 	if !strings.Contains(plain, "Context Size: 16384") {
 		t.Errorf("expected ctx-size value from short-form `c`; got header:\n%s", plain)
+	}
+}
+
+// ---- Phase 4: hardware-panel tests ----
+
+// TestHardwarePanelRendersCPUOnly covers the minimum case: one CPU
+// device, no GPUs (the typical CI / non-NVIDIA dev box). Both the
+// device header line and the value row should appear.
+func TestHardwarePanelRendersCPUOnly(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.hardware = []hwinfo.Device{
+		{
+			Class: hwinfo.ClassCPU, Index: 0, Name: "AMD Ryzen 9 7950X",
+			UtilPct: 23, MemPct: 65,
+			PowerW: 120, HasPower: true,
+			TempC: 68, HasTemp: true,
+			FanRPM: 1200, HasFan: true,
+		},
+	}
+	plain := stripANSI(r.renderHardwarePanel(80))
+	for _, want := range []string{"[0]", "AMD Ryzen 9 7950X", "Util  23%", "RAM   65%", "120W", "68°C", "1200rpm"} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("Hardware panel missing %q\nout:\n%s", want, plain)
+		}
+	}
+}
+
+// TestHardwarePanelRendersCPUAndGPU covers the typical desktop
+// rendering with 1 CPU + 1 GPU. Each device gets its own [N] index
+// within its class, so we expect [0] twice.
+func TestHardwarePanelRendersCPUAndGPU(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.hardware = []hwinfo.Device{
+		{Class: hwinfo.ClassCPU, Index: 0, Name: "AMD Ryzen 9 7950X", UtilPct: 23, MemPct: 65},
+		{
+			Class: hwinfo.ClassGPU, Index: 0, Name: "NVIDIA GeForce RTX 4090",
+			UtilPct: 89, MemPct: 78,
+			PowerW: 320, HasPower: true,
+			TempC: 72, HasTemp: true,
+			FanPct: 65, HasFan: true,
+		},
+	}
+	plain := stripANSI(r.renderHardwarePanel(80))
+	for _, want := range []string{"AMD Ryzen 9 7950X", "NVIDIA GeForce RTX 4090", "RAM", "VRAM", "320W", "72°C", "65%"} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("Hardware panel missing %q\nout:\n%s", want, plain)
+		}
+	}
+	// Two devices = two [0] markers (per-class indexing).
+	if got := strings.Count(plain, "[0]"); got != 2 {
+		t.Errorf("expected per-class [0] markers (one per device); got %d\nout:\n%s", got, plain)
+	}
+}
+
+// TestHardwarePanelMissingFieldsRenderNA pins the n/a slot rendering
+// for devices with Has*=false. Power, temp, and fan must show n/a in
+// fixed-width slots so the column shape matches a populated device.
+func TestHardwarePanelMissingFieldsRenderNA(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.hardware = []hwinfo.Device{
+		{Class: hwinfo.ClassCPU, Index: 0, Name: "Generic CPU", UtilPct: 5, MemPct: 12},
+	}
+	plain := stripANSI(r.renderHardwarePanel(80))
+	if strings.Count(plain, "n/a") < 3 {
+		t.Errorf("expected at least 3 n/a slots (power+temp+fan); out:\n%s", plain)
+	}
+}
+
+// TestHardwarePanelEmptyShowsPlaceholder pins the no-devices fallback
+// (gopsutil failed entirely + no NVML). Renders a placeholder so the
+// panel's bordered shape stays consistent.
+func TestHardwarePanelEmptyShowsPlaceholder(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.hardware = nil
+	plain := stripANSI(r.renderHardwarePanel(80))
+	if !strings.Contains(plain, "no devices") {
+		t.Errorf("expected (no devices…) placeholder; out:\n%s", plain)
+	}
+}
+
+// TestHwSnapshotMsgUpdatesField pins the wiring path: hwSnapshotMsg
+// hits Update and lands on r.hardware.
+func TestHwSnapshotMsgUpdatesField(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	devs := []hwinfo.Device{{Class: hwinfo.ClassCPU, Index: 0, Name: "Probe"}}
+	r.Update(hwSnapshotMsg{devices: devs})
+	if len(r.hardware) != 1 || r.hardware[0].Name != "Probe" {
+		t.Errorf("hwSnapshotMsg did not land in r.hardware; got %+v", r.hardware)
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
+	"github.com/cmoro-deusto/llamaman/internal/hwinfo"
 	"github.com/cmoro-deusto/llamaman/internal/llamaapi"
 	"github.com/cmoro-deusto/llamaman/internal/paths"
 	"github.com/cmoro-deusto/llamaman/internal/server"
@@ -113,6 +114,12 @@ type RunMode struct {
 	queuedCount         int
 	tokensIdle          bool // last tick saw zero predicted-tokens delta
 	promptIdle          bool // last tick saw zero prompt-tokens delta
+
+	// Hardware-panel state. Refreshed on every live-poll tick from
+	// hwinfo.Snapshot (gopsutil + NVML). Empty until the first tick
+	// lands so the panel renders n/a placeholders during the first
+	// second after Ready.
+	hardware []hwinfo.Device
 }
 
 // RunModeOpts bundles the inputs to NewRunMode. Spawn is the responsibility
@@ -206,6 +213,7 @@ func (r *RunMode) startLivePoll() []tea.Cmd {
 	r.livePollStarted = true
 	out := []tea.Cmd{
 		fetchSlotsCmd(r.fetchCtx, r.fetcher),
+		hwSnapshotCmd(),
 		tickLivePoll(),
 	}
 	if r.metricsAvailable {
@@ -350,19 +358,24 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 
 	case livePollTickMsg:
 		// Drive the next round of fetches. /metrics is suppressed once
-		// we've learned the server was launched without --metrics; the
-		// Hardware-panel poll lands here in Phase 4.
+		// we've learned the server was launched without --metrics.
+		// hwinfo always runs — it has no concept of "disabled".
 		if r.fetcher == nil {
 			return r, nil
 		}
 		cmds := []tea.Cmd{
 			fetchSlotsCmd(r.fetchCtx, r.fetcher),
+			hwSnapshotCmd(),
 			tickLivePoll(),
 		}
 		if r.metricsAvailable {
 			cmds = append(cmds, fetchMetricsCmd(r.fetchCtx, r.fetcher))
 		}
 		return r, tea.Batch(cmds...)
+
+	case hwSnapshotMsg:
+		r.hardware = m.devices
+		return r, nil
 
 	case metricsFetchedMsg:
 		if m.err != nil {
@@ -1005,10 +1018,15 @@ const wordmarkLines = 4
 const liveBandMinWidth = 110
 
 // liveBandHeight is the row count consumed by the live-data band: 1
-// top border + 2 content rows + 1 bottom border = 4 rows. Will grow
-// in Phase 4 when the Hardware panel surfaces multiple devices —
-// keep this in sync with the panel height math then.
-const liveBandHeight = 4
+// top border + liveBandContentRows content rows + 1 bottom border.
+// The server panel always uses 2 content rows; the Hardware panel
+// uses 2 rows per device. We size the band to fit the typical 1 CPU
+// + 1 GPU = 4 content rows, padding the server panel with blank
+// trailing rows so both columns align flush-bottom.
+const (
+	liveBandContentRows = 4
+	liveBandHeight      = liveBandContentRows + 2
+)
 
 // renderHeader composes the top strip and (when wide enough) the live
 // band into a single header block. The state machine is:
@@ -1135,7 +1153,21 @@ func (r *RunMode) renderServerPanel(width int) string {
 		subtle.Render("Prompt eval:") + " " + promptCell
 	row2 := subtle.Render("Busy:") + " " + busyCell + "                 " +
 		subtle.Render("Queued:") + " " + queuedCell
-	return r.renderTitledPanel("llama-server", width, []string{row1, row2})
+	rows := padRows([]string{row1, row2}, liveBandContentRows)
+	return r.renderTitledPanel("llama-server", width, rows)
+}
+
+// padRows trims or pads `rows` to exactly n entries. Used to keep
+// the server panel and Hardware panel at the same vertical size so
+// JoinHorizontal aligns their bottom borders.
+func padRows(rows []string, n int) []string {
+	if len(rows) >= n {
+		return rows[:n]
+	}
+	for len(rows) < n {
+		rows = append(rows, "")
+	}
+	return rows
 }
 
 // fmtRatePair renders the "now / avg avg" cell. Slot widths are fixed
@@ -1172,14 +1204,80 @@ func fmtQueued(queued int, available bool) string {
 	return strconv.Itoa(queued)
 }
 
-// renderHardwarePanel renders the Hardware live data box. Phase 2
-// shape: titled border + two n/a placeholder rows. Phase 4 fills in
-// real CPU + GPU rows via gopsutil/NVML.
+// renderHardwarePanel renders the Hardware live data box. Two rows
+// per device: name + values. Always fills exactly liveBandContentRows
+// rows so the panel stays aligned with the server panel — extra
+// devices truncate, fewer pad with blanks. Empty hardware (no CPU
+// info, no NVIDIA GPU) renders an n/a placeholder block.
 func (r *RunMode) renderHardwarePanel(width int) string {
-	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
-	row1 := "[0] " + subtle.Render("(no devices)")
-	row2 := "    " + subtle.Render("Util  n/a   RAM  n/a    n/a   n/a   n/a")
-	return r.renderTitledPanel("Hardware", width, []string{row1, row2})
+	rows := []string{}
+	if len(r.hardware) == 0 {
+		subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+		rows = []string{
+			"[0] " + subtle.Render("(no devices reported)"),
+			"    " + subtle.Render("Util  n/a   RAM  n/a    n/a   n/a   n/a"),
+		}
+	} else {
+		// Stop once we'd exceed the panel's row budget. liveBandContentRows
+		// rows per panel; each device emits 2 rows.
+		maxDevices := liveBandContentRows / 2
+		for i, d := range r.hardware {
+			if i >= maxDevices {
+				break
+			}
+			rows = append(rows, hardwareDeviceRows(d)...)
+		}
+	}
+	rows = padRows(rows, liveBandContentRows)
+	return r.renderTitledPanel("Hardware", width, rows)
+}
+
+// hardwareDeviceRows formats one device into its two-row block. All
+// numeric slots are fixed-width so column positions stay stable as
+// values transition.
+func hardwareDeviceRows(d hwinfo.Device) []string {
+	header := fmt.Sprintf("[%d] %s", d.Index, d.Name)
+	memLabel := "RAM"
+	if d.Class == ClassGPU {
+		memLabel = "VRAM"
+	}
+	utilCell := fmt.Sprintf("Util %3d%%", d.UtilPct)
+	memCell := fmt.Sprintf("%-4s %3d%%", memLabel, d.MemPct)
+	powerCell := naSlot(5)
+	if d.HasPower {
+		powerCell = fmt.Sprintf("%4dW", d.PowerW)
+	}
+	tempCell := naSlot(5)
+	if d.HasTemp {
+		tempCell = fmt.Sprintf("%3d°C", d.TempC)
+	}
+	fanCell := naSlot(7)
+	if d.HasFan {
+		switch d.Class {
+		case ClassGPU:
+			fanCell = fmt.Sprintf("%6d%%", d.FanPct)
+		default:
+			fanCell = fmt.Sprintf("%4drpm", d.FanRPM)
+		}
+	}
+	values := fmt.Sprintf("    %s  %s  %s  %s  %s",
+		utilCell, memCell, powerCell, tempCell, fanCell)
+	return []string{header, values}
+}
+
+// ClassGPU is re-exported here so renderHardwarePanel doesn't have
+// to qualify it as hwinfo.ClassGPU at every reference. The single
+// alias keeps the panel-formatting code skim-friendly.
+const ClassGPU = hwinfo.ClassGPU
+
+// naSlot returns "n/a" right-padded to width — used so missing
+// fields don't shift columns relative to populated ones.
+func naSlot(width int) string {
+	const v = "n/a"
+	if len(v) >= width {
+		return v
+	}
+	return strings.Repeat(" ", width-len(v)) + v
 }
 
 // renderTitledPanel draws a hand-rolled rounded box with the title

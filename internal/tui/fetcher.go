@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/cmoro-deusto/llamaman/internal/hwinfo"
 	"github.com/cmoro-deusto/llamaman/internal/llamaapi"
 )
 
@@ -54,6 +55,13 @@ type slotsFetchedMsg struct {
 	err error
 }
 
+// hwSnapshotMsg carries the result of a periodic hwinfo.Snapshot.
+// Defined here next to the other live-poll msgs so RunMode wires them
+// through the same Update branch.
+type hwSnapshotMsg struct {
+	devices []hwinfo.Device
+}
+
 type livePollTickMsg time.Time
 
 // fetchMetricsCmd is a single one-shot fetch. Returns a metricsFetchedMsg.
@@ -69,6 +77,17 @@ func fetchSlotsCmd(ctx context.Context, fetcher Fetcher) tea.Cmd {
 	return func() tea.Msg {
 		s, err := fetcher.FetchSlots(ctx)
 		return slotsFetchedMsg{s: s, err: err}
+	}
+}
+
+// hwSnapshotCmd performs a synchronous hwinfo.Snapshot in a tea.Cmd
+// goroutine and emits the result. NVML/gopsutil reads finish in
+// milliseconds on a typical desktop, but we wrap them in a Cmd
+// anyway so a slow sysfs read can't block the Bubble Tea event loop.
+func hwSnapshotCmd() tea.Cmd {
+	return func() tea.Msg {
+		devs, _ := hwinfo.Snapshot()
+		return hwSnapshotMsg{devices: devs}
 	}
 }
 
