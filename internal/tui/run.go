@@ -72,6 +72,7 @@ type RunMode struct {
 
 	showQuit      bool // quit prompt overlay active
 	showHelp      bool // help overlay active
+	showInfo      bool // i-info overlay active (model + preset detail)
 	restartPrompt bool // r-confirm overlay
 	killPrompt    bool // k-confirm overlay
 	flash         string
@@ -174,11 +175,14 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 // wordmarkMinWidth is the minimum terminal width at which the
 // run-mode header shows the llamaman wordmark on the left side. Below
 // this threshold the wordmark would be truncated mid-letter, so we
-// fall back to the compact info-only layout instead.
-const wordmarkMinWidth = 110
+// fall back to the compact info-only layout instead. The smblock
+// wordmark is 31 cols wide so this threshold is a state-machine
+// breakpoint (see DESIGN.md §7.4) — Phase 2 layers in the live-band
+// breakpoint at 110 on top of this.
+const wordmarkMinWidth = 90
 
 // SetSize configures viewport dimensions. Chrome above the viewport
-// is the bordered top box (10 or 6 rows depending on whether the
+// is the bordered top box (8 or 6 rows depending on whether the
 // wordmark is shown); chrome below is the bordered log frame (2
 // rows: top + bottom border) plus the 1-row footer. The viewport
 // itself fills the inner area of the log box, with horizontal
@@ -201,8 +205,9 @@ func (r *RunMode) SetSize(w, h int) {
 }
 
 // chromeHeight returns the total rows reserved above and below the
-// viewport content: top box (10 with wordmark / 6 without) + log
-// box's 2 borders + 1 footer.
+// viewport content: top strip (8 with wordmark / 6 without) + live
+// band (liveBandHeight rows when the wide-mode breakpoint is hit, 0
+// otherwise) + log box's 2 borders + 1 footer.
 func (r *RunMode) chromeHeight() int {
 	const logBoxBorders = 2
 	const footerHeight = 1
@@ -210,7 +215,11 @@ func (r *RunMode) chromeHeight() int {
 	if r.width >= wordmarkMinWidth {
 		top = headerHeightWithWordmark
 	}
-	return top + logBoxBorders + footerHeight
+	band := 0
+	if r.width >= liveBandMinWidth {
+		band = liveBandHeight
+	}
+	return top + band + logBoxBorders + footerHeight
 }
 
 // Update routes messages: log chunks, process exit, uptime tick, and key
@@ -310,6 +319,10 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			r.showHelp = false
 			return r, nil
 		}
+		if r.showInfo {
+			r.showInfo = false
+			return r, nil
+		}
 		switch m.String() {
 		case "esc":
 			// Layered Esc: on the main run screen, clear any applied
@@ -332,6 +345,9 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		case "?":
 			r.showHelp = true
+			return r, nil
+		case "i":
+			r.showInfo = true
 			return r, nil
 		case "/":
 			r.searchActive = true
@@ -671,6 +687,8 @@ func (r *RunMode) View() string {
 		return overlayCenter(bg, r.renderKillPrompt(), r.width, r.height)
 	case r.showHelp:
 		return overlayCenter(bg, r.renderHelp(), r.width, r.height)
+	case r.showInfo:
+		return overlayCenter(bg, r.renderInfoOverlay(), r.width, r.height)
 	}
 	return bg
 }
@@ -702,12 +720,59 @@ func (r *RunMode) renderKillPrompt() string {
 	))
 }
 
+// renderInfoOverlay renders the `i`-toggled overlay: model identity
+// (alias + Source/HF) followed by the preset name + every preset
+// param in source order. The full param list — which the header
+// dropped in Phase 0 — is the point of this overlay; iterating
+// r.preset.Params directly preserves the user's JSON key order
+// (CLAUDE.md: "Param order matters end-to-end").
+func (r *RunMode) renderInfoOverlay() string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	accent := lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true)
+
+	lines := []string{accent.Render("Model & preset")}
+	lines = append(lines, "")
+	lines = append(lines, subtle.Render("Alias  : ")+r.model.Alias)
+	switch {
+	case r.model.HF != "":
+		lines = append(lines, subtle.Render("HF     : ")+r.model.HF)
+	case r.model.Location != "":
+		lines = append(lines, subtle.Render("Source : ")+r.model.Location)
+	}
+	lines = append(lines, "")
+	lines = append(lines, subtle.Render("Preset : ")+presetNameOrDash(r.preset))
+	if len(r.preset.Params) == 0 {
+		lines = append(lines, "  "+subtle.Render("(no params)"))
+	} else {
+		// Right-pad keys to the longest key width so values line up.
+		keyWidth := 0
+		for _, p := range r.preset.Params {
+			if len(p.Key) > keyWidth {
+				keyWidth = len(p.Key)
+			}
+		}
+		for _, p := range r.preset.Params {
+			pad := strings.Repeat(" ", keyWidth-len(p.Key))
+			lines = append(lines, "  "+p.Key+pad+"  "+paramValueAsString(p.Value))
+		}
+	}
+	lines = append(lines, "")
+	lines = append(lines, subtle.Render("(any key to close)"))
+
+	box := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(r.theme.Accent).
+		Padding(1, 3)
+	return box.Render(strings.Join(lines, "\n"))
+}
+
 func (r *RunMode) renderHelp() string {
 	keys := []string{
 		"q / Ctrl+C  open quit prompt (k)ill / (d)etach / (c)ancel",
 		"k           kill server and return to main",
 		"r           restart server (confirm if ready)",
 		"c           copy launch command to clipboard",
+		"i           show model & preset details",
 		"/           search (live highlights; Enter applies, Esc cancels)",
 		"n / N       next / previous match",
 		"Esc         clear active search and highlights",
@@ -727,7 +792,7 @@ func (r *RunMode) renderFooter() string {
 	if r.searchActive {
 		return r.searchInput.View()
 	}
-	parts := []string{"q: quit  k: kill  r: restart  c: copy  /: search  ?: help  g/G: top/bottom  space/b: page  ↑/↓: scroll"}
+	parts := []string{"q: quit  k: kill  r: restart  c: copy  i: info  /: search  ?: help  g/G: top/bottom  space/b: page  ↑/↓: scroll"}
 	if !r.proc.IsOwner() {
 		parts = append([]string{"[adopted]"}, parts...)
 	}
@@ -779,37 +844,65 @@ const headerHeight = 6
 
 // headerHeightWithWordmark is the row count when the llamaman ASCII
 // wordmark is shown on the left side: 1 top border + 1 empty padding
-// + 6 wordmark rows + 1 empty padding + 1 bottom border = 10 rows.
-const headerHeightWithWordmark = 10
+// + 4 wordmark rows + 1 empty padding + 1 bottom border = 8 rows.
+const headerHeightWithWordmark = 8
 
 // wordmarkLines is the number of lines in the embedded Wordmark asset
-// (72×6). Exposed as a constant so layout math is explicit; the
-// renderer also vertically centers the 2 info content rows inside
-// this many rows on the right side of the box.
-const wordmarkLines = 6
+// (31×4 — smblock with letter spacing). Exposed as a constant so
+// layout math is explicit; the renderer also vertically centers the 2
+// info content rows inside this many rows on the right side of the box.
+const wordmarkLines = 4
 
+// liveBandMinWidth is the breakpoint at which the run-mode header
+// gains a second row of side-by-side panels (llama-server live data
+// + Hardware). Below this threshold the band is hidden so the
+// identity strip can keep its full width without truncation noise
+// from the live cells.
+const liveBandMinWidth = 110
+
+// liveBandHeight is the row count consumed by the live-data band: 1
+// top border + 2 content rows + 1 bottom border = 4 rows. Will grow
+// in Phase 4 when the Hardware panel surfaces multiple devices —
+// keep this in sync with the panel height math then.
+const liveBandHeight = 4
+
+// renderHeader composes the top strip and (when wide enough) the live
+// band into a single header block. The state machine is:
+//
+//	Width        Top strip                  Live band
+//	≥110 (1)     wordmark + 3×2 identity    visible
+//	90–110 (2)   wordmark + 2×3 identity    hidden
+//	<90 (3)      no wordmark, 3×2 identity  hidden
+//
+// (See DESIGN.md §7.4 for the rationale.) Identity cells are kept in
+// the same source order across states so the user's eye doesn't have
+// to relearn the layout when resizing.
 func (r *RunMode) renderHeader() string {
+	top := r.renderTopStrip()
+	if r.width < liveBandMinWidth {
+		return top
+	}
+	band := r.renderLiveBand()
+	return lipgloss.JoinVertical(lipgloss.Left, top, band)
+}
+
+// renderTopStrip renders the bordered top box (identity cells, plus
+// wordmark when the terminal is wide enough). One of three layouts is
+// produced based on r.width — see the table on renderHeader.
+func (r *RunMode) renderTopStrip() string {
 	params := canonicalParams(r.preset, r.registry)
 
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	accent := lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true)
 
-	row1 := strings.Join([]string{
+	cells := []string{
 		subtle.Render("Alias:") + " " + accent.Render(r.model.Alias),
 		subtle.Render("Server:") + " " + serverVersionOrNA(r.serverVersion),
 		subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params),
+		subtle.Render("Preset:") + " " + accent.Render(presetNameOrDash(r.preset)),
 		subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
 		statusBadge(r.statusLabel(), r.statusColor()),
-		metricsIndicator(params, r.theme),
-	}, "   ")
-
-	row2 := strings.Join([]string{
-		subtle.Render("Preset:") + " " + accent.Render(presetNameOrDash(r.preset)),
-		subtle.Render("Temp:") + " " + paramOrNA(params, "temp"),
-		subtle.Render("Top_P:") + " " + paramOrNA(params, "top-p"),
-		subtle.Render("Top_K:") + " " + paramOrNA(params, "top-k"),
-		subtle.Render("Min_P:") + " " + paramOrNA(params, "min-p"),
-	}, "   ")
+	}
 
 	box := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
@@ -818,8 +911,9 @@ func (r *RunMode) renderHeader() string {
 		Width(r.width - 2)
 
 	if r.width < wordmarkMinWidth {
-		// Compact 6-row layout: rows truncated to inner width, sandwiched
-		// by empty padding rows. Same as v0.3.0.
+		// State 3: 3 cells × 2 rows, no wordmark.
+		row1 := strings.Join(cells[:3], "   ")
+		row2 := strings.Join(cells[3:], "   ")
 		innerWidth := r.width - 4
 		if innerWidth < 1 {
 			innerWidth = 1
@@ -833,9 +927,6 @@ func (r *RunMode) renderHeader() string {
 		return box.Render(body)
 	}
 
-	// Wide layout: wordmark column on the left (subtle) + vertically
-	// centered info rows on the right. The right column matches the
-	// wordmark's height so JoinHorizontal lines them up cleanly.
 	wordmark := lipgloss.NewStyle().
 		Foreground(r.theme.Subtle).
 		Render(strings.TrimRight(Wordmark, "\n"))
@@ -847,16 +938,112 @@ func (r *RunMode) renderHeader() string {
 	if rightWidth < 10 {
 		rightWidth = 10
 	}
-	row1 = ansi.Truncate(row1, rightWidth, "")
-	row2 = ansi.Truncate(row2, rightWidth, "")
 
-	// Vertically center the 2 content rows inside `wordmarkLines`
-	// rows: 2 blank top + row1 + row2 + 2 blank bottom = 6 rows.
-	rightCol := strings.Join([]string{"", "", row1, row2, "", ""}, "\n")
+	var rightCol string
+	if r.width < liveBandMinWidth {
+		// State 2: 2 cells × 3 rows.
+		row1 := ansi.Truncate(strings.Join(cells[0:2], "   "), rightWidth, "")
+		row2 := ansi.Truncate(strings.Join(cells[2:4], "   "), rightWidth, "")
+		row3 := ansi.Truncate(strings.Join(cells[4:6], "   "), rightWidth, "")
+		// 4 rows total to match wordmarkLines: 3 content + 1 bottom blank.
+		rightCol = strings.Join([]string{row1, row2, row3, ""}, "\n")
+	} else {
+		// State 1: 3 cells × 2 rows.
+		row1 := ansi.Truncate(strings.Join(cells[:3], "   "), rightWidth, "")
+		row2 := ansi.Truncate(strings.Join(cells[3:], "   "), rightWidth, "")
+		// 4 rows total: 1 blank top + row1 + row2 + 1 blank bottom.
+		rightCol = strings.Join([]string{"", row1, row2, ""}, "\n")
+	}
 
 	twoColumn := lipgloss.JoinHorizontal(lipgloss.Top, wordmark, "  ", rightCol)
 	body := strings.Join([]string{"", twoColumn, ""}, "\n")
 	return box.Render(body)
+}
+
+// renderLiveBand renders the side-by-side llama-server + Hardware
+// panels that sit below the top strip in State 1. Both panels are
+// placeholders in Phase 2 — Phase 3 wires real /metrics + /slots
+// data into the server panel and Phase 4 wires NVML/gopsutil into the
+// Hardware panel.
+func (r *RunMode) renderLiveBand() string {
+	leftWidth := r.width / 2
+	rightWidth := r.width - leftWidth
+
+	left := r.renderServerPanel(leftWidth)
+	right := r.renderHardwarePanel(rightWidth)
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+}
+
+// renderServerPanel renders the llama-server live data box. Phase 2
+// shape: titled border + two content rows of n/a placeholders. Phase 3
+// fills in the slots with sampled tokens/s + busy/queued counters.
+func (r *RunMode) renderServerPanel(width int) string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	row1 := subtle.Render("Tokens/s:") + "   n/a /   n/a avg     " +
+		subtle.Render("Prompt eval:") + "   n/a /   n/a avg"
+	row2 := subtle.Render("Busy:") + " n/a              " +
+		subtle.Render("Queued:") + " n/a"
+	return r.renderTitledPanel("llama-server", width, []string{row1, row2})
+}
+
+// renderHardwarePanel renders the Hardware live data box. Phase 2
+// shape: titled border + two n/a placeholder rows. Phase 4 fills in
+// real CPU + GPU rows via gopsutil/NVML.
+func (r *RunMode) renderHardwarePanel(width int) string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	row1 := "[0] " + subtle.Render("(no devices)")
+	row2 := "    " + subtle.Render("Util  n/a   RAM  n/a    n/a   n/a   n/a")
+	return r.renderTitledPanel("Hardware", width, []string{row1, row2})
+}
+
+// renderTitledPanel draws a hand-rolled rounded box with the title
+// label embedded in the top border (the design summary's
+// "╭── llama-server ───╮" shape). Lipgloss's bordered styles render a
+// plain border so we hand-build the four sides to keep total panel
+// height at exactly 1 (top) + len(rows) + 1 (bottom) — important for
+// liveBandHeight to stay tight against its declared value.
+func (r *RunMode) renderTitledPanel(title string, width int, contentRows []string) string {
+	border := lipgloss.NewStyle().Foreground(r.theme.Border)
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+
+	if width < 8 {
+		width = 8
+	}
+	// Top border: ╭── <title> ───╮
+	prefix := "── "
+	suffix := " "
+	titleVisible := title
+	maxTitleLen := width - 1 - len(prefix) - len(suffix) - 1
+	if maxTitleLen < 1 {
+		maxTitleLen = 1
+	}
+	if len(titleVisible) > maxTitleLen {
+		titleVisible = titleVisible[:maxTitleLen]
+	}
+	usedCols := 1 + len(prefix) + len(titleVisible) + len(suffix) + 1 // ╭ + "── " + title + " " + ╮
+	fillerCount := width - usedCols
+	if fillerCount < 0 {
+		fillerCount = 0
+	}
+	top := border.Render("╭"+prefix) + subtle.Render(titleVisible) + border.Render(suffix+strings.Repeat("─", fillerCount)+"╮")
+
+	innerWidth := width - 4 // "│ " + content + " │"
+	if innerWidth < 1 {
+		innerWidth = 1
+	}
+	rows := make([]string, len(contentRows))
+	for i, line := range contentRows {
+		truncated := ansi.Truncate(line, innerWidth, "")
+		w := lipgloss.Width(truncated)
+		if w < innerWidth {
+			truncated += strings.Repeat(" ", innerWidth-w)
+		}
+		rows[i] = border.Render("│ ") + truncated + border.Render(" │")
+	}
+
+	bottom := border.Render("╰" + strings.Repeat("─", width-2) + "╯")
+
+	return strings.Join(append(append([]string{top}, rows...), bottom), "\n")
 }
 
 // serverVersionOrNA renders the parsed llama-server version, falling
@@ -891,47 +1078,14 @@ func ctxSizeDisplay(live int, params map[string]any) string {
 	return paramOrNA(params, "ctx-size")
 }
 
-// metricsOn / metricsOff are the SGR sequences used by the
-// [Metrics] indicator: black foreground on green background when the
-// preset has `metrics: true` (the "lit-button" look the user asked
-// for); a full reset closes the run. The bold modifier was dropped
-// because terminals tend to render bold-black as gray, washing out
-// the text against the green background — pure-black sticks. Literal
-// SGR rather than lipgloss so the styling is deterministic in tests
-// where lipgloss suppresses styling without a TTY.
-const (
-	metricsOnOpen  = "\x1b[30;42m"
-	metricsOnClose = "\x1b[0m"
-)
-
-// statusBadge renders the run-mode status indicator that sits between
-// Uptime and [Metrics] on row 1. Bracketed, uppercase, bold, with the
-// state's themed foreground color and no background fill — chosen
-// over the [Metrics]-style black-on-color treatment because the
-// status palette spans 4 themed colors that double as foregrounds in
-// light mode (where black-on-dark-red would be unreadable).
+// statusBadge renders the run-mode status indicator that sits at the
+// end of row 1. Bracketed, uppercase, bold, with the state's themed
+// foreground color and no background fill.
 func statusBadge(label string, color lipgloss.Color) string {
 	return lipgloss.NewStyle().
 		Foreground(color).
 		Bold(true).
 		Render("[" + strings.ToUpper(label) + "]")
-}
-
-// metricsIndicator renders the [Metrics] tag at the end of row 1.
-// Bold black-on-green when the preset has `metrics: true`; subtle/dim
-// otherwise. Always shown so the indicator's spot is stable across
-// state changes.
-func metricsIndicator(params map[string]any, theme Theme) string {
-	on := false
-	if v, ok := params["metrics"]; ok {
-		if b, isBool := v.(bool); isBool && b {
-			on = true
-		}
-	}
-	if on {
-		return metricsOnOpen + "[Metrics]" + metricsOnClose
-	}
-	return lipgloss.NewStyle().Foreground(theme.Muted).Render("[Metrics]")
 }
 
 func (r *RunMode) statusColor() lipgloss.Color {

@@ -274,11 +274,18 @@ func TestCanonicalParamsKeepsUnknownKeys(t *testing.T) {
 }
 
 // runHeaderWideWidth is the terminal width used by tests that need
-// the right-column info (`[Metrics]`, `Min_P:`, etc.) to fit
-// alongside the 72-col wordmark without truncation. Below ~170 cols
-// the right column gets clipped — that degradation is intentional
-// for real users at narrow widths but breaks substring assertions.
+// the right-column identity content to fit alongside the 31-col
+// smblock wordmark without truncation, and that exercise the full
+// State 1 layout (top strip + live band).
 const runHeaderWideWidth = 200
+
+// runHeaderState2Width is in the 90–110 band: wordmark visible, live
+// band hidden, identity arranged 2 cells × 3 rows.
+const runHeaderState2Width = 100
+
+// runHeaderState3Width is below the wordmark breakpoint: no wordmark,
+// no live band, identity arranged 3 cells × 2 rows.
+const runHeaderState3Width = 60
 
 func TestRunHeaderHasFixedHeightAtWideWidth(t *testing.T) {
 	r := newHeaderTestRunMode(
@@ -288,8 +295,26 @@ func TestRunHeaderHasFixedHeightAtWideWidth(t *testing.T) {
 	)
 	header := r.renderHeader()
 	got := strings.Count(header, "\n") + 1
+	want := headerHeightWithWordmark + liveBandHeight
+	if got != want {
+		t.Errorf("State 1 header height = %d, want %d (top + band)\nheader:\n%s", got, want, header)
+	}
+}
+
+// TestRunHeaderHasFixedHeightAtState2Width covers the 90–110 band:
+// wordmark visible, live band hidden, identity arranged 2 cells × 3
+// rows.
+func TestRunHeaderHasFixedHeightAtState2Width(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderState2Width,
+	)
+	header := r.renderHeader()
+	got := strings.Count(header, "\n") + 1
 	if got != headerHeightWithWordmark {
-		t.Errorf("header height = %d, want %d\nheader:\n%s", got, headerHeightWithWordmark, header)
+		t.Errorf("State 2 header height = %d, want %d (top only, no band)\nheader:\n%s",
+			got, headerHeightWithWordmark, header)
 	}
 }
 
@@ -300,18 +325,92 @@ func TestRunHeaderHasFixedHeightAtNarrowWidth(t *testing.T) {
 			{Key: "temp", Value: json.Number("0.7")},
 			{Key: "top-p", Value: json.Number("0.9")},
 		}},
-		nil, 60,
+		nil, runHeaderState3Width,
 	)
 	header := r.renderHeader()
 	got := strings.Count(header, "\n") + 1
 	if got != headerHeight {
-		t.Errorf("narrow header height = %d, want %d (truncation should keep height fixed)\nheader:\n%s",
+		t.Errorf("State 3 header height = %d, want %d (truncation should keep height fixed)\nheader:\n%s",
 			got, headerHeight, header)
+	}
+}
+
+// TestRunHeaderStateMachine exercises the three width breakpoints in
+// one place and pins the cell count + live-band visibility at each.
+// 6 identity cells get redistributed across all three states; the
+// content stays the same, only the row/column shape changes.
+func TestRunHeaderStateMachine(t *testing.T) {
+	model := config.Model{Alias: "alpha"}
+	preset := config.Preset{Name: "default"}
+
+	cases := []struct {
+		name     string
+		width    int
+		wantBand bool
+		wantWM   bool
+		wantH    int
+	}{
+		{"state1-wide", runHeaderWideWidth, true, true, headerHeightWithWordmark + liveBandHeight},
+		{"state2-mid", runHeaderState2Width, false, true, headerHeightWithWordmark},
+		{"state3-narrow", runHeaderState3Width, false, false, headerHeight},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newHeaderTestRunMode(model, preset, nil, tc.width)
+			header := r.renderHeader()
+			plain := stripANSI(header)
+			gotH := strings.Count(header, "\n") + 1
+			if gotH != tc.wantH {
+				t.Errorf("height = %d, want %d\nheader:\n%s", gotH, tc.wantH, header)
+			}
+			gotWM := strings.Contains(plain, "▐  ▐")
+			if gotWM != tc.wantWM {
+				t.Errorf("wordmark visible = %v, want %v\nheader:\n%s", gotWM, tc.wantWM, plain)
+			}
+			gotBand := strings.Contains(plain, "llama-server") && strings.Contains(plain, "Hardware")
+			if gotBand != tc.wantBand {
+				t.Errorf("live band visible = %v, want %v\nheader:\n%s", gotBand, tc.wantBand, plain)
+			}
+			// Identity cells must be present in every state.
+			for _, want := range []string{"alpha", "default", "Context Size", "[READY]"} {
+				if !strings.Contains(plain, want) {
+					t.Errorf("identity cell %q missing\nheader:\n%s", want, plain)
+				}
+			}
+		})
+	}
+}
+
+// TestRunHeaderDropsSamplingParamsAndMetricsIndicator pins Phase 0:
+// the four sampling-param cells (Temp/Top_P/Top_K/Min_P) and the
+// [Metrics] indicator have been removed from the header. They live in
+// the `i` info overlay (Phase 1) and the live-band server panel
+// (Phase 3) respectively.
+func TestRunHeaderDropsSamplingParamsAndMetricsIndicator(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "temp", Value: json.Number("0.7")},
+			{Key: "top-p", Value: json.Number("0.9")},
+			{Key: "top-k", Value: json.Number("40")},
+			{Key: "min-p", Value: json.Number("0.05")},
+			{Key: "metrics", Value: true},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	plain := stripANSI(r.renderHeader())
+	for _, dont := range []string{"Temp:", "Top_P:", "Top_K:", "Min_P:", "[Metrics]"} {
+		if strings.Contains(plain, dont) {
+			t.Errorf("header should not contain %q after Phase 0; got:\n%s", dont, plain)
+		}
 	}
 }
 
 // TestRunHeaderShowsWordmarkAtWideWidth confirms the wordmark is
 // rendered on the left side of the box when the terminal can fit it.
+// The smblock wordmark uses several distinct quad-pixel block glyphs;
+// we look for a substring stable across the asset (the doubled "▐  ▐"
+// L-pair on row 2 is unambiguous).
 func TestRunHeaderShowsWordmarkAtWideWidth(t *testing.T) {
 	r := newHeaderTestRunMode(
 		config.Model{Alias: "alpha"},
@@ -319,9 +418,7 @@ func TestRunHeaderShowsWordmarkAtWideWidth(t *testing.T) {
 		nil, runHeaderWideWidth,
 	)
 	plain := stripANSI(r.renderHeader())
-	// Each wordmark line starts with the same character cells; check
-	// for a substring stable across font/asset edits.
-	if !strings.Contains(plain, "█") {
+	if !strings.Contains(plain, "▐  ▐") {
 		t.Errorf("expected wordmark cells in header; got:\n%s", plain)
 	}
 }
@@ -333,59 +430,23 @@ func TestRunHeaderHidesWordmarkAtNarrowWidth(t *testing.T) {
 	r := newHeaderTestRunMode(
 		config.Model{Alias: "alpha"},
 		config.Preset{Name: "default"},
-		nil, 80,
+		nil, 60,
 	)
 	plain := stripANSI(r.renderHeader())
-	if strings.Contains(plain, "█") {
+	if strings.Contains(plain, "▐  ▐") {
 		t.Errorf("expected no wordmark on narrow terminal; got:\n%s", plain)
 	}
 }
 
-func TestRunHeaderMetricsOnUsesGreenBackground(t *testing.T) {
-	r := newHeaderTestRunMode(
-		config.Model{Alias: "alpha"},
-		config.Preset{Name: "default", Params: config.Params{
-			{Key: "metrics", Value: true},
-		}},
-		nil, runHeaderWideWidth,
-	)
-	header := r.renderHeader()
-	// `\x1b[30;42m` = black fg on green bg (no bold — bold renders as
-	// gray on many terminals, killing contrast against the green).
-	// Pinned literally rather than via lipgloss.Render so it's
-	// deterministic in tests where lipgloss has no TTY to detect.
-	if !strings.Contains(header, "\x1b[30;42m") {
-		t.Errorf("expected black-on-green SGR around [Metrics]; got header:\n%q", header)
-	}
-}
-
-func TestRunHeaderMetricsOffNoGreenBackground(t *testing.T) {
-	r := newHeaderTestRunMode(
-		config.Model{Alias: "alpha"},
-		config.Preset{Name: "default"}, // no metrics param
-		nil, runHeaderWideWidth,
-	)
-	header := r.renderHeader()
-	if strings.Contains(header, "\x1b[30;42m") {
-		t.Errorf("expected no green-bg SGR when metrics is absent; got header:\n%q", header)
-	}
-	// And [Metrics] is still rendered (subtle/dim, not lit).
-	if !strings.Contains(stripANSI(header), "[Metrics]") {
-		t.Error("expected [Metrics] indicator to be rendered even when off")
-	}
-}
-
-func TestRunHeaderShowsNAForMissingParams(t *testing.T) {
+func TestRunHeaderShowsNAForMissingCtxSize(t *testing.T) {
 	r := newHeaderTestRunMode(
 		config.Model{Alias: "alpha"},
 		config.Preset{Name: "default"}, // no params at all
 		nil, runHeaderWideWidth,
 	)
 	plain := stripANSI(r.renderHeader())
-	for _, want := range []string{"Temp: n/a", "Top_P: n/a", "Top_K: n/a", "Min_P: n/a", "Context Size: n/a"} {
-		if !strings.Contains(plain, want) {
-			t.Errorf("expected %q in header; got:\n%s", want, plain)
-		}
+	if !strings.Contains(plain, "Context Size: n/a") {
+		t.Errorf("expected Context Size: n/a fallback in header; got:\n%s", plain)
 	}
 }
 
@@ -474,6 +535,128 @@ func TestRunHeaderShowsCanonicalCtxSizeFromShortForm(t *testing.T) {
 	plain := stripANSI(r.renderHeader())
 	if !strings.Contains(plain, "Context Size: 16384") {
 		t.Errorf("expected ctx-size value from short-form `c`; got header:\n%s", plain)
+	}
+}
+
+// ---- i info overlay tests ----
+
+// TestRunInfoOverlayTogglesOnIKey covers the basic press-i-shows,
+// press-any-shows-closes flow. Direct field assertions (showInfo)
+// rather than view scraping so the test is independent of the
+// overlay's pixel layout.
+func TestRunInfoOverlayTogglesOnIKey(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha", Location: "/m/alpha.gguf"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "ctx-size", Value: json.Number("8192")},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	if !r.showInfo {
+		t.Fatal("`i` did not set showInfo")
+	}
+	// Any subsequent key closes.
+	r.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if r.showInfo {
+		t.Fatal("subsequent key did not clear showInfo")
+	}
+}
+
+// TestRunInfoOverlayContentLocalModel pins the rendered body for a
+// local-file model: alias + Source path + preset name + every preset
+// param surfaces in source order.
+func TestRunInfoOverlayContentLocalModel(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha", Location: "/models/alpha.gguf"},
+		config.Preset{Name: "fast", Params: config.Params{
+			{Key: "ctx-size", Value: json.Number("8192")},
+			{Key: "temp", Value: json.Number("0.7")},
+			{Key: "jinja", Value: true},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	plain := stripANSI(r.renderInfoOverlay())
+	for _, want := range []string{
+		"alpha",
+		"/models/alpha.gguf",
+		"fast",
+		"ctx-size",
+		"8192",
+		"temp",
+		"0.7",
+		"jinja",
+		"true",
+	} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("info overlay missing %q\nout:\n%s", want, plain)
+		}
+	}
+}
+
+// TestRunInfoOverlayContentHFModel covers the HF-sourced model branch:
+// the overlay shows `HF :` rather than `Source :`.
+func TestRunInfoOverlayContentHFModel(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "qwen", HF: "Qwen/Qwen2.5-7B-Instruct-GGUF"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	plain := stripANSI(r.renderInfoOverlay())
+	if !strings.Contains(plain, "HF") {
+		t.Errorf("HF model overlay missing `HF` label; out:\n%s", plain)
+	}
+	if !strings.Contains(plain, "Qwen/Qwen2.5-7B-Instruct-GGUF") {
+		t.Errorf("HF model overlay missing identifier; out:\n%s", plain)
+	}
+	if strings.Contains(plain, "Source ") {
+		t.Errorf("HF model overlay should not show Source line; out:\n%s", plain)
+	}
+}
+
+// TestRunInfoOverlayPreservesParamOrder pins the source-order
+// invariant: keys appear in the order they were declared, not
+// alphabetical or any other rearrangement (CLAUDE.md: "Param order
+// matters end-to-end").
+func TestRunInfoOverlayPreservesParamOrder(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha", Location: "/m/alpha.gguf"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "zeta", Value: "z"},
+			{Key: "alpha-flag", Value: "a"},
+			{Key: "mu", Value: "m"},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	plain := stripANSI(r.renderInfoOverlay())
+	zIdx := strings.Index(plain, "zeta")
+	aIdx := strings.Index(plain, "alpha-flag")
+	mIdx := strings.Index(plain, "mu")
+	if zIdx < 0 || aIdx < 0 || mIdx < 0 {
+		t.Fatalf("missing one or more keys; out:\n%s", plain)
+	}
+	if !(zIdx < aIdx && aIdx < mIdx) {
+		t.Errorf("expected source order zeta < alpha-flag < mu; got positions %d, %d, %d", zIdx, aIdx, mIdx)
+	}
+}
+
+// TestRunInfoOverlayRenderedInView covers the integration: with
+// showInfo set the View output contains the overlay text alongside
+// the header (which the overlay floats on top of, not replaces).
+func TestRunInfoOverlayRenderedInView(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha", Location: "/m/alpha.gguf"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.height = 30
+	r.showInfo = true
+	view := stripANSI(r.View())
+	if !strings.Contains(view, "Model & preset") {
+		t.Errorf("View did not include info overlay header; out:\n%s", view)
+	}
+	if !strings.Contains(view, "Alias") {
+		t.Errorf("View overlay missing Alias label; out:\n%s", view)
 	}
 }
 
