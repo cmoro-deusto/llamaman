@@ -12,6 +12,7 @@ import (
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
+	"github.com/cmoro-deusto/llamaman/internal/llamaapi"
 	"github.com/cmoro-deusto/llamaman/internal/logging"
 	"github.com/cmoro-deusto/llamaman/internal/paths"
 	"github.com/cmoro-deusto/llamaman/internal/server"
@@ -283,7 +284,23 @@ func acquireAndSpawn(cfg *config.Config, registry flags.Registry, sessMgr *serve
 		Process:    proc,
 		SessionMgr: sessMgr,
 		Registry:   registry,
+		Fetcher:    fetcherFor(res.Argv, registry),
 	}, nil
+}
+
+// fetcherFor constructs the live /props HTTP client from an already-built
+// argv. The host:port live in argv (whether auto-added by translate.Build
+// or preset-overridden), so a preset that retargets the listen address
+// dials the right place. ExtractAddr returns ok=false only if the argv
+// invariant is violated; callers leave Fetcher nil in that case and the
+// run-mode header gracefully degrades to the preset value.
+func fetcherFor(argv []string, registry flags.Registry) tui.Fetcher {
+	host, port, ok := flags.ExtractAddr(argv, registry)
+	if !ok {
+		slog.Warn("could not extract host:port from argv; live ctx-size disabled")
+		return nil
+	}
+	return llamaapi.NewClient(host, port)
 }
 
 // buildReattachOpts wraps an existing session in a RunModeOpts. The model
@@ -314,6 +331,7 @@ func buildReattachOpts(cfg *config.Config, registry flags.Registry, sess server.
 		Process:    server.Adopt(sess),
 		SessionMgr: sessMgr,
 		Registry:   registry,
+		Fetcher:    fetcherFor(sess.Command, registry),
 	}, nil
 }
 
