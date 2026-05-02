@@ -356,7 +356,7 @@ There is no separate "selection mode" — model selection is the main mode.
 ```
 
 Top pane: 3 lines.
-- Line 1: identity, host:port, status indicator (● starting / ● ready / ● error / ● exited), uptime.
+- Line 1: identity, host:port, uptime, status indicator (`[STARTING]` / `[READY]` / `[EXITED]` / `[ERROR]`, bracketed uppercase rendered in the state's themed color — bold foreground only, no background fill, so the badge works in both dark and light themes).
 - Line 2: condensed param summary.
 - Line 3: boolean flags + warnings.
 
