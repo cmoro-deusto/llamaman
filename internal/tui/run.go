@@ -793,13 +793,13 @@ func (r *RunMode) renderHeader() string {
 
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	accent := lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true)
-	uptimeStyle := lipgloss.NewStyle().Foreground(r.statusColor())
 
 	row1 := strings.Join([]string{
 		subtle.Render("Alias:") + " " + accent.Render(r.model.Alias),
 		subtle.Render("Server:") + " " + serverVersionOrNA(r.serverVersion),
 		subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params),
-		subtle.Render("Uptime:") + " " + uptimeStyle.Render(formatUptime(time.Since(r.proc.Started))),
+		subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
+		statusBadge(r.statusLabel(), r.statusColor()),
 		metricsIndicator(params, r.theme),
 	}, "   ")
 
@@ -903,6 +903,19 @@ const (
 	metricsOnOpen  = "\x1b[30;42m"
 	metricsOnClose = "\x1b[0m"
 )
+
+// statusBadge renders the run-mode status indicator that sits between
+// Uptime and [Metrics] on row 1. Bracketed, uppercase, bold, with the
+// state's themed foreground color and no background fill — chosen
+// over the [Metrics]-style black-on-color treatment because the
+// status palette spans 4 themed colors that double as foregrounds in
+// light mode (where black-on-dark-red would be unreadable).
+func statusBadge(label string, color lipgloss.Color) string {
+	return lipgloss.NewStyle().
+		Foreground(color).
+		Bold(true).
+		Render("[" + strings.ToUpper(label) + "]")
+}
 
 // metricsIndicator renders the [Metrics] tag at the end of row 1.
 // Bold black-on-green when the preset has `metrics: true`; subtle/dim
