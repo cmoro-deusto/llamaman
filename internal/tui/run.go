@@ -798,7 +798,7 @@ func (r *RunMode) renderHeader() string {
 	row1 := strings.Join([]string{
 		subtle.Render("Alias:") + " " + accent.Render(r.model.Alias),
 		subtle.Render("Server:") + " " + serverVersionOrNA(r.serverVersion),
-		subtle.Render("Context Size:") + " " + paramOrNA(params, "ctx-size"),
+		subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params),
 		subtle.Render("Uptime:") + " " + uptimeStyle.Render(formatUptime(time.Since(r.proc.Started))),
 		metricsIndicator(params, r.theme),
 	}, "   ")
@@ -877,6 +877,18 @@ func paramOrNA(params map[string]any, key string) string {
 		return "n/a"
 	}
 	return paramValueAsString(v)
+}
+
+// ctxSizeDisplay renders the Context Size cell. The live value (from
+// /props) wins when present; otherwise we fall back to the preset's
+// declared value or "n/a". Live value is rendered as a plain integer
+// without a thousands separator so it matches the rest of the
+// param-row formatting.
+func ctxSizeDisplay(live int, params map[string]any) string {
+	if live > 0 {
+		return strconv.Itoa(live)
+	}
+	return paramOrNA(params, "ctx-size")
 }
 
 // metricsOn / metricsOff are the SGR sequences used by the
