@@ -82,7 +82,9 @@ func assertNotLogged(t *testing.T, recs *[]capturedRecord, level slog.Level, msg
 
 // fakeFetcher is the test-side Fetcher. Behavior is parameterized so a
 // single struct serves the "happy fetch", "first attempt fails / retry
-// succeeds", and "always fails" cases.
+// succeeds", and "always fails" cases. Phase 3 extends it with
+// /metrics + /slots responders so RunMode tests can exercise the
+// live-data path without standing up an httptest server per test.
 type fakeFetcher struct {
 	mu       sync.Mutex
 	calls    int
@@ -90,6 +92,17 @@ type fakeFetcher struct {
 	err      error
 	delay    time.Duration // optional, simulate slow server
 	errFirst error         // returned on call 1, then fall through to props/err
+
+	// Live-poll responders (zero values = ErrMetricsNotEnabled / empty
+	// slot list / no error). Each call increments its own counter so
+	// tests can verify the polling cadence.
+	metrics       *llamaapi.Metrics
+	metricsErr    error
+	metricsCalls  int
+	slots         *llamaapi.Slots
+	slotsErr      error
+	slotsCalls    int
+	metricsScript []*llamaapi.Metrics // when non-nil, serve consecutive entries
 }
 
 func (f *fakeFetcher) FetchProps(ctx context.Context) (*llamaapi.Props, error) {
@@ -108,6 +121,27 @@ func (f *fakeFetcher) FetchProps(ctx context.Context) (*llamaapi.Props, error) {
 		return nil, f.errFirst
 	}
 	return f.props, f.err
+}
+
+func (f *fakeFetcher) FetchMetrics(_ context.Context) (*llamaapi.Metrics, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	idx := f.metricsCalls
+	f.metricsCalls++
+	if len(f.metricsScript) > 0 {
+		if idx >= len(f.metricsScript) {
+			idx = len(f.metricsScript) - 1
+		}
+		return f.metricsScript[idx], nil
+	}
+	return f.metrics, f.metricsErr
+}
+
+func (f *fakeFetcher) FetchSlots(_ context.Context) (*llamaapi.Slots, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.slotsCalls++
+	return f.slots, f.slotsErr
 }
 
 func (f *fakeFetcher) callCount() int {
@@ -175,6 +209,41 @@ func TestFetchPropsCmdBothAttemptsFail(t *testing.T) {
 	}
 	if c := fake.callCount(); c != 2 {
 		t.Errorf("FetchProps call count = %d, want 2 (one retry)", c)
+	}
+}
+
+// ---- Phase 3: live-poll Cmd tests ----
+
+func TestFetchMetricsCmdHappy(t *testing.T) {
+	fake := &fakeFetcher{metrics: &llamaapi.Metrics{TokensPredictedTotal: 42}}
+	msg := fetchMetricsCmd(context.Background(), fake)()
+	got, ok := msg.(metricsFetchedMsg)
+	if !ok {
+		t.Fatalf("expected metricsFetchedMsg, got %T", msg)
+	}
+	if got.err != nil || got.m == nil || got.m.TokensPredictedTotal != 42 {
+		t.Errorf("unexpected msg: %+v", got)
+	}
+}
+
+func TestFetchMetricsCmdSurfacesError(t *testing.T) {
+	fake := &fakeFetcher{metricsErr: llamaapi.ErrMetricsNotEnabled}
+	msg := fetchMetricsCmd(context.Background(), fake)()
+	got := msg.(metricsFetchedMsg)
+	if !errors.Is(got.err, llamaapi.ErrMetricsNotEnabled) {
+		t.Errorf("err = %v, want ErrMetricsNotEnabled", got.err)
+	}
+}
+
+func TestFetchSlotsCmdHappy(t *testing.T) {
+	fake := &fakeFetcher{slots: &llamaapi.Slots{Total: 4, BusyCount: 2}}
+	msg := fetchSlotsCmd(context.Background(), fake)()
+	got, ok := msg.(slotsFetchedMsg)
+	if !ok {
+		t.Fatalf("expected slotsFetchedMsg, got %T", msg)
+	}
+	if got.err != nil || got.s.BusyCount != 2 || got.s.Total != 4 {
+		t.Errorf("unexpected msg: %+v", got)
 	}
 }
 

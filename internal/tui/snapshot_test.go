@@ -313,9 +313,17 @@ func TestSnapshotRunMode(t *testing.T) {
 	}
 
 	out := stripANSI(root.View())
-	for _, want := range []string{"Alias:", "alpha", "Preset:", "default", "[READY]", "[Metrics]"} {
+	for _, want := range []string{"Alias:", "alpha", "Preset:", "default", "[READY]", "llama-server", "Hardware", "Tokens", "Prompt"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("run mode output missing %q\nout:\n%s", want, out)
+		}
+	}
+	// Phase 0: the sampling-param row and [Metrics] indicator have been
+	// removed from the header. Pin those negatives so a regression that
+	// reintroduces them fails this test.
+	for _, dont := range []string{"[Metrics]", "Temp:", "Top_P:", "Top_K:", "Min_P:"} {
+		if strings.Contains(out, dont) {
+			t.Errorf("run mode output should no longer contain %q\nout:\n%s", dont, out)
 		}
 	}
 }

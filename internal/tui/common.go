@@ -15,13 +15,19 @@ var Wordmark string
 // Theme holds the resolved color palette for the current run. Two
 // hard-coded variants in v1: dark and light. NO_COLOR is honored
 // automatically by lipgloss when termenv detects it.
+//
+// StatusIdle/Ready/Start/Err double as the live-band metric color
+// zones (see Zone* constants in zones.go): the same palette that
+// drives the run-mode status badge tints bars, sparklines, and
+// trailing values when their value crosses the threshold cuts.
 type Theme struct {
 	Accent      lipgloss.Color
 	Subtle      lipgloss.Color
 	Muted       lipgloss.Color
-	StatusReady lipgloss.Color
-	StatusStart lipgloss.Color
-	StatusErr   lipgloss.Color
+	StatusIdle  lipgloss.Color // light blue — low/idle utilization (Q6a Blue zone)
+	StatusReady lipgloss.Color // green   — healthy operating range
+	StatusStart lipgloss.Color // yellow  — elevated; warning
+	StatusErr   lipgloss.Color // red     — saturated; danger
 	StatusGone  lipgloss.Color
 	BorderFocus lipgloss.Color
 	Border      lipgloss.Color
@@ -34,6 +40,7 @@ func CurrentTheme() Theme {
 			Accent:      lipgloss.Color("#E8A33D"), // soft orange (DESIGN §10.4)
 			Subtle:      lipgloss.Color("#9A9A9A"),
 			Muted:       lipgloss.Color("#5C5C5C"),
+			StatusIdle:  lipgloss.Color("#7DC4E4"), // steel-blue / soft cyan
 			StatusReady: lipgloss.Color("#7BC96F"),
 			StatusStart: lipgloss.Color("#E8C547"),
 			StatusErr:   lipgloss.Color("#E06C75"),
@@ -46,6 +53,7 @@ func CurrentTheme() Theme {
 		Accent:      lipgloss.Color("#C26B11"),
 		Subtle:      lipgloss.Color("#5A5A5A"),
 		Muted:       lipgloss.Color("#9A9A9A"),
+		StatusIdle:  lipgloss.Color("#3A7AAB"), // medium blue — readable on light bg
 		StatusReady: lipgloss.Color("#1F7A28"),
 		StatusStart: lipgloss.Color("#A06B00"),
 		StatusErr:   lipgloss.Color("#B22222"),
