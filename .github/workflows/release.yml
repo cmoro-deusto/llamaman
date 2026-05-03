@@ -34,7 +34,14 @@ jobs:
       - name: Install C toolchain (CGO + arm64 cross)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends gcc gcc-aarch64-linux-gnu
+          # `gcc-aarch64-linux-gnu` is the cross-compiler binary;
+          # `libc6-dev-arm64-cross` is its matching libc headers
+          # (without it, every CGO arm64 build fails with
+          # `bits/libc-header-start.h: No such file or directory`).
+          sudo apt-get install -y --no-install-recommends \
+            gcc \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
