@@ -64,6 +64,12 @@ type hwSnapshotMsg struct {
 
 type livePollTickMsg time.Time
 
+// hwTickMsg drives the hardware-panel poll cadence. Decoupled from
+// livePollTickMsg so the Hardware panel can start populating
+// immediately at RunMode birth — it doesn't need the server to be
+// ready (gopsutil/NVML have no dependency on llama-server).
+type hwTickMsg time.Time
+
 // fetchMetricsCmd is a single one-shot fetch. Returns a metricsFetchedMsg.
 func fetchMetricsCmd(ctx context.Context, fetcher Fetcher) tea.Cmd {
 	return func() tea.Msg {
@@ -97,6 +103,16 @@ func hwSnapshotCmd() tea.Cmd {
 func tickLivePoll() tea.Cmd {
 	return tea.Tick(livePollInterval, func(t time.Time) tea.Msg {
 		return livePollTickMsg(t)
+	})
+}
+
+// tickHwPoll is the hardware panel's independent ticker — fires at
+// the same livePollInterval as the server poll but on its own
+// schedule so it can start before (and continue independently of)
+// the server-readiness gate.
+func tickHwPoll() tea.Cmd {
+	return tea.Tick(livePollInterval, func(t time.Time) tea.Msg {
+		return hwTickMsg(t)
 	})
 }
 

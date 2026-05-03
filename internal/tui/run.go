@@ -112,14 +112,27 @@ type RunMode struct {
 	busyCount           int
 	totalSlots          int
 	queuedCount         int
-	tokensIdle          bool // last tick saw zero predicted-tokens delta
-	promptIdle          bool // last tick saw zero prompt-tokens delta
+	// tokensSeen / promptSeen latch true once we've observed the first
+	// non-zero rate. Bug 3: after the first real value, we persist the
+	// last-known rate even on subsequent zero-delta ticks (no more "—"
+	// majority of the time). Before the first non-zero, we keep showing
+	// "—" so the user knows we just don't have data yet.
+	tokensSeen bool
+	promptSeen bool
+	// Token-rate history for the server-panel sparklines. Each ring
+	// holds the last 30 seconds of "tokens this tick" / "prompt eval
+	// this tick" values. Auto-scaled by renderSparkline.
+	tokensHistory *ringBuffer
+	promptHistory *ringBuffer
 
 	// Hardware-panel state. Refreshed on every live-poll tick from
 	// hwinfo.Snapshot (gopsutil + NVML). Empty until the first tick
 	// lands so the panel renders n/a placeholders during the first
 	// second after Ready.
 	hardware []hwinfo.Device
+	// Per-device Util% history (key = "<class><index>" e.g. "cpu0",
+	// "gpu0"). Each entry is a 30-second ring buffer fed each tick.
+	utilHistory map[string]*ringBuffer
 }
 
 // RunModeOpts bundles the inputs to NewRunMode. Spawn is the responsibility
@@ -181,12 +194,19 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 		serverVersion:    loadServerVersion(opts.Cfg.Globals.Bin),
 		fetcher:          opts.Fetcher,
 		metricsAvailable: true,
+		tokensHistory:    newRingBuffer(sparkBufferSamples),
+		promptHistory:    newRingBuffer(sparkBufferSamples),
+		utilHistory:      map[string]*ringBuffer{},
 	}
 	r.fetchCtx, r.fetchCancel = context.WithCancel(context.Background())
 	cmds := []tea.Cmd{
 		waitForChunk(tail.Chunks()),
 		waitForProc(opts.Process),
 		tickUptime(),
+		// Hardware polling kicks off immediately — no dependency on
+		// the server being ready (gopsutil + NVML are local reads).
+		hwSnapshotCmd(),
+		tickHwPoll(),
 	}
 	// Reattach: the process is already running, so the readyMarker log
 	// line happened before we started tailing and we won't see a
@@ -205,7 +225,9 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 // startLivePoll fires the first /metrics + /slots fetch and schedules
 // the recurring tick. Returns the Cmds the caller should batch.
 // Idempotent: livePollStarted guards against double-arming when both
-// the reattach and ready-marker paths reach this code.
+// the reattach and ready-marker paths reach this code. Hardware
+// polling runs on its own ticker (started in NewRunMode) and is not
+// gated on server readiness.
 func (r *RunMode) startLivePoll() []tea.Cmd {
 	if r.fetcher == nil || r.livePollStarted {
 		return nil
@@ -213,7 +235,6 @@ func (r *RunMode) startLivePoll() []tea.Cmd {
 	r.livePollStarted = true
 	out := []tea.Cmd{
 		fetchSlotsCmd(r.fetchCtx, r.fetcher),
-		hwSnapshotCmd(),
 		tickLivePoll(),
 	}
 	if r.metricsAvailable {
@@ -255,21 +276,16 @@ func (r *RunMode) SetSize(w, h int) {
 }
 
 // chromeHeight returns the total rows reserved above and below the
-// viewport content: top strip (8 with wordmark / 6 without) + live
-// band (liveBandHeight rows when the wide-mode breakpoint is hit, 0
-// otherwise) + log box's 2 borders + 1 footer.
+// viewport content. The 2-state machine: at width ≥ wordmarkMinWidth
+// (wide mode), top strip + live band are both visible; at narrower
+// widths, only the compact identity strip.
 func (r *RunMode) chromeHeight() int {
 	const logBoxBorders = 2
 	const footerHeight = 1
-	top := headerHeight
 	if r.width >= wordmarkMinWidth {
-		top = headerHeightWithWordmark
+		return headerHeightWithWordmark + liveBandHeight + logBoxBorders + footerHeight
 	}
-	band := 0
-	if r.width >= liveBandMinWidth {
-		band = liveBandHeight
-	}
-	return top + band + logBoxBorders + footerHeight
+	return headerHeight + logBoxBorders + footerHeight
 }
 
 // Update routes messages: log chunks, process exit, uptime tick, and key
@@ -357,15 +373,15 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		return r, tickUptime()
 
 	case livePollTickMsg:
-		// Drive the next round of fetches. /metrics is suppressed once
-		// we've learned the server was launched without --metrics.
-		// hwinfo always runs — it has no concept of "disabled".
+		// Drive the next round of server fetches. /metrics is
+		// suppressed once we've learned the server was launched
+		// without --metrics. Hardware polling has its own ticker
+		// (hwTickMsg) — independent of server readiness.
 		if r.fetcher == nil {
 			return r, nil
 		}
 		cmds := []tea.Cmd{
 			fetchSlotsCmd(r.fetchCtx, r.fetcher),
-			hwSnapshotCmd(),
 			tickLivePoll(),
 		}
 		if r.metricsAvailable {
@@ -373,8 +389,27 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		}
 		return r, tea.Batch(cmds...)
 
+	case hwTickMsg:
+		// Independent hardware-poll cadence: starts at RunMode
+		// birth, keeps running until the fetch context is
+		// cancelled (kill/detach). No dependency on server state.
+		return r, tea.Batch(hwSnapshotCmd(), tickHwPoll())
+
 	case hwSnapshotMsg:
 		r.hardware = m.devices
+		// Feed the per-device util history so each device's spark
+		// row shows trend over the last 30s. Key by class+index so
+		// CPU 0 and GPU 0 don't collide; missing devices keep their
+		// existing buffer (rolls off naturally).
+		for _, d := range m.devices {
+			key := deviceKey(d)
+			buf, ok := r.utilHistory[key]
+			if !ok {
+				buf = newRingBuffer(sparkBufferSamples)
+				r.utilHistory[key] = buf
+			}
+			buf.Append(float64(d.UtilPct))
+		}
 		return r, nil
 
 	case metricsFetchedMsg:
@@ -507,12 +542,15 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	return r, cmd
 }
 
-// applyMetrics computes instantaneous tokens/s by differencing the
-// counter values against the previous tick. The first tick after
-// startup has no prev so we publish only the gauges (lifetime
-// averages); subsequent ticks update both. tokensIdle/promptIdle
-// flags let the renderer show "—" instead of "0.0" when nothing
-// happened in the window — easier to read than rolling zeros.
+// applyMetrics computes instantaneous tokens/s + prompt-eval rates
+// by differencing the counter values against the previous tick.
+// First-tick (no prev) publishes only the lifetime gauges. After a
+// tick yields a non-zero delta, the *Seen flags latch true and the
+// rate value persists across subsequent zero-delta ticks (Bug 3) —
+// the user's "majority of the time it shows —" complaint stems
+// from inference being bursty. We feed every tick (including zero)
+// into the sparkline ring buffers so the spark visualizes idle
+// periods (low / blue zone) honestly.
 func (r *RunMode) applyMetrics(m *llamaapi.Metrics) {
 	r.avgTokensPerSec = m.PredictedTokensSecondsAvg
 	r.avgPromptPerSec = m.PromptTokensSecondsAvg
@@ -520,29 +558,44 @@ func (r *RunMode) applyMetrics(m *llamaapi.Metrics) {
 
 	if r.prevMetrics == nil {
 		r.prevMetrics = m
-		// First-tick: no delta to compute. Mark as idle so the
-		// renderer shows "—" rather than a stale zero.
-		r.tokensIdle = true
-		r.promptIdle = true
+		// First tick: no delta available; sparklines stay empty
+		// until the second tick when we have something to compute.
 		return
 	}
 	prev := r.prevMetrics
 	dTokens := m.TokensPredictedTotal - prev.TokensPredictedTotal
 	dTokenSecs := m.TokensPredictedSecondsTotal - prev.TokensPredictedSecondsTotal
-	if dTokens > 0 && dTokenSecs > 0 {
-		r.currentTokensPerSec = dTokens / dTokenSecs
-		r.tokensIdle = false
-	} else {
-		r.tokensIdle = true
+	tickTokensRate := 0.0
+	if dTokens > 0 {
+		// Prefer server-side time (tokens-per-predict-second) when
+		// available — that's the true generation rate. Fall back to
+		// wall-clock when the server hasn't ticked the seconds
+		// counter yet (some llama-server builds only increment it
+		// at slot completion, so a long single response would
+		// otherwise show "—" for its whole duration).
+		if dTokenSecs > 0 {
+			tickTokensRate = dTokens / dTokenSecs
+		} else {
+			tickTokensRate = dTokens / livePollInterval.Seconds()
+		}
+		r.currentTokensPerSec = tickTokensRate
+		r.tokensSeen = true
 	}
+	r.tokensHistory.Append(tickTokensRate)
+
 	dPrompt := m.PromptTokensTotal - prev.PromptTokensTotal
 	dPromptSecs := m.PromptSecondsTotal - prev.PromptSecondsTotal
-	if dPrompt > 0 && dPromptSecs > 0 {
-		r.currentPromptPerSec = dPrompt / dPromptSecs
-		r.promptIdle = false
-	} else {
-		r.promptIdle = true
+	tickPromptRate := 0.0
+	if dPrompt > 0 {
+		if dPromptSecs > 0 {
+			tickPromptRate = dPrompt / dPromptSecs
+		} else {
+			tickPromptRate = dPrompt / livePollInterval.Seconds()
+		}
+		r.currentPromptPerSec = tickPromptRate
+		r.promptSeen = true
 	}
+	r.promptHistory.Append(tickPromptRate)
 	r.prevMetrics = m
 }
 
@@ -828,26 +881,78 @@ func (r *RunMode) View() string {
 	}
 	header := r.renderHeader()
 	footer := r.renderFooter()
+	// Pre-truncate viewport content per-line to viewport.Width so
+	// lipgloss's bordered box (which auto-wraps lines wider than its
+	// .Width()) can't add extra physical rows. Without this, a single
+	// log line wider than the inner box wraps inside the box, the
+	// rendered logFrame grows by k extra rows, and bubbletea's diff
+	// renderer overwrites at the wrong row on the next frame —
+	// manifests as the live band "duplicating, moving upward" with
+	// every log line.
+	logContent := truncateLines(r.viewport.View(), r.viewport.Width)
 	logFrame := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(r.theme.Border).
 		Padding(0, 1).
 		Width(r.width - 2).
-		Render(r.viewport.View())
+		Render(logContent)
 	bg := lipgloss.JoinVertical(lipgloss.Left, header, logFrame, footer)
+	var out string
 	switch {
 	case r.showQuit:
-		return overlayCenter(bg, r.renderQuitPrompt(), r.width, r.height)
+		out = overlayCenter(bg, r.renderQuitPrompt(), r.width, r.height)
 	case r.restartPrompt:
-		return overlayCenter(bg, r.renderRestartPrompt(), r.width, r.height)
+		out = overlayCenter(bg, r.renderRestartPrompt(), r.width, r.height)
 	case r.killPrompt:
-		return overlayCenter(bg, r.renderKillPrompt(), r.width, r.height)
+		out = overlayCenter(bg, r.renderKillPrompt(), r.width, r.height)
 	case r.showHelp:
-		return overlayCenter(bg, r.renderHelp(), r.width, r.height)
+		out = overlayCenter(bg, r.renderHelp(), r.width, r.height)
 	case r.showInfo:
-		return overlayCenter(bg, r.renderInfoOverlay(), r.width, r.height)
+		out = overlayCenter(bg, r.renderInfoOverlay(), r.width, r.height)
+	default:
+		out = bg
 	}
-	return bg
+	return clampViewLines(out, r.width)
+}
+
+// truncateLines hard-truncates every line of `s` to `width` visual
+// columns. ANSI-aware via ansi.Truncate so SGR escape sequences are
+// preserved while content is clipped. Used to prevent lipgloss's
+// bordered styles from auto-wrapping content longer than their
+// declared width — wrapping silently grows the rendered box height,
+// which breaks bubbletea's frame diffing.
+func truncateLines(s string, width int) string {
+	if width <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if lipgloss.Width(line) > width {
+			lines[i] = ansi.Truncate(line, width, "")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// clampViewLines is a defensive truncation pass: every line of the
+// rendered View is hard-truncated to r.width visual columns. Without
+// this, a single line wider than the terminal triggers terminal-side
+// wrap, which adds an extra physical row that bubbletea's diff
+// renderer doesn't account for — the next frame then overwrites at
+// the wrong row, leaving stale text and shifting the panel "up" with
+// every redraw. Pin the line widths here and the framework's frame
+// math always matches reality.
+func clampViewLines(s string, width int) string {
+	if width <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if lipgloss.Width(line) > width {
+			lines[i] = ansi.Truncate(line, width, "")
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (r *RunMode) renderQuitPrompt() string {
@@ -1010,47 +1115,48 @@ const headerHeightWithWordmark = 8
 // info content rows inside this many rows on the right side of the box.
 const wordmarkLines = 4
 
-// liveBandMinWidth is the breakpoint at which the run-mode header
-// gains a second row of side-by-side panels (llama-server live data
-// + Hardware). Below this threshold the band is hidden so the
-// identity strip can keep its full width without truncation noise
-// from the live cells.
-const liveBandMinWidth = 110
-
 // liveBandHeight is the row count consumed by the live-data band: 1
 // top border + liveBandContentRows content rows + 1 bottom border.
-// The server panel always uses 2 content rows; the Hardware panel
-// uses 2 rows per device. We size the band to fit the typical 1 CPU
-// + 1 GPU = 4 content rows, padding the server panel with blank
+// The Hardware panel uses 5 rows per device (name + util spark + RAM
+// bar + Power bar + Temp bar). We size the band to fit the typical
+// 1 CPU + 1 GPU = 10 content rows. The server panel pads with blank
 // trailing rows so both columns align flush-bottom.
 const (
-	liveBandContentRows = 4
+	liveBandContentRows = 10
 	liveBandHeight      = liveBandContentRows + 2
 )
 
-// renderHeader composes the top strip and (when wide enough) the live
-// band into a single header block. The state machine is:
+// Run-mode header layout state machine (DESIGN.md §7.4):
 //
-//	Width        Top strip                  Live band
-//	≥110 (1)     wordmark + 3×2 identity    visible
-//	90–110 (2)   wordmark + 2×3 identity    hidden
-//	<90 (3)      no wordmark, 3×2 identity  hidden
+//	Width        Top strip                     Live band
+//	≥90 (wide)   wordmark + 3×2 identity       visible
+//	<90 (compact) identity only (3×2)          hidden
 //
-// (See DESIGN.md §7.4 for the rationale.) Identity cells are kept in
-// the same source order across states so the user's eye doesn't have
-// to relearn the layout when resizing.
+// Two states. Below 90 cols, the wordmark is dropped to free
+// horizontal room and the live band hides entirely (its content
+// would truncate uselessly at half-half-narrow widths). At 90+ the
+// band renders at full width — content may visually truncate at the
+// right edge between 90 and ~120 cols (band content needs ~110 to
+// fit cleanly), and that truncation is honest signal to the user
+// that they should widen the terminal. No word wrap; no graceful
+// per-column degradation.
+
+// renderHeader composes the top strip and (in wide mode) the live
+// band into a single header block. Two states (DESIGN.md §7.4):
+// width ≥ wordmarkMinWidth → wordmark + 3×2 identity + live band;
+// width < wordmarkMinWidth → identity only, no wordmark, no band.
 func (r *RunMode) renderHeader() string {
 	top := r.renderTopStrip()
-	if r.width < liveBandMinWidth {
+	if r.width < wordmarkMinWidth {
 		return top
 	}
 	band := r.renderLiveBand()
 	return lipgloss.JoinVertical(lipgloss.Left, top, band)
 }
 
-// renderTopStrip renders the bordered top box (identity cells, plus
-// wordmark when the terminal is wide enough). One of three layouts is
-// produced based on r.width — see the table on renderHeader.
+// renderTopStrip renders the bordered top box. Wide mode shows
+// wordmark + 3-cells-per-2-rows identity; compact mode shows just
+// the 3×2 identity, no wordmark.
 func (r *RunMode) renderTopStrip() string {
 	params := canonicalParams(r.preset, r.registry)
 
@@ -1066,6 +1172,20 @@ func (r *RunMode) renderTopStrip() string {
 		statusBadge(r.statusLabel(), r.statusColor()),
 	}
 
+	// Right-pad each cell to its column's max width so the second
+	// row's cells line up directly under the first row's. Without
+	// this, "Preset: default" (col 0) is shorter than "Alias:
+	// alpha", which pushes Uptime out from under Server and the
+	// status badge out from under Context Size.
+	col0w := maxWidth(cells[0], cells[3])
+	col1w := maxWidth(cells[1], cells[4])
+	cells[0] = padRight(cells[0], col0w)
+	cells[3] = padRight(cells[3], col0w)
+	cells[1] = padRight(cells[1], col1w)
+	cells[4] = padRight(cells[4], col1w)
+	// Col 2 doesn't need padding — it's the rightmost cell, nothing
+	// downstream needs to align under it.
+
 	box := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(r.theme.Border).
@@ -1073,7 +1193,7 @@ func (r *RunMode) renderTopStrip() string {
 		Width(r.width - 2)
 
 	if r.width < wordmarkMinWidth {
-		// State 3: 3 cells × 2 rows, no wordmark.
+		// Compact mode: 3 cells × 2 rows, no wordmark.
 		row1 := strings.Join(cells[:3], "   ")
 		row2 := strings.Join(cells[3:], "   ")
 		innerWidth := r.width - 4
@@ -1089,6 +1209,7 @@ func (r *RunMode) renderTopStrip() string {
 		return box.Render(body)
 	}
 
+	// Wide mode: wordmark + 3-cells-per-2-rows identity.
 	wordmark := lipgloss.NewStyle().
 		Foreground(r.theme.Subtle).
 		Render(strings.TrimRight(Wordmark, "\n"))
@@ -1100,22 +1221,10 @@ func (r *RunMode) renderTopStrip() string {
 	if rightWidth < 10 {
 		rightWidth = 10
 	}
-
-	var rightCol string
-	if r.width < liveBandMinWidth {
-		// State 2: 2 cells × 3 rows.
-		row1 := ansi.Truncate(strings.Join(cells[0:2], "   "), rightWidth, "")
-		row2 := ansi.Truncate(strings.Join(cells[2:4], "   "), rightWidth, "")
-		row3 := ansi.Truncate(strings.Join(cells[4:6], "   "), rightWidth, "")
-		// 4 rows total to match wordmarkLines: 3 content + 1 bottom blank.
-		rightCol = strings.Join([]string{row1, row2, row3, ""}, "\n")
-	} else {
-		// State 1: 3 cells × 2 rows.
-		row1 := ansi.Truncate(strings.Join(cells[:3], "   "), rightWidth, "")
-		row2 := ansi.Truncate(strings.Join(cells[3:], "   "), rightWidth, "")
-		// 4 rows total: 1 blank top + row1 + row2 + 1 blank bottom.
-		rightCol = strings.Join([]string{"", row1, row2, ""}, "\n")
-	}
+	row1 := ansi.Truncate(strings.Join(cells[:3], "   "), rightWidth, "")
+	row2 := ansi.Truncate(strings.Join(cells[3:], "   "), rightWidth, "")
+	// 4 rows total: 1 blank top + row1 + row2 + 1 blank bottom.
+	rightCol := strings.Join([]string{"", row1, row2, ""}, "\n")
 
 	twoColumn := lipgloss.JoinHorizontal(lipgloss.Top, wordmark, "  ", rightCol)
 	body := strings.Join([]string{"", twoColumn, ""}, "\n")
@@ -1136,29 +1245,77 @@ func (r *RunMode) renderLiveBand() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 }
 
-// renderServerPanel renders the llama-server live data box. Tokens/s
-// and Prompt eval are formatted into fixed-width slots so column
-// alignment stays stable as values transition (e.g. 99.9 → 100.0).
-// `now` shows "—" while idle (no token delta last tick); avg is the
-// lifetime gauge llama-server already maintains.
+// metricLabelWidth right-pads every live-band metric label
+// ("Util", "RAM", "VRAM", "Power", "Temp", "Tokens", "Prompt") to a
+// uniform column so the bar/spark viz starts at the same column on
+// every row. 5 fits the longest ("Power", "Tokens", "Prompt").
+const metricLabelWidth = 5
+
+// renderServerPanel renders the llama-server live data box (SP3
+// shape, DESIGN.md §7.4): two content rows.
+//
+//	Tokens <spark>   80.0 /  60.0 /s avg   Busy   2/4 slots
+//	Prompt <spark> 2331.0 / 2300.0 /s avg  Queued 1
+//
+// Tokens/Prompt sparklines roll over 40s. Trailing rate cell shows
+// "current / avg /s avg" — current is the per-tick instantaneous,
+// avg is the lifetime gauge llama-server maintains. Both persist
+// last-known after the first non-zero (Bug 3); before any inference,
+// the cell reads "—". When --metrics is off, "n/a".
 func (r *RunMode) renderServerPanel(width int) string {
-	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
-
-	tokensCell := fmtRatePair(r.currentTokensPerSec, r.avgTokensPerSec, r.tokensIdle, r.metricsAvailable)
-	promptCell := fmtRatePair(r.currentPromptPerSec, r.avgPromptPerSec, r.promptIdle, r.metricsAvailable)
-	busyCell := fmtBusy(r.busyCount, r.totalSlots)
-	queuedCell := fmtQueued(r.queuedCount, r.metricsAvailable)
-
-	row1 := subtle.Render("Tokens/s:") + " " + tokensCell + "     " +
-		subtle.Render("Prompt eval:") + " " + promptCell
-	row2 := subtle.Render("Busy:") + " " + busyCell + "                 " +
-		subtle.Render("Queued:") + " " + queuedCell
-	rows := padRows([]string{row1, row2}, liveBandContentRows)
-	return r.renderTitledPanel("llama-server", width, rows)
+	rows := []string{
+		r.renderServerRow("Tokens", r.tokensHistory, r.currentTokensPerSec, r.avgTokensPerSec, r.tokensSeen, r.busyCount, r.totalSlots, true),
+		r.renderServerRow("Prompt", r.promptHistory, r.currentPromptPerSec, r.avgPromptPerSec, r.promptSeen, r.queuedCount, 0, false),
+	}
+	return r.renderTitledPanel("llama-server", width, padRows(rows, liveBandContentRows))
 }
 
-// padRows trims or pads `rows` to exactly n entries. Used to keep
-// the server panel and Hardware panel at the same vertical size so
+// renderServerRow builds one row of the server panel: label + spark
+// + rate cell ("current / avg /s") + secondary scalar (Busy or
+// Queued). When the rate has never been seen, the cell renders as
+// "—" (Bug 3 persistence). When metrics are disabled, "n/a".
+func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, avgRate float64, seen bool, sec1, sec2 int, isBusyRow bool) string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	labelCell := subtle.Render(padRight(label, metricLabelWidth))
+
+	spark := renderSparkline(r.theme, hist.Snapshot(), MetricUtil)
+
+	// Rate cell: "<current> / <avg> tps". Fixed-width slots so
+	// the column stays put as values transition (e.g. 99.9 → 100.0
+	// or 999 → 1000). %6.1f covers up to "9999.9" which is more
+	// than llama-server ever produces.
+	const rateSlot = "%6.1f"
+	var rateCell string
+	switch {
+	case !r.metricsAvailable:
+		rateCell = "          n/a"
+	case !seen:
+		rateCell = "            —"
+	default:
+		rateCell = fmt.Sprintf(rateSlot+" / "+rateSlot+" tps", currentRate, avgRate)
+	}
+
+	var secondary string
+	if isBusyRow {
+		// Busy: "Busy <n>/<total> slots", or n/a when /slots unread.
+		if sec2 > 0 {
+			secondary = subtle.Render("Busy ") + fmt.Sprintf("%d/%d slots", sec1, sec2)
+		} else {
+			secondary = subtle.Render("Busy ") + "n/a"
+		}
+	} else {
+		// Queued: "Queued <n>", or n/a when /metrics disabled.
+		if r.metricsAvailable {
+			secondary = subtle.Render("Queued ") + strconv.Itoa(sec1)
+		} else {
+			secondary = subtle.Render("Queued ") + "n/a"
+		}
+	}
+	return labelCell + " " + spark + " " + rateCell + "   " + secondary
+}
+
+// padRows trims or pads `rows` to exactly n entries. Keeps the
+// server panel and Hardware panel at the same vertical size so
 // JoinHorizontal aligns their bottom borders.
 func padRows(rows []string, n int) []string {
 	if len(rows) >= n {
@@ -1170,114 +1327,204 @@ func padRows(rows []string, n int) []string {
 	return rows
 }
 
-// fmtRatePair renders the "now / avg avg" cell. Slot widths are fixed
-// (5.1 → 7 chars) so transitions don't shift columns. When metrics
-// are unavailable, both halves show fixed-width "  n/a"; when idle,
-// `now` shows "  —" while avg keeps its lifetime value.
-func fmtRatePair(now, avg float64, idle, available bool) string {
-	const slot = "%7.1f"
-	if !available {
-		return "    n/a /     n/a avg"
+// padRight right-pads `s` with spaces to at least `width` visual
+// cols. Used for fixed-width label columns. ANSI-aware via
+// lipgloss.Width — caller's pre-styled label stays correctly sized.
+func padRight(s string, width int) string {
+	w := lipgloss.Width(s)
+	if w >= width {
+		return s
 	}
-	nowStr := fmt.Sprintf(slot, now)
-	if idle {
-		nowStr = "      —"
-	}
-	return nowStr + " / " + fmt.Sprintf(slot, avg) + " avg"
+	return s + strings.Repeat(" ", width-w)
 }
 
-// fmtBusy renders "<busy>/<total> slots". Total is small (typically
-// 1–8); no padding needed beyond the natural width.
-func fmtBusy(busy, total int) string {
-	if total == 0 {
-		return "n/a"
-	}
-	return fmt.Sprintf("%d/%d slots", busy, total)
-}
-
-// fmtQueued renders the queued-requests cell. Falls back to n/a when
-// /metrics is disabled (queued counter only ships via /metrics).
-func fmtQueued(queued int, available bool) string {
-	if !available {
-		return "n/a"
-	}
-	return strconv.Itoa(queued)
-}
-
-// renderHardwarePanel renders the Hardware live data box. Two rows
-// per device: name + values. Always fills exactly liveBandContentRows
-// rows so the panel stays aligned with the server panel — extra
-// devices truncate, fewer pad with blanks. Empty hardware (no CPU
-// info, no NVIDIA GPU) renders an n/a placeholder block.
+// renderHardwarePanel renders the Hardware live data box (T4 shape,
+// DESIGN.md §7.4): 5 rows per device — name row + Util spark + RAM
+// bar + Power bar + Temp bar (with optional Fan trailing). Missing
+// hardware renders an n/a placeholder block in the same shape.
 func (r *RunMode) renderHardwarePanel(width int) string {
 	rows := []string{}
 	if len(r.hardware) == 0 {
 		subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
-		rows = []string{
-			"[0] " + subtle.Render("(no devices reported)"),
-			"    " + subtle.Render("Util  n/a   RAM  n/a    n/a   n/a   n/a"),
-		}
+		rows = []string{"[0] " + subtle.Render("(no devices reported)")}
 	} else {
-		// Stop once we'd exceed the panel's row budget. liveBandContentRows
-		// rows per panel; each device emits 2 rows.
-		maxDevices := liveBandContentRows / 2
+		// 5 rows per device → max devices = liveBandContentRows / 5.
+		maxDevices := liveBandContentRows / hardwareRowsPerDevice
 		for i, d := range r.hardware {
 			if i >= maxDevices {
 				break
 			}
-			rows = append(rows, hardwareDeviceRows(d)...)
+			rows = append(rows, r.hardwareDeviceRows(d)...)
 		}
 	}
-	rows = padRows(rows, liveBandContentRows)
-	return r.renderTitledPanel("Hardware", width, rows)
+	return r.renderTitledPanel("Hardware", width, padRows(rows, liveBandContentRows))
 }
 
-// hardwareDeviceRows formats one device into its two-row block. All
-// numeric slots are fixed-width so column positions stay stable as
-// values transition.
-func hardwareDeviceRows(d hwinfo.Device) []string {
+// hardwareRowsPerDevice is the row budget each Hardware device
+// claims: name + util-spark + memory-bar + power-bar + temp-bar.
+const hardwareRowsPerDevice = 5
+
+// metricValueWidth pads the current-of-max column (between bar and
+// %) to a fixed width. 13 fits the longest natural value:
+// `41.0G / 64.0G`. Right-aligned so units + slash position stay
+// consistent across rows.
+const metricValueWidth = 13
+
+// hardwareDeviceRows formats one device into its 5-row block (T4):
+//
+//	[N] <name>
+//	    Util  <spark>                      XX.X%
+//	    RAM   <bar>      41.0G / 64.0G     XX.X%
+//	    Power <bar>      32W / 125W        XX.X%
+//	    Temp  <bar>      68°C / 100°C      XX.X%   Fan XX%/XXrpm
+//
+// The values column is fixed-width and right-aligned so the slash
+// and unit positions don't drift between rows. Util has no
+// current/max value — its slot renders as blank to keep the % column
+// aligned with the bar rows below it.
+func (r *RunMode) hardwareDeviceRows(d hwinfo.Device) []string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	labelStyle := func(label string) string {
+		return subtle.Render(padRight(label, metricLabelWidth))
+	}
+	blankValue := strings.Repeat(" ", metricValueWidth)
+
+	// Name row — no leading indent so the [N] marker aligns to the
+	// device-name column at the panel's left edge.
 	header := fmt.Sprintf("[%d] %s", d.Index, d.Name)
+
+	// Util spark.
+	utilSamples := []float64{}
+	if buf, ok := r.utilHistory[deviceKey(d)]; ok {
+		utilSamples = buf.Snapshot()
+	}
+	utilSpark := renderSparkline(r.theme, utilSamples, MetricUtil)
+	utilRow := joinMetricCells(labelStyle("Util"), utilSpark, blankValue, fmtTrailingPct(float64(d.UtilPct)))
+
+	// Memory bar + bytes value.
 	memLabel := "RAM"
-	if d.Class == ClassGPU {
+	if d.Class == hwinfo.ClassGPU {
 		memLabel = "VRAM"
 	}
-	utilCell := fmt.Sprintf("Util %3d%%", d.UtilPct)
-	memCell := fmt.Sprintf("%-4s %3d%%", memLabel, d.MemPct)
-	powerCell := naSlot(5)
-	if d.HasPower {
-		powerCell = fmt.Sprintf("%4dW", d.PowerW)
+	memBar := renderBar(r.theme, float64(d.MemPct), zoneFor(MetricMem, float64(d.MemPct)))
+	memValue := blankValue
+	if d.MemTotalBytes > 0 {
+		memValue = padLeft(
+			fmt.Sprintf("%s / %s", formatBytes(d.MemUsedBytes), formatBytes(d.MemTotalBytes)),
+			metricValueWidth)
 	}
-	tempCell := naSlot(5)
-	if d.HasTemp {
-		tempCell = fmt.Sprintf("%3d°C", d.TempC)
+	memRow := joinMetricCells(labelStyle(memLabel), memBar, memValue, fmtTrailingPct(float64(d.MemPct)))
+
+	// Power bar + W value.
+	var powerRow string
+	switch {
+	case d.HasPower && d.PowerMaxW > 0:
+		powerPct := float64(d.PowerW) * 100.0 / float64(d.PowerMaxW)
+		powerBar := renderBar(r.theme, powerPct, zoneFor(MetricPower, powerPct))
+		powerValue := padLeft(fmt.Sprintf("%dW / %dW", d.PowerW, d.PowerMaxW), metricValueWidth)
+		powerRow = joinMetricCells(labelStyle("Power"), powerBar, powerValue, fmtTrailingPct(powerPct))
+	case d.HasPower:
+		// Current draw known but no max → omit bar; show just the
+		// scalar in the value column for column-alignment.
+		powerValue := padLeft(fmt.Sprintf("%dW", d.PowerW), metricValueWidth)
+		powerRow = joinMetricCells(labelStyle("Power"), strings.Repeat(" ", liveBarWidth), powerValue, "")
+	default:
+		// No power reading at all (Bug 6: omit, don't render n/a).
+		powerRow = ""
 	}
-	fanCell := naSlot(7)
-	if d.HasFan {
+
+	// Temp bar + °C value.
+	var tempRow string
+	switch {
+	case d.HasTemp && d.TempMaxC > 0:
+		tempPct := float64(d.TempC) * 100.0 / float64(d.TempMaxC)
+		tempBar := renderBar(r.theme, tempPct, zoneFor(MetricTemp, tempPct))
+		tempValue := padLeft(fmt.Sprintf("%d°C / %d°C", d.TempC, d.TempMaxC), metricValueWidth)
+		tempRow = joinMetricCells(labelStyle("Temp"), tempBar, tempValue, fmtTrailingPct(tempPct))
+	case d.HasTemp:
+		tempValue := padLeft(fmt.Sprintf("%d°C", d.TempC), metricValueWidth)
+		tempRow = joinMetricCells(labelStyle("Temp"), strings.Repeat(" ", liveBarWidth), tempValue, "")
+	default:
+		tempRow = ""
+	}
+	// Fan trails the temp row only when present (Bug 6).
+	if d.HasFan && tempRow != "" {
+		fanText := ""
 		switch d.Class {
-		case ClassGPU:
-			fanCell = fmt.Sprintf("%6d%%", d.FanPct)
+		case hwinfo.ClassGPU:
+			fanText = fmt.Sprintf("%d%%", d.FanPct)
 		default:
-			fanCell = fmt.Sprintf("%4drpm", d.FanRPM)
+			fanText = fmt.Sprintf("%drpm", d.FanRPM)
 		}
+		tempRow += "   " + subtle.Render("Fan ") + fanText
 	}
-	values := fmt.Sprintf("    %s  %s  %s  %s  %s",
-		utilCell, memCell, powerCell, tempCell, fanCell)
-	return []string{header, values}
+
+	return []string{header, utilRow, memRow, powerRow, tempRow}
 }
 
-// ClassGPU is re-exported here so renderHardwarePanel doesn't have
-// to qualify it as hwinfo.ClassGPU at every reference. The single
-// alias keeps the panel-formatting code skim-friendly.
-const ClassGPU = hwinfo.ClassGPU
+// joinMetricCells builds a metric row from its four cell parts:
+// label + viz + value + trailing-%. Cells are joined by fixed
+// separators so the column positions are deterministic across rows.
+//   "    LABEL VIZ    VALUE  PCT"
+// Separator spacing matches the user's "value to the right of bar,
+// to the left of %, all aligned" directive (last grilling round).
+func joinMetricCells(label, viz, value, pct string) string {
+	return "    " + label + " " + viz + "  " + value + "  " + pct
+}
 
-// naSlot returns "n/a" right-padded to width — used so missing
-// fields don't shift columns relative to populated ones.
-func naSlot(width int) string {
-	const v = "n/a"
-	if len(v) >= width {
-		return v
+// padLeft right-aligns `s` to at least `width` visual cols by
+// prepending spaces. ANSI-aware via lipgloss.Width.
+func padLeft(s string, width int) string {
+	w := lipgloss.Width(s)
+	if w >= width {
+		return s
 	}
-	return strings.Repeat(" ", width-len(v)) + v
+	return strings.Repeat(" ", width-w) + s
+}
+
+// maxWidth returns the larger of the two strings' visual widths.
+// Used by the top-strip column-alignment math.
+func maxWidth(a, b string) int {
+	wa := lipgloss.Width(a)
+	wb := lipgloss.Width(b)
+	if wa > wb {
+		return wa
+	}
+	return wb
+}
+
+// fmtTrailingPct formats the right-edge percentage cell that sits
+// after every bar/spark. 5 chars wide ("23.4%" / "100.0%" → 5–6).
+func fmtTrailingPct(pct float64) string {
+	return fmt.Sprintf("%5.1f%%", pct)
+}
+
+// formatBytes turns a byte count into a human-readable size with
+// one decimal: bytes → KiB → MiB → GiB → TiB. Used for memory
+// overlays inside the Hardware panel's RAM/VRAM bars.
+func formatBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%dB", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	suffix := []string{"K", "M", "G", "T", "P"}[exp]
+	return fmt.Sprintf("%.1f%s", float64(b)/float64(div), suffix)
+}
+
+// deviceKey returns a stable map key for per-device history (e.g.
+// the Util sparkline ring buffer). Uses class + index so CPU 0 and
+// GPU 0 don't collide.
+func deviceKey(d hwinfo.Device) string {
+	prefix := "cpu"
+	if d.Class == hwinfo.ClassGPU {
+		prefix = "gpu"
+	}
+	return fmt.Sprintf("%s%d", prefix, d.Index)
 }
 
 // renderTitledPanel draws a hand-rolled rounded box with the title
@@ -1296,15 +1543,25 @@ func (r *RunMode) renderTitledPanel(title string, width int, contentRows []strin
 	// Top border: ╭── <title> ───╮
 	prefix := "── "
 	suffix := " "
+	// Use visual width (lipgloss.Width) — `len()` is byte length and
+	// counts each `─` (3 bytes UTF-8) as 3 instead of 1, leaving the
+	// top border a few visual cols short of `width`. JoinHorizontal
+	// then pads the gap with spaces, which manifests as visible
+	// trailing whitespace inside the panel — and at narrow widths can
+	// push content past the terminal edge and trigger wrap.
+	prefixVis := lipgloss.Width(prefix)
+	suffixVis := lipgloss.Width(suffix)
 	titleVisible := title
-	maxTitleLen := width - 1 - len(prefix) - len(suffix) - 1
+	maxTitleLen := width - 1 - prefixVis - suffixVis - 1
 	if maxTitleLen < 1 {
 		maxTitleLen = 1
 	}
-	if len(titleVisible) > maxTitleLen {
-		titleVisible = titleVisible[:maxTitleLen]
+	titleRunes := []rune(titleVisible)
+	if len(titleRunes) > maxTitleLen {
+		titleVisible = string(titleRunes[:maxTitleLen])
 	}
-	usedCols := 1 + len(prefix) + len(titleVisible) + len(suffix) + 1 // ╭ + "── " + title + " " + ╮
+	titleVis := lipgloss.Width(titleVisible)
+	usedCols := 1 + prefixVis + titleVis + suffixVis + 1 // ╭ + "── " + title + " " + ╮
 	fillerCount := width - usedCols
 	if fillerCount < 0 {
 		fillerCount = 0

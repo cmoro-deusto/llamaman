@@ -84,7 +84,7 @@ Copy the launch command to your clipboard with `c` (Wayland's `wl-copy` first, X
 
 - **OS**: Linux (x86_64 or arm64). macOS and Windows are not currently supported — see the [FAQ](#faq).
 - **Terminal**: any modern terminal emulator with UTF-8 and 24-bit colour. The TUI degrades gracefully below that, but boxes and accents look best with truecolor. `NO_COLOR` is honoured.
-- **Width**: 80 columns minimum; 110+ enables the figlet wordmark in the run-mode header. Narrower terminals collapse to a compact identity line.
+- **Width**: 80 columns minimum; 90+ enables wide mode in run mode (wordmark + live band with `llama-server` and `Hardware` panels). Below 90 cols, run mode collapses to a compact identity strip.
 - **Locale**: a UTF-8 locale (`LANG=*.UTF-8`).
 - **Clipboard (optional)**: `wl-clipboard` (Wayland) or `xclip` (X11) for the `c` "copy launch command" shortcut. Without either, the shortcut becomes a no-op with a brief status flash.
 - **`llama-server`**: a working build of llama.cpp's HTTP server on `PATH` or under one of the standard prefixes (`/usr/local/bin`, `/usr/local/llama.cpp/bin`, `/opt/llama.cpp/bin`). See [Compatibility](#compatibility).
@@ -94,6 +94,8 @@ Copy the launch command to your clipboard with `c` (Wayland's `wl-copy` first, X
 ### Prerequisites
 
 llamaman is a launcher, not a runtime — you also need `llama-server` itself. Build llama.cpp from source ([upstream instructions](https://github.com/ggml-org/llama.cpp#building)) or install a packaged build for your distro. Once the binary is reachable, llamaman's first-run flow autodetects it.
+
+The run-mode `Hardware` panel shows live NVIDIA GPU stats via NVML — install `nvidia-utils` (or your distro's equivalent providing `libnvidia-ml.so`) to see GPU rows. The binary works without it; the panel just shows CPU rows only.
 
 ### Pre-built binary (GitHub Releases)
 
@@ -280,18 +282,31 @@ Row order follows the configuration file's `models[]` order; reorder via `Shift+
 ### Run mode
 
 ```
-┌─ <alias> / <preset> ──────── <host>:<port>  <status>  uptime hh:mm:ss ──┐
-│ <condensed param summary: model basename, ngl, ctx, fa, ctk/ctv>        │
-│ <boolean flags>    [warning: unknown flag "..."]                        │
-└─────────────────────────────────────────────────────────────────────────┘
-┌─ output (tailing) ─── /: search  G: end  g: top ────────────────────────┐
-│ ...                                                                     │
-│ main: HTTP server is listening, hostname: 127.0.0.1, port: 9080         │
-│ ▼                                                                       │
-└─ q: quit  k: kill  r: restart  c: copy  /: search  ↑/↓: scroll ─────────┘
+╭─────────────────────────────────────────────────────────────────────────────╮
+│ ▜  ▜                                                                        │
+│ ▐  ▐  ▝▀▖ ...   Alias: alpha    Server: 8994     Context Size: 8192         │
+│ ▐  ▐  ▞▀▌ ...   Preset: fast    Uptime: 00:01:30   [READY]                  │
+│  ▘  ▘ ▝▀▘ ...                                                               │
+╰─────────────────────────────────────────────────────────────────────────────╯
+╭── llama-server ──────────────────────╮╭── Hardware ────────────────────────╮
+│ Tokens <spark>   80.0 /  60.0 tps   ││ [0] AMD Ryzen 9 7950X              │
+│ Prompt <spark> 2331.0 /2300.0 tps   ││     Util  <spark>          23.4%   │
+│                          Busy  2/4  ││     RAM   <bar> 41.0G/64.0G  65.2% │
+│                          Queued 1   ││     Power <bar> 32W / 125W   25.6% │
+│                                     ││     Temp  <bar> 68°C/100°C   68.0% │
+│                                     ││ [0] NVIDIA GeForce RTX 4090        │
+│                                     ││     Util  <spark>          89.0%   │
+│                                     ││     VRAM  <bar> 21.1G/24.0G  87.9% │
+│                                     ││     Power <bar> 320W/450W    71.1% │
+│                                     ││     Temp  <bar> 72°C/83°C    86.7% Fan 65% │
+╰─────────────────────────────────────╯╰────────────────────────────────────╯
+╭─ output (tailing) ──────────────────────────────────────────────────────────╮
+│ main: HTTP server is listening, hostname: 127.0.0.1, port: 9080             │
+│ ▼                                                                           │
+╰─ q: quit  k: kill  r: restart  c: copy  i: info  /: search  ?: help ────────╯
 ```
 
-The top box shows the wordmark on terminals ≥110 cols, plus alias / `llama-server` version / context size / uptime / `[Metrics]` on row 1, and preset / temp / top_p / top_k / min_p on row 2. `[Metrics]` lights up black-on-green when the active preset has `metrics: true`. Param keys are looked up canonically — a preset using the short form `c` for `ctx-size` still surfaces the value. The log area below sits in its own bordered frame and fills the remaining screen.
+Two-section header (DESIGN.md §7.4): a **top strip** with identity cells (alias, `llama-server` version, ctx size, preset, uptime, status badge) and a **live band** of two side-by-side panels — `llama-server` (tokens/s + prompt-eval rates as 40-cell sparklines, busy/queued counts) and `Hardware` (per-CPU + per-GPU rows with util sparkline, RAM/VRAM bar with bytes, Power bar, Temp bar; values colored across blue/green/yellow/red zones). Press `i` for an overlay with the model + every preset param in source order. Two-state width machine: at <90 cols, the wordmark and live band drop and only the identity strip remains. Hardware polling starts at run-mode birth — values appear immediately, no need to wait for the server to be ready.
 
 Status state machine: `starting → ready → exited|error`. `ready` is detected by matching `server is listening` in stdout. Auto-scroll is locked to the bottom unless you've scrolled up; when scrolled up, a `↓ N new lines` indicator appears, and `G` returns to live tail.
 
@@ -301,6 +316,7 @@ Status state machine: `starting → ready → exited|error`. `ready` is detected
 | `k` | Direct kill (with `(y)es / (n)o` confirm). Stops the server, removes log + session, returns to main; llamaman stays open |
 | `r` | Restart the server (confirm if status is `ready`) |
 | `c` | Copy the full launch command to clipboard (`wl-copy` → `xclip` fallback) |
+| `i` | Show model & preset detail overlay — alias + Source/HF + every preset param in source order. Any key closes |
 | `/` | Search forward — matches highlighted live (reverse video) as you type, persist after `Enter` for `n`/`N` |
 | `Esc` | Clear the active search and remove highlights |
 | `n` / `N` | Next / previous match |

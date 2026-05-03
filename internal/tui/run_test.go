@@ -25,8 +25,11 @@ import (
 // poke r.buf directly and exercise the search/render/refresh paths.
 func newTestRunMode(initial string) *RunMode {
 	r := &RunMode{
-		viewport:    viewport.New(80, 24),
-		searchInput: textinput.New(),
+		viewport:      viewport.New(80, 24),
+		searchInput:   textinput.New(),
+		tokensHistory: newRingBuffer(sparkBufferSamples),
+		promptHistory: newRingBuffer(sparkBufferSamples),
+		utilHistory:   map[string]*ringBuffer{},
 	}
 	r.buf.WriteString(initial)
 	return r
@@ -232,15 +235,18 @@ func TestRunModeSearchEnterRefreshesHighlights(t *testing.T) {
 // other code paths don't trip over zero values.
 func newHeaderTestRunMode(model config.Model, preset config.Preset, reg flags.Registry, width int) *RunMode {
 	r := &RunMode{
-		cfg:         &config.Config{Globals: config.Globals{Host: "127.0.0.1", Port: 9080}},
-		model:       model,
-		preset:      preset,
-		registry:    reg,
-		proc:        &server.Process{Started: time.Now().Add(-90 * time.Second)},
-		viewport:    viewport.New(width, 24),
-		searchInput: textinput.New(),
-		theme:       CurrentTheme(),
-		status:      StatusReady,
+		cfg:           &config.Config{Globals: config.Globals{Host: "127.0.0.1", Port: 9080}},
+		model:         model,
+		preset:        preset,
+		registry:      reg,
+		proc:          &server.Process{Started: time.Now().Add(-90 * time.Second)},
+		viewport:      viewport.New(width, 24),
+		searchInput:   textinput.New(),
+		theme:         CurrentTheme(),
+		status:        StatusReady,
+		tokensHistory: newRingBuffer(sparkBufferSamples),
+		promptHistory: newRingBuffer(sparkBufferSamples),
+		utilHistory:   map[string]*ringBuffer{},
 	}
 	r.SetSize(width, 30)
 	return r
@@ -278,16 +284,13 @@ func TestCanonicalParamsKeepsUnknownKeys(t *testing.T) {
 // runHeaderWideWidth is the terminal width used by tests that need
 // the right-column identity content to fit alongside the 31-col
 // smblock wordmark without truncation, and that exercise the full
-// State 1 layout (top strip + live band).
+// wide-mode layout (top strip + live band).
 const runHeaderWideWidth = 200
 
-// runHeaderState2Width is in the 90–110 band: wordmark visible, live
-// band hidden, identity arranged 2 cells × 3 rows.
-const runHeaderState2Width = 100
-
-// runHeaderState3Width is below the wordmark breakpoint: no wordmark,
-// no live band, identity arranged 3 cells × 2 rows.
-const runHeaderState3Width = 60
+// runHeaderCompactWidth is below the wordmark breakpoint: compact
+// mode (no wordmark, no live band), identity arranged 3 cells × 2
+// rows.
+const runHeaderCompactWidth = 60
 
 func TestRunHeaderHasFixedHeightAtWideWidth(t *testing.T) {
 	r := newHeaderTestRunMode(
@@ -303,23 +306,6 @@ func TestRunHeaderHasFixedHeightAtWideWidth(t *testing.T) {
 	}
 }
 
-// TestRunHeaderHasFixedHeightAtState2Width covers the 90–110 band:
-// wordmark visible, live band hidden, identity arranged 2 cells × 3
-// rows.
-func TestRunHeaderHasFixedHeightAtState2Width(t *testing.T) {
-	r := newHeaderTestRunMode(
-		config.Model{Alias: "alpha"},
-		config.Preset{Name: "default"},
-		nil, runHeaderState2Width,
-	)
-	header := r.renderHeader()
-	got := strings.Count(header, "\n") + 1
-	if got != headerHeightWithWordmark {
-		t.Errorf("State 2 header height = %d, want %d (top only, no band)\nheader:\n%s",
-			got, headerHeightWithWordmark, header)
-	}
-}
-
 func TestRunHeaderHasFixedHeightAtNarrowWidth(t *testing.T) {
 	r := newHeaderTestRunMode(
 		config.Model{Alias: "alpha-with-a-deliberately-long-name"},
@@ -327,20 +313,68 @@ func TestRunHeaderHasFixedHeightAtNarrowWidth(t *testing.T) {
 			{Key: "temp", Value: json.Number("0.7")},
 			{Key: "top-p", Value: json.Number("0.9")},
 		}},
-		nil, runHeaderState3Width,
+		nil, runHeaderCompactWidth,
 	)
 	header := r.renderHeader()
 	got := strings.Count(header, "\n") + 1
 	if got != headerHeight {
-		t.Errorf("State 3 header height = %d, want %d (truncation should keep height fixed)\nheader:\n%s",
+		t.Errorf("compact header height = %d, want %d (truncation should keep height fixed)\nheader:\n%s",
 			got, headerHeight, header)
 	}
 }
 
-// TestRunHeaderStateMachine exercises the three width breakpoints in
+// TestTopStripColumnsAlign pins the alignment of identity cells:
+// row 2's "Preset" sits under row 1's "Alias", "Uptime" sits under
+// "Server", and the status badge sits under "Context Size".
+// Without per-column padding the cells drift because labels and
+// values have different widths.
+func TestTopStripColumnsAlign(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.serverVersion = "8994 (aab68217b)"
+	plain := stripANSI(r.renderTopStrip())
+	lines := strings.Split(plain, "\n")
+
+	findCol := func(needle string) int {
+		for _, line := range lines {
+			runes := []rune(line)
+			lineStr := string(runes)
+			if idx := strings.Index(lineStr, needle); idx >= 0 {
+				// Convert byte index to rune index (visual col).
+				prefixRunes := []rune(lineStr[:idx])
+				return len(prefixRunes)
+			}
+		}
+		return -1
+	}
+	pairs := []struct {
+		row1, row2 string
+	}{
+		{"Alias:", "Preset:"},
+		{"Server:", "Uptime:"},
+		{"Context Size:", "[READY]"},
+	}
+	for _, p := range pairs {
+		c1 := findCol(p.row1)
+		c2 := findCol(p.row2)
+		if c1 < 0 || c2 < 0 {
+			t.Errorf("could not find %q or %q in:\n%s", p.row1, p.row2, plain)
+			continue
+		}
+		if c1 != c2 {
+			t.Errorf("%q (col %d) does not align with %q (col %d) in:\n%s",
+				p.row1, c1, p.row2, c2, plain)
+		}
+	}
+}
+
+// TestRunHeaderStateMachine exercises the two width breakpoints in
 // one place and pins the cell count + live-band visibility at each.
-// 6 identity cells get redistributed across all three states; the
-// content stays the same, only the row/column shape changes.
+// 6 identity cells stay in the same source order across modes; only
+// the wordmark and live band toggle.
 func TestRunHeaderStateMachine(t *testing.T) {
 	model := config.Model{Alias: "alpha"}
 	preset := config.Preset{Name: "default"}
@@ -352,9 +386,8 @@ func TestRunHeaderStateMachine(t *testing.T) {
 		wantWM   bool
 		wantH    int
 	}{
-		{"state1-wide", runHeaderWideWidth, true, true, headerHeightWithWordmark + liveBandHeight},
-		{"state2-mid", runHeaderState2Width, false, true, headerHeightWithWordmark},
-		{"state3-narrow", runHeaderState3Width, false, false, headerHeight},
+		{"wide", runHeaderWideWidth, true, true, headerHeightWithWordmark + liveBandHeight},
+		{"compact", runHeaderCompactWidth, false, false, headerHeight},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -490,14 +523,17 @@ func TestRunHeaderShowsNAWhenServerVersionMissing(t *testing.T) {
 func TestRunModeLogFrameRendersWithBorder(t *testing.T) {
 	cfg := &config.Config{Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
 	r := &RunMode{
-		cfg:         cfg,
-		model:       config.Model{Alias: "alpha"},
-		preset:      config.Preset{Name: "default"},
-		proc:        &server.Process{Started: time.Now()},
-		viewport:    viewport.New(0, 0),
-		searchInput: textinput.New(),
-		theme:       CurrentTheme(),
-		status:      StatusReady,
+		cfg:           cfg,
+		model:         config.Model{Alias: "alpha"},
+		preset:        config.Preset{Name: "default"},
+		proc:          &server.Process{Started: time.Now()},
+		viewport:      viewport.New(0, 0),
+		searchInput:   textinput.New(),
+		theme:         CurrentTheme(),
+		status:        StatusReady,
+		tokensHistory: newRingBuffer(sparkBufferSamples),
+		promptHistory: newRingBuffer(sparkBufferSamples),
+		utilHistory:   map[string]*ringBuffer{},
 	}
 	r.SetSize(runHeaderWideWidth, 30)
 	r.buf.WriteString("hello\n")
@@ -555,13 +591,15 @@ func TestHardwarePanelRendersCPUOnly(t *testing.T) {
 		{
 			Class: hwinfo.ClassCPU, Index: 0, Name: "AMD Ryzen 9 7950X",
 			UtilPct: 23, MemPct: 65,
-			PowerW: 120, HasPower: true,
-			TempC: 68, HasTemp: true,
+			MemUsedBytes: 41 * 1024 * 1024 * 1024, MemTotalBytes: 64 * 1024 * 1024 * 1024,
+			PowerW: 120, PowerMaxW: 125, HasPower: true,
+			TempC: 68, TempMaxC: 100, HasTemp: true,
 			FanRPM: 1200, HasFan: true,
 		},
 	}
-	plain := stripANSI(r.renderHardwarePanel(80))
-	for _, want := range []string{"[0]", "AMD Ryzen 9 7950X", "Util  23%", "RAM   65%", "120W", "68°C", "1200rpm"} {
+	plain := stripANSI(r.renderHardwarePanel(120))
+	// T4 layout: name row, then 4 metric rows (Util / RAM / Power / Temp).
+	for _, want := range []string{"[0]", "AMD Ryzen 9 7950X", "Util", "RAM", "Power", "Temp", "120W", "125W", "68°C", "100°C", "1200rpm"} {
 		if !strings.Contains(plain, want) {
 			t.Errorf("Hardware panel missing %q\nout:\n%s", want, plain)
 		}
@@ -578,17 +616,22 @@ func TestHardwarePanelRendersCPUAndGPU(t *testing.T) {
 		nil, runHeaderWideWidth,
 	)
 	r.hardware = []hwinfo.Device{
-		{Class: hwinfo.ClassCPU, Index: 0, Name: "AMD Ryzen 9 7950X", UtilPct: 23, MemPct: 65},
+		{
+			Class: hwinfo.ClassCPU, Index: 0, Name: "AMD Ryzen 9 7950X",
+			UtilPct: 23, MemPct: 65,
+			MemUsedBytes: 41 * 1024 * 1024 * 1024, MemTotalBytes: 64 * 1024 * 1024 * 1024,
+		},
 		{
 			Class: hwinfo.ClassGPU, Index: 0, Name: "NVIDIA GeForce RTX 4090",
 			UtilPct: 89, MemPct: 78,
-			PowerW: 320, HasPower: true,
-			TempC: 72, HasTemp: true,
+			MemUsedBytes: 18 * 1024 * 1024 * 1024, MemTotalBytes: 24 * 1024 * 1024 * 1024,
+			PowerW: 320, PowerMaxW: 450, HasPower: true,
+			TempC: 72, TempMaxC: 83, HasTemp: true,
 			FanPct: 65, HasFan: true,
 		},
 	}
-	plain := stripANSI(r.renderHardwarePanel(80))
-	for _, want := range []string{"AMD Ryzen 9 7950X", "NVIDIA GeForce RTX 4090", "RAM", "VRAM", "320W", "72°C", "65%"} {
+	plain := stripANSI(r.renderHardwarePanel(120))
+	for _, want := range []string{"AMD Ryzen 9 7950X", "NVIDIA GeForce RTX 4090", "RAM", "VRAM", "320W", "450W", "72°C", "Fan "} {
 		if !strings.Contains(plain, want) {
 			t.Errorf("Hardware panel missing %q\nout:\n%s", want, plain)
 		}
@@ -599,21 +642,210 @@ func TestHardwarePanelRendersCPUAndGPU(t *testing.T) {
 	}
 }
 
-// TestHardwarePanelMissingFieldsRenderNA pins the n/a slot rendering
-// for devices with Has*=false. Power, temp, and fan must show n/a in
-// fixed-width slots so the column shape matches a populated device.
-func TestHardwarePanelMissingFieldsRenderNA(t *testing.T) {
+// TestHardwarePanelOmitsFanWhenUnavailable covers Bug 6: when a CPU
+// reports no fan reading, the Fan slot is omitted entirely (not
+// rendered as "n/a"). The Temp row's tail just stops after the bar.
+func TestHardwarePanelOmitsFanWhenUnavailable(t *testing.T) {
 	r := newHeaderTestRunMode(
 		config.Model{Alias: "alpha"},
 		config.Preset{Name: "default"},
 		nil, runHeaderWideWidth,
 	)
 	r.hardware = []hwinfo.Device{
-		{Class: hwinfo.ClassCPU, Index: 0, Name: "Generic CPU", UtilPct: 5, MemPct: 12},
+		{
+			Class: hwinfo.ClassCPU, Index: 0, Name: "Generic CPU",
+			UtilPct: 5, MemPct: 12,
+			MemUsedBytes: 8 * 1024 * 1024 * 1024, MemTotalBytes: 64 * 1024 * 1024 * 1024,
+			TempC: 50, TempMaxC: 100, HasTemp: true,
+			// no fan, no power
+		},
 	}
-	plain := stripANSI(r.renderHardwarePanel(80))
-	if strings.Count(plain, "n/a") < 3 {
-		t.Errorf("expected at least 3 n/a slots (power+temp+fan); out:\n%s", plain)
+	plain := stripANSI(r.renderHardwarePanel(120))
+	if strings.Contains(plain, "n/a") {
+		t.Errorf("missing fields must be omitted, not rendered as n/a; out:\n%s", plain)
+	}
+	if strings.Contains(plain, "Fan ") {
+		t.Errorf("Fan slot must be entirely omitted when no fan reading; out:\n%s", plain)
+	}
+}
+
+// TestViewHeightStableAndNoLineExceedsWidth is the regression for
+// the "live band duplicates and shifts upward as new log lines
+// arrive" bug. The user reported it after the T4 redesign; root
+// cause was that long log lines wrapped inside the bordered
+// log-frame box (lipgloss auto-wraps when Width is set), growing
+// the rendered chrome past r.height. Bubble Tea then overwrote
+// frames at the wrong row, leaving the band visually drifting up
+// each tick. We now pre-truncate viewport content to
+// viewport.Width (so lipgloss can't wrap it) and clamp every View
+// line to r.width as a defensive last pass.
+//
+// The test feeds long log lines into the buffer and asserts
+// (1) View() always returns exactly r.height lines and (2) no
+// individual line exceeds r.width visual cols.
+func TestViewHeightStableAndNoLineExceedsWidth(t *testing.T) {
+	cfg := &config.Config{Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
+	r := &RunMode{
+		cfg:           cfg,
+		model:         config.Model{Alias: "alpha"},
+		preset:        config.Preset{Name: "default"},
+		proc:          &server.Process{Started: time.Now()},
+		viewport:      viewport.New(0, 0),
+		searchInput:   textinput.New(),
+		theme:         CurrentTheme(),
+		status:        StatusReady,
+		tokensHistory: newRingBuffer(sparkBufferSamples),
+		promptHistory: newRingBuffer(sparkBufferSamples),
+		utilHistory:   map[string]*ringBuffer{},
+	}
+	const W, H = 200, 40
+	r.SetSize(W, H)
+	// Hardware populated with both CPU + GPU.
+	r.hardware = []hwinfo.Device{
+		{
+			Class: hwinfo.ClassCPU, Index: 0, Name: "AMD Ryzen 9 7950X",
+			UtilPct: 23, MemPct: 65,
+			MemUsedBytes: 41 * 1024 * 1024 * 1024, MemTotalBytes: 64 * 1024 * 1024 * 1024,
+			PowerW: 32, PowerMaxW: 125, HasPower: true,
+			TempC: 68, TempMaxC: 100, HasTemp: true,
+		},
+		{
+			Class: hwinfo.ClassGPU, Index: 0, Name: "NVIDIA GeForce RTX 4090",
+			UtilPct: 89, MemPct: 78,
+			MemUsedBytes: 18 * 1024 * 1024 * 1024, MemTotalBytes: 24 * 1024 * 1024 * 1024,
+			PowerW: 320, PowerMaxW: 450, HasPower: true,
+			TempC: 72, TempMaxC: 83, HasTemp: true,
+			FanPct: 65, HasFan: true,
+		},
+	}
+	for i := 0; i < 10; i++ {
+		// Log lines of varying lengths, including one wider than
+		// viewport.Width to trigger the historical wrap bug.
+		r.buf.WriteString("main: " + strings.Repeat("x", 250) + " #" + string(rune('a'+i%26)) + "\n")
+		r.viewport.SetContent(r.buf.String())
+		r.viewport.GotoBottom()
+		v := r.View()
+		gotH := strings.Count(v, "\n") + 1
+		if gotH != H {
+			t.Fatalf("after log chunk %d: View height = %d, want %d (panel-duplication regression)",
+				i, gotH, H)
+		}
+		for j, line := range strings.Split(v, "\n") {
+			if w := len([]rune(stripANSI(line))); w > W {
+				t.Fatalf("after log chunk %d, line %d width = %d > terminal W = %d (will trigger terminal wrap)",
+					i, j, w, W)
+			}
+		}
+	}
+}
+
+// TestHardwarePanelAlignsBarsAndSparks pins the alignment guarantee:
+// every metric row's viz column starts at the same character index.
+// Regression catch — the user explicitly called out misaligned bars
+// in the previous design.
+func TestHardwarePanelAlignsBarsAndSparks(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.hardware = []hwinfo.Device{
+		{
+			Class: hwinfo.ClassCPU, Index: 0, Name: "CPU",
+			UtilPct: 23, MemPct: 65,
+			MemUsedBytes: 41 * 1024 * 1024 * 1024, MemTotalBytes: 64 * 1024 * 1024 * 1024,
+			PowerW: 32, PowerMaxW: 125, HasPower: true,
+			TempC: 68, TempMaxC: 100, HasTemp: true,
+		},
+	}
+	plain := stripANSI(r.renderHardwarePanel(120))
+	lines := strings.Split(plain, "\n")
+	// Find the Util / RAM / Power / Temp lines. Each one's viz column
+	// (the bar/spark) should start at the same byte offset relative
+	// to the metric label (which is right-padded to the same width).
+	want := map[string]int{}
+	for _, label := range []string{"Util ", "RAM  ", "Power", "Temp "} {
+		for _, line := range lines {
+			if idx := strings.Index(line, label); idx >= 0 {
+				want[label] = idx
+				break
+			}
+		}
+	}
+	if len(want) != 4 {
+		t.Fatalf("could not find all metric labels in rendered panel:\n%s", plain)
+	}
+	first := -1
+	for _, idx := range want {
+		if first == -1 {
+			first = idx
+			continue
+		}
+		if idx != first {
+			t.Errorf("metric labels not column-aligned: got positions %v in panel:\n%s", want, plain)
+			break
+		}
+	}
+}
+
+// TestHardwarePanelValueColumnAligned pins the new "values to the
+// right of the bar, to the left of the %" requirement (last
+// grilling round). The current/max value (RAM bytes, Power W, Temp
+// °C) sits in a fixed-width column; the trailing % must therefore
+// land at the same column on every metric row.
+func TestHardwarePanelValueColumnAligned(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.hardware = []hwinfo.Device{
+		{
+			Class: hwinfo.ClassCPU, Index: 0, Name: "CPU",
+			UtilPct: 23, MemPct: 65,
+			MemUsedBytes: 41 * 1024 * 1024 * 1024, MemTotalBytes: 64 * 1024 * 1024 * 1024,
+			PowerW: 32, PowerMaxW: 125, HasPower: true,
+			TempC: 68, TempMaxC: 100, HasTemp: true,
+		},
+	}
+	plain := stripANSI(r.renderHardwarePanel(120))
+	lines := strings.Split(plain, "\n")
+	// Each metric row should end (sans trailing whitespace) with the
+	// trailing %. Find the % position on each row in VISUAL columns
+	// (not bytes — ▆ is 3 bytes UTF-8 but 1 visual col) and assert
+	// they line up.
+	pctVisualCol := map[string]int{}
+	for _, label := range []string{"Util ", "RAM  ", "Power", "Temp "} {
+		for _, line := range lines {
+			if !strings.Contains(line, label) {
+				continue
+			}
+			runes := []rune(line)
+			lastPct := -1
+			for i, r := range runes {
+				if r == '%' {
+					lastPct = i
+				}
+			}
+			if lastPct >= 0 {
+				pctVisualCol[label] = lastPct
+			}
+			break
+		}
+	}
+	if len(pctVisualCol) != 4 {
+		t.Fatalf("could not find percent positions on all rows: %v\npanel:\n%s", pctVisualCol, plain)
+	}
+	first := -1
+	for _, p := range pctVisualCol {
+		if first == -1 {
+			first = p
+			continue
+		}
+		if p != first {
+			t.Errorf("percent column not aligned across metric rows: %v\npanel:\n%s", pctVisualCol, plain)
+			break
+		}
 	}
 }
 
@@ -652,8 +884,9 @@ func TestHwSnapshotMsgUpdatesField(t *testing.T) {
 
 // TestApplyMetricsFirstTickPublishesGaugesOnly pins the rule that the
 // first /metrics fetch after startup has no prev to delta against, so
-// we publish only the lifetime gauges and mark the now-cell as idle
-// (renderer will show "—" instead of a stale 0.0).
+// we publish only the lifetime gauges. tokensSeen stays false until
+// the second tick yields a non-zero delta — the renderer shows "—"
+// in that window (Bug 3 semantics).
 func TestApplyMetricsFirstTickPublishesGaugesOnly(t *testing.T) {
 	r := newHeaderTestRunMode(
 		config.Model{Alias: "alpha"},
@@ -668,8 +901,8 @@ func TestApplyMetricsFirstTickPublishesGaugesOnly(t *testing.T) {
 		PromptTokensSecondsAvg:      2300,
 		RequestsDeferred:            3,
 	})
-	if !r.tokensIdle {
-		t.Error("tokensIdle = false after first tick; want true (no delta yet)")
+	if r.tokensSeen {
+		t.Error("tokensSeen = true after first tick; want false (no delta yet)")
 	}
 	if r.avgTokensPerSec != 60 {
 		t.Errorf("avgTokensPerSec = %v, want 60", r.avgTokensPerSec)
@@ -701,15 +934,19 @@ func TestApplyMetricsSecondTickComputesRate(t *testing.T) {
 	if r.currentTokensPerSec != 80 {
 		t.Errorf("currentTokensPerSec = %v, want 80", r.currentTokensPerSec)
 	}
-	if r.tokensIdle {
-		t.Error("tokensIdle = true; want false after non-zero delta")
+	if !r.tokensSeen {
+		t.Error("tokensSeen = false after non-zero delta; want true (latched)")
 	}
 }
 
-// TestApplyMetricsIdleTickShowsDash covers the "no work happened in
-// the last second" branch: the delta computes to zero, so we mark the
-// now-cell idle so the renderer shows "—" rather than 0.0.
-func TestApplyMetricsIdleTickShowsDash(t *testing.T) {
+// TestApplyMetricsFallsBackToWallClockWhenSecondsCounterStuck pins
+// the responsiveness fix: some llama-server builds only increment
+// `tokens_predicted_seconds_total` at slot completion. During a long
+// generation, dTokens grows but dTokenSecs stays zero — and our
+// rate stayed `—` until the response finished. The fallback uses
+// wall-clock seconds (the 1s poll interval) so a value appears the
+// next tick even when the seconds counter is lagging.
+func TestApplyMetricsFallsBackToWallClockWhenSecondsCounterStuck(t *testing.T) {
 	r := newHeaderTestRunMode(
 		config.Model{Alias: "alpha"},
 		config.Preset{Name: "default"},
@@ -717,14 +954,46 @@ func TestApplyMetricsIdleTickShowsDash(t *testing.T) {
 	)
 	r.metricsAvailable = true
 	r.applyMetrics(&llamaapi.Metrics{TokensPredictedTotal: 100, TokensPredictedSecondsTotal: 2})
-	r.applyMetrics(&llamaapi.Metrics{TokensPredictedTotal: 100, TokensPredictedSecondsTotal: 2})
-	if !r.tokensIdle {
-		t.Error("tokensIdle = false on zero-delta tick; want true")
+	// Tokens advance by 50 but the seconds counter is stuck at 2
+	// (mid-generation, slot hasn't completed yet).
+	r.applyMetrics(&llamaapi.Metrics{TokensPredictedTotal: 150, TokensPredictedSecondsTotal: 2})
+	if !r.tokensSeen {
+		t.Error("tokensSeen = false; want true via wall-clock fallback")
+	}
+	// Wall-clock fallback: 50 tokens / 1s poll interval = 50 tokens/s.
+	if r.currentTokensPerSec != 50 {
+		t.Errorf("currentTokensPerSec = %v, want 50 (wall-clock)", r.currentTokensPerSec)
 	}
 }
 
-// TestServerPanelRendersLiveData covers the integration: simulated
-// live values surface in the rendered panel.
+// TestApplyMetricsPersistsLastValueOnZeroDelta covers Bug 3: once
+// tokensSeen latches true, subsequent zero-delta ticks must NOT
+// reset currentTokensPerSec to 0. The user wants the last-known
+// value to persist so the trailing column doesn't flash to "—" in
+// between bursts.
+func TestApplyMetricsPersistsLastValueOnZeroDelta(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	r.applyMetrics(&llamaapi.Metrics{TokensPredictedTotal: 100, TokensPredictedSecondsTotal: 2})
+	r.applyMetrics(&llamaapi.Metrics{TokensPredictedTotal: 180, TokensPredictedSecondsTotal: 3})
+	// Now feed a zero-delta tick (server idle for one second).
+	r.applyMetrics(&llamaapi.Metrics{TokensPredictedTotal: 180, TokensPredictedSecondsTotal: 3})
+	if !r.tokensSeen {
+		t.Error("tokensSeen got cleared on zero-delta tick; want it to remain latched")
+	}
+	if r.currentTokensPerSec != 80 {
+		t.Errorf("currentTokensPerSec = %v on zero-delta tick; want 80 (persist last-known)", r.currentTokensPerSec)
+	}
+}
+
+// TestServerPanelRendersLiveData covers the SP3 layout: rate cell
+// (current / avg /s) shows after the spark, secondary scalar
+// (Busy/Queued) at the row end. With tokensSeen + currentTokensPerSec
+// + avgTokensPerSec set, the panel reads both rate values cleanly.
 func TestServerPanelRendersLiveData(t *testing.T) {
 	r := newHeaderTestRunMode(
 		config.Model{Alias: "alpha"},
@@ -734,11 +1003,14 @@ func TestServerPanelRendersLiveData(t *testing.T) {
 	r.metricsAvailable = true
 	r.currentTokensPerSec = 80
 	r.avgTokensPerSec = 60
+	r.tokensSeen = true
 	r.busyCount = 2
 	r.totalSlots = 4
 	r.queuedCount = 1
-	plain := stripANSI(r.renderServerPanel(80))
-	for _, want := range []string{"Tokens/s:", "80.0", "60.0", "Busy:", "2/4 slots", "Queued:", "1"} {
+	// Width 140 fits the 40-cell spark + label + rate cell + busy
+	// scalar without truncating any content.
+	plain := stripANSI(r.renderServerPanel(140))
+	for _, want := range []string{"Tokens", "80.0", "60.0", "Busy", "2/4 slots", "Queued", "1"} {
 		if !strings.Contains(plain, want) {
 			t.Errorf("server panel missing %q\nout:\n%s", want, plain)
 		}
@@ -746,8 +1018,7 @@ func TestServerPanelRendersLiveData(t *testing.T) {
 }
 
 // TestServerPanelMetricsDisabledShowsNA covers the --metrics-off
-// fallback: tokens/s and queued read n/a; busy still works (it comes
-// from /slots).
+// fallback: rate value reads n/a; busy still works from /slots.
 func TestServerPanelMetricsDisabledShowsNA(t *testing.T) {
 	r := newHeaderTestRunMode(
 		config.Model{Alias: "alpha"},
@@ -757,7 +1028,7 @@ func TestServerPanelMetricsDisabledShowsNA(t *testing.T) {
 	r.metricsAvailable = false
 	r.busyCount = 1
 	r.totalSlots = 2
-	plain := stripANSI(r.renderServerPanel(80))
+	plain := stripANSI(r.renderServerPanel(140))
 	if !strings.Contains(plain, "n/a") {
 		t.Errorf("expected n/a for tokens/s when --metrics off; out:\n%s", plain)
 	}
@@ -766,23 +1037,20 @@ func TestServerPanelMetricsDisabledShowsNA(t *testing.T) {
 	}
 }
 
-// TestServerPanelIdleShowsDash verifies the idle marker for the now
-// half of the rate cell while keeping avg visible.
-func TestServerPanelIdleShowsDash(t *testing.T) {
+// TestServerPanelShowsDashBeforeFirstNonZero covers Bug 3 init: when
+// metrics are available but we've never observed a non-zero rate,
+// the trailing rate cell shows "—".
+func TestServerPanelShowsDashBeforeFirstNonZero(t *testing.T) {
 	r := newHeaderTestRunMode(
 		config.Model{Alias: "alpha"},
 		config.Preset{Name: "default"},
 		nil, runHeaderWideWidth,
 	)
 	r.metricsAvailable = true
-	r.tokensIdle = true
-	r.avgTokensPerSec = 60
-	plain := stripANSI(r.renderServerPanel(80))
+	// tokensSeen and promptSeen both default false.
+	plain := stripANSI(r.renderServerPanel(140))
 	if !strings.Contains(plain, "—") {
-		t.Errorf("expected idle dash in rate cell; out:\n%s", plain)
-	}
-	if !strings.Contains(plain, "60.0") {
-		t.Errorf("avg should still render alongside idle now; out:\n%s", plain)
+		t.Errorf("expected dash before first non-zero rate; out:\n%s", plain)
 	}
 }
 

@@ -17,21 +17,30 @@ const (
 
 // Device is one row in the Hardware panel. The Has* booleans signal
 // whether the corresponding numeric field is meaningful — many
-// systems don't expose power or fan, so we render `n/a` cleanly
-// instead of misleading zeros.
+// systems don't expose power or fan, so callers can render `n/a` (or
+// omit the slot, per Bug 6) cleanly instead of misleading zeros.
+//
+// MemUsedBytes/MemTotalBytes/PowerMaxW/TempMaxC carry the absolute
+// denominators the run-mode header needs for bar rendering: bytes
+// overlaid inside the memory bar, current/max W in the power bar,
+// current/throttle °C in the temp bar.
 type Device struct {
-	Class    Class
-	Index    int
-	Name     string
-	UtilPct  int // 0–100
-	MemPct   int // 0–100
-	PowerW   int
-	TempC    int
-	FanRPM   int
-	FanPct   int
-	HasPower bool
-	HasTemp  bool
-	HasFan   bool
+	Class         Class
+	Index         int
+	Name          string
+	UtilPct       int    // 0–100
+	MemPct        int    // 0–100
+	MemUsedBytes  uint64 // 0 when unavailable; pair with MemTotalBytes
+	MemTotalBytes uint64
+	PowerW        int
+	PowerMaxW     int // CPU TDP from RAPL / GPU power-management limit; 0 if unavailable
+	TempC         int
+	TempMaxC      int // throttle ceiling; 0 if unavailable
+	FanRPM        int
+	FanPct        int
+	HasPower      bool
+	HasTemp       bool
+	HasFan        bool
 }
 
 // Snapshot returns the current state of every available CPU socket

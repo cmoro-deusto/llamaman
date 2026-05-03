@@ -77,7 +77,7 @@ type Metrics struct {
 	TokensPredictedTotal        float64 // llamacpp:tokens_predicted_total
 	TokensPredictedSecondsTotal float64 // llamacpp:tokens_predicted_seconds_total
 	PromptTokensTotal           float64 // llamacpp:prompt_tokens_total
-	PromptSecondsTotal          float64 // llamacpp:prompt_tokens_seconds_total
+	PromptSecondsTotal          float64 // llamacpp:prompt_seconds_total (note: NO "tokens_" infix; llama-server names it asymmetrically vs. tokens_predicted_seconds_total)
 
 	// Gauges (lifetime running averages reported by the server).
 	PredictedTokensSecondsAvg float64 // llamacpp:predicted_tokens_seconds
@@ -164,7 +164,10 @@ func parseMetrics(body interface{ Read([]byte) (int, error) }) (*Metrics, error)
 			m.TokensPredictedSecondsTotal = v
 		case "llamacpp:prompt_tokens_total":
 			m.PromptTokensTotal = v
-		case "llamacpp:prompt_tokens_seconds_total":
+		case "llamacpp:prompt_seconds_total", "llamacpp:prompt_tokens_seconds_total":
+			// llama-server emits `prompt_seconds_total`. The
+			// `prompt_tokens_seconds_total` alias is kept as a
+			// fallback for older builds that may have used it.
 			m.PromptSecondsTotal = v
 		case "llamacpp:predicted_tokens_seconds":
 			m.PredictedTokensSecondsAvg = v

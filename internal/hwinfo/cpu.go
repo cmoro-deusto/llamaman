@@ -50,22 +50,28 @@ func cpuSnapshot() []Device {
 		utilOverall = int(utilPcts[0] + 0.5)
 	}
 	memPct := 0
+	var memUsed, memTotal uint64
 	if vm, err := mem.VirtualMemory(); err == nil {
 		memPct = int(vm.UsedPercent + 0.5)
+		memUsed = vm.Used
+		memTotal = vm.Total
 	}
 
-	temps := readCPUTemps()
+	temps, tempMax := readCPUTemps()
 	powerW, hasPower := readCPUPower()
+	powerMaxW := readCPUPowerMax()
 	fanRPM, hasFan := readFirstFan()
 
 	out := make([]Device, 0, len(sockets))
 	for i, info := range sockets {
 		d := Device{
-			Class:   ClassCPU,
-			Index:   i,
-			Name:    cleanupCPUName(info.ModelName),
-			UtilPct: utilOverall,
-			MemPct:  memPct,
+			Class:         ClassCPU,
+			Index:         i,
+			Name:          cleanupCPUName(info.ModelName),
+			UtilPct:       utilOverall,
+			MemPct:        memPct,
+			MemUsedBytes:  memUsed,
+			MemTotalBytes: memTotal,
 		}
 		// Per-socket temp if we found one; falls back to package temp.
 		if t, ok := temps[i]; ok {
@@ -75,10 +81,14 @@ func cpuSnapshot() []Device {
 			d.TempC = t
 			d.HasTemp = true
 		}
+		if d.HasTemp {
+			d.TempMaxC = tempMax
+		}
 		// Power/fan are system-wide; attach only to socket 0 to avoid
 		// double-counting in multi-socket displays.
 		if i == 0 && hasPower {
 			d.PowerW = powerW
+			d.PowerMaxW = powerMaxW
 			d.HasPower = true
 		}
 		if i == 0 && hasFan {
@@ -104,14 +114,16 @@ func cleanupCPUName(name string) string {
 }
 
 // readCPUTemps walks gopsutil's sensor list looking for the canonical
-// per-socket package temp keys. Returns a map of socket index → °C.
-// We tolerate any of the common SensorKey patterns: coretemp's
+// per-socket package temp keys. Returns a map of socket index → °C
+// plus the throttle ceiling (Tjmax / Critical, 0 if not exposed). We
+// tolerate any of the common SensorKey patterns: coretemp's
 // "Package id N", k10temp/zenpower's "Tctl"/"Tdie", or plain "package".
-func readCPUTemps() map[int]int {
+func readCPUTemps() (map[int]int, int) {
 	out := map[int]int{}
+	tempMax := 0
 	sensors, err := host.SensorsTemperatures()
 	if err != nil {
-		return out
+		return out, 0
 	}
 	for _, s := range sensors {
 		key := strings.ToLower(s.SensorKey)
@@ -119,9 +131,15 @@ func readCPUTemps() map[int]int {
 		case strings.HasPrefix(key, "package id "):
 			idx, _ := strconv.Atoi(strings.TrimPrefix(key, "package id "))
 			out[idx] = int(s.Temperature + 0.5)
+			if s.Critical > 0 && tempMax == 0 {
+				tempMax = int(s.Critical + 0.5)
+			}
 		case key == "tctl" || key == "tdie" || key == "k10temp":
 			if _, ok := out[0]; !ok {
 				out[0] = int(s.Temperature + 0.5)
+				if s.Critical > 0 && tempMax == 0 {
+					tempMax = int(s.Critical + 0.5)
+				}
 			}
 		}
 	}
@@ -131,11 +149,31 @@ func readCPUTemps() map[int]int {
 			key := strings.ToLower(s.SensorKey)
 			if strings.Contains(key, "core") || strings.Contains(key, "cpu") {
 				out[0] = int(s.Temperature + 0.5)
+				if s.Critical > 0 && tempMax == 0 {
+					tempMax = int(s.Critical + 0.5)
+				}
 				break
 			}
 		}
 	}
-	return out
+	return out, tempMax
+}
+
+// readCPUPowerMax returns the configured long-term TDP from RAPL
+// constraint_0_max_power_uw (microwatts → watts). Returns 0 when the
+// path is missing or the value is zero/invalid (e.g. older kernels
+// or virtualized hosts where powercap is absent).
+func readCPUPowerMax() int {
+	const path = "/sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw"
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	v, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil || v == 0 {
+		return 0
+	}
+	return int(v / 1_000_000)
 }
 
 // rapEnergySnap captures the (energy_uj, time) pair from the

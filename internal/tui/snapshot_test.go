@@ -313,7 +313,7 @@ func TestSnapshotRunMode(t *testing.T) {
 	}
 
 	out := stripANSI(root.View())
-	for _, want := range []string{"Alias:", "alpha", "Preset:", "default", "[READY]"} {
+	for _, want := range []string{"Alias:", "alpha", "Preset:", "default", "[READY]", "llama-server", "Hardware", "Tokens", "Prompt"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("run mode output missing %q\nout:\n%s", want, out)
 		}

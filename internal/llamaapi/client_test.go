@@ -115,7 +115,7 @@ llamacpp:tokens_predicted_total 1234.0
 # TYPE llamacpp:tokens_predicted_seconds_total counter
 llamacpp:tokens_predicted_seconds_total 12.5
 llamacpp:prompt_tokens_total 4321
-llamacpp:prompt_tokens_seconds_total 1.5
+llamacpp:prompt_seconds_total 1.5
 llamacpp:predicted_tokens_seconds 60.5
 llamacpp:prompt_tokens_seconds 2300
 llamacpp:requests_processing 2
@@ -179,6 +179,31 @@ func TestFetchMetrics5xx(t *testing.T) {
 
 	if _, err := clientFor(t, srv).FetchMetrics(context.Background()); err == nil {
 		t.Fatal("expected error for 5xx")
+	}
+}
+
+// TestFetchMetricsAcceptsLegacyPromptSecondsAlias guards the
+// `prompt_tokens_seconds_total` legacy name in case any older
+// llama-server build (or fork) emits that variant. Current
+// llama-server uses `prompt_seconds_total` (no `tokens_` infix).
+func TestFetchMetricsAcceptsLegacyPromptSecondsAlias(t *testing.T) {
+	body := `llamacpp:prompt_tokens_total 100
+llamacpp:prompt_tokens_seconds_total 0.5
+`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	got, err := clientFor(t, srv).FetchMetrics(context.Background())
+	if err != nil {
+		t.Fatalf("FetchMetrics: %v", err)
+	}
+	if got.PromptTokensTotal != 100 {
+		t.Errorf("PromptTokensTotal = %v, want 100", got.PromptTokensTotal)
+	}
+	if got.PromptSecondsTotal != 0.5 {
+		t.Errorf("PromptSecondsTotal = %v, want 0.5 (legacy alias should map)", got.PromptSecondsTotal)
 	}
 }
 
