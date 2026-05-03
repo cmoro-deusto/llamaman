@@ -344,21 +344,126 @@ There is no separate "selection mode" — model selection is the main mode.
 ### 7.4 Run mode
 
 ```
-┌─ <alias> / <preset> ──────── <host>:<port>  <status>  uptime hh:mm:ss ──┐
-│ <condensed param summary: model basename, ngl, ctx, fa, ctk/ctv>        │
-│ <boolean flags>    [warning: unknown flag "..."]                        │
-└─────────────────────────────────────────────────────────────────────────┘
-┌─ output (tailing) ─── /: search  G: end  g: top ────────────────────────┐
-│ ...                                                                     │
-│ main: HTTP server is listening, hostname: 127.0.0.1, port: 9080         │
-│ ▼                                                                       │
-└─ q: quit  k: kill  r: restart  c: copy  /: search  ↑/↓: scroll ─────────┘
+╭──────────────────────────────────────────────────────────────────────────────────╮
+│ ▜  ▜                                                                             │
+│ ▐  ▐  ▝▀▖ ...   Alias: alpha    Server: 8994     Context Size: 8192              │
+│ ▐  ▐  ▞▀▌ ...   Preset: fast    Uptime: 00:01:30   [READY]                       │
+│  ▘  ▘ ▝▀▘ ...                                                                    │
+╰──────────────────────────────────────────────────────────────────────────────────╯
+╭── llama-server ──────────────────────╮╭── Hardware ──────────────────────────────╮
+│ Tokens ▁▂▃▅▇█▆▄▃ 80.0 /s  Busy 2/4   ││ [0] AMD Ryzen 9 7950X                    │
+│ Prompt ▁▂▃▅▇█▆▄▃ 2331 /s  Queued 1   ││     Util  ▁▂▃▅▇█▆▄▃▂ 23.4%               │
+│                                      ││     RAM   ▆▆▆ 41.0G / 64.0G ▆▆▆▆ 65.0%   │
+│                                      ││     Power ▆▆▆ 32W / 125W ▆▆▆▆ 25.6%      │
+│                                      ││     Temp  ▆▆▆ 68°C / 100°C ▆▆▆▆ 68.0%    │
+│                                      ││ [0] NVIDIA GeForce RTX 4090              │
+│                                      ││     Util  ▆▇████████▇▆▅ 89.0%            │
+│                                      ││     VRAM  ▆▆▆ 21.1G / 24.0G ▆▆▆▆ 87.9%   │
+│                                      ││     Power ▆▆▆ 320W / 450W ▆▆▆▆ 71.1%     │
+│                                      ││     Temp  ▆▆▆ 72°C / 83°C ▆▆▆▆ 86.7% Fan65%│
+╰──────────────────────────────────────╯╰──────────────────────────────────────────╯
+╭─ output (tailing) ───────────────────────────────────────────────────────────────╮
+│ main: HTTP server is listening, hostname: 127.0.0.1, port: 9080                  │
+│ …                                                                                │
+╰─ q: quit  k: kill  r: restart  c: copy  i: info  /: search  ?: help ─────────────╯
 ```
 
-Top pane: 3 lines.
-- Line 1: identity, host:port, status indicator (● starting / ● ready / ● error / ● exited), uptime.
-- Line 2: condensed param summary.
-- Line 3: boolean flags + warnings.
+The header is a two-section block: a **top strip** carrying the
+identity cells (alias, server version, ctx size, preset, uptime,
+status badge) and a **live band** of two side-by-side panels
+showing real-time data from the running server. Both sections are
+fixed-shape — there is no graceful stacking and no word wrap;
+content past the right edge truncates if the terminal is too narrow,
+on the assumption that the user will widen the window.
+
+**Layout state machine** (two states):
+
+| Width | Layout |
+|---|---|
+| **≥ wordmarkMinWidth (90 cols)** | wordmark + 3 identity cells × 2 rows + live band |
+| **< 90** | identity only (3 cells × 2 rows), no wordmark, no band |
+
+The wide mode renders at full layout width regardless of terminal
+size — the right edge of the live band will visually truncate
+between roughly 90–115 cols where its content needs ~110 to fit
+cleanly. That truncation is honest signal: widen the terminal.
+
+**Wordmark**: the smblock-letterspaced llamaman wordmark
+(31 cols × 4 rows) embedded from `internal/tui/wordmark.txt`.
+
+**Identity cells**: `Alias`, `Server` (parsed `llama-server
+--version`), `Context Size` (`/props.n_ctx` if available, else
+preset value, else `n/a`), `Preset`, `Uptime`, status badge. The
+badge is bracketed, bold, themed-foreground only — `[STARTING]` /
+`[READY]` / `[EXITED]` / `[ERROR]` — no background fill, so it
+works in both dark and light themes.
+
+**Live band — `llama-server` panel** (SP3 shape): two content rows,
+each with a 20-cell sparkline of the rate's last 30 seconds, the
+current rate, and a secondary scalar.
+
+```
+Tokens <30s sparkline> 80.0 /s    Busy   2/4 slots
+Prompt <30s sparkline> 2331 /s    Queued 1
+```
+
+Tokens/s and Prompt eval rates are sampled across two `/metrics`
+ticks (Δtokens / Δseconds) and persisted: once the first non-zero
+rate is observed, the trailing value latches and persists across
+subsequent zero-delta ticks (so users see `80.0 /s` between
+inference bursts instead of resetting to `—`). Before the first
+non-zero rate, the trailing reads `—`. When `/metrics` is disabled
+(preset doesn't set `metrics: true`), the rate reads `n/a`; busy
+keeps working from `/slots`.
+
+**Live band — `Hardware` panel** (T4 shape): five rows per device.
+
+```
+[N] <device name>
+    Util  <30s sparkline>     XX.X%
+    RAM   <bar with bytes overlay>     XX.X%
+    Power <bar with W overlay>         XX.X%
+    Temp  <bar with °C overlay>        XX.X%   [Fan XXrpm | Fan XX%]
+```
+
+CPU socket(s) come first (deduped by gopsutil `PhysicalID`), then
+NVIDIA GPUs via NVML. Memory bar bytes overlay (M2): used/total
+GiB centered inside the 20-cell bar; bar chars (`▆`, BC2) sit on
+either side, color tells filled apart from empty. Power bar uses
+CPU TDP from RAPL `constraint_0_max_power_uw` or NVML
+`DeviceGetPowerManagementLimit`. Temp bar uses the throttle
+ceiling (NVML SLOWDOWN threshold for GPU, gopsutil sensor
+`Critical` for CPU). Fan slot is omitted entirely when not
+available — never rendered as `n/a` (Bug 6 resolution).
+
+**Color zones** (4-tier, threshold cuts in `internal/tui/zones.go`):
+
+| Metric | Blue (idle) | Green (ok) | Yellow (warn) | Red (danger) |
+|---|---|---|---|---|
+| Util | 0–30% | 30–60% | 60–85% | >85% |
+| RAM/VRAM | 0–30% | 30–70% | 70–90% | >90% |
+| Power (% of max) | 0–30% | 30–70% | 70–90% | >90% |
+| Temp (% of throttle) | 0–30% | 30–70% | 70–85% | >85% |
+
+Color paints the bar fill chars + the trailing percentage value
+(C1). Bytes-overlay text inside the bar stays neutral for legibility.
+Sparklines are S1 (per-cell): each cell is colored by its own value's
+zone, so a usage spike from blue → green → red shows mid-line.
+Palette: dark-theme `StatusIdle = #7DC4E4`, light-theme `#3A7AAB`;
+`StatusReady/Start/Err` reuse the run-mode status badge palette.
+
+**Sparkline cadence**: each rate or device-util history is a 30-tick
+ring buffer. Render compresses 30 samples into 20 visual cells via
+integer-stride bucketing (alternating 1- and 2-sample buckets), so
+older samples compress tighter than recent ones — newest live
+transients on the right edge stay sharp.
+
+**Polling**: a single 1s ticker (`livePollTickMsg`) drives the band.
+Each tick fans out `/metrics` + `/slots` HTTP fetches plus a
+`hwinfo.Snapshot()` call in parallel goroutines; results land as
+their respective `tea.Msg` types. The fetch context is shared with
+the `r.fetchCancel` cancellation, so detach/kill stops the cadence
+immediately.
 
 Status state machine: `starting → ready → exited|error`.
 - `ready` is detected by matching the substring `server is listening` in stdout.
@@ -371,6 +476,7 @@ Status state machine: `starting → ready → exited|error`.
 | `k` | Direct kill shortcut (with `(y)es / (n)o` confirm). On confirm: stops llama-server, removes the log + session record, and returns to the main screen — llamaman itself stays open. |
 | `r` | Restart server (confirm if currently ready) |
 | `c` | Copy full launch command to clipboard (`wl-copy`, fallback `xclip`, fallback flash status) |
+| `i` | Show model & preset detail overlay (alias + Source/HF + preset name + every preset param in source order). Any key closes. |
 | `/` | Search forward in output. Live highlights (reverse video + bold) wrap matches as you type; `Enter` applies, `Esc` cancels. |
 | `n` / `N` | Next / previous search match |
 | `Esc` | Clear active search and remove highlights (no-op when nothing is applied) |
@@ -378,6 +484,14 @@ Status state machine: `starting → ready → exited|error`.
 | `↑` / `↓` / wheel | Scroll one line. `j`/`k` are **not** bound here so `k` is free for the kill shortcut. |
 | `Space` / `b` | Page down / up |
 | `?` | Help overlay |
+
+**Info overlay** (`i`): centered modal showing the model alias +
+`Source: <path>` or `HF: <id>` (whichever the model declares) +
+preset name + every preset param in source order. The header
+deliberately hides per-param detail (sampling knobs, etc.) so this
+overlay is the on-demand read for the full configuration.
+Implementation iterates `r.preset.Params` directly — see CLAUDE.md
+*"Param order matters end-to-end"*.
 
 Auto-scroll: locked to bottom unless the user has scrolled up. When scrolled up, a `↓ N new lines` indicator appears; `G` returns to live tail.
 

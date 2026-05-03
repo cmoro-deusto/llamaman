@@ -9,16 +9,24 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
         with:
           go-version: stable
+      - name: Install C toolchain (CGO + arm64 cross)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends gcc gcc-aarch64-linux-gnu
       - name: Build (binaries needed by integration tests)
         run: |
           mkdir -p bin
           go build -o bin/llamaman .
-          go build -o bin/llamaman-fakeserver ./cmd/llamaman-fakeserver
+          # fakeserver is pure-Go; build with CGO off to keep it
+          # static and avoid pulling libc into the test fixture.
+          CGO_ENABLED=0 go build -o bin/llamaman-fakeserver ./cmd/llamaman-fakeserver
       - name: Vet
         run: go vet ./...
       - name: Test

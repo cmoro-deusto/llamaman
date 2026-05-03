@@ -11,7 +11,8 @@ builds:
     main: .
     binary: llamaman
     env:
-      - CGO_ENABLED=0
+      - CGO_ENABLED=1
+      - "{{- if eq .Arch \"amd64\" }}CC=gcc{{- else if eq .Arch \"arm64\" }}CC=aarch64-linux-gnu-gcc{{- end }}"
     goos:
       - linux
     goarch:
@@ -83,6 +84,7 @@ aurs:
       - "wl-clipboard: clipboard support on Wayland"
       - "xclip: clipboard support on X11"
       - "llama.cpp: provides the llama-server binary"
+      - "nvidia-utils: live NVIDIA GPU stats in the run-mode Hardware panel"
     commit_msg_template: "Update to {{ .Tag }}"
     package: |-
       install -Dm755 "./llamaman" "${pkgdir}/usr/bin/llamaman"

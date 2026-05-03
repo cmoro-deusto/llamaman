@@ -1,7 +1,10 @@
 package tui
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +15,8 @@ import (
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
+	"github.com/cmoro-deusto/llamaman/internal/hwinfo"
+	"github.com/cmoro-deusto/llamaman/internal/llamaapi"
 	"github.com/cmoro-deusto/llamaman/internal/server"
 )
 
@@ -20,8 +25,11 @@ import (
 // poke r.buf directly and exercise the search/render/refresh paths.
 func newTestRunMode(initial string) *RunMode {
 	r := &RunMode{
-		viewport:    viewport.New(80, 24),
-		searchInput: textinput.New(),
+		viewport:      viewport.New(80, 24),
+		searchInput:   textinput.New(),
+		tokensHistory: newRingBuffer(sparkBufferSamples),
+		promptHistory: newRingBuffer(sparkBufferSamples),
+		utilHistory:   map[string]*ringBuffer{},
 	}
 	r.buf.WriteString(initial)
 	return r
@@ -227,15 +235,18 @@ func TestRunModeSearchEnterRefreshesHighlights(t *testing.T) {
 // other code paths don't trip over zero values.
 func newHeaderTestRunMode(model config.Model, preset config.Preset, reg flags.Registry, width int) *RunMode {
 	r := &RunMode{
-		cfg:         &config.Config{Globals: config.Globals{Host: "127.0.0.1", Port: 9080}},
-		model:       model,
-		preset:      preset,
-		registry:    reg,
-		proc:        &server.Process{Started: time.Now().Add(-90 * time.Second)},
-		viewport:    viewport.New(width, 24),
-		searchInput: textinput.New(),
-		theme:       CurrentTheme(),
-		status:      StatusReady,
+		cfg:           &config.Config{Globals: config.Globals{Host: "127.0.0.1", Port: 9080}},
+		model:         model,
+		preset:        preset,
+		registry:      reg,
+		proc:          &server.Process{Started: time.Now().Add(-90 * time.Second)},
+		viewport:      viewport.New(width, 24),
+		searchInput:   textinput.New(),
+		theme:         CurrentTheme(),
+		status:        StatusReady,
+		tokensHistory: newRingBuffer(sparkBufferSamples),
+		promptHistory: newRingBuffer(sparkBufferSamples),
+		utilHistory:   map[string]*ringBuffer{},
 	}
 	r.SetSize(width, 30)
 	return r
@@ -271,11 +282,15 @@ func TestCanonicalParamsKeepsUnknownKeys(t *testing.T) {
 }
 
 // runHeaderWideWidth is the terminal width used by tests that need
-// the right-column info (`[Metrics]`, `Min_P:`, etc.) to fit
-// alongside the 72-col wordmark without truncation. Below ~170 cols
-// the right column gets clipped — that degradation is intentional
-// for real users at narrow widths but breaks substring assertions.
+// the right-column identity content to fit alongside the 31-col
+// smblock wordmark without truncation, and that exercise the full
+// wide-mode layout (top strip + live band).
 const runHeaderWideWidth = 200
+
+// runHeaderCompactWidth is below the wordmark breakpoint: compact
+// mode (no wordmark, no live band), identity arranged 3 cells × 2
+// rows.
+const runHeaderCompactWidth = 60
 
 func TestRunHeaderHasFixedHeightAtWideWidth(t *testing.T) {
 	r := newHeaderTestRunMode(
@@ -285,8 +300,9 @@ func TestRunHeaderHasFixedHeightAtWideWidth(t *testing.T) {
 	)
 	header := r.renderHeader()
 	got := strings.Count(header, "\n") + 1
-	if got != headerHeightWithWordmark {
-		t.Errorf("header height = %d, want %d\nheader:\n%s", got, headerHeightWithWordmark, header)
+	want := headerHeightWithWordmark + liveBandHeight
+	if got != want {
+		t.Errorf("State 1 header height = %d, want %d (top + band)\nheader:\n%s", got, want, header)
 	}
 }
 
@@ -297,18 +313,139 @@ func TestRunHeaderHasFixedHeightAtNarrowWidth(t *testing.T) {
 			{Key: "temp", Value: json.Number("0.7")},
 			{Key: "top-p", Value: json.Number("0.9")},
 		}},
-		nil, 60,
+		nil, runHeaderCompactWidth,
 	)
 	header := r.renderHeader()
 	got := strings.Count(header, "\n") + 1
 	if got != headerHeight {
-		t.Errorf("narrow header height = %d, want %d (truncation should keep height fixed)\nheader:\n%s",
+		t.Errorf("compact header height = %d, want %d (truncation should keep height fixed)\nheader:\n%s",
 			got, headerHeight, header)
+	}
+}
+
+// TestTopStripColumnsAlign pins the alignment of identity cells:
+// row 2's "Preset" sits under row 1's "Alias", "Uptime" sits under
+// "Server", and the status badge sits under "Context Size".
+// Without per-column padding the cells drift because labels and
+// values have different widths.
+func TestTopStripColumnsAlign(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.serverVersion = "8994 (aab68217b)"
+	plain := stripANSI(r.renderTopStrip())
+	lines := strings.Split(plain, "\n")
+
+	findCol := func(needle string) int {
+		for _, line := range lines {
+			runes := []rune(line)
+			lineStr := string(runes)
+			if idx := strings.Index(lineStr, needle); idx >= 0 {
+				// Convert byte index to rune index (visual col).
+				prefixRunes := []rune(lineStr[:idx])
+				return len(prefixRunes)
+			}
+		}
+		return -1
+	}
+	pairs := []struct {
+		row1, row2 string
+	}{
+		{"Alias:", "Preset:"},
+		{"Server:", "Uptime:"},
+		{"Context Size:", "[READY]"},
+	}
+	for _, p := range pairs {
+		c1 := findCol(p.row1)
+		c2 := findCol(p.row2)
+		if c1 < 0 || c2 < 0 {
+			t.Errorf("could not find %q or %q in:\n%s", p.row1, p.row2, plain)
+			continue
+		}
+		if c1 != c2 {
+			t.Errorf("%q (col %d) does not align with %q (col %d) in:\n%s",
+				p.row1, c1, p.row2, c2, plain)
+		}
+	}
+}
+
+// TestRunHeaderStateMachine exercises the two width breakpoints in
+// one place and pins the cell count + live-band visibility at each.
+// 6 identity cells stay in the same source order across modes; only
+// the wordmark and live band toggle.
+func TestRunHeaderStateMachine(t *testing.T) {
+	model := config.Model{Alias: "alpha"}
+	preset := config.Preset{Name: "default"}
+
+	cases := []struct {
+		name     string
+		width    int
+		wantBand bool
+		wantWM   bool
+		wantH    int
+	}{
+		{"wide", runHeaderWideWidth, true, true, headerHeightWithWordmark + liveBandHeight},
+		{"compact", runHeaderCompactWidth, false, false, headerHeight},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newHeaderTestRunMode(model, preset, nil, tc.width)
+			header := r.renderHeader()
+			plain := stripANSI(header)
+			gotH := strings.Count(header, "\n") + 1
+			if gotH != tc.wantH {
+				t.Errorf("height = %d, want %d\nheader:\n%s", gotH, tc.wantH, header)
+			}
+			gotWM := strings.Contains(plain, "▐  ▐")
+			if gotWM != tc.wantWM {
+				t.Errorf("wordmark visible = %v, want %v\nheader:\n%s", gotWM, tc.wantWM, plain)
+			}
+			gotBand := strings.Contains(plain, "llama-server") && strings.Contains(plain, "Hardware")
+			if gotBand != tc.wantBand {
+				t.Errorf("live band visible = %v, want %v\nheader:\n%s", gotBand, tc.wantBand, plain)
+			}
+			// Identity cells must be present in every state.
+			for _, want := range []string{"alpha", "default", "Context Size", "[READY]"} {
+				if !strings.Contains(plain, want) {
+					t.Errorf("identity cell %q missing\nheader:\n%s", want, plain)
+				}
+			}
+		})
+	}
+}
+
+// TestRunHeaderDropsSamplingParamsAndMetricsIndicator pins Phase 0:
+// the four sampling-param cells (Temp/Top_P/Top_K/Min_P) and the
+// [Metrics] indicator have been removed from the header. They live in
+// the `i` info overlay (Phase 1) and the live-band server panel
+// (Phase 3) respectively.
+func TestRunHeaderDropsSamplingParamsAndMetricsIndicator(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "temp", Value: json.Number("0.7")},
+			{Key: "top-p", Value: json.Number("0.9")},
+			{Key: "top-k", Value: json.Number("40")},
+			{Key: "min-p", Value: json.Number("0.05")},
+			{Key: "metrics", Value: true},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	plain := stripANSI(r.renderHeader())
+	for _, dont := range []string{"Temp:", "Top_P:", "Top_K:", "Min_P:", "[Metrics]"} {
+		if strings.Contains(plain, dont) {
+			t.Errorf("header should not contain %q after Phase 0; got:\n%s", dont, plain)
+		}
 	}
 }
 
 // TestRunHeaderShowsWordmarkAtWideWidth confirms the wordmark is
 // rendered on the left side of the box when the terminal can fit it.
+// The smblock wordmark uses several distinct quad-pixel block glyphs;
+// we look for a substring stable across the asset (the doubled "▐  ▐"
+// L-pair on row 2 is unambiguous).
 func TestRunHeaderShowsWordmarkAtWideWidth(t *testing.T) {
 	r := newHeaderTestRunMode(
 		config.Model{Alias: "alpha"},
@@ -316,9 +453,7 @@ func TestRunHeaderShowsWordmarkAtWideWidth(t *testing.T) {
 		nil, runHeaderWideWidth,
 	)
 	plain := stripANSI(r.renderHeader())
-	// Each wordmark line starts with the same character cells; check
-	// for a substring stable across font/asset edits.
-	if !strings.Contains(plain, "█") {
+	if !strings.Contains(plain, "▐  ▐") {
 		t.Errorf("expected wordmark cells in header; got:\n%s", plain)
 	}
 }
@@ -330,59 +465,23 @@ func TestRunHeaderHidesWordmarkAtNarrowWidth(t *testing.T) {
 	r := newHeaderTestRunMode(
 		config.Model{Alias: "alpha"},
 		config.Preset{Name: "default"},
-		nil, 80,
+		nil, 60,
 	)
 	plain := stripANSI(r.renderHeader())
-	if strings.Contains(plain, "█") {
+	if strings.Contains(plain, "▐  ▐") {
 		t.Errorf("expected no wordmark on narrow terminal; got:\n%s", plain)
 	}
 }
 
-func TestRunHeaderMetricsOnUsesGreenBackground(t *testing.T) {
-	r := newHeaderTestRunMode(
-		config.Model{Alias: "alpha"},
-		config.Preset{Name: "default", Params: config.Params{
-			{Key: "metrics", Value: true},
-		}},
-		nil, runHeaderWideWidth,
-	)
-	header := r.renderHeader()
-	// `\x1b[30;42m` = black fg on green bg (no bold — bold renders as
-	// gray on many terminals, killing contrast against the green).
-	// Pinned literally rather than via lipgloss.Render so it's
-	// deterministic in tests where lipgloss has no TTY to detect.
-	if !strings.Contains(header, "\x1b[30;42m") {
-		t.Errorf("expected black-on-green SGR around [Metrics]; got header:\n%q", header)
-	}
-}
-
-func TestRunHeaderMetricsOffNoGreenBackground(t *testing.T) {
-	r := newHeaderTestRunMode(
-		config.Model{Alias: "alpha"},
-		config.Preset{Name: "default"}, // no metrics param
-		nil, runHeaderWideWidth,
-	)
-	header := r.renderHeader()
-	if strings.Contains(header, "\x1b[30;42m") {
-		t.Errorf("expected no green-bg SGR when metrics is absent; got header:\n%q", header)
-	}
-	// And [Metrics] is still rendered (subtle/dim, not lit).
-	if !strings.Contains(stripANSI(header), "[Metrics]") {
-		t.Error("expected [Metrics] indicator to be rendered even when off")
-	}
-}
-
-func TestRunHeaderShowsNAForMissingParams(t *testing.T) {
+func TestRunHeaderShowsNAForMissingCtxSize(t *testing.T) {
 	r := newHeaderTestRunMode(
 		config.Model{Alias: "alpha"},
 		config.Preset{Name: "default"}, // no params at all
 		nil, runHeaderWideWidth,
 	)
 	plain := stripANSI(r.renderHeader())
-	for _, want := range []string{"Temp: n/a", "Top_P: n/a", "Top_K: n/a", "Min_P: n/a", "Context Size: n/a"} {
-		if !strings.Contains(plain, want) {
-			t.Errorf("expected %q in header; got:\n%s", want, plain)
-		}
+	if !strings.Contains(plain, "Context Size: n/a") {
+		t.Errorf("expected Context Size: n/a fallback in header; got:\n%s", plain)
 	}
 }
 
@@ -424,14 +523,17 @@ func TestRunHeaderShowsNAWhenServerVersionMissing(t *testing.T) {
 func TestRunModeLogFrameRendersWithBorder(t *testing.T) {
 	cfg := &config.Config{Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
 	r := &RunMode{
-		cfg:         cfg,
-		model:       config.Model{Alias: "alpha"},
-		preset:      config.Preset{Name: "default"},
-		proc:        &server.Process{Started: time.Now()},
-		viewport:    viewport.New(0, 0),
-		searchInput: textinput.New(),
-		theme:       CurrentTheme(),
-		status:      StatusReady,
+		cfg:           cfg,
+		model:         config.Model{Alias: "alpha"},
+		preset:        config.Preset{Name: "default"},
+		proc:          &server.Process{Started: time.Now()},
+		viewport:      viewport.New(0, 0),
+		searchInput:   textinput.New(),
+		theme:         CurrentTheme(),
+		status:        StatusReady,
+		tokensHistory: newRingBuffer(sparkBufferSamples),
+		promptHistory: newRingBuffer(sparkBufferSamples),
+		utilHistory:   map[string]*ringBuffer{},
 	}
 	r.SetSize(runHeaderWideWidth, 30)
 	r.buf.WriteString("hello\n")
@@ -472,4 +574,766 @@ func TestRunHeaderShowsCanonicalCtxSizeFromShortForm(t *testing.T) {
 	if !strings.Contains(plain, "Context Size: 16384") {
 		t.Errorf("expected ctx-size value from short-form `c`; got header:\n%s", plain)
 	}
+}
+
+// ---- Phase 4: hardware-panel tests ----
+
+// TestHardwarePanelRendersCPUOnly covers the minimum case: one CPU
+// device, no GPUs (the typical CI / non-NVIDIA dev box). Both the
+// device header line and the value row should appear.
+func TestHardwarePanelRendersCPUOnly(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.hardware = []hwinfo.Device{
+		{
+			Class: hwinfo.ClassCPU, Index: 0, Name: "AMD Ryzen 9 7950X",
+			UtilPct: 23, MemPct: 65,
+			MemUsedBytes: 41 * 1024 * 1024 * 1024, MemTotalBytes: 64 * 1024 * 1024 * 1024,
+			PowerW: 120, PowerMaxW: 125, HasPower: true,
+			TempC: 68, TempMaxC: 100, HasTemp: true,
+			FanRPM: 1200, HasFan: true,
+		},
+	}
+	plain := stripANSI(r.renderHardwarePanel(120))
+	// T4 layout: name row, then 4 metric rows (Util / RAM / Power / Temp).
+	for _, want := range []string{"[0]", "AMD Ryzen 9 7950X", "Util", "RAM", "Power", "Temp", "120W", "125W", "68°C", "100°C", "1200rpm"} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("Hardware panel missing %q\nout:\n%s", want, plain)
+		}
+	}
+}
+
+// TestHardwarePanelRendersCPUAndGPU covers the typical desktop
+// rendering with 1 CPU + 1 GPU. Each device gets its own [N] index
+// within its class, so we expect [0] twice.
+func TestHardwarePanelRendersCPUAndGPU(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.hardware = []hwinfo.Device{
+		{
+			Class: hwinfo.ClassCPU, Index: 0, Name: "AMD Ryzen 9 7950X",
+			UtilPct: 23, MemPct: 65,
+			MemUsedBytes: 41 * 1024 * 1024 * 1024, MemTotalBytes: 64 * 1024 * 1024 * 1024,
+		},
+		{
+			Class: hwinfo.ClassGPU, Index: 0, Name: "NVIDIA GeForce RTX 4090",
+			UtilPct: 89, MemPct: 78,
+			MemUsedBytes: 18 * 1024 * 1024 * 1024, MemTotalBytes: 24 * 1024 * 1024 * 1024,
+			PowerW: 320, PowerMaxW: 450, HasPower: true,
+			TempC: 72, TempMaxC: 83, HasTemp: true,
+			FanPct: 65, HasFan: true,
+		},
+	}
+	plain := stripANSI(r.renderHardwarePanel(120))
+	for _, want := range []string{"AMD Ryzen 9 7950X", "NVIDIA GeForce RTX 4090", "RAM", "VRAM", "320W", "450W", "72°C", "Fan "} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("Hardware panel missing %q\nout:\n%s", want, plain)
+		}
+	}
+	// Two devices = two [0] markers (per-class indexing).
+	if got := strings.Count(plain, "[0]"); got != 2 {
+		t.Errorf("expected per-class [0] markers (one per device); got %d\nout:\n%s", got, plain)
+	}
+}
+
+// TestHardwarePanelOmitsFanWhenUnavailable covers Bug 6: when a CPU
+// reports no fan reading, the Fan slot is omitted entirely (not
+// rendered as "n/a"). The Temp row's tail just stops after the bar.
+func TestHardwarePanelOmitsFanWhenUnavailable(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.hardware = []hwinfo.Device{
+		{
+			Class: hwinfo.ClassCPU, Index: 0, Name: "Generic CPU",
+			UtilPct: 5, MemPct: 12,
+			MemUsedBytes: 8 * 1024 * 1024 * 1024, MemTotalBytes: 64 * 1024 * 1024 * 1024,
+			TempC: 50, TempMaxC: 100, HasTemp: true,
+			// no fan, no power
+		},
+	}
+	plain := stripANSI(r.renderHardwarePanel(120))
+	if strings.Contains(plain, "n/a") {
+		t.Errorf("missing fields must be omitted, not rendered as n/a; out:\n%s", plain)
+	}
+	if strings.Contains(plain, "Fan ") {
+		t.Errorf("Fan slot must be entirely omitted when no fan reading; out:\n%s", plain)
+	}
+}
+
+// TestViewHeightStableAndNoLineExceedsWidth is the regression for
+// the "live band duplicates and shifts upward as new log lines
+// arrive" bug. The user reported it after the T4 redesign; root
+// cause was that long log lines wrapped inside the bordered
+// log-frame box (lipgloss auto-wraps when Width is set), growing
+// the rendered chrome past r.height. Bubble Tea then overwrote
+// frames at the wrong row, leaving the band visually drifting up
+// each tick. We now pre-truncate viewport content to
+// viewport.Width (so lipgloss can't wrap it) and clamp every View
+// line to r.width as a defensive last pass.
+//
+// The test feeds long log lines into the buffer and asserts
+// (1) View() always returns exactly r.height lines and (2) no
+// individual line exceeds r.width visual cols.
+func TestViewHeightStableAndNoLineExceedsWidth(t *testing.T) {
+	cfg := &config.Config{Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
+	r := &RunMode{
+		cfg:           cfg,
+		model:         config.Model{Alias: "alpha"},
+		preset:        config.Preset{Name: "default"},
+		proc:          &server.Process{Started: time.Now()},
+		viewport:      viewport.New(0, 0),
+		searchInput:   textinput.New(),
+		theme:         CurrentTheme(),
+		status:        StatusReady,
+		tokensHistory: newRingBuffer(sparkBufferSamples),
+		promptHistory: newRingBuffer(sparkBufferSamples),
+		utilHistory:   map[string]*ringBuffer{},
+	}
+	const W, H = 200, 40
+	r.SetSize(W, H)
+	// Hardware populated with both CPU + GPU.
+	r.hardware = []hwinfo.Device{
+		{
+			Class: hwinfo.ClassCPU, Index: 0, Name: "AMD Ryzen 9 7950X",
+			UtilPct: 23, MemPct: 65,
+			MemUsedBytes: 41 * 1024 * 1024 * 1024, MemTotalBytes: 64 * 1024 * 1024 * 1024,
+			PowerW: 32, PowerMaxW: 125, HasPower: true,
+			TempC: 68, TempMaxC: 100, HasTemp: true,
+		},
+		{
+			Class: hwinfo.ClassGPU, Index: 0, Name: "NVIDIA GeForce RTX 4090",
+			UtilPct: 89, MemPct: 78,
+			MemUsedBytes: 18 * 1024 * 1024 * 1024, MemTotalBytes: 24 * 1024 * 1024 * 1024,
+			PowerW: 320, PowerMaxW: 450, HasPower: true,
+			TempC: 72, TempMaxC: 83, HasTemp: true,
+			FanPct: 65, HasFan: true,
+		},
+	}
+	for i := 0; i < 10; i++ {
+		// Log lines of varying lengths, including one wider than
+		// viewport.Width to trigger the historical wrap bug.
+		r.buf.WriteString("main: " + strings.Repeat("x", 250) + " #" + string(rune('a'+i%26)) + "\n")
+		r.viewport.SetContent(r.buf.String())
+		r.viewport.GotoBottom()
+		v := r.View()
+		gotH := strings.Count(v, "\n") + 1
+		if gotH != H {
+			t.Fatalf("after log chunk %d: View height = %d, want %d (panel-duplication regression)",
+				i, gotH, H)
+		}
+		for j, line := range strings.Split(v, "\n") {
+			if w := len([]rune(stripANSI(line))); w > W {
+				t.Fatalf("after log chunk %d, line %d width = %d > terminal W = %d (will trigger terminal wrap)",
+					i, j, w, W)
+			}
+		}
+	}
+}
+
+// TestHardwarePanelAlignsBarsAndSparks pins the alignment guarantee:
+// every metric row's viz column starts at the same character index.
+// Regression catch — the user explicitly called out misaligned bars
+// in the previous design.
+func TestHardwarePanelAlignsBarsAndSparks(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.hardware = []hwinfo.Device{
+		{
+			Class: hwinfo.ClassCPU, Index: 0, Name: "CPU",
+			UtilPct: 23, MemPct: 65,
+			MemUsedBytes: 41 * 1024 * 1024 * 1024, MemTotalBytes: 64 * 1024 * 1024 * 1024,
+			PowerW: 32, PowerMaxW: 125, HasPower: true,
+			TempC: 68, TempMaxC: 100, HasTemp: true,
+		},
+	}
+	plain := stripANSI(r.renderHardwarePanel(120))
+	lines := strings.Split(plain, "\n")
+	// Find the Util / RAM / Power / Temp lines. Each one's viz column
+	// (the bar/spark) should start at the same byte offset relative
+	// to the metric label (which is right-padded to the same width).
+	want := map[string]int{}
+	for _, label := range []string{"Util ", "RAM  ", "Power", "Temp "} {
+		for _, line := range lines {
+			if idx := strings.Index(line, label); idx >= 0 {
+				want[label] = idx
+				break
+			}
+		}
+	}
+	if len(want) != 4 {
+		t.Fatalf("could not find all metric labels in rendered panel:\n%s", plain)
+	}
+	first := -1
+	for _, idx := range want {
+		if first == -1 {
+			first = idx
+			continue
+		}
+		if idx != first {
+			t.Errorf("metric labels not column-aligned: got positions %v in panel:\n%s", want, plain)
+			break
+		}
+	}
+}
+
+// TestHardwarePanelValueColumnAligned pins the new "values to the
+// right of the bar, to the left of the %" requirement (last
+// grilling round). The current/max value (RAM bytes, Power W, Temp
+// °C) sits in a fixed-width column; the trailing % must therefore
+// land at the same column on every metric row.
+func TestHardwarePanelValueColumnAligned(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.hardware = []hwinfo.Device{
+		{
+			Class: hwinfo.ClassCPU, Index: 0, Name: "CPU",
+			UtilPct: 23, MemPct: 65,
+			MemUsedBytes: 41 * 1024 * 1024 * 1024, MemTotalBytes: 64 * 1024 * 1024 * 1024,
+			PowerW: 32, PowerMaxW: 125, HasPower: true,
+			TempC: 68, TempMaxC: 100, HasTemp: true,
+		},
+	}
+	plain := stripANSI(r.renderHardwarePanel(120))
+	lines := strings.Split(plain, "\n")
+	// Each metric row should end (sans trailing whitespace) with the
+	// trailing %. Find the % position on each row in VISUAL columns
+	// (not bytes — ▆ is 3 bytes UTF-8 but 1 visual col) and assert
+	// they line up.
+	pctVisualCol := map[string]int{}
+	for _, label := range []string{"Util ", "RAM  ", "Power", "Temp "} {
+		for _, line := range lines {
+			if !strings.Contains(line, label) {
+				continue
+			}
+			runes := []rune(line)
+			lastPct := -1
+			for i, r := range runes {
+				if r == '%' {
+					lastPct = i
+				}
+			}
+			if lastPct >= 0 {
+				pctVisualCol[label] = lastPct
+			}
+			break
+		}
+	}
+	if len(pctVisualCol) != 4 {
+		t.Fatalf("could not find percent positions on all rows: %v\npanel:\n%s", pctVisualCol, plain)
+	}
+	first := -1
+	for _, p := range pctVisualCol {
+		if first == -1 {
+			first = p
+			continue
+		}
+		if p != first {
+			t.Errorf("percent column not aligned across metric rows: %v\npanel:\n%s", pctVisualCol, plain)
+			break
+		}
+	}
+}
+
+// TestHardwarePanelEmptyShowsPlaceholder pins the no-devices fallback
+// (gopsutil failed entirely + no NVML). Renders a placeholder so the
+// panel's bordered shape stays consistent.
+func TestHardwarePanelEmptyShowsPlaceholder(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.hardware = nil
+	plain := stripANSI(r.renderHardwarePanel(80))
+	if !strings.Contains(plain, "no devices") {
+		t.Errorf("expected (no devices…) placeholder; out:\n%s", plain)
+	}
+}
+
+// TestHwSnapshotMsgUpdatesField pins the wiring path: hwSnapshotMsg
+// hits Update and lands on r.hardware.
+func TestHwSnapshotMsgUpdatesField(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	devs := []hwinfo.Device{{Class: hwinfo.ClassCPU, Index: 0, Name: "Probe"}}
+	r.Update(hwSnapshotMsg{devices: devs})
+	if len(r.hardware) != 1 || r.hardware[0].Name != "Probe" {
+		t.Errorf("hwSnapshotMsg did not land in r.hardware; got %+v", r.hardware)
+	}
+}
+
+// ---- Phase 3: live server-panel tests ----
+
+// TestApplyMetricsFirstTickPublishesGaugesOnly pins the rule that the
+// first /metrics fetch after startup has no prev to delta against, so
+// we publish only the lifetime gauges. tokensSeen stays false until
+// the second tick yields a non-zero delta — the renderer shows "—"
+// in that window (Bug 3 semantics).
+func TestApplyMetricsFirstTickPublishesGaugesOnly(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	r.applyMetrics(&llamaapi.Metrics{
+		TokensPredictedTotal:        100,
+		TokensPredictedSecondsTotal: 2,
+		PredictedTokensSecondsAvg:   60,
+		PromptTokensSecondsAvg:      2300,
+		RequestsDeferred:            3,
+	})
+	if r.tokensSeen {
+		t.Error("tokensSeen = true after first tick; want false (no delta yet)")
+	}
+	if r.avgTokensPerSec != 60 {
+		t.Errorf("avgTokensPerSec = %v, want 60", r.avgTokensPerSec)
+	}
+	if r.queuedCount != 3 {
+		t.Errorf("queuedCount = %d, want 3", r.queuedCount)
+	}
+}
+
+// TestApplyMetricsSecondTickComputesRate is the core delta math: the
+// second tick should produce currentTokensPerSec = ΔTokens / ΔSeconds
+// based on the prev counters, not the cumulative absolutes.
+func TestApplyMetricsSecondTickComputesRate(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	r.applyMetrics(&llamaapi.Metrics{
+		TokensPredictedTotal:        100,
+		TokensPredictedSecondsTotal: 2,
+	})
+	r.applyMetrics(&llamaapi.Metrics{
+		TokensPredictedTotal:        180,
+		TokensPredictedSecondsTotal: 3,
+	})
+	// Δtokens = 80, Δsecs = 1 → 80 tokens/s
+	if r.currentTokensPerSec != 80 {
+		t.Errorf("currentTokensPerSec = %v, want 80", r.currentTokensPerSec)
+	}
+	if !r.tokensSeen {
+		t.Error("tokensSeen = false after non-zero delta; want true (latched)")
+	}
+}
+
+// TestApplyMetricsFallsBackToWallClockWhenSecondsCounterStuck pins
+// the responsiveness fix: some llama-server builds only increment
+// `tokens_predicted_seconds_total` at slot completion. During a long
+// generation, dTokens grows but dTokenSecs stays zero — and our
+// rate stayed `—` until the response finished. The fallback uses
+// wall-clock seconds (the 1s poll interval) so a value appears the
+// next tick even when the seconds counter is lagging.
+func TestApplyMetricsFallsBackToWallClockWhenSecondsCounterStuck(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	r.applyMetrics(&llamaapi.Metrics{TokensPredictedTotal: 100, TokensPredictedSecondsTotal: 2})
+	// Tokens advance by 50 but the seconds counter is stuck at 2
+	// (mid-generation, slot hasn't completed yet).
+	r.applyMetrics(&llamaapi.Metrics{TokensPredictedTotal: 150, TokensPredictedSecondsTotal: 2})
+	if !r.tokensSeen {
+		t.Error("tokensSeen = false; want true via wall-clock fallback")
+	}
+	// Wall-clock fallback: 50 tokens / 1s poll interval = 50 tokens/s.
+	if r.currentTokensPerSec != 50 {
+		t.Errorf("currentTokensPerSec = %v, want 50 (wall-clock)", r.currentTokensPerSec)
+	}
+}
+
+// TestApplyMetricsPersistsLastValueOnZeroDelta covers Bug 3: once
+// tokensSeen latches true, subsequent zero-delta ticks must NOT
+// reset currentTokensPerSec to 0. The user wants the last-known
+// value to persist so the trailing column doesn't flash to "—" in
+// between bursts.
+func TestApplyMetricsPersistsLastValueOnZeroDelta(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	r.applyMetrics(&llamaapi.Metrics{TokensPredictedTotal: 100, TokensPredictedSecondsTotal: 2})
+	r.applyMetrics(&llamaapi.Metrics{TokensPredictedTotal: 180, TokensPredictedSecondsTotal: 3})
+	// Now feed a zero-delta tick (server idle for one second).
+	r.applyMetrics(&llamaapi.Metrics{TokensPredictedTotal: 180, TokensPredictedSecondsTotal: 3})
+	if !r.tokensSeen {
+		t.Error("tokensSeen got cleared on zero-delta tick; want it to remain latched")
+	}
+	if r.currentTokensPerSec != 80 {
+		t.Errorf("currentTokensPerSec = %v on zero-delta tick; want 80 (persist last-known)", r.currentTokensPerSec)
+	}
+}
+
+// TestServerPanelRendersLiveData covers the SP3 layout: rate cell
+// (current / avg /s) shows after the spark, secondary scalar
+// (Busy/Queued) at the row end. With tokensSeen + currentTokensPerSec
+// + avgTokensPerSec set, the panel reads both rate values cleanly.
+func TestServerPanelRendersLiveData(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	r.currentTokensPerSec = 80
+	r.avgTokensPerSec = 60
+	r.tokensSeen = true
+	r.busyCount = 2
+	r.totalSlots = 4
+	r.queuedCount = 1
+	// Width 140 fits the 40-cell spark + label + rate cell + busy
+	// scalar without truncating any content.
+	plain := stripANSI(r.renderServerPanel(140))
+	for _, want := range []string{"Tokens", "80.0", "60.0", "Busy", "2/4 slots", "Queued", "1"} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("server panel missing %q\nout:\n%s", want, plain)
+		}
+	}
+}
+
+// TestServerPanelMetricsDisabledShowsNA covers the --metrics-off
+// fallback: rate value reads n/a; busy still works from /slots.
+func TestServerPanelMetricsDisabledShowsNA(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = false
+	r.busyCount = 1
+	r.totalSlots = 2
+	plain := stripANSI(r.renderServerPanel(140))
+	if !strings.Contains(plain, "n/a") {
+		t.Errorf("expected n/a for tokens/s when --metrics off; out:\n%s", plain)
+	}
+	if !strings.Contains(plain, "1/2 slots") {
+		t.Errorf("Busy slots should still render from /slots; out:\n%s", plain)
+	}
+}
+
+// TestServerPanelShowsDashBeforeFirstNonZero covers Bug 3 init: when
+// metrics are available but we've never observed a non-zero rate,
+// the trailing rate cell shows "—".
+func TestServerPanelShowsDashBeforeFirstNonZero(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	// tokensSeen and promptSeen both default false.
+	plain := stripANSI(r.renderServerPanel(140))
+	if !strings.Contains(plain, "—") {
+		t.Errorf("expected dash before first non-zero rate; out:\n%s", plain)
+	}
+}
+
+// TestRunModeMetricsNotEnabledFlipsFlag confirms the
+// metricsFetchedMsg handler stops polling /metrics on the sentinel
+// error and emits the one-time INFO log.
+func TestRunModeMetricsNotEnabledFlipsFlag(t *testing.T) {
+	logs := captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.metricsAvailable = true
+	r.Update(metricsFetchedMsg{err: llamaapi.ErrMetricsNotEnabled})
+	if r.metricsAvailable {
+		t.Error("metricsAvailable still true after ErrMetricsNotEnabled")
+	}
+	assertLogged(t, logs, slog.LevelInfo, "/metrics endpoint disabled — preset lacks metrics: true")
+}
+
+// TestRunModeSlotsFetchedUpdatesCounts pins the slotsFetchedMsg
+// handler: busy/total land on the run-mode struct.
+func TestRunModeSlotsFetchedUpdatesCounts(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(slotsFetchedMsg{s: &llamaapi.Slots{Total: 4, BusyCount: 3}})
+	if r.busyCount != 3 || r.totalSlots != 4 {
+		t.Errorf("busy/total = %d/%d, want 3/4", r.busyCount, r.totalSlots)
+	}
+}
+
+// ---- i info overlay tests ----
+
+// TestRunInfoOverlayTogglesOnIKey covers the basic press-i-shows,
+// press-any-shows-closes flow. Direct field assertions (showInfo)
+// rather than view scraping so the test is independent of the
+// overlay's pixel layout.
+func TestRunInfoOverlayTogglesOnIKey(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha", Location: "/m/alpha.gguf"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "ctx-size", Value: json.Number("8192")},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	if !r.showInfo {
+		t.Fatal("`i` did not set showInfo")
+	}
+	// Any subsequent key closes.
+	r.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if r.showInfo {
+		t.Fatal("subsequent key did not clear showInfo")
+	}
+}
+
+// TestRunInfoOverlayContentLocalModel pins the rendered body for a
+// local-file model: alias + Source path + preset name + every preset
+// param surfaces in source order.
+func TestRunInfoOverlayContentLocalModel(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha", Location: "/models/alpha.gguf"},
+		config.Preset{Name: "fast", Params: config.Params{
+			{Key: "ctx-size", Value: json.Number("8192")},
+			{Key: "temp", Value: json.Number("0.7")},
+			{Key: "jinja", Value: true},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	plain := stripANSI(r.renderInfoOverlay())
+	for _, want := range []string{
+		"alpha",
+		"/models/alpha.gguf",
+		"fast",
+		"ctx-size",
+		"8192",
+		"temp",
+		"0.7",
+		"jinja",
+		"true",
+	} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("info overlay missing %q\nout:\n%s", want, plain)
+		}
+	}
+}
+
+// TestRunInfoOverlayContentHFModel covers the HF-sourced model branch:
+// the overlay shows `HF :` rather than `Source :`.
+func TestRunInfoOverlayContentHFModel(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "qwen", HF: "Qwen/Qwen2.5-7B-Instruct-GGUF"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	plain := stripANSI(r.renderInfoOverlay())
+	if !strings.Contains(plain, "HF") {
+		t.Errorf("HF model overlay missing `HF` label; out:\n%s", plain)
+	}
+	if !strings.Contains(plain, "Qwen/Qwen2.5-7B-Instruct-GGUF") {
+		t.Errorf("HF model overlay missing identifier; out:\n%s", plain)
+	}
+	if strings.Contains(plain, "Source ") {
+		t.Errorf("HF model overlay should not show Source line; out:\n%s", plain)
+	}
+}
+
+// TestRunInfoOverlayPreservesParamOrder pins the source-order
+// invariant: keys appear in the order they were declared, not
+// alphabetical or any other rearrangement (CLAUDE.md: "Param order
+// matters end-to-end").
+func TestRunInfoOverlayPreservesParamOrder(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha", Location: "/m/alpha.gguf"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "zeta", Value: "z"},
+			{Key: "alpha-flag", Value: "a"},
+			{Key: "mu", Value: "m"},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	plain := stripANSI(r.renderInfoOverlay())
+	zIdx := strings.Index(plain, "zeta")
+	aIdx := strings.Index(plain, "alpha-flag")
+	mIdx := strings.Index(plain, "mu")
+	if zIdx < 0 || aIdx < 0 || mIdx < 0 {
+		t.Fatalf("missing one or more keys; out:\n%s", plain)
+	}
+	if !(zIdx < aIdx && aIdx < mIdx) {
+		t.Errorf("expected source order zeta < alpha-flag < mu; got positions %d, %d, %d", zIdx, aIdx, mIdx)
+	}
+}
+
+// TestRunInfoOverlayRenderedInView covers the integration: with
+// showInfo set the View output contains the overlay text alongside
+// the header (which the overlay floats on top of, not replaces).
+func TestRunInfoOverlayRenderedInView(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha", Location: "/m/alpha.gguf"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.height = 30
+	r.showInfo = true
+	view := stripANSI(r.View())
+	if !strings.Contains(view, "Model & preset") {
+		t.Errorf("View did not include info overlay header; out:\n%s", view)
+	}
+	if !strings.Contains(view, "Alias") {
+		t.Errorf("View overlay missing Alias label; out:\n%s", view)
+	}
+}
+
+// ---- propsFetchedMsg handler tests ----
+
+// TestRunHeaderLiveCtxSizeWins confirms the live value from /props is
+// rendered as `Context Size:` once propsFetchedMsg lands, even when the
+// preset declared no ctx-size at all.
+func TestRunHeaderLiveCtxSizeWins(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"}, // no ctx-size
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{nctx: 4096})
+	plain := stripANSI(r.renderHeader())
+	if !strings.Contains(plain, "Context Size: 4096") {
+		t.Errorf("expected Context Size: 4096; got header:\n%s", plain)
+	}
+}
+
+// TestRunHeaderLiveCtxSizeOverridesPreset confirms that the live value
+// wins over a preset's declared ctx-size when they disagree (typical
+// case: llama-server clamped a too-large request). captureSlog absorbs
+// the disagreement-INFO line that the handler emits — its content is
+// covered by TestRunHeaderDisagreementLogsInfo and we don't want a
+// noisy stderr trail from this test.
+func TestRunHeaderLiveCtxSizeOverridesPreset(t *testing.T) {
+	_ = captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "ctx-size", Value: json.Number("8192")},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{nctx: 4096})
+	plain := stripANSI(r.renderHeader())
+	if !strings.Contains(plain, "Context Size: 4096") {
+		t.Errorf("expected live value 4096 to win over preset 8192; got header:\n%s", plain)
+	}
+	if strings.Contains(plain, "Context Size: 8192") {
+		t.Errorf("preset value 8192 leaked into header:\n%s", plain)
+	}
+}
+
+// TestRunHeaderFetchFailureFallsBackAndLogsWarn pins the rule that a
+// hard /props failure does NOT flash to the TUI (header stays at the
+// preset value or n/a) but DOES land a slog.Warn record so the user
+// has a paper trail.
+func TestRunHeaderFetchFailureFallsBackAndLogsWarn(t *testing.T) {
+	logs := captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"}, // no ctx-size — fallback should be n/a
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{err: errors.New("connection refused")})
+	plain := stripANSI(r.renderHeader())
+	if !strings.Contains(plain, "Context Size: n/a") {
+		t.Errorf("expected Context Size: n/a fallback; got header:\n%s", plain)
+	}
+	assertLogged(t, logs, slog.LevelWarn, "/props fetch failed")
+}
+
+// TestRunHeaderFetchCancelledNoWarn covers the kill-during-fetch path:
+// a context.Canceled error is the user closing the run mode, not an
+// actionable failure, so the handler must suppress the WARN line.
+func TestRunHeaderFetchCancelledNoWarn(t *testing.T) {
+	logs := captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{err: context.Canceled})
+	assertNotLogged(t, logs, slog.LevelWarn, "/props fetch failed")
+}
+
+// TestRunHeaderDisagreementLogsInfo confirms the diagnostic path:
+// when preset and live disagree, slog.Info is emitted with the
+// "ctx-size mismatch" message so users can correlate later.
+func TestRunHeaderDisagreementLogsInfo(t *testing.T) {
+	logs := captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "ctx-size", Value: json.Number("8192")},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{nctx: 4096})
+	assertLogged(t, logs, slog.LevelInfo, "ctx-size mismatch")
+}
+
+// TestRunHeaderAgreementNoInfo: when preset and live match, the
+// disagreement diagnostic must NOT fire. This guards against the
+// log-spam regression risk: every successful fetch with a declared
+// preset value would otherwise emit a record.
+func TestRunHeaderAgreementNoInfo(t *testing.T) {
+	logs := captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "ctx-size", Value: json.Number("4096")},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{nctx: 4096})
+	assertNotLogged(t, logs, slog.LevelInfo, "ctx-size mismatch")
+}
+
+// TestRunHeaderNCtxZeroIgnored covers the "/props returned 0" path
+// (server speaks /props but hasn't populated n_ctx yet): treat as
+// unavailable, fall back to the preset value, do NOT log.
+func TestRunHeaderNCtxZeroIgnored(t *testing.T) {
+	logs := captureSlog(t)
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default", Params: config.Params{
+			{Key: "ctx-size", Value: json.Number("16384")},
+		}},
+		nil, runHeaderWideWidth,
+	)
+	r.Update(propsFetchedMsg{nctx: 0})
+	plain := stripANSI(r.renderHeader())
+	if !strings.Contains(plain, "Context Size: 16384") {
+		t.Errorf("expected fall-back to preset value 16384 when n_ctx is 0; got:\n%s", plain)
+	}
+	assertNotLogged(t, logs, slog.LevelWarn, "/props fetch failed")
+	assertNotLogged(t, logs, slog.LevelInfo, "ctx-size mismatch")
 }
