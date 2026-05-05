@@ -10,7 +10,7 @@ require (
 	github.com/charmbracelet/huh v1.0.0
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/ansi v0.11.7
-	github.com/fsnotify/fsnotify v1.10.0
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/shirou/gopsutil/v3 v3.24.5
 	golang.org/x/sys v0.43.0
 )
