@@ -944,7 +944,11 @@ func (c *ConfigMode) View() string {
 	if c.width == 0 {
 		return ""
 	}
-	bg := c.renderPanes()
+	// Center the panes block in the terminal — same idiom main and
+	// firstrun modes use. Overlays (picker / form / help) continue to
+	// paste over the centered bg via overlayCenter, which also operates
+	// on (c.width, c.height), so popup-center == screen-center.
+	bg := lipgloss.Place(c.width, c.height, lipgloss.Center, lipgloss.Center, c.renderPanes())
 	if c.picker != nil {
 		return overlayCenter(bg, c.picker.View(c.theme), c.width, c.height)
 	}
@@ -965,11 +969,10 @@ func (c *ConfigMode) View() string {
 // renderPanes draws the three-pane editor without any overlay.
 //
 // Vertical layout intentionally mimics main mode: a wordmark sits on top
-// of a subtitle line, then the panes, then the footer. A fixed 6-row top
-// padding pushes the whole block off the top edge — config used to be
-// glued to row 0, which felt jarring after the centered main screen.
-// Padding is fixed (not proportional to terminal height) so the position
-// stays predictable across resizes.
+// of a subtitle line, then the panes, then the footer. The whole block
+// is horizontally centered (`JoinVertical(Center, …)`) so the wordmark
+// and subtitle line up over the panes row; vertical centering happens
+// in View() via lipgloss.Place, matching main / firstrun modes exactly.
 func (c *ConfigMode) renderPanes() string {
 	wordmark := lipgloss.NewStyle().
 		Foreground(c.theme.Accent).
@@ -986,7 +989,7 @@ func (c *ConfigMode) renderPanes() string {
 			BorderForeground(c.theme.Accent).
 			Padding(0, 2).
 			Render("First-time setup — globals saved. Press n in the Models pane to add your first model.")
-		header = lipgloss.JoinVertical(lipgloss.Left, header, banner)
+		header = lipgloss.JoinVertical(lipgloss.Center, header, banner)
 	}
 
 	paneW := (c.width - 4) / 3
@@ -997,13 +1000,7 @@ func (c *ConfigMode) renderPanes() string {
 	row := lipgloss.JoinHorizontal(lipgloss.Top, left, mid, right)
 	footer := c.renderFooter()
 
-	const topPadding = 6
-	parts := make([]string, 0, topPadding+7)
-	for i := 0; i < topPadding; i++ {
-		parts = append(parts, "")
-	}
-	parts = append(parts, wordmark, "", header, "", row, "", footer)
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+	return lipgloss.JoinVertical(lipgloss.Center, wordmark, "", header, "", row, "", footer)
 }
 
 func (c *ConfigMode) renderPane(focus ConfigFocus, title string, w int, body string) string {
