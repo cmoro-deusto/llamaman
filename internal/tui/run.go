@@ -73,8 +73,9 @@ type RunMode struct {
 	theme         Theme
 
 	showQuit      bool // quit prompt overlay active
-	showHelp      bool // help overlay active
-	showInfo      bool // i-info overlay active (model + preset detail)
+	showHelp      bool   // help overlay active
+	showInfo      bool   // i-info overlay active (model + preset detail)
+	copyResult    string // when non-empty, a centered "command copied" modal is shown; any key dismisses
 	restartPrompt bool // r-confirm overlay
 	killPrompt    bool // k-confirm overlay
 	flash         string
@@ -476,6 +477,10 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			r.showInfo = false
 			return r, nil
 		}
+		if r.copyResult != "" {
+			r.copyResult = ""
+			return r, nil
+		}
 		switch m.String() {
 		case "esc":
 			// Layered Esc: on the main run screen, clear any applied
@@ -529,12 +534,12 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			r.copyCommand()
 			return r, nil
 		case "r":
-			if r.status == StatusReady {
-				r.restartPrompt = true
-				return r, nil
-			}
-			// Not ready: skip the confirm and restart immediately.
-			return r, r.requestRestart()
+			// Always confirm — restart kills the running child even
+			// when startup is mid-progress or the server has already
+			// died, and an accidental `r` shouldn't blow away whatever
+			// state the user was inspecting.
+			r.restartPrompt = true
+			return r, nil
 		}
 	}
 	var cmd tea.Cmd
@@ -709,10 +714,11 @@ func (r *RunMode) requestRestart() tea.Cmd {
 }
 
 // copyCommand pushes the launch argv onto the clipboard via wl-copy then
-// xclip; flashes a confirmation status either way.
+// xclip; surfaces the outcome in a centered modal (`r.copyResult`) so
+// the success / failure is unmissable instead of buried in the footer.
 func (r *RunMode) copyCommand() {
 	if len(r.argv) == 0 {
-		r.flash = "no command to copy"
+		r.copyResult = "Nothing to copy — the launch command is empty."
 		return
 	}
 	cmdLine := strings.Join(r.argv, " ")
@@ -729,11 +735,11 @@ func (r *RunMode) copyCommand() {
 		c := exec.Command(candidate.name, candidate.args...)
 		c.Stdin = bytes.NewReader([]byte(cmdLine))
 		if err := c.Run(); err == nil {
-			r.flash = fmt.Sprintf("command copied via %s", candidate.name)
+			r.copyResult = fmt.Sprintf("Command copied to clipboard via %s.", candidate.name)
 			return
 		}
 	}
-	r.flash = "no clipboard tool found (install wl-copy or xclip)"
+	r.copyResult = "No clipboard tool found.\n\nInstall wl-copy (Wayland) or xclip (X11) and try again."
 }
 
 // effectiveQuery returns the query whose matches should be highlighted
@@ -909,6 +915,8 @@ func (r *RunMode) View() string {
 		out = overlayCenter(bg, r.renderHelp(), r.width, r.height)
 	case r.showInfo:
 		out = overlayCenter(bg, r.renderInfoOverlay(), r.width, r.height)
+	case r.copyResult != "":
+		out = overlayCenter(bg, r.renderCopyResult(), r.width, r.height)
 	default:
 		out = bg
 	}
@@ -955,31 +963,83 @@ func clampViewLines(s string, width int) string {
 	return strings.Join(lines, "\n")
 }
 
-func (r *RunMode) renderQuitPrompt() string {
-	box := lipgloss.NewStyle().
+// promptBox is the shared wrapper for run-mode confirmation modals —
+// rounded accent border, comfortable padding. Centralized so quit /
+// restart / kill prompts stay visually identical.
+func (r *RunMode) promptBox() lipgloss.Style {
+	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(r.theme.Accent).
 		Padding(1, 3)
-	return box.Render("Quit llamaman?\n\n  (k) kill server   (d) detach (leaves it running)   (c) cancel")
+}
+
+// promptShortcuts joins shortcut tokens (`k kill server`, `y yes`, …)
+// with three spaces between them, each rendered via paneShortcut so
+// the key gets accent-bold and the label gets subtle — same two-tone
+// styling as main mode's `shortcut()` helper and the config footer.
+func (r *RunMode) promptShortcuts(tokens ...string) string {
+	parts := make([]string, len(tokens))
+	for i, t := range tokens {
+		parts[i] = paneShortcut(t, r.theme, true)
+	}
+	return strings.Join(parts, "   ")
+}
+
+func (r *RunMode) renderQuitPrompt() string {
+	body := "Quit llamaman?\n\n  " + r.promptShortcuts(
+		"k kill server",
+		"d detach (leaves it running)",
+		"c cancel",
+	)
+	return r.promptBox().Render(body)
 }
 
 func (r *RunMode) renderRestartPrompt() string {
-	box := lipgloss.NewStyle().
+	body := "Restart llama-server?\n\n  " + r.promptShortcuts(
+		"y yes",
+		"n no",
+	)
+	return r.promptBox().Render(body)
+}
+
+// renderCopyResult is the centered modal that surfaces the outcome of
+// `c` (copy launch command). Same shape as the error modal in config
+// mode: focus-styled [Dismiss] button, "(any key)" hint, accent border
+// — except the border colour reflects success vs failure so a glance
+// at the modal tells you whether the clipboard write actually worked.
+func (r *RunMode) renderCopyResult() string {
+	success := strings.HasPrefix(r.copyResult, "Command copied")
+	border := r.theme.StatusErr
+	titleText := "⚠  Copy failed"
+	if success {
+		border = r.theme.StatusReady
+		titleText = "✓  Copied"
+	}
+	title := lipgloss.NewStyle().Foreground(border).Bold(true).Render(titleText)
+	msg := lipgloss.NewStyle().Foreground(r.theme.Subtle).Render(r.copyResult)
+	button := lipgloss.NewStyle().Reverse(true).Padding(0, 2).Render(" Dismiss ")
+	hint := lipgloss.NewStyle().Foreground(r.theme.Muted).Render("(any key)")
+	body := strings.Join([]string{
+		title,
+		"",
+		msg,
+		"",
+		button + "  " + hint,
+	}, "\n")
+	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(r.theme.Accent).
-		Padding(1, 3)
-	return box.Render("Server is ready. Restart anyway?\n\n  (y) yes   (n) no")
+		BorderForeground(border).
+		Padding(1, 2).
+		Render(body)
 }
 
 func (r *RunMode) renderKillPrompt() string {
-	box := lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(r.theme.Accent).
-		Padding(1, 3)
-	return box.Render(fmt.Sprintf(
-		"Kill llama-server (%s/%s)?\n\n  (y) yes   (n) no",
-		r.model.Alias, presetNameOrDash(r.preset),
-	))
+	title := fmt.Sprintf("Kill llama-server (%s/%s)?", r.model.Alias, presetNameOrDash(r.preset))
+	body := title + "\n\n  " + r.promptShortcuts(
+		"y yes",
+		"n no",
+	)
+	return r.promptBox().Render(body)
 }
 
 // renderInfoOverlay renders the `i`-toggled overlay: model identity
@@ -1029,36 +1089,57 @@ func (r *RunMode) renderInfoOverlay() string {
 }
 
 func (r *RunMode) renderHelp() string {
-	keys := []string{
-		"q / Ctrl+C  open quit prompt (k)ill / (d)etach / (c)ancel",
-		"k           kill server and return to main",
-		"r           restart server (confirm if ready)",
-		"c           copy launch command to clipboard",
-		"i           show model & preset details",
-		"/           search (live highlights; Enter applies, Esc cancels)",
-		"n / N       next / previous match",
-		"Esc         clear active search and highlights",
-		"g / G       jump to top / bottom",
-		"space / b   page down / up",
-		"↑ / ↓       scroll one line",
-		"?           toggle this help",
+	type entry struct{ key, desc string }
+	rows := []entry{
+		{"q / Ctrl+C", "open quit prompt — kill / detach / cancel"},
+		{"k", "kill server and return to main"},
+		{"r", "restart server (confirms)"},
+		{"c", "copy launch command to clipboard"},
+		{"i", "show model & preset details"},
+		{"/", "search (live highlights; Enter applies, Esc cancels)"},
+		{"n / N", "next / previous match"},
+		{"Esc", "clear active search and highlights"},
+		{"g / G", "jump to top / bottom"},
+		{"space / b", "page down / up"},
+		{"↑ / ↓", "scroll one line"},
+		{"?", "toggle this help"},
 	}
-	box := lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(r.theme.Accent).
-		Padding(1, 3)
-	return box.Render("Run mode keys\n\n" + strings.Join(keys, "\n"))
+	keyW := 0
+	for _, e := range rows {
+		if w := lipgloss.Width(e.key); w > keyW {
+			keyW = w
+		}
+	}
+	keyStyle := lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true)
+	descStyle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	lines := make([]string, 0, len(rows))
+	for _, e := range rows {
+		pad := strings.Repeat(" ", keyW-lipgloss.Width(e.key)+2)
+		lines = append(lines, keyStyle.Render(e.key)+pad+descStyle.Render(e.desc))
+	}
+	return r.promptBox().Render(
+		lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true).Render("Run mode keys") +
+			"\n\n" + strings.Join(lines, "\n"))
 }
 
 func (r *RunMode) renderFooter() string {
 	if r.searchActive {
 		return r.searchInput.View()
 	}
-	parts := []string{"q: quit  k: kill  r: restart  c: copy  i: info  /: search  ?: help  g/G: top/bottom  space/b: page  ↑/↓: scroll"}
-	if !r.proc.IsOwner() {
-		parts = append([]string{"[adopted]"}, parts...)
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	sep := subtle.Render(" · ")
+	tokens := []string{
+		"q quit", "k kill", "r restart", "c copy", "i info",
+		"/ search", "? help", "g/G top/bottom", "space/b page", "↑/↓ scroll",
 	}
-	hint := lipgloss.NewStyle().Foreground(r.theme.Subtle).Render(strings.Join(parts, " "))
+	parts := make([]string, len(tokens))
+	for i, t := range tokens {
+		parts[i] = paneShortcut(t, r.theme, true)
+	}
+	hint := strings.Join(parts, sep)
+	if !r.proc.IsOwner() {
+		hint = subtle.Render("[adopted] ") + hint
+	}
 	stack := []string{}
 	if r.flash != "" {
 		stack = append(stack, lipgloss.NewStyle().Foreground(r.theme.StatusStart).Render(r.flash))
