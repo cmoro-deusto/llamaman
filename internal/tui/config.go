@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
@@ -13,6 +14,17 @@ import (
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
 )
+
+// savedFlashTTL is how long the "● saved" indicator stays in the
+// subtitle after a successful save. Long enough that a quick eye
+// catches it, short enough that it doesn't read as stale state.
+const savedFlashTTL = 5 * time.Second
+
+// savedExpiredMsg is delivered by tea.Tick `savedFlashTTL` after a
+// successful save. The generation field guards against race conditions
+// when the user saves again within the TTL window: only the latest
+// save's tick is allowed to clear the indicator.
+type savedExpiredMsg struct{ gen int }
 
 // ConfigFocus identifies which of the three panes is active.
 type ConfigFocus int
@@ -88,6 +100,7 @@ type ConfigMode struct {
 	firstRunBanner bool   // shown until user presses 'n' in Models pane
 	helpOverlay    bool   // ? toggles a centered help reference; any key dismisses
 	errorModal     string // when non-empty, a centered error modal is overlaid; any key dismisses
+	savedGen       int    // bumped on every successful save; matched by the auto-expire tick
 
 	width, height int
 	theme         Theme
@@ -136,6 +149,15 @@ func (c *ConfigMode) Saved() *config.Config { return c.saved }
 // Update routes keys when no form/picker is active, and forwards to the
 // active overlay otherwise.
 func (c *ConfigMode) Update(msg tea.Msg) (*ConfigMode, tea.Cmd) {
+	// Auto-clear the "saved" subtitle indicator after savedFlashTTL.
+	// The gen check prevents a stale tick from clearing the indicator
+	// of a *subsequent* save that landed within the TTL window.
+	if m, ok := msg.(savedExpiredMsg); ok {
+		if m.gen == c.savedGen && c.flash == "saved" {
+			c.flash = ""
+		}
+		return c, nil
+	}
 	// Error modal takes priority over every other input path: until the
 	// user acknowledges the failure, no other key should mutate state
 	// (otherwise typing through the modal could trigger destructive
@@ -276,8 +298,7 @@ func (c *ConfigMode) handleKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 	case "g":
 		return c, c.openGlobalsForm()
 	case "s":
-		c.save()
-		return c, nil
+		return c, c.save()
 	case "?":
 		c.helpOverlay = true
 		return c, nil
@@ -950,7 +971,11 @@ func (c *ConfigMode) deleteParam() {
 	c.flash = "param deleted"
 }
 
-func (c *ConfigMode) save() {
+// save validates, writes, and on success sets the "saved" subtitle
+// indicator plus returns a tea.Cmd that clears the indicator after
+// `savedFlashTTL`. Failure paths surface in the error modal and return
+// nil — there's nothing to expire when the indicator never appeared.
+func (c *ConfigMode) save() tea.Cmd {
 	issues := config.Validate(c.work)
 	if issues.HasErrors() {
 		var bullets []string
@@ -963,17 +988,22 @@ func (c *ConfigMode) save() {
 			strings.Join(bullets, "\n")
 		c.saveErr = nil
 		c.flash = ""
-		return
+		return nil
 	}
 	if err := config.Save(c.cfgPath, c.work); err != nil {
 		c.saveErr = err
 		c.errorModal = fmt.Sprintf("Save failed:\n\n%v", err)
 		c.flash = ""
-		return
+		return nil
 	}
 	c.saveErr = nil
 	c.saved = cloneConfig(c.work)
 	c.flash = "saved"
+	c.savedGen++
+	gen := c.savedGen
+	return tea.Tick(savedFlashTTL, func(time.Time) tea.Msg {
+		return savedExpiredMsg{gen: gen}
+	})
 }
 
 // ---- view ----
