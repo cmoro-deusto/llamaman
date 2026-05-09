@@ -85,8 +85,9 @@ type ConfigMode struct {
 	saveErr error
 	flash   string
 
-	firstRunBanner bool // shown until user presses 'n' in Models pane
-	helpOverlay    bool // ? toggles a centered help reference; any key dismisses
+	firstRunBanner bool   // shown until user presses 'n' in Models pane
+	helpOverlay    bool   // ? toggles a centered help reference; any key dismisses
+	errorModal     string // when non-empty, a centered error modal is overlaid; any key dismisses
 
 	width, height int
 	theme         Theme
@@ -135,6 +136,16 @@ func (c *ConfigMode) Saved() *config.Config { return c.saved }
 // Update routes keys when no form/picker is active, and forwards to the
 // active overlay otherwise.
 func (c *ConfigMode) Update(msg tea.Msg) (*ConfigMode, tea.Cmd) {
+	// Error modal takes priority over every other input path: until the
+	// user acknowledges the failure, no other key should mutate state
+	// (otherwise typing through the modal could trigger destructive
+	// actions whose feedback they never saw).
+	if c.errorModal != "" {
+		if _, ok := msg.(tea.KeyMsg); ok {
+			c.errorModal = ""
+		}
+		return c, nil
+	}
 	if pm, ok := msg.(paramPickerDoneMsg); ok {
 		return c.handlePickerDone(pm)
 	}
@@ -245,6 +256,18 @@ func (c *ConfigMode) handleKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 		return c, nil
 	case "?":
 		c.helpOverlay = true
+		return c, nil
+	case "E":
+		// TEMPORARY: triggers a sample error modal so the user can
+		// manually verify rendering / dismissal without having to
+		// produce a real save failure (chmod the file, write a bad
+		// host, etc.). REMOVE this case once the modal flow is
+		// confirmed working — there's a follow-up task to add proper
+		// regression tests at that point.
+		c.errorModal = "Cannot save — fix these validation errors:\n\n" +
+			"  • models[1].alias — alias \"alpha\" is already used by another model\n" +
+			"  • models[2].location — file does not exist: /m/qwen3-32b.gguf\n" +
+			"  • globals.port — must be between 1 and 65535"
 		return c, nil
 	}
 	switch c.focus {
@@ -924,13 +947,22 @@ func (c *ConfigMode) deleteParam() {
 func (c *ConfigMode) save() {
 	issues := config.Validate(c.work)
 	if issues.HasErrors() {
-		c.flash = "save blocked: validation errors — fix and retry"
+		var bullets []string
+		for _, iss := range issues {
+			if iss.Severity == config.Error {
+				bullets = append(bullets, fmt.Sprintf("  • %s — %s", iss.Path, iss.Message))
+			}
+		}
+		c.errorModal = "Cannot save — fix these validation errors:\n\n" +
+			strings.Join(bullets, "\n")
 		c.saveErr = nil
+		c.flash = ""
 		return
 	}
 	if err := config.Save(c.cfgPath, c.work); err != nil {
 		c.saveErr = err
-		c.flash = fmt.Sprintf("save failed: %v", err)
+		c.errorModal = fmt.Sprintf("Save failed:\n\n%v", err)
+		c.flash = ""
 		return
 	}
 	c.saveErr = nil
@@ -945,6 +977,11 @@ func (c *ConfigMode) View() string {
 		return ""
 	}
 	bg := c.renderPanes()
+	// Error modal stacks above any other overlay so a failure surfaces
+	// even if a form / picker / help overlay was open when it fired.
+	if c.errorModal != "" {
+		return overlayCenter(bg, c.renderErrorModal(), c.width, c.height)
+	}
 	if c.picker != nil {
 		return overlayCenter(bg, c.picker.View(c.theme), c.width, c.height)
 	}
@@ -1128,15 +1165,12 @@ func (c *ConfigMode) renderParams() string {
 // reorder, and `?` itself.
 func (c *ConfigMode) renderFooter() string {
 	flash := ""
-	// "saved" is rendered in the subtitle next to the wordmark, not here
-	// — see renderPanes(). Footer flash still handles save errors and
-	// non-save action confirmations ("model added", "preset deleted", …).
+	// Save state ("saved") lives in the subtitle, not here — see
+	// renderPanes(). Save failures surface as a centered error modal,
+	// not as flash text. Footer flash is reserved for non-save action
+	// confirmations ("model added", "preset deleted", …).
 	if c.flash != "" && c.flash != "saved" {
-		col := c.theme.Subtle
-		if strings.HasPrefix(c.flash, "save failed") || strings.HasPrefix(c.flash, "save blocked") {
-			col = c.theme.StatusErr
-		}
-		flash = lipgloss.NewStyle().Foreground(col).Render(c.flash)
+		flash = lipgloss.NewStyle().Foreground(c.theme.Subtle).Render(c.flash)
 	}
 	paneLine := c.renderPaneHint()
 	sep := lipgloss.NewStyle().Foreground(c.theme.Subtle).Render(" · ")
@@ -1209,6 +1243,33 @@ func (c *ConfigMode) renderPaneHint() string {
 		}, sep)
 	}
 	return ""
+}
+
+// renderErrorModal draws the centered error popup with a focused
+// [Dismiss] button. Any key dismisses; the button styling (reverse
+// video) signals that hitting Enter / Space / Esc — anything, really —
+// closes the modal. Border + title use StatusErr so the failure mode
+// reads at a glance.
+func (c *ConfigMode) renderErrorModal() string {
+	title := lipgloss.NewStyle().
+		Foreground(c.theme.StatusErr).
+		Bold(true).
+		Render("⚠  Error")
+	msg := lipgloss.NewStyle().Foreground(c.theme.Subtle).Render(c.errorModal)
+	button := lipgloss.NewStyle().Reverse(true).Padding(0, 2).Render(" Dismiss ")
+	hint := lipgloss.NewStyle().Foreground(c.theme.Muted).Render("(any key)")
+	body := strings.Join([]string{
+		title,
+		"",
+		msg,
+		"",
+		button + "  " + hint,
+	}, "\n")
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(c.theme.StatusErr).
+		Padding(1, 2).
+		Render(body)
 }
 
 // renderHelpOverlay is the manual surfaced by `?`: full key map plus the
