@@ -47,6 +47,7 @@ const (
 	formNewPreset
 	formEditPreset
 	formDuplicatePreset
+	formCloneToModelPreset
 	formDeletePreset
 	formNewParamPickKey
 	formNewParamPickValue
@@ -69,6 +70,7 @@ type formStaging struct {
 	paramKey, paramVal *string
 	confirm            *bool
 	choice             *string
+	targetIdx          *int // for clone-to-model preset form
 }
 
 const (
@@ -329,12 +331,12 @@ func (c *ConfigMode) cycleFocus(delta int) {
 
 func (c *ConfigMode) handleModelsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 	switch k.String() {
-	case "up", "k":
+	case "up":
 		if c.modelIdx > 0 {
 			c.modelIdx--
 			c.presetIdx, c.paramIdx = 0, 0
 		}
-	case "down", "j":
+	case "down":
 		if c.modelIdx < len(c.work.Models)-1 {
 			c.modelIdx++
 			c.presetIdx, c.paramIdx = 0, 0
@@ -376,12 +378,12 @@ func (c *ConfigMode) handlePresetsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 	}
 	presets := c.work.Models[c.modelIdx].Presets
 	switch k.String() {
-	case "up", "k":
+	case "up":
 		if c.presetIdx > 0 {
 			c.presetIdx--
 			c.paramIdx = 0
 		}
-	case "down", "j":
+	case "down":
 		if c.presetIdx < len(presets)-1 {
 			c.presetIdx++
 			c.paramIdx = 0
@@ -408,6 +410,14 @@ func (c *ConfigMode) handlePresetsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 		if c.hasPreset() {
 			return c, c.openDuplicatePresetForm()
 		}
+	case "k":
+		if c.hasPreset() {
+			if len(c.work.Models) < 2 {
+				c.flash = "no other model to clone to"
+				return c, nil
+			}
+			return c, c.openClonePresetToModelForm()
+		}
 	case "d":
 		if c.hasPreset() {
 			return c, c.openDeletePresetPrompt()
@@ -422,11 +432,11 @@ func (c *ConfigMode) handleParamsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 	}
 	params := c.work.Models[c.modelIdx].Presets[c.presetIdx].Params
 	switch k.String() {
-	case "up", "k":
+	case "up":
 		if c.paramIdx > 0 {
 			c.paramIdx--
 		}
-	case "down", "j":
+	case "down":
 		if c.paramIdx < len(params)-1 {
 			c.paramIdx++
 		}
@@ -637,6 +647,68 @@ func (c *ConfigMode) openDuplicatePresetForm() tea.Cmd {
 		huh.NewInput().Title("new preset name").Value(&name).Validate(nonEmpty("name")),
 	))
 	return c.installForm(form, formDuplicatePreset)
+}
+
+// openClonePresetToModelForm opens the cross-model preset clone form:
+// a target-model select (every model except the source) plus a new
+// preset name (default `<src>-copy`) with a collision check that runs
+// against the *currently selected* target's presets — so flipping the
+// select between models re-evaluates the name on submit.
+func (c *ConfigMode) openClonePresetToModelForm() tea.Cmd {
+	src := c.work.Models[c.modelIdx].Presets[c.presetIdx]
+	name := src.Name + "-copy"
+	// Pick the first non-source model as the initial target. The select
+	// excludes the source itself — that's the existing `c clone` action.
+	target := 0
+	if target == c.modelIdx {
+		target = 1
+	}
+	c.formStaging = formStaging{name: &name, targetIdx: &target}
+
+	opts := make([]huh.Option[int], 0, len(c.work.Models)-1)
+	for i, m := range c.work.Models {
+		if i == c.modelIdx {
+			continue
+		}
+		opts = append(opts, huh.NewOption(m.Alias, i))
+	}
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[int]().
+			Title("target model").
+			Options(opts...).
+			Value(&target),
+		huh.NewInput().
+			Title("new preset name").
+			Value(&name).
+			Validate(clonePresetNameValidator(c.work.Models, &target)),
+	))
+	return c.installForm(form, formCloneToModelPreset)
+}
+
+// clonePresetNameValidator rejects empty input and any name already used
+// by a preset in the currently-selected target model. Closes over the
+// target pointer so a Tab back to the Select and a different choice
+// re-evaluates against the new target's presets at submit time.
+func clonePresetNameValidator(models []config.Model, target *int) func(string) error {
+	return func(s string) error {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return fmt.Errorf("name is required")
+		}
+		idx := 0
+		if target != nil {
+			idx = *target
+		}
+		if idx < 0 || idx >= len(models) {
+			return nil
+		}
+		for _, p := range models[idx].Presets {
+			if p.Name == s {
+				return fmt.Errorf("preset %q already exists in %q", s, models[idx].Alias)
+			}
+		}
+		return nil
+	}
 }
 
 // openNewParamForm starts a two-step flow: pick key (registry picker
@@ -866,6 +938,26 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		c.work.Models[c.modelIdx].Presets = append(c.work.Models[c.modelIdx].Presets, dup)
 		c.presetIdx = len(c.work.Models[c.modelIdx].Presets) - 1
 		c.flash = "preset duplicated"
+	case formCloneToModelPreset:
+		// Cursor stays on the source preset — the target model isn't
+		// focused after clone. The flash names the target alias so the
+		// user has confirmation that the right model received it.
+		src := c.work.Models[c.modelIdx].Presets[c.presetIdx]
+		target := 0
+		if c.formStaging.targetIdx != nil {
+			target = *c.formStaging.targetIdx
+		}
+		if target < 0 || target >= len(c.work.Models) || target == c.modelIdx {
+			c.flash = "invalid target model"
+			return nil, true
+		}
+		dup := config.Preset{
+			Name:        deref(c.formStaging.name),
+			Description: src.Description,
+			Params:      append(config.Params(nil), src.Params...),
+		}
+		c.work.Models[target].Presets = append(c.work.Models[target].Presets, dup)
+		c.flash = fmt.Sprintf("preset cloned to %q", c.work.Models[target].Alias)
 	case formDeletePreset:
 		if c.formStaging.confirm != nil && *c.formStaging.confirm {
 			c.deletePresetNow()
@@ -1296,10 +1388,16 @@ func (c *ConfigMode) renderPaneHint() string {
 		}, sep)
 	case FocusPresets:
 		has := c.hasPreset()
+		// `k clone-to` is grayed when there's only one model — pressing
+		// it then is a no-op with a flash, and dimming the hint matches
+		// the available/grayed pattern used by the other context-gated
+		// shortcuts above.
+		canCloneTo := has && len(c.work.Models) > 1
 		return subtle.Render("[Presets] ") + strings.Join([]string{
 			paneShortcut("n new", c.theme, c.hasModel()),
 			paneShortcut("e/⏎ edit", c.theme, has),
 			paneShortcut("c clone", c.theme, has),
+			paneShortcut("k clone-to", c.theme, canCloneTo),
 			paneShortcut("d delete", c.theme, has),
 		}, sep)
 	case FocusParams:
@@ -1351,13 +1449,14 @@ func (c *ConfigMode) renderHelpOverlay() string {
 	muted := lipgloss.NewStyle().Foreground(c.theme.Muted)
 	body := strings.Join([]string{
 		heading.Render("NAVIGATION"),
-		"  ↑/k  ↓/j        select item in focused pane",
+		"  ↑    ↓          select item in focused pane",
 		"  ⇧↑   ⇧↓         reorder (changes argv order on next launch)",
 		"  tab / → / l     next pane",
 		"  shift+tab / ← / h   previous pane",
 		"",
 		heading.Render("MODELS / PRESETS"),
 		"  n new      e or ⏎ edit      c clone      d delete (confirms)",
+		muted.Render("  Presets only:  k clone-to (copy preset to another model)."),
 		"",
 		heading.Render("PARAMS"),
 		"  n new      e or ⏎ edit value      d delete (confirms)",
