@@ -323,14 +323,12 @@ func (c *ConfigMode) handleModelsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 			c.work.Models[c.modelIdx-1], c.work.Models[c.modelIdx] =
 				c.work.Models[c.modelIdx], c.work.Models[c.modelIdx-1]
 			c.modelIdx--
-			c.flash = "moved up"
 		}
 	case "shift+down":
 		if c.hasModel() && c.modelIdx < len(c.work.Models)-1 {
 			c.work.Models[c.modelIdx+1], c.work.Models[c.modelIdx] =
 				c.work.Models[c.modelIdx], c.work.Models[c.modelIdx+1]
 			c.modelIdx++
-			c.flash = "moved down"
 		}
 	case "n":
 		c.firstRunBanner = false
@@ -372,14 +370,12 @@ func (c *ConfigMode) handlePresetsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 			ps := c.work.Models[c.modelIdx].Presets
 			ps[c.presetIdx-1], ps[c.presetIdx] = ps[c.presetIdx], ps[c.presetIdx-1]
 			c.presetIdx--
-			c.flash = "moved up"
 		}
 	case "shift+down":
 		if c.hasPreset() && c.presetIdx < len(presets)-1 {
 			ps := c.work.Models[c.modelIdx].Presets
 			ps[c.presetIdx+1], ps[c.presetIdx] = ps[c.presetIdx], ps[c.presetIdx+1]
 			c.presetIdx++
-			c.flash = "moved down"
 		}
 	case "n":
 		return c, c.openNewPresetForm()
@@ -417,13 +413,11 @@ func (c *ConfigMode) handleParamsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 		if len(params) > 0 && c.paramIdx > 0 {
 			params[c.paramIdx-1], params[c.paramIdx] = params[c.paramIdx], params[c.paramIdx-1]
 			c.paramIdx--
-			c.flash = "moved up"
 		}
 	case "shift+down":
 		if len(params) > 0 && c.paramIdx < len(params)-1 {
 			params[c.paramIdx+1], params[c.paramIdx] = params[c.paramIdx], params[c.paramIdx+1]
 			c.paramIdx++
-			c.flash = "moved down"
 		}
 	case "n":
 		return c, c.openNewParamForm()
@@ -1056,24 +1050,29 @@ func (c *ConfigMode) renderPanes() string {
 	topParts = append(topParts, wordmark, "", header, "", row)
 
 	// Edit form (when open) renders inline below the Presets pane at
-	// the same column width. Each line is padded out to the full
-	// terminal width so the surrounding JoinVertical(Center, …) keeps
-	// the form anchored at column `paneW` instead of re-centering it
-	// across the screen.
+	// the same column width. The padded line must match the panes
+	// row width exactly (rowW, typically c.width - 2) — padding to
+	// c.width instead would make JoinVertical(Center, …) shift the
+	// narrower panes row right by 1 column to center it within the
+	// wider form line.
+	rowW := lipgloss.Width(row)
 	if c.form != nil {
 		popup := lipgloss.NewStyle().
 			BorderStyle(lipgloss.RoundedBorder()).
 			BorderForeground(c.theme.Accent).
 			Padding(1, 2).
 			Render(c.form.View())
-		topParts = append(topParts, "", padToColumn(popup, paneW, c.width))
+		topParts = append(topParts, "", padToColumn(popup, paneW, rowW))
 	}
 	top := lipgloss.JoinVertical(lipgloss.Center, topParts...)
 
 	// Footer is rendered separately and pinned to the bottom of the
 	// terminal via a calculated filler. Each footer line is centered
 	// horizontally across the full width.
-	footer := lipgloss.NewStyle().Width(c.width).Align(lipgloss.Center).
+	// Footer width matches the panes-row width too, so the wordmark,
+	// header, panes, form, and footer all share one canonical block
+	// width and stay aligned.
+	footer := lipgloss.NewStyle().Width(rowW).Align(lipgloss.Center).
 		Render(c.renderFooter())
 
 	gap := c.height - lipgloss.Height(top) - lipgloss.Height(footer)

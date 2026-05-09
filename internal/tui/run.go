@@ -73,8 +73,9 @@ type RunMode struct {
 	theme         Theme
 
 	showQuit      bool // quit prompt overlay active
-	showHelp      bool // help overlay active
-	showInfo      bool // i-info overlay active (model + preset detail)
+	showHelp      bool   // help overlay active
+	showInfo      bool   // i-info overlay active (model + preset detail)
+	copyResult    string // when non-empty, a centered "command copied" modal is shown; any key dismisses
 	restartPrompt bool // r-confirm overlay
 	killPrompt    bool // k-confirm overlay
 	flash         string
@@ -476,6 +477,10 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			r.showInfo = false
 			return r, nil
 		}
+		if r.copyResult != "" {
+			r.copyResult = ""
+			return r, nil
+		}
 		switch m.String() {
 		case "esc":
 			// Layered Esc: on the main run screen, clear any applied
@@ -709,10 +714,11 @@ func (r *RunMode) requestRestart() tea.Cmd {
 }
 
 // copyCommand pushes the launch argv onto the clipboard via wl-copy then
-// xclip; flashes a confirmation status either way.
+// xclip; surfaces the outcome in a centered modal (`r.copyResult`) so
+// the success / failure is unmissable instead of buried in the footer.
 func (r *RunMode) copyCommand() {
 	if len(r.argv) == 0 {
-		r.flash = "no command to copy"
+		r.copyResult = "Nothing to copy — the launch command is empty."
 		return
 	}
 	cmdLine := strings.Join(r.argv, " ")
@@ -729,11 +735,11 @@ func (r *RunMode) copyCommand() {
 		c := exec.Command(candidate.name, candidate.args...)
 		c.Stdin = bytes.NewReader([]byte(cmdLine))
 		if err := c.Run(); err == nil {
-			r.flash = fmt.Sprintf("command copied via %s", candidate.name)
+			r.copyResult = fmt.Sprintf("Command copied to clipboard via %s.", candidate.name)
 			return
 		}
 	}
-	r.flash = "no clipboard tool found (install wl-copy or xclip)"
+	r.copyResult = "No clipboard tool found.\n\nInstall wl-copy (Wayland) or xclip (X11) and try again."
 }
 
 // effectiveQuery returns the query whose matches should be highlighted
@@ -909,6 +915,8 @@ func (r *RunMode) View() string {
 		out = overlayCenter(bg, r.renderHelp(), r.width, r.height)
 	case r.showInfo:
 		out = overlayCenter(bg, r.renderInfoOverlay(), r.width, r.height)
+	case r.copyResult != "":
+		out = overlayCenter(bg, r.renderCopyResult(), r.width, r.height)
 	default:
 		out = bg
 	}
@@ -992,6 +1000,37 @@ func (r *RunMode) renderRestartPrompt() string {
 		"n no",
 	)
 	return r.promptBox().Render(body)
+}
+
+// renderCopyResult is the centered modal that surfaces the outcome of
+// `c` (copy launch command). Same shape as the error modal in config
+// mode: focus-styled [Dismiss] button, "(any key)" hint, accent border
+// — except the border colour reflects success vs failure so a glance
+// at the modal tells you whether the clipboard write actually worked.
+func (r *RunMode) renderCopyResult() string {
+	success := strings.HasPrefix(r.copyResult, "Command copied")
+	border := r.theme.StatusErr
+	titleText := "⚠  Copy failed"
+	if success {
+		border = r.theme.StatusReady
+		titleText = "✓  Copied"
+	}
+	title := lipgloss.NewStyle().Foreground(border).Bold(true).Render(titleText)
+	msg := lipgloss.NewStyle().Foreground(r.theme.Subtle).Render(r.copyResult)
+	button := lipgloss.NewStyle().Reverse(true).Padding(0, 2).Render(" Dismiss ")
+	hint := lipgloss.NewStyle().Foreground(r.theme.Muted).Render("(any key)")
+	body := strings.Join([]string{
+		title,
+		"",
+		msg,
+		"",
+		button + "  " + hint,
+	}, "\n")
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(border).
+		Padding(1, 2).
+		Render(body)
 }
 
 func (r *RunMode) renderKillPrompt() string {
