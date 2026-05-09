@@ -977,8 +977,16 @@ func (c *ConfigMode) renderPanes() string {
 
 	header := lipgloss.NewStyle().Foreground(c.theme.Subtle).
 		Render("llamaman — configuration")
+	// Save state lives in the subtitle so the indicator doesn't jump
+	// between the top and the bottom of the screen on save: "● modified"
+	// (yellow) while dirty, "● saved" (green) right after a clean save.
+	// Save errors stay in the footer flash because Modified() is still
+	// true after a failed save, so the subtitle correctly keeps showing
+	// "● modified" and the footer surfaces the detailed error message.
 	if c.Modified() {
 		header += lipgloss.NewStyle().Foreground(c.theme.StatusStart).Render("  ● modified")
+	} else if c.flash == "saved" {
+		header += lipgloss.NewStyle().Foreground(c.theme.StatusReady).Render("  ● saved")
 	}
 	if c.firstRunBanner {
 		banner := lipgloss.NewStyle().
@@ -1120,12 +1128,13 @@ func (c *ConfigMode) renderParams() string {
 // reorder, and `?` itself.
 func (c *ConfigMode) renderFooter() string {
 	flash := ""
-	if c.flash != "" {
+	// "saved" is rendered in the subtitle next to the wordmark, not here
+	// — see renderPanes(). Footer flash still handles save errors and
+	// non-save action confirmations ("model added", "preset deleted", …).
+	if c.flash != "" && c.flash != "saved" {
 		col := c.theme.Subtle
 		if strings.HasPrefix(c.flash, "save failed") || strings.HasPrefix(c.flash, "save blocked") {
 			col = c.theme.StatusErr
-		} else if strings.HasPrefix(c.flash, "saved") {
-			col = c.theme.StatusReady
 		}
 		flash = lipgloss.NewStyle().Foreground(col).Render(c.flash)
 	}
