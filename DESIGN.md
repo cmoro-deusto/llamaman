@@ -513,7 +513,7 @@ Three-pane master-detail:
 │ [g] globals       │                              │   ctx-size         262144   │
 │                   │                              │   ...                       │
 │                   │                              │   [+ add param]             │
-└── Tab: pane ─ e: edit ─ D: dup ─ d: del ─ s: save ─ Esc: back ─────────────────┘
+└── Tab: pane ─ e: edit ─ c: dup ─ k: clone-to ─ d: del ─ s: save ─ Esc: back ───┘
 ```
 
 `Tab` / `Shift+Tab` cycle focus across panes. `Right` / `Left` (and `l` / `h`) do the same — the user can navigate to any pane with arrow keys without lifting from the navigation cluster.
@@ -521,14 +521,15 @@ Three-pane master-detail:
 **Models pane**:
 - `e` rename alias / change source (modal form: alias, source select [`local` | `huggingface`], then either a path input or a `org/repo[:quant]` input depending on the selection).
 - `n` new model (same modal as edit).
-- `D` duplicate, prompt for new alias (presets and params copied; source kind and value preserved).
+- `c` duplicate, prompt for new alias (presets and params copied; source kind and value preserved).
 - `d` delete (confirm with preset count).
 - `Shift+↑/↓` reorder (persisted in JSON).
 
 **Presets pane**:
 - `e` rename preset / edit description.
 - `n` new preset (name + description; starts with empty params).
-- `D` duplicate, prompt for new name.
+- `c` duplicate within the same model, prompt for new name.
+- `k` clone to a different model — opens a form with a target-model select (every model except the source) and a new-name input (default `<src>-copy`). Submitting deep-copies the source preset's description and params into the chosen target. Cursor stays on the source row; flash names the target alias. When only one model exists the shortcut renders dimmed and pressing `k` is a no-op with the flash `no other model to clone to`.
 - `d` delete (confirm).
 - `Shift+↑/↓` reorder.
 

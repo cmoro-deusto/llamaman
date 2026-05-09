@@ -341,7 +341,7 @@ A three-pane master/detail editor:
 │ [g] globals       │                              │   ctx-size         262144   │
 │                   │                              │   ...                       │
 │                   │                              │   [+ add param]             │
-└── Tab: pane ─ e: edit ─ D: dup ─ d: del ─ s: save ─ Esc: back ─────────────────┘
+└── Tab: pane ─ e: edit ─ c: dup ─ k: clone-to ─ d: del ─ s: save ─ Esc: back ───┘
 ```
 
 | Key | Action |
@@ -352,7 +352,8 @@ A three-pane master/detail editor:
 | `Shift+↑` / `Shift+↓` | Reorder the focused row (models, presets, or params) |
 | `e` | Edit the highlighted item |
 | `n` | New item (model / preset / param, depending on focused pane) |
-| `D` | Duplicate (models and presets) |
+| `c` | Duplicate (models and presets, within the same parent) |
+| `k` | Clone preset to another model (Presets pane only — opens a target-model select + new-name input) |
 | `d` | Delete (with confirm where lossy) |
 | `g` | Open the Globals form (binary path, host, port) |
 | `s` | Save (atomic, with `.bak`) |
@@ -521,7 +522,8 @@ The minimum tested `llama-server` build is **`build 8994 (aab68217b)`**. Older b
 | Config | `Shift+↑` / `Shift+↓` | Reorder rows |
 | Config | `e` | Edit highlighted item |
 | Config | `n` | New item (model / preset / param) |
-| Config | `D` | Duplicate (models, presets) |
+| Config | `c` | Duplicate (models, presets) |
+| Config | `k` | Clone preset to another model (Presets pane) |
 | Config | `d` | Delete (with confirm) |
 | Config | `g` | Open Globals form |
 | Config | `s` | Save (atomic, with `.bak`) |
