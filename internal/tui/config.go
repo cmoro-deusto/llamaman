@@ -206,21 +206,25 @@ func (c *ConfigMode) dismissForm() {
 	c.formStaging = formStaging{}
 }
 
-// installForm wires a freshly constructed huh.Form into ConfigMode and
-// drives a WindowSizeMsg through it so its inputs size to the available
-// width. Without this, huh defaults to a tiny width and long values
-// (e.g. model paths) scroll off the right edge invisibly.
+// installForm wires a freshly constructed huh.Form into ConfigMode,
+// applies our customized huh theme (so the form's help line picks up the
+// same accent-bold key + subtle label styling used by the bottom hint
+// rows), and drives a WindowSizeMsg through it so the inputs size to
+// the column width assigned to the form.
 //
-// The form is rendered inside a centered, bordered, padded box; we
-// subtract a generous frame allowance to keep the inputs comfortably
-// inside the box.
+// The form is rendered below the Presets pane (see renderPanes) at the
+// width of one pane (`paneW`). The bordered popup wrapper consumes 2
+// cols of border + 4 cols of horizontal padding, so the inner huh
+// content is sized to `paneW - 6`.
 func (c *ConfigMode) installForm(form *huh.Form, kind formKind) tea.Cmd {
+	form.WithTheme(configHuhTheme(c.theme))
 	c.form = form
 	c.formKind = kind
 	cmds := []tea.Cmd{form.Init()}
 	if c.width > 0 && c.height > 0 {
-		const frame = 12 // border + padding + breathing room
-		w := c.width - frame
+		paneW := (c.width - 4) / 3
+		const popupFrame = 6 // border (2) + horizontal padding (4)
+		w := paneW - popupFrame
 		if w < 20 {
 			w = 20
 		}
@@ -234,6 +238,26 @@ func (c *ConfigMode) installForm(form *huh.Form, kind formKind) tea.Cmd {
 		}
 	}
 	return tea.Batch(cmds...)
+}
+
+// configHuhTheme starts from huh.ThemeBase() and overrides only the
+// help styles so the form's bottom shortcut row matches the two-tone
+// styling used by main mode (`shortcut()`) and the config-mode footer
+// (`paneShortcut`): accent-bold key + subtle label + subtle separator.
+// All other huh styling stays at its base defaults.
+func configHuhTheme(t Theme) *huh.Theme {
+	th := huh.ThemeBase()
+	keyStyle := lipgloss.NewStyle().Foreground(t.Accent).Bold(true)
+	descStyle := lipgloss.NewStyle().Foreground(t.Subtle)
+	sepStyle := lipgloss.NewStyle().Foreground(t.Subtle)
+	th.Help.ShortKey = keyStyle
+	th.Help.ShortDesc = descStyle
+	th.Help.ShortSeparator = sepStyle
+	th.Help.FullKey = keyStyle
+	th.Help.FullDesc = descStyle
+	th.Help.FullSeparator = sepStyle
+	th.Help.Ellipsis = descStyle
+	return th
 }
 
 func (c *ConfigMode) handleKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
@@ -256,18 +280,6 @@ func (c *ConfigMode) handleKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 		return c, nil
 	case "?":
 		c.helpOverlay = true
-		return c, nil
-	case "E":
-		// TEMPORARY: triggers a sample error modal so the user can
-		// manually verify rendering / dismissal without having to
-		// produce a real save failure (chmod the file, write a bad
-		// host, etc.). REMOVE this case once the modal flow is
-		// confirmed working — there's a follow-up task to add proper
-		// regression tests at that point.
-		c.errorModal = "Cannot save — fix these validation errors:\n\n" +
-			"  • models[1].alias — alias \"alpha\" is already used by another model\n" +
-			"  • models[2].location — file does not exist: /m/qwen3-32b.gguf\n" +
-			"  • globals.port — must be between 1 and 65535"
 		return c, nil
 	}
 	switch c.focus {
@@ -438,7 +450,7 @@ func (c *ConfigMode) openGlobalsForm() tea.Cmd {
 		huh.NewInput().Title("llama-server binary").Value(&bin).Validate(nonEmpty("binary")),
 		huh.NewInput().Title("host (IPv4 / [::IPv6] / hostname)").Value(&host).Validate(hostValidator),
 		huh.NewInput().Title("port").Value(&port).Validate(numericRange(1, 65535)),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formGlobals)
 }
 
@@ -494,7 +506,7 @@ func buildModelForm(alias, source, location, hf *string) *huh.Form {
 			CharLimit(256).
 			Validate(hfFormValidator),
 	).WithHideFunc(func() bool { return *source != sourceHF })
-	return huh.NewForm(g1, g2Local, g2HF).WithTheme(huh.ThemeBase())
+	return huh.NewForm(g1, g2Local, g2HF)
 }
 
 // hfFormValidator combines the non-empty check with the format check
@@ -517,7 +529,7 @@ func (c *ConfigMode) openDuplicateModelForm() tea.Cmd {
 	c.formStaging = formStaging{alias: &alias}
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("new alias").Value(&alias).Validate(uniqueAliasValidator(c.work.Models)),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formDuplicateModel)
 }
 
@@ -547,7 +559,7 @@ func (c *ConfigMode) openDeleteModelPrompt() tea.Cmd {
 		m.Alias, len(m.Presets), plural(len(m.Presets)))
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewConfirm().Title(prompt).Affirmative("Delete").Negative("Cancel").Value(&confirm),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formDeleteModel)
 }
 
@@ -557,7 +569,7 @@ func (c *ConfigMode) openNewPresetForm() tea.Cmd {
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("preset name").Value(&name).Validate(nonEmpty("name")),
 		huh.NewInput().Title("description").Value(&desc),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formNewPreset)
 }
 
@@ -568,7 +580,7 @@ func (c *ConfigMode) openEditPresetForm() tea.Cmd {
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("preset name").Value(&name).Validate(nonEmpty("name")),
 		huh.NewInput().Title("description").Value(&desc),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formEditPreset)
 }
 
@@ -585,7 +597,7 @@ func (c *ConfigMode) openDeleteParamPrompt() tea.Cmd {
 		huh.NewConfirm().Title(prompt).
 			Affirmative("Delete").Negative("Cancel").
 			Value(&confirm),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formDeleteParam)
 }
 
@@ -598,7 +610,7 @@ func (c *ConfigMode) openDeletePresetPrompt() tea.Cmd {
 		huh.NewConfirm().Title(prompt).
 			Affirmative("Delete").Negative("Cancel").
 			Value(&confirm),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formDeletePreset)
 }
 
@@ -608,7 +620,7 @@ func (c *ConfigMode) openDuplicatePresetForm() tea.Cmd {
 	c.formStaging = formStaging{name: &name}
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("new preset name").Value(&name).Validate(nonEmpty("name")),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formDuplicatePreset)
 }
 
@@ -627,7 +639,7 @@ func (c *ConfigMode) openNewParamForm() tea.Cmd {
 				Title("flag key (without leading dashes)").
 				Value(&c.pendingKey).
 				Validate(nonEmpty("key")),
-		)).WithTheme(huh.ThemeBase())
+		))
 		return c.installForm(form, formNewParamPickKey)
 	}
 	c.picker = newParamPicker(c.registry)
@@ -697,7 +709,7 @@ func (c *ConfigMode) openValueFormFor(key, initial string) tea.Cmd {
 			Title(title).
 			Value(&val)
 	}
-	form := huh.NewForm(huh.NewGroup(field)).WithTheme(huh.ThemeBase())
+	form := huh.NewForm(huh.NewGroup(field))
 	return c.installForm(form, formNewParamPickValue)
 }
 
@@ -761,7 +773,7 @@ func (c *ConfigMode) openExitPrompt() tea.Cmd {
 				huh.NewOption("Cancel", "cancel"),
 			).
 			Value(&choice),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formExitPrompt)
 }
 
@@ -985,14 +997,10 @@ func (c *ConfigMode) View() string {
 	if c.picker != nil {
 		return overlayCenter(bg, c.picker.View(c.theme), c.width, c.height)
 	}
-	if c.form != nil {
-		popup := lipgloss.NewStyle().
-			BorderStyle(lipgloss.RoundedBorder()).
-			BorderForeground(c.theme.Accent).
-			Padding(1, 2).
-			Render(c.form.View())
-		return overlayCenter(bg, popup, c.width, c.height)
-	}
+	// The form is no longer overlaid here — renderPanes() inlines it
+	// below the Presets pane at the same column width, so the panes
+	// stay visible above it. View() only handles the truly-modal
+	// overlays (picker, help, error).
 	if c.helpOverlay {
 		return overlayCenter(bg, c.renderHelpOverlay(), c.width, c.height)
 	}
@@ -1041,11 +1049,25 @@ func (c *ConfigMode) renderPanes() string {
 	row := lipgloss.JoinHorizontal(lipgloss.Top, left, mid, right)
 
 	const topPadding = 8
-	topParts := make([]string, 0, topPadding+5)
+	topParts := make([]string, 0, topPadding+7)
 	for i := 0; i < topPadding; i++ {
 		topParts = append(topParts, "")
 	}
 	topParts = append(topParts, wordmark, "", header, "", row)
+
+	// Edit form (when open) renders inline below the Presets pane at
+	// the same column width. Each line is padded out to the full
+	// terminal width so the surrounding JoinVertical(Center, …) keeps
+	// the form anchored at column `paneW` instead of re-centering it
+	// across the screen.
+	if c.form != nil {
+		popup := lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(c.theme.Accent).
+			Padding(1, 2).
+			Render(c.form.View())
+		topParts = append(topParts, "", padToColumn(popup, paneW, c.width))
+	}
 	top := lipgloss.JoinVertical(lipgloss.Center, topParts...)
 
 	// Footer is rendered separately and pinned to the bottom of the
@@ -1072,6 +1094,26 @@ func (c *ConfigMode) renderPane(focus ConfigFocus, title string, w int, body str
 	}
 	titleLine := lipgloss.NewStyle().Foreground(c.theme.Subtle).Render(title)
 	return border.Render(titleLine + "\n" + body)
+}
+
+// padToColumn shifts a multi-line string so each line starts at column
+// `leftCol` and the whole thing is padded with trailing spaces out to
+// `totalW`. Used to anchor the inline form below the Presets pane: the
+// surrounding JoinVertical(Center, …) would otherwise re-center the
+// form's narrower lines across the full terminal width.
+func padToColumn(s string, leftCol, totalW int) string {
+	lines := strings.Split(s, "\n")
+	leftPad := strings.Repeat(" ", leftCol)
+	out := make([]string, len(lines))
+	for i, line := range lines {
+		w := lipgloss.Width(line)
+		rightPad := totalW - leftCol - w
+		if rightPad < 0 {
+			rightPad = 0
+		}
+		out[i] = leftPad + line + strings.Repeat(" ", rightPad)
+	}
+	return strings.Join(out, "\n")
 }
 
 // reverseSelected wraps the row text in ANSI reverse-video SGR when the
