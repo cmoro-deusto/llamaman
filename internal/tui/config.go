@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
@@ -13,6 +14,17 @@ import (
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
 )
+
+// savedFlashTTL is how long the "● saved" indicator stays in the
+// subtitle after a successful save. Long enough that a quick eye
+// catches it, short enough that it doesn't read as stale state.
+const savedFlashTTL = 5 * time.Second
+
+// savedExpiredMsg is delivered by tea.Tick `savedFlashTTL` after a
+// successful save. The generation field guards against race conditions
+// when the user saves again within the TTL window: only the latest
+// save's tick is allowed to clear the indicator.
+type savedExpiredMsg struct{ gen int }
 
 // ConfigFocus identifies which of the three panes is active.
 type ConfigFocus int
@@ -39,6 +51,7 @@ const (
 	formNewParamPickKey
 	formNewParamPickValue
 	formEditParam
+	formDeleteParam
 	formExitPrompt
 )
 
@@ -84,7 +97,10 @@ type ConfigMode struct {
 	saveErr error
 	flash   string
 
-	firstRunBanner bool // shown until user presses 'n' in Models pane
+	firstRunBanner bool   // shown until user presses 'n' in Models pane
+	helpOverlay    bool   // ? toggles a centered help reference; any key dismisses
+	errorModal     string // when non-empty, a centered error modal is overlaid; any key dismisses
+	savedGen       int    // bumped on every successful save; matched by the auto-expire tick
 
 	width, height int
 	theme         Theme
@@ -133,6 +149,25 @@ func (c *ConfigMode) Saved() *config.Config { return c.saved }
 // Update routes keys when no form/picker is active, and forwards to the
 // active overlay otherwise.
 func (c *ConfigMode) Update(msg tea.Msg) (*ConfigMode, tea.Cmd) {
+	// Auto-clear the "saved" subtitle indicator after savedFlashTTL.
+	// The gen check prevents a stale tick from clearing the indicator
+	// of a *subsequent* save that landed within the TTL window.
+	if m, ok := msg.(savedExpiredMsg); ok {
+		if m.gen == c.savedGen && c.flash == "saved" {
+			c.flash = ""
+		}
+		return c, nil
+	}
+	// Error modal takes priority over every other input path: until the
+	// user acknowledges the failure, no other key should mutate state
+	// (otherwise typing through the modal could trigger destructive
+	// actions whose feedback they never saw).
+	if c.errorModal != "" {
+		if _, ok := msg.(tea.KeyMsg); ok {
+			c.errorModal = ""
+		}
+		return c, nil
+	}
 	if pm, ok := msg.(paramPickerDoneMsg); ok {
 		return c.handlePickerDone(pm)
 	}
@@ -145,6 +180,10 @@ func (c *ConfigMode) Update(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 		return c.updateForm(msg)
 	}
 	if k, ok := msg.(tea.KeyMsg); ok {
+		if c.helpOverlay {
+			c.helpOverlay = false
+			return c, nil
+		}
 		return c.handleKey(k)
 	}
 	return c, nil
@@ -189,21 +228,25 @@ func (c *ConfigMode) dismissForm() {
 	c.formStaging = formStaging{}
 }
 
-// installForm wires a freshly constructed huh.Form into ConfigMode and
-// drives a WindowSizeMsg through it so its inputs size to the available
-// width. Without this, huh defaults to a tiny width and long values
-// (e.g. model paths) scroll off the right edge invisibly.
+// installForm wires a freshly constructed huh.Form into ConfigMode,
+// applies our customized huh theme (so the form's help line picks up the
+// same accent-bold key + subtle label styling used by the bottom hint
+// rows), and drives a WindowSizeMsg through it so the inputs size to
+// the column width assigned to the form.
 //
-// The form is rendered inside a centered, bordered, padded box; we
-// subtract a generous frame allowance to keep the inputs comfortably
-// inside the box.
+// The form is rendered below the Presets pane (see renderPanes) at the
+// width of one pane (`paneW`). The bordered popup wrapper consumes 2
+// cols of border + 4 cols of horizontal padding, so the inner huh
+// content is sized to `paneW - 6`.
 func (c *ConfigMode) installForm(form *huh.Form, kind formKind) tea.Cmd {
+	form.WithTheme(configHuhTheme(c.theme))
 	c.form = form
 	c.formKind = kind
 	cmds := []tea.Cmd{form.Init()}
 	if c.width > 0 && c.height > 0 {
-		const frame = 12 // border + padding + breathing room
-		w := c.width - frame
+		paneW := (c.width - 4) / 3
+		const popupFrame = 6 // border (2) + horizontal padding (4)
+		w := paneW - popupFrame
 		if w < 20 {
 			w = 20
 		}
@@ -217,6 +260,26 @@ func (c *ConfigMode) installForm(form *huh.Form, kind formKind) tea.Cmd {
 		}
 	}
 	return tea.Batch(cmds...)
+}
+
+// configHuhTheme starts from huh.ThemeBase() and overrides only the
+// help styles so the form's bottom shortcut row matches the two-tone
+// styling used by main mode (`shortcut()`) and the config-mode footer
+// (`paneShortcut`): accent-bold key + subtle label + subtle separator.
+// All other huh styling stays at its base defaults.
+func configHuhTheme(t Theme) *huh.Theme {
+	th := huh.ThemeBase()
+	keyStyle := lipgloss.NewStyle().Foreground(t.Accent).Bold(true)
+	descStyle := lipgloss.NewStyle().Foreground(t.Subtle)
+	sepStyle := lipgloss.NewStyle().Foreground(t.Subtle)
+	th.Help.ShortKey = keyStyle
+	th.Help.ShortDesc = descStyle
+	th.Help.ShortSeparator = sepStyle
+	th.Help.FullKey = keyStyle
+	th.Help.FullDesc = descStyle
+	th.Help.FullSeparator = sepStyle
+	th.Help.Ellipsis = descStyle
+	return th
 }
 
 func (c *ConfigMode) handleKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
@@ -235,10 +298,9 @@ func (c *ConfigMode) handleKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 	case "g":
 		return c, c.openGlobalsForm()
 	case "s":
-		c.save()
-		return c, nil
+		return c, c.save()
 	case "?":
-		c.flash = "tab/← →: cycle pane · ↑↓: select · e: edit · n: new · D: dup · d: delete · g: globals · s: save · esc: back"
+		c.helpOverlay = true
 		return c, nil
 	}
 	switch c.focus {
@@ -282,23 +344,21 @@ func (c *ConfigMode) handleModelsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 			c.work.Models[c.modelIdx-1], c.work.Models[c.modelIdx] =
 				c.work.Models[c.modelIdx], c.work.Models[c.modelIdx-1]
 			c.modelIdx--
-			c.flash = "moved up"
 		}
 	case "shift+down":
 		if c.hasModel() && c.modelIdx < len(c.work.Models)-1 {
 			c.work.Models[c.modelIdx+1], c.work.Models[c.modelIdx] =
 				c.work.Models[c.modelIdx], c.work.Models[c.modelIdx+1]
 			c.modelIdx++
-			c.flash = "moved down"
 		}
 	case "n":
 		c.firstRunBanner = false
 		return c, c.openNewModelForm()
-	case "e":
+	case "e", "enter":
 		if c.hasModel() {
 			return c, c.openEditModelForm()
 		}
-	case "D":
+	case "c":
 		if c.hasModel() {
 			return c, c.openDuplicateModelForm()
 		}
@@ -331,22 +391,20 @@ func (c *ConfigMode) handlePresetsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 			ps := c.work.Models[c.modelIdx].Presets
 			ps[c.presetIdx-1], ps[c.presetIdx] = ps[c.presetIdx], ps[c.presetIdx-1]
 			c.presetIdx--
-			c.flash = "moved up"
 		}
 	case "shift+down":
 		if c.hasPreset() && c.presetIdx < len(presets)-1 {
 			ps := c.work.Models[c.modelIdx].Presets
 			ps[c.presetIdx+1], ps[c.presetIdx] = ps[c.presetIdx], ps[c.presetIdx+1]
 			c.presetIdx++
-			c.flash = "moved down"
 		}
 	case "n":
 		return c, c.openNewPresetForm()
-	case "e":
+	case "e", "enter":
 		if c.hasPreset() {
 			return c, c.openEditPresetForm()
 		}
-	case "D":
+	case "c":
 		if c.hasPreset() {
 			return c, c.openDuplicatePresetForm()
 		}
@@ -376,13 +434,11 @@ func (c *ConfigMode) handleParamsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 		if len(params) > 0 && c.paramIdx > 0 {
 			params[c.paramIdx-1], params[c.paramIdx] = params[c.paramIdx], params[c.paramIdx-1]
 			c.paramIdx--
-			c.flash = "moved up"
 		}
 	case "shift+down":
 		if len(params) > 0 && c.paramIdx < len(params)-1 {
 			params[c.paramIdx+1], params[c.paramIdx] = params[c.paramIdx], params[c.paramIdx+1]
 			c.paramIdx++
-			c.flash = "moved down"
 		}
 	case "n":
 		return c, c.openNewParamForm()
@@ -392,7 +448,7 @@ func (c *ConfigMode) handleParamsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 		}
 	case "d":
 		if len(params) > 0 {
-			c.deleteParam()
+			return c, c.openDeleteParamPrompt()
 		}
 	}
 	return c, nil
@@ -409,7 +465,7 @@ func (c *ConfigMode) openGlobalsForm() tea.Cmd {
 		huh.NewInput().Title("llama-server binary").Value(&bin).Validate(nonEmpty("binary")),
 		huh.NewInput().Title("host (IPv4 / [::IPv6] / hostname)").Value(&host).Validate(hostValidator),
 		huh.NewInput().Title("port").Value(&port).Validate(numericRange(1, 65535)),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formGlobals)
 }
 
@@ -465,7 +521,7 @@ func buildModelForm(alias, source, location, hf *string) *huh.Form {
 			CharLimit(256).
 			Validate(hfFormValidator),
 	).WithHideFunc(func() bool { return *source != sourceHF })
-	return huh.NewForm(g1, g2Local, g2HF).WithTheme(huh.ThemeBase())
+	return huh.NewForm(g1, g2Local, g2HF)
 }
 
 // hfFormValidator combines the non-empty check with the format check
@@ -488,7 +544,7 @@ func (c *ConfigMode) openDuplicateModelForm() tea.Cmd {
 	c.formStaging = formStaging{alias: &alias}
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("new alias").Value(&alias).Validate(uniqueAliasValidator(c.work.Models)),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formDuplicateModel)
 }
 
@@ -518,7 +574,7 @@ func (c *ConfigMode) openDeleteModelPrompt() tea.Cmd {
 		m.Alias, len(m.Presets), plural(len(m.Presets)))
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewConfirm().Title(prompt).Affirmative("Delete").Negative("Cancel").Value(&confirm),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formDeleteModel)
 }
 
@@ -528,7 +584,7 @@ func (c *ConfigMode) openNewPresetForm() tea.Cmd {
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("preset name").Value(&name).Validate(nonEmpty("name")),
 		huh.NewInput().Title("description").Value(&desc),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formNewPreset)
 }
 
@@ -539,8 +595,25 @@ func (c *ConfigMode) openEditPresetForm() tea.Cmd {
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("preset name").Value(&name).Validate(nonEmpty("name")),
 		huh.NewInput().Title("description").Value(&desc),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formEditPreset)
+}
+
+// openDeleteParamPrompt mirrors the model/preset delete confirms so the
+// behavior across all three panes is identical: `d` always pops a modal
+// before any destructive change. Without this, Params silently deleted
+// the focused row, which surprised first-time users.
+func (c *ConfigMode) openDeleteParamPrompt() tea.Cmd {
+	confirm := false
+	c.formStaging = formStaging{confirm: &confirm}
+	p := c.work.Models[c.modelIdx].Presets[c.presetIdx].Params[c.paramIdx]
+	prompt := fmt.Sprintf("Delete param %q?", p.Key)
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().Title(prompt).
+			Affirmative("Delete").Negative("Cancel").
+			Value(&confirm),
+	))
+	return c.installForm(form, formDeleteParam)
 }
 
 func (c *ConfigMode) openDeletePresetPrompt() tea.Cmd {
@@ -552,7 +625,7 @@ func (c *ConfigMode) openDeletePresetPrompt() tea.Cmd {
 		huh.NewConfirm().Title(prompt).
 			Affirmative("Delete").Negative("Cancel").
 			Value(&confirm),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formDeletePreset)
 }
 
@@ -562,7 +635,7 @@ func (c *ConfigMode) openDuplicatePresetForm() tea.Cmd {
 	c.formStaging = formStaging{name: &name}
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("new preset name").Value(&name).Validate(nonEmpty("name")),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formDuplicatePreset)
 }
 
@@ -581,7 +654,7 @@ func (c *ConfigMode) openNewParamForm() tea.Cmd {
 				Title("flag key (without leading dashes)").
 				Value(&c.pendingKey).
 				Validate(nonEmpty("key")),
-		)).WithTheme(huh.ThemeBase())
+		))
 		return c.installForm(form, formNewParamPickKey)
 	}
 	c.picker = newParamPicker(c.registry)
@@ -651,7 +724,7 @@ func (c *ConfigMode) openValueFormFor(key, initial string) tea.Cmd {
 			Title(title).
 			Value(&val)
 	}
-	form := huh.NewForm(huh.NewGroup(field)).WithTheme(huh.ThemeBase())
+	form := huh.NewForm(huh.NewGroup(field))
 	return c.installForm(form, formNewParamPickValue)
 }
 
@@ -715,7 +788,7 @@ func (c *ConfigMode) openExitPrompt() tea.Cmd {
 				huh.NewOption("Cancel", "cancel"),
 			).
 			Value(&choice),
-	)).WithTheme(huh.ThemeBase())
+	))
 	return c.installForm(form, formExitPrompt)
 }
 
@@ -819,6 +892,10 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		p := &c.work.Models[c.modelIdx].Presets[c.presetIdx].Params[c.paramIdx]
 		p.Value = c.applyParamValueFromStaging()
 		c.flash = "param updated"
+	case formDeleteParam:
+		if c.formStaging.confirm != nil && *c.formStaging.confirm {
+			c.deleteParam()
+		}
 	case formExitPrompt:
 		switch deref(c.formStaging.choice) {
 		case "save":
@@ -894,21 +971,39 @@ func (c *ConfigMode) deleteParam() {
 	c.flash = "param deleted"
 }
 
-func (c *ConfigMode) save() {
+// save validates, writes, and on success sets the "saved" subtitle
+// indicator plus returns a tea.Cmd that clears the indicator after
+// `savedFlashTTL`. Failure paths surface in the error modal and return
+// nil — there's nothing to expire when the indicator never appeared.
+func (c *ConfigMode) save() tea.Cmd {
 	issues := config.Validate(c.work)
 	if issues.HasErrors() {
-		c.flash = "save blocked: validation errors — fix and retry"
+		var bullets []string
+		for _, iss := range issues {
+			if iss.Severity == config.Error {
+				bullets = append(bullets, fmt.Sprintf("  • %s — %s", iss.Path, iss.Message))
+			}
+		}
+		c.errorModal = "Cannot save — fix these validation errors:\n\n" +
+			strings.Join(bullets, "\n")
 		c.saveErr = nil
-		return
+		c.flash = ""
+		return nil
 	}
 	if err := config.Save(c.cfgPath, c.work); err != nil {
 		c.saveErr = err
-		c.flash = fmt.Sprintf("save failed: %v", err)
-		return
+		c.errorModal = fmt.Sprintf("Save failed:\n\n%v", err)
+		c.flash = ""
+		return nil
 	}
 	c.saveErr = nil
 	c.saved = cloneConfig(c.work)
 	c.flash = "saved"
+	c.savedGen++
+	gen := c.savedGen
+	return tea.Tick(savedFlashTTL, func(time.Time) tea.Msg {
+		return savedExpiredMsg{gen: gen}
+	})
 }
 
 // ---- view ----
@@ -918,26 +1013,49 @@ func (c *ConfigMode) View() string {
 		return ""
 	}
 	bg := c.renderPanes()
+	// Error modal stacks above any other overlay so a failure surfaces
+	// even if a form / picker / help overlay was open when it fired.
+	if c.errorModal != "" {
+		return overlayCenter(bg, c.renderErrorModal(), c.width, c.height)
+	}
 	if c.picker != nil {
 		return overlayCenter(bg, c.picker.View(c.theme), c.width, c.height)
 	}
-	if c.form != nil {
-		popup := lipgloss.NewStyle().
-			BorderStyle(lipgloss.RoundedBorder()).
-			BorderForeground(c.theme.Accent).
-			Padding(1, 2).
-			Render(c.form.View())
-		return overlayCenter(bg, popup, c.width, c.height)
+	// The form is no longer overlaid here — renderPanes() inlines it
+	// below the Presets pane at the same column width, so the panes
+	// stay visible above it. View() only handles the truly-modal
+	// overlays (picker, help, error).
+	if c.helpOverlay {
+		return overlayCenter(bg, c.renderHelpOverlay(), c.width, c.height)
 	}
 	return bg
 }
 
 // renderPanes draws the three-pane editor without any overlay.
+//
+// Vertical layout: 8 fixed blank rows on top, then the wordmark + subtitle
+// + panes block (horizontally centered above the panes row), then the
+// footer pinned to the bottom of the screen with whatever vertical space
+// is left in between. The fixed top padding plus a bottom-anchored footer
+// gives a stable position across resizes — the panes don't drift, and the
+// hint rows always sit on the last terminal lines like a status bar.
 func (c *ConfigMode) renderPanes() string {
-	headerStyle := lipgloss.NewStyle().Foreground(c.theme.Accent).Bold(true)
-	header := headerStyle.Render("llamaman — configuration")
+	wordmark := lipgloss.NewStyle().
+		Foreground(c.theme.Accent).
+		Render(strings.TrimRight(Wordmark, "\n"))
+
+	header := lipgloss.NewStyle().Foreground(c.theme.Subtle).
+		Render("llamaman — configuration")
+	// Save state lives in the subtitle so the indicator doesn't jump
+	// between the top and the bottom of the screen on save: "● modified"
+	// (yellow) while dirty, "● saved" (green) right after a clean save.
+	// Save errors stay in the footer flash because Modified() is still
+	// true after a failed save, so the subtitle correctly keeps showing
+	// "● modified" and the footer surfaces the detailed error message.
 	if c.Modified() {
 		header += lipgloss.NewStyle().Foreground(c.theme.StatusStart).Render("  ● modified")
+	} else if c.flash == "saved" {
+		header += lipgloss.NewStyle().Foreground(c.theme.StatusReady).Render("  ● saved")
 	}
 	if c.firstRunBanner {
 		banner := lipgloss.NewStyle().
@@ -945,17 +1063,53 @@ func (c *ConfigMode) renderPanes() string {
 			BorderForeground(c.theme.Accent).
 			Padding(0, 2).
 			Render("First-time setup — globals saved. Press n in the Models pane to add your first model.")
-		header = lipgloss.JoinVertical(lipgloss.Left, header, banner)
+		header = lipgloss.JoinVertical(lipgloss.Center, header, banner)
 	}
 
 	paneW := (c.width - 4) / 3
 	left := c.renderPane(FocusModels, "Models", paneW, c.renderModels())
 	mid := c.renderPane(FocusPresets, "Presets", paneW, c.renderPresets())
 	right := c.renderPane(FocusParams, "Params", c.width-2*paneW-2, c.renderParams())
-
 	row := lipgloss.JoinHorizontal(lipgloss.Top, left, mid, right)
-	footer := c.renderFooter()
-	return lipgloss.JoinVertical(lipgloss.Left, header, row, footer)
+
+	const topPadding = 8
+	topParts := make([]string, 0, topPadding+7)
+	for i := 0; i < topPadding; i++ {
+		topParts = append(topParts, "")
+	}
+	topParts = append(topParts, wordmark, "", header, "", row)
+
+	// Edit form (when open) renders inline below the Presets pane at
+	// the same column width. The padded line must match the panes
+	// row width exactly (rowW, typically c.width - 2) — padding to
+	// c.width instead would make JoinVertical(Center, …) shift the
+	// narrower panes row right by 1 column to center it within the
+	// wider form line.
+	rowW := lipgloss.Width(row)
+	if c.form != nil {
+		popup := lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(c.theme.Accent).
+			Padding(1, 2).
+			Render(c.form.View())
+		topParts = append(topParts, "", padToColumn(popup, paneW, rowW))
+	}
+	top := lipgloss.JoinVertical(lipgloss.Center, topParts...)
+
+	// Footer is rendered separately and pinned to the bottom of the
+	// terminal via a calculated filler. Each footer line is centered
+	// horizontally across the full width.
+	// Footer width matches the panes-row width too, so the wordmark,
+	// header, panes, form, and footer all share one canonical block
+	// width and stay aligned.
+	footer := lipgloss.NewStyle().Width(rowW).Align(lipgloss.Center).
+		Render(c.renderFooter())
+
+	gap := c.height - lipgloss.Height(top) - lipgloss.Height(footer)
+	if gap < 1 {
+		gap = 1
+	}
+	return top + strings.Repeat("\n", gap) + footer
 }
 
 func (c *ConfigMode) renderPane(focus ConfigFocus, title string, w int, body string) string {
@@ -971,17 +1125,44 @@ func (c *ConfigMode) renderPane(focus ConfigFocus, title string, w int, body str
 	return border.Render(titleLine + "\n" + body)
 }
 
+// padToColumn shifts a multi-line string so each line starts at column
+// `leftCol` and the whole thing is padded with trailing spaces out to
+// `totalW`. Used to anchor the inline form below the Presets pane: the
+// surrounding JoinVertical(Center, …) would otherwise re-center the
+// form's narrower lines across the full terminal width.
+func padToColumn(s string, leftCol, totalW int) string {
+	lines := strings.Split(s, "\n")
+	leftPad := strings.Repeat(" ", leftCol)
+	out := make([]string, len(lines))
+	for i, line := range lines {
+		w := lipgloss.Width(line)
+		rightPad := totalW - leftCol - w
+		if rightPad < 0 {
+			rightPad = 0
+		}
+		out[i] = leftPad + line + strings.Repeat(" ", rightPad)
+	}
+	return strings.Join(out, "\n")
+}
+
+// reverseSelected wraps the row text in ANSI reverse-video SGR when the
+// row is selected. Same literal sequence main mode's inlineDelegate uses
+// (cmd: \x1b[7m … \x1b[0m), so selection styling is uniform across main,
+// the three config panes, and the param-picker delegate.
+func reverseSelected(row string, selected bool) string {
+	if !selected {
+		return row
+	}
+	return "\x1b[7m" + row + "\x1b[0m"
+}
+
 func (c *ConfigMode) renderModels() string {
 	if len(c.work.Models) == 0 {
 		return lipgloss.NewStyle().Foreground(c.theme.Muted).Render("(none — n to add)")
 	}
 	var lines []string
 	for i, m := range c.work.Models {
-		marker := "  "
-		if i == c.modelIdx {
-			marker = "▶ "
-		}
-		lines = append(lines, marker+m.Alias)
+		lines = append(lines, reverseSelected(m.Alias, i == c.modelIdx))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -996,11 +1177,7 @@ func (c *ConfigMode) renderPresets() string {
 	}
 	var lines []string
 	for i, p := range presets {
-		marker := "  "
-		if i == c.presetIdx {
-			marker = "▶ "
-		}
-		lines = append(lines, marker+p.Name)
+		lines = append(lines, reverseSelected(p.Name, i == c.presetIdx))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1025,11 +1202,14 @@ func (c *ConfigMode) renderParams() string {
 		lines = append(lines, lipgloss.NewStyle().Foreground(c.theme.Muted).Render("(no params — n to add)"))
 	} else {
 		for i, p := range params {
-			marker := "  "
-			if i == c.paramIdx {
-				marker = "▶ "
-			}
-			line := fmt.Sprintf("%s%-22s %s", marker, p.Key, paramValueAsString(p.Value))
+			// Reverse-video wraps the key/value text only — the
+			// trailing yellow `(?)` warning marker keeps its own
+			// color so its meaning still reads on a selected row.
+			keyVal := reverseSelected(
+				fmt.Sprintf("%-22s %s", p.Key, paramValueAsString(p.Value)),
+				i == c.paramIdx,
+			)
+			line := keyVal
 			if len(c.registry) > 0 {
 				if _, ok := c.registry.Lookup(p.Key); !ok {
 					line += lipgloss.NewStyle().Foreground(c.theme.StatusStart).Render("  (?)")
@@ -1046,23 +1226,154 @@ func (c *ConfigMode) renderParams() string {
 	return strings.Join(lines, "\n")
 }
 
+// renderFooter draws the two-line hint area: a pane-specific CRUD line
+// (verbs greyed out when the focused pane has no rows to act on), then a
+// global line for navigation + meta keys that work regardless of focus.
+// Each token is rendered via the main-mode `shortcut()` helper so keys
+// pop in accent-bold and labels fall back to subtle grey, matching
+// main's two-tone shortcut row exactly. Closes #12: the previous
+// one-line `e/n/d` hint hid `D` (now `c`) duplicate, the shift-arrow
+// reorder, and `?` itself.
 func (c *ConfigMode) renderFooter() string {
-	hint := lipgloss.NewStyle().Foreground(c.theme.Subtle).
-		Render("tab: pane · e/n/d · g: globals · s: save · esc: back")
 	flash := ""
-	if c.flash != "" {
-		col := c.theme.Subtle
-		if strings.HasPrefix(c.flash, "save failed") || strings.HasPrefix(c.flash, "save blocked") {
-			col = c.theme.StatusErr
-		} else if strings.HasPrefix(c.flash, "saved") {
-			col = c.theme.StatusReady
+	// Save state ("saved") lives in the subtitle, not here — see
+	// renderPanes(). Save failures surface as a centered error modal,
+	// not as flash text. Footer flash is reserved for non-save action
+	// confirmations ("model added", "preset deleted", …).
+	if c.flash != "" && c.flash != "saved" {
+		flash = lipgloss.NewStyle().Foreground(c.theme.Subtle).Render(c.flash)
+	}
+	paneLine := c.renderPaneHint()
+	sep := lipgloss.NewStyle().Foreground(c.theme.Subtle).Render(" · ")
+	globalParts := []string{
+		paneShortcut("↑↓ select", c.theme, true),
+		paneShortcut("⇧↑⇧↓ reorder", c.theme, true),
+		paneShortcut("tab pane", c.theme, true),
+		paneShortcut("g globals", c.theme, true),
+		paneShortcut("s save", c.theme, true),
+		paneShortcut("? help", c.theme, true),
+		paneShortcut("esc back", c.theme, true),
+	}
+	globalLine := strings.Join(globalParts, sep)
+	lines := []string{paneLine, globalLine}
+	if flash != "" {
+		lines = append([]string{flash}, lines...)
+	}
+	return lipgloss.JoinVertical(lipgloss.Center, lines...)
+}
+
+// paneShortcut renders a "<key> <label>" token in main mode's two-tone
+// style: accent-bold key + subtle label when available, muted overall
+// when not. Splits on the first space, so multi-character keys like
+// `⇧↑⇧↓` and `e/⏎` stay on the key side. Falls back to a single-token
+// render when there's no space (caller passed only a key).
+func paneShortcut(s string, t Theme, available bool) string {
+	if !available {
+		return lipgloss.NewStyle().Foreground(t.Muted).Render(s)
+	}
+	parts := strings.SplitN(s, " ", 2)
+	if len(parts) < 2 {
+		return lipgloss.NewStyle().Foreground(t.Accent).Bold(true).Render(s)
+	}
+	return shortcut(parts[0], parts[1], t)
+}
+
+// renderPaneHint produces the per-pane CRUD line. Verbs that operate on
+// the currently-focused row (e/c/d) are greyed out when the pane is
+// empty, since pressing them is a no-op there.
+func (c *ConfigMode) renderPaneHint() string {
+	subtle := lipgloss.NewStyle().Foreground(c.theme.Subtle)
+	sep := subtle.Render(" · ")
+
+	switch c.focus {
+	case FocusModels:
+		has := c.hasModel()
+		return subtle.Render("[Models] ") + strings.Join([]string{
+			paneShortcut("n new", c.theme, true),
+			paneShortcut("e/⏎ edit", c.theme, has),
+			paneShortcut("c clone", c.theme, has),
+			paneShortcut("d delete", c.theme, has),
+		}, sep)
+	case FocusPresets:
+		has := c.hasPreset()
+		return subtle.Render("[Presets] ") + strings.Join([]string{
+			paneShortcut("n new", c.theme, c.hasModel()),
+			paneShortcut("e/⏎ edit", c.theme, has),
+			paneShortcut("c clone", c.theme, has),
+			paneShortcut("d delete", c.theme, has),
+		}, sep)
+	case FocusParams:
+		hasParam := false
+		if c.hasPreset() {
+			hasParam = len(c.work.Models[c.modelIdx].Presets[c.presetIdx].Params) > 0
 		}
-		flash = lipgloss.NewStyle().Foreground(col).Render(c.flash)
+		return subtle.Render("[Params] ") + strings.Join([]string{
+			paneShortcut("n new", c.theme, c.hasPreset()),
+			paneShortcut("e/⏎ edit", c.theme, hasParam),
+			paneShortcut("d delete", c.theme, hasParam),
+		}, sep)
 	}
-	if flash == "" {
-		return hint
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, flash, hint)
+	return ""
+}
+
+// renderErrorModal draws the centered error popup with a focused
+// [Dismiss] button. Any key dismisses; the button styling (reverse
+// video) signals that hitting Enter / Space / Esc — anything, really —
+// closes the modal. Border + title use StatusErr so the failure mode
+// reads at a glance.
+func (c *ConfigMode) renderErrorModal() string {
+	title := lipgloss.NewStyle().
+		Foreground(c.theme.StatusErr).
+		Bold(true).
+		Render("⚠  Error")
+	msg := lipgloss.NewStyle().Foreground(c.theme.Subtle).Render(c.errorModal)
+	button := lipgloss.NewStyle().Reverse(true).Padding(0, 2).Render(" Dismiss ")
+	hint := lipgloss.NewStyle().Foreground(c.theme.Muted).Render("(any key)")
+	body := strings.Join([]string{
+		title,
+		"",
+		msg,
+		"",
+		button + "  " + hint,
+	}, "\n")
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(c.theme.StatusErr).
+		Padding(1, 2).
+		Render(body)
+}
+
+// renderHelpOverlay is the manual surfaced by `?`: full key map plus the
+// non-obvious nuances (param edit can't rename; clone is intentionally
+// absent on Params; esc on a modified config prompts to save/discard).
+func (c *ConfigMode) renderHelpOverlay() string {
+	heading := lipgloss.NewStyle().Foreground(c.theme.Accent).Bold(true)
+	muted := lipgloss.NewStyle().Foreground(c.theme.Muted)
+	body := strings.Join([]string{
+		heading.Render("NAVIGATION"),
+		"  ↑/k  ↓/j        select item in focused pane",
+		"  ⇧↑   ⇧↓         reorder (changes argv order on next launch)",
+		"  tab / → / l     next pane",
+		"  shift+tab / ← / h   previous pane",
+		"",
+		heading.Render("MODELS / PRESETS"),
+		"  n new      e or ⏎ edit      c clone      d delete (confirms)",
+		"",
+		heading.Render("PARAMS"),
+		"  n new      e or ⏎ edit value      d delete (confirms)",
+		muted.Render("  Note: editing a param can't rename it — delete and re-add to change the key."),
+		muted.Render("  Note: clone is intentionally absent — two flags with the same key produce invalid argv."),
+		"",
+		heading.Render("GLOBAL"),
+		"  g globals      s save      esc back (prompts on unsaved changes)",
+		"",
+		muted.Render("(press any key to dismiss)"),
+	}, "\n")
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(c.theme.Accent).
+		Padding(1, 2).
+		Render(body)
 }
 
 // ---- helpers ----

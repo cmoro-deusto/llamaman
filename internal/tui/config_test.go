@@ -226,6 +226,47 @@ func TestConfigExitPromptDiscardEmitsReturn(t *testing.T) {
 	}
 }
 
+// TestConfigParamDeleteRequiresConfirm pins the cross-pane consistency
+// fix: pressing `d` on a Params row no longer mutates immediately —
+// it stages a formDeleteParam confirm modal, and only an affirmative
+// answer removes the row. Mirrors model/preset delete behavior.
+func TestConfigParamDeleteRequiresConfirm(t *testing.T) {
+	cfg := duplicateTestConfig()
+	c := NewConfigMode("/dev/null", cfg)
+	c.modelIdx, c.presetIdx, c.paramIdx = 0, 0, 0
+	c.focus = FocusParams
+
+	before := len(c.work.Models[0].Presets[0].Params)
+	if before < 2 {
+		t.Fatalf("fixture should have at least 2 params; got %d", before)
+	}
+
+	// Pressing `d` should stage the confirm form, not delete.
+	if _, _ = c.handleParamsKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}}); c.formKind != formDeleteParam {
+		t.Fatalf("expected formDeleteParam staged; got %v", c.formKind)
+	}
+	if got := len(c.work.Models[0].Presets[0].Params); got != before {
+		t.Errorf("param deleted before confirm: %d → %d", before, got)
+	}
+
+	// Cancel branch: confirm=false leaves the slice untouched.
+	no := false
+	c.formStaging.confirm = &no
+	c.applyForm()
+	if got := len(c.work.Models[0].Presets[0].Params); got != before {
+		t.Errorf("cancel deleted: %d → %d", before, got)
+	}
+
+	// Affirm branch: confirm=true removes the focused row.
+	yes := true
+	c.formKind = formDeleteParam
+	c.formStaging.confirm = &yes
+	c.applyForm()
+	if got, want := len(c.work.Models[0].Presets[0].Params), before-1; got != want {
+		t.Errorf("after confirm: params len = %d, want %d", got, want)
+	}
+}
+
 // TestConfigExitPromptSaveBlockedByValidationDoesNotExit confirms that
 // when save() is blocked by validation errors (e.g. duplicate alias),
 // applyForm returns no cmd so the user stays in config mode and can
