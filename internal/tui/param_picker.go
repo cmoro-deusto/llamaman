@@ -70,6 +70,15 @@ func newParamPicker(reg flags.Registry) *paramPicker {
 	}
 	delegate := list.NewDefaultDelegate()
 	delegate.SetSpacing(0)
+	// Selection styling consistent with main mode and the config-mode
+	// panes: ANSI reverse video on both the title and description rows.
+	// Replacing the default styles (which paint an accent-colored left
+	// bar plus colored title text) with bare reverse-video styles drops
+	// the bar — the reverse video carries the entire selection signal,
+	// matching what inlineDelegate does in main.go.
+	reverse := lipgloss.NewStyle().Reverse(true)
+	delegate.Styles.SelectedTitle = reverse
+	delegate.Styles.SelectedDesc = reverse
 	l := list.New(items, delegate, 0, 0)
 	// Hide every chrome element bubbles/list provides — title, status
 	// bar, and crucially the filter input itself. Default filter input

@@ -963,9 +963,20 @@ func (c *ConfigMode) View() string {
 }
 
 // renderPanes draws the three-pane editor without any overlay.
+//
+// Vertical layout intentionally mimics main mode: a wordmark sits on top
+// of a subtitle line, then the panes, then the footer. A fixed 6-row top
+// padding pushes the whole block off the top edge — config used to be
+// glued to row 0, which felt jarring after the centered main screen.
+// Padding is fixed (not proportional to terminal height) so the position
+// stays predictable across resizes.
 func (c *ConfigMode) renderPanes() string {
-	headerStyle := lipgloss.NewStyle().Foreground(c.theme.Accent).Bold(true)
-	header := headerStyle.Render("llamaman — configuration")
+	wordmark := lipgloss.NewStyle().
+		Foreground(c.theme.Accent).
+		Render(strings.TrimRight(Wordmark, "\n"))
+
+	header := lipgloss.NewStyle().Foreground(c.theme.Subtle).
+		Render("llamaman — configuration")
 	if c.Modified() {
 		header += lipgloss.NewStyle().Foreground(c.theme.StatusStart).Render("  ● modified")
 	}
@@ -985,7 +996,14 @@ func (c *ConfigMode) renderPanes() string {
 
 	row := lipgloss.JoinHorizontal(lipgloss.Top, left, mid, right)
 	footer := c.renderFooter()
-	return lipgloss.JoinVertical(lipgloss.Left, header, row, footer)
+
+	const topPadding = 6
+	parts := make([]string, 0, topPadding+7)
+	for i := 0; i < topPadding; i++ {
+		parts = append(parts, "")
+	}
+	parts = append(parts, wordmark, "", header, "", row, "", footer)
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
 func (c *ConfigMode) renderPane(focus ConfigFocus, title string, w int, body string) string {
@@ -1001,17 +1019,24 @@ func (c *ConfigMode) renderPane(focus ConfigFocus, title string, w int, body str
 	return border.Render(titleLine + "\n" + body)
 }
 
+// reverseSelected wraps the row text in ANSI reverse-video SGR when the
+// row is selected. Same literal sequence main mode's inlineDelegate uses
+// (cmd: \x1b[7m … \x1b[0m), so selection styling is uniform across main,
+// the three config panes, and the param-picker delegate.
+func reverseSelected(row string, selected bool) string {
+	if !selected {
+		return row
+	}
+	return "\x1b[7m" + row + "\x1b[0m"
+}
+
 func (c *ConfigMode) renderModels() string {
 	if len(c.work.Models) == 0 {
 		return lipgloss.NewStyle().Foreground(c.theme.Muted).Render("(none — n to add)")
 	}
 	var lines []string
 	for i, m := range c.work.Models {
-		marker := "  "
-		if i == c.modelIdx {
-			marker = "▶ "
-		}
-		lines = append(lines, marker+m.Alias)
+		lines = append(lines, reverseSelected(m.Alias, i == c.modelIdx))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1026,11 +1051,7 @@ func (c *ConfigMode) renderPresets() string {
 	}
 	var lines []string
 	for i, p := range presets {
-		marker := "  "
-		if i == c.presetIdx {
-			marker = "▶ "
-		}
-		lines = append(lines, marker+p.Name)
+		lines = append(lines, reverseSelected(p.Name, i == c.presetIdx))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1055,11 +1076,14 @@ func (c *ConfigMode) renderParams() string {
 		lines = append(lines, lipgloss.NewStyle().Foreground(c.theme.Muted).Render("(no params — n to add)"))
 	} else {
 		for i, p := range params {
-			marker := "  "
-			if i == c.paramIdx {
-				marker = "▶ "
-			}
-			line := fmt.Sprintf("%s%-22s %s", marker, p.Key, paramValueAsString(p.Value))
+			// Reverse-video wraps the key/value text only — the
+			// trailing yellow `(?)` warning marker keeps its own
+			// color so its meaning still reads on a selected row.
+			keyVal := reverseSelected(
+				fmt.Sprintf("%-22s %s", p.Key, paramValueAsString(p.Value)),
+				i == c.paramIdx,
+			)
+			line := keyVal
 			if len(c.registry) > 0 {
 				if _, ok := c.registry.Lookup(p.Key); !ok {
 					line += lipgloss.NewStyle().Foreground(c.theme.StatusStart).Render("  (?)")
