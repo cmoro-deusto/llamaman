@@ -944,11 +944,7 @@ func (c *ConfigMode) View() string {
 	if c.width == 0 {
 		return ""
 	}
-	// Center the panes block in the terminal — same idiom main and
-	// firstrun modes use. Overlays (picker / form / help) continue to
-	// paste over the centered bg via overlayCenter, which also operates
-	// on (c.width, c.height), so popup-center == screen-center.
-	bg := lipgloss.Place(c.width, c.height, lipgloss.Center, lipgloss.Center, c.renderPanes())
+	bg := c.renderPanes()
 	if c.picker != nil {
 		return overlayCenter(bg, c.picker.View(c.theme), c.width, c.height)
 	}
@@ -968,11 +964,12 @@ func (c *ConfigMode) View() string {
 
 // renderPanes draws the three-pane editor without any overlay.
 //
-// Vertical layout intentionally mimics main mode: a wordmark sits on top
-// of a subtitle line, then the panes, then the footer. The whole block
-// is horizontally centered (`JoinVertical(Center, …)`) so the wordmark
-// and subtitle line up over the panes row; vertical centering happens
-// in View() via lipgloss.Place, matching main / firstrun modes exactly.
+// Vertical layout: 8 fixed blank rows on top, then the wordmark + subtitle
+// + panes block (horizontally centered above the panes row), then the
+// footer pinned to the bottom of the screen with whatever vertical space
+// is left in between. The fixed top padding plus a bottom-anchored footer
+// gives a stable position across resizes — the panes don't drift, and the
+// hint rows always sit on the last terminal lines like a status bar.
 func (c *ConfigMode) renderPanes() string {
 	wordmark := lipgloss.NewStyle().
 		Foreground(c.theme.Accent).
@@ -996,11 +993,27 @@ func (c *ConfigMode) renderPanes() string {
 	left := c.renderPane(FocusModels, "Models", paneW, c.renderModels())
 	mid := c.renderPane(FocusPresets, "Presets", paneW, c.renderPresets())
 	right := c.renderPane(FocusParams, "Params", c.width-2*paneW-2, c.renderParams())
-
 	row := lipgloss.JoinHorizontal(lipgloss.Top, left, mid, right)
-	footer := c.renderFooter()
 
-	return lipgloss.JoinVertical(lipgloss.Center, wordmark, "", header, "", row, "", footer)
+	const topPadding = 8
+	topParts := make([]string, 0, topPadding+5)
+	for i := 0; i < topPadding; i++ {
+		topParts = append(topParts, "")
+	}
+	topParts = append(topParts, wordmark, "", header, "", row)
+	top := lipgloss.JoinVertical(lipgloss.Center, topParts...)
+
+	// Footer is rendered separately and pinned to the bottom of the
+	// terminal via a calculated filler. Each footer line is centered
+	// horizontally across the full width.
+	footer := lipgloss.NewStyle().Width(c.width).Align(lipgloss.Center).
+		Render(c.renderFooter())
+
+	gap := c.height - lipgloss.Height(top) - lipgloss.Height(footer)
+	if gap < 1 {
+		gap = 1
+	}
+	return top + strings.Repeat("\n", gap) + footer
 }
 
 func (c *ConfigMode) renderPane(focus ConfigFocus, title string, w int, body string) string {
@@ -1100,8 +1113,11 @@ func (c *ConfigMode) renderParams() string {
 // renderFooter draws the two-line hint area: a pane-specific CRUD line
 // (verbs greyed out when the focused pane has no rows to act on), then a
 // global line for navigation + meta keys that work regardless of focus.
-// Closes #12: the previous one-line `e/n/d` hint hid `D` (now `c`)
-// duplicate, the shift-arrow reorder, and `?` itself.
+// Each token is rendered via the main-mode `shortcut()` helper so keys
+// pop in accent-bold and labels fall back to subtle grey, matching
+// main's two-tone shortcut row exactly. Closes #12: the previous
+// one-line `e/n/d` hint hid `D` (now `c`) duplicate, the shift-arrow
+// reorder, and `?` itself.
 func (c *ConfigMode) renderFooter() string {
 	flash := ""
 	if c.flash != "" {
@@ -1114,68 +1130,74 @@ func (c *ConfigMode) renderFooter() string {
 		flash = lipgloss.NewStyle().Foreground(col).Render(c.flash)
 	}
 	paneLine := c.renderPaneHint()
-	globalLine := lipgloss.NewStyle().Foreground(c.theme.Subtle).
-		Render("↑↓ select · ⇧↑⇧↓ reorder · tab pane · g globals · s save · ? help · esc back")
+	sep := lipgloss.NewStyle().Foreground(c.theme.Subtle).Render(" · ")
+	globalParts := []string{
+		paneShortcut("↑↓ select", c.theme, true),
+		paneShortcut("⇧↑⇧↓ reorder", c.theme, true),
+		paneShortcut("tab pane", c.theme, true),
+		paneShortcut("g globals", c.theme, true),
+		paneShortcut("s save", c.theme, true),
+		paneShortcut("? help", c.theme, true),
+		paneShortcut("esc back", c.theme, true),
+	}
+	globalLine := strings.Join(globalParts, sep)
 	lines := []string{paneLine, globalLine}
 	if flash != "" {
 		lines = append([]string{flash}, lines...)
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	return lipgloss.JoinVertical(lipgloss.Center, lines...)
+}
+
+// paneShortcut renders a "<key> <label>" token in main mode's two-tone
+// style: accent-bold key + subtle label when available, muted overall
+// when not. Splits on the first space, so multi-character keys like
+// `⇧↑⇧↓` and `e/⏎` stay on the key side. Falls back to a single-token
+// render when there's no space (caller passed only a key).
+func paneShortcut(s string, t Theme, available bool) string {
+	if !available {
+		return lipgloss.NewStyle().Foreground(t.Muted).Render(s)
+	}
+	parts := strings.SplitN(s, " ", 2)
+	if len(parts) < 2 {
+		return lipgloss.NewStyle().Foreground(t.Accent).Bold(true).Render(s)
+	}
+	return shortcut(parts[0], parts[1], t)
 }
 
 // renderPaneHint produces the per-pane CRUD line. Verbs that operate on
 // the currently-focused row (e/c/d) are greyed out when the pane is
 // empty, since pressing them is a no-op there.
 func (c *ConfigMode) renderPaneHint() string {
-	on := lipgloss.NewStyle().Foreground(c.theme.Subtle)
-	off := lipgloss.NewStyle().Foreground(c.theme.Muted)
-	label := on.Render
-	tag := func(s string, available bool) string {
-		if available {
-			return on.Render(s)
-		}
-		return off.Render(s)
-	}
-	sep := on.Render(" · ")
+	subtle := lipgloss.NewStyle().Foreground(c.theme.Subtle)
+	sep := subtle.Render(" · ")
 
 	switch c.focus {
 	case FocusModels:
 		has := c.hasModel()
-		return strings.Join([]string{
-			label("[Models] "),
-			tag("n new", true),
-			sep,
-			tag("e/⏎ edit", has),
-			sep,
-			tag("c clone", has),
-			sep,
-			tag("d delete", has),
-		}, "")
+		return subtle.Render("[Models] ") + strings.Join([]string{
+			paneShortcut("n new", c.theme, true),
+			paneShortcut("e/⏎ edit", c.theme, has),
+			paneShortcut("c clone", c.theme, has),
+			paneShortcut("d delete", c.theme, has),
+		}, sep)
 	case FocusPresets:
 		has := c.hasPreset()
-		return strings.Join([]string{
-			label("[Presets] "),
-			tag("n new", c.hasModel()),
-			sep,
-			tag("e/⏎ edit", has),
-			sep,
-			tag("c clone", has),
-			sep,
-			tag("d delete", has),
-		}, "")
+		return subtle.Render("[Presets] ") + strings.Join([]string{
+			paneShortcut("n new", c.theme, c.hasModel()),
+			paneShortcut("e/⏎ edit", c.theme, has),
+			paneShortcut("c clone", c.theme, has),
+			paneShortcut("d delete", c.theme, has),
+		}, sep)
 	case FocusParams:
 		hasParam := false
 		if c.hasPreset() {
 			hasParam = len(c.work.Models[c.modelIdx].Presets[c.presetIdx].Params) > 0
 		}
-		return strings.Join([]string{
-			label("[Params] "),
-			tag("n new", c.hasPreset()),
-			sep,
-			tag("e/⏎ edit", hasParam),
-			sep,
-			tag("d delete", hasParam),
-		}, "")
+		return subtle.Render("[Params] ") + strings.Join([]string{
+			paneShortcut("n new", c.theme, c.hasPreset()),
+			paneShortcut("e/⏎ edit", c.theme, hasParam),
+			paneShortcut("d delete", c.theme, hasParam),
+		}, sep)
 	}
 	return ""
 }
