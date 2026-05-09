@@ -3,6 +3,7 @@ package tui
 import (
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -264,6 +265,178 @@ func TestConfigParamDeleteRequiresConfirm(t *testing.T) {
 	c.applyForm()
 	if got, want := len(c.work.Models[0].Presets[0].Params), before-1; got != want {
 		t.Errorf("after confirm: params len = %d, want %d", got, want)
+	}
+}
+
+// intPtr is the int-flavored sibling of strPtr — used by the clone-to-
+// model staging where the form binds an int (target model index).
+func intPtr(i int) *int { return &i }
+
+// TestConfigClonePresetToModel covers the happy path: a preset cloned
+// from Model A to Model B lands as a deep copy on the target, the
+// source model is unchanged, and cursor state stays on the source.
+func TestConfigClonePresetToModel(t *testing.T) {
+	cfg := duplicateTestConfig()
+	c := NewConfigMode("/dev/null", cfg)
+	c.modelIdx, c.presetIdx = 0, 0 // alpha / default
+	c.focus = FocusPresets
+
+	c.formStaging = formStaging{name: strPtr("default-from-alpha"), targetIdx: intPtr(1)}
+	c.formKind = formCloneToModelPreset
+	c.applyForm()
+
+	// Source untouched.
+	if got := len(c.work.Models[0].Presets); got != 2 {
+		t.Errorf("source presets len = %d, want 2 (unchanged)", got)
+	}
+	// Target grew by one.
+	if got := len(c.work.Models[1].Presets); got != 2 {
+		t.Fatalf("target presets len = %d, want 2", got)
+	}
+	dup := c.work.Models[1].Presets[1]
+	src := c.work.Models[0].Presets[0]
+
+	if dup.Name != "default-from-alpha" {
+		t.Errorf("dup.Name = %q, want %q", dup.Name, "default-from-alpha")
+	}
+	if dup.Description != src.Description {
+		t.Errorf("dup.Description = %q, want %q", dup.Description, src.Description)
+	}
+	if len(dup.Params) != len(src.Params) {
+		t.Fatalf("dup.Params len = %d, want %d", len(dup.Params), len(src.Params))
+	}
+
+	// Cursor: stays on the source preset, not the new clone.
+	if c.modelIdx != 0 || c.presetIdx != 0 {
+		t.Errorf("cursor moved: (model=%d, preset=%d), want (0,0)", c.modelIdx, c.presetIdx)
+	}
+
+	// Deep copy: mutating the clone must not bleed into the source.
+	dup.Params[0].Value = json.Number("1")
+	if got := c.work.Models[0].Presets[0].Params[0].Value; got != json.Number("99") {
+		t.Errorf("source params mutated: %v, want 99 (deep copy broken)", got)
+	}
+
+	// Flash mentions the target alias.
+	if c.flash == "" || !strings.Contains(c.flash, "beta") {
+		t.Errorf("flash = %q, want one referencing target alias %q", c.flash, "beta")
+	}
+}
+
+// TestClonePresetNameCollisionRejected ensures the validator closure
+// over the target index rejects a name that already exists in the
+// chosen target's presets.
+func TestClonePresetNameCollisionRejected(t *testing.T) {
+	cfg := duplicateTestConfig()
+	target := 1 // beta has a preset called "default"
+	v := clonePresetNameValidator(cfg.Models, &target)
+
+	if err := v("default"); err == nil {
+		t.Error("validator accepted colliding preset name")
+	}
+	if err := v(""); err == nil {
+		t.Error("validator accepted empty name")
+	}
+	if err := v("brand-new"); err != nil {
+		t.Errorf("validator rejected unique name: %v", err)
+	}
+
+	// Switching the target pointer must re-evaluate against the new
+	// model's presets — beta has "default", alpha has "default" and
+	// "smallctx", but cloning *to* alpha while a name like "smallctx"
+	// is typed should now collide.
+	target = 0
+	if err := v("smallctx"); err == nil {
+		t.Error("validator did not pick up new target's collision")
+	}
+}
+
+// TestClonePresetToSingleModelIsNoOp covers the edge case in
+// handlePresetsKey: with only one model in the config, pressing `k`
+// flashes "no other model to clone to" and leaves the config alone.
+func TestClonePresetToSingleModelIsNoOp(t *testing.T) {
+	cfg := &config.Config{
+		Version: 1,
+		Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Models: []config.Model{
+			{Alias: "alpha", Location: "/m/alpha.gguf", Presets: []config.Preset{
+				{Name: "default"},
+			}},
+		},
+	}
+	c := NewConfigMode("/dev/null", cfg)
+	c.modelIdx, c.presetIdx = 0, 0
+	c.focus = FocusPresets
+
+	_, cmd := c.handlePresetsKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	if cmd != nil {
+		t.Fatalf("k with single model should not open a form; got cmd %T", cmd())
+	}
+	if c.form != nil || c.formKind != formNone {
+		t.Errorf("k staged a form: kind=%v, form=%v", c.formKind, c.form != nil)
+	}
+	if c.flash != "no other model to clone to" {
+		t.Errorf("flash = %q, want %q", c.flash, "no other model to clone to")
+	}
+	if len(c.work.Models[0].Presets) != 1 {
+		t.Errorf("config mutated despite no-op: presets len = %d", len(c.work.Models[0].Presets))
+	}
+}
+
+// TestCloneToFormExcludesSourceModel checks that the target Select's
+// options never include the source model's index — the source self-
+// clone is the existing `c clone` action.
+func TestCloneToFormExcludesSourceModel(t *testing.T) {
+	cfg := duplicateTestConfig()
+	c := NewConfigMode("/dev/null", cfg)
+	c.modelIdx, c.presetIdx = 0, 0 // alpha / default
+	c.focus = FocusPresets
+	c.SetSize(140, 40) // installForm uses width/height; non-zero avoids the no-op path
+
+	if cmd := c.openClonePresetToModelForm(); cmd != nil {
+		// Drain the init Cmd; we don't need the resulting message.
+		_ = cmd
+	}
+	if c.formKind != formCloneToModelPreset {
+		t.Fatalf("form kind = %v, want formCloneToModelPreset", c.formKind)
+	}
+	// The staged target index must not point at the source model. With
+	// modelIdx = 0 and len(Models) = 2, the only valid initial value is 1.
+	if c.formStaging.targetIdx == nil {
+		t.Fatal("targetIdx not staged")
+	}
+	if *c.formStaging.targetIdx == c.modelIdx {
+		t.Errorf("initial target = %d, must differ from source modelIdx %d",
+			*c.formStaging.targetIdx, c.modelIdx)
+	}
+}
+
+// TestConfigPaneNavIgnoresVimKeys pins the vim-nav purge: pressing j/k
+// in the three config panes must not move the selection cursor. Arrow
+// keys still work (covered indirectly by TestConfigModeArrowCyclesPanes).
+func TestConfigPaneNavIgnoresVimKeys(t *testing.T) {
+	cfg := duplicateTestConfig()
+	c := NewConfigMode("/dev/null", cfg)
+	c.SetSize(140, 40)
+
+	cases := []struct {
+		focus ConfigFocus
+		setup func()
+		idx   func() int
+	}{
+		{FocusModels, func() { c.modelIdx = 0 }, func() int { return c.modelIdx }},
+		{FocusPresets, func() { c.modelIdx, c.presetIdx = 0, 0 }, func() int { return c.presetIdx }},
+		{FocusParams, func() { c.modelIdx, c.presetIdx, c.paramIdx = 0, 0, 0 }, func() int { return c.paramIdx }},
+	}
+	for _, tc := range cases {
+		c.focus = tc.focus
+		tc.setup()
+		before := tc.idx()
+		c.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		c.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+		if got := tc.idx(); got != before {
+			t.Errorf("focus=%d: vim key moved index %d → %d", tc.focus, before, got)
+		}
 	}
 }
 

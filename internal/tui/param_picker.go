@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -93,6 +94,11 @@ func newParamPicker(reg flags.Registry) *paramPicker {
 	l.SetShowStatusBar(false)
 	l.SetShowPagination(true)
 	l.SetFilteringEnabled(true)
+	// Drop vim-style j/k from cursor movement so the picker matches
+	// the config-mode panes (arrow keys only). bubbles/list's default
+	// KeyMap binds both arrows and j/k; we keep only the arrows.
+	l.KeyMap.CursorUp = key.NewBinding(key.WithKeys("up"), key.WithHelp("↑", "up"))
+	l.KeyMap.CursorDown = key.NewBinding(key.WithKeys("down"), key.WithHelp("↓", "down"))
 	return &paramPicker{list: l}
 }
 
