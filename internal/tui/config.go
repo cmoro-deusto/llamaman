@@ -39,6 +39,7 @@ const (
 	formNewParamPickKey
 	formNewParamPickValue
 	formEditParam
+	formDeleteParam
 	formExitPrompt
 )
 
@@ -85,6 +86,7 @@ type ConfigMode struct {
 	flash   string
 
 	firstRunBanner bool // shown until user presses 'n' in Models pane
+	helpOverlay    bool // ? toggles a centered help reference; any key dismisses
 
 	width, height int
 	theme         Theme
@@ -145,6 +147,10 @@ func (c *ConfigMode) Update(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 		return c.updateForm(msg)
 	}
 	if k, ok := msg.(tea.KeyMsg); ok {
+		if c.helpOverlay {
+			c.helpOverlay = false
+			return c, nil
+		}
 		return c.handleKey(k)
 	}
 	return c, nil
@@ -238,7 +244,7 @@ func (c *ConfigMode) handleKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 		c.save()
 		return c, nil
 	case "?":
-		c.flash = "tab/← →: cycle pane · ↑↓: select · e: edit · n: new · D: dup · d: delete · g: globals · s: save · esc: back"
+		c.helpOverlay = true
 		return c, nil
 	}
 	switch c.focus {
@@ -294,11 +300,11 @@ func (c *ConfigMode) handleModelsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 	case "n":
 		c.firstRunBanner = false
 		return c, c.openNewModelForm()
-	case "e":
+	case "e", "enter":
 		if c.hasModel() {
 			return c, c.openEditModelForm()
 		}
-	case "D":
+	case "c":
 		if c.hasModel() {
 			return c, c.openDuplicateModelForm()
 		}
@@ -342,11 +348,11 @@ func (c *ConfigMode) handlePresetsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 		}
 	case "n":
 		return c, c.openNewPresetForm()
-	case "e":
+	case "e", "enter":
 		if c.hasPreset() {
 			return c, c.openEditPresetForm()
 		}
-	case "D":
+	case "c":
 		if c.hasPreset() {
 			return c, c.openDuplicatePresetForm()
 		}
@@ -392,7 +398,7 @@ func (c *ConfigMode) handleParamsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 		}
 	case "d":
 		if len(params) > 0 {
-			c.deleteParam()
+			return c, c.openDeleteParamPrompt()
 		}
 	}
 	return c, nil
@@ -541,6 +547,23 @@ func (c *ConfigMode) openEditPresetForm() tea.Cmd {
 		huh.NewInput().Title("description").Value(&desc),
 	)).WithTheme(huh.ThemeBase())
 	return c.installForm(form, formEditPreset)
+}
+
+// openDeleteParamPrompt mirrors the model/preset delete confirms so the
+// behavior across all three panes is identical: `d` always pops a modal
+// before any destructive change. Without this, Params silently deleted
+// the focused row, which surprised first-time users.
+func (c *ConfigMode) openDeleteParamPrompt() tea.Cmd {
+	confirm := false
+	c.formStaging = formStaging{confirm: &confirm}
+	p := c.work.Models[c.modelIdx].Presets[c.presetIdx].Params[c.paramIdx]
+	prompt := fmt.Sprintf("Delete param %q?", p.Key)
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().Title(prompt).
+			Affirmative("Delete").Negative("Cancel").
+			Value(&confirm),
+	)).WithTheme(huh.ThemeBase())
+	return c.installForm(form, formDeleteParam)
 }
 
 func (c *ConfigMode) openDeletePresetPrompt() tea.Cmd {
@@ -819,6 +842,10 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		p := &c.work.Models[c.modelIdx].Presets[c.presetIdx].Params[c.paramIdx]
 		p.Value = c.applyParamValueFromStaging()
 		c.flash = "param updated"
+	case formDeleteParam:
+		if c.formStaging.confirm != nil && *c.formStaging.confirm {
+			c.deleteParam()
+		}
 	case formExitPrompt:
 		switch deref(c.formStaging.choice) {
 		case "save":
@@ -928,6 +955,9 @@ func (c *ConfigMode) View() string {
 			Padding(1, 2).
 			Render(c.form.View())
 		return overlayCenter(bg, popup, c.width, c.height)
+	}
+	if c.helpOverlay {
+		return overlayCenter(bg, c.renderHelpOverlay(), c.width, c.height)
 	}
 	return bg
 }
@@ -1046,9 +1076,12 @@ func (c *ConfigMode) renderParams() string {
 	return strings.Join(lines, "\n")
 }
 
+// renderFooter draws the two-line hint area: a pane-specific CRUD line
+// (verbs greyed out when the focused pane has no rows to act on), then a
+// global line for navigation + meta keys that work regardless of focus.
+// Closes #12: the previous one-line `e/n/d` hint hid `D` (now `c`)
+// duplicate, the shift-arrow reorder, and `?` itself.
 func (c *ConfigMode) renderFooter() string {
-	hint := lipgloss.NewStyle().Foreground(c.theme.Subtle).
-		Render("tab: pane · e/n/d · g: globals · s: save · esc: back")
 	flash := ""
 	if c.flash != "" {
 		col := c.theme.Subtle
@@ -1059,10 +1092,104 @@ func (c *ConfigMode) renderFooter() string {
 		}
 		flash = lipgloss.NewStyle().Foreground(col).Render(c.flash)
 	}
-	if flash == "" {
-		return hint
+	paneLine := c.renderPaneHint()
+	globalLine := lipgloss.NewStyle().Foreground(c.theme.Subtle).
+		Render("↑↓ select · ⇧↑⇧↓ reorder · tab pane · g globals · s save · ? help · esc back")
+	lines := []string{paneLine, globalLine}
+	if flash != "" {
+		lines = append([]string{flash}, lines...)
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, flash, hint)
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
+// renderPaneHint produces the per-pane CRUD line. Verbs that operate on
+// the currently-focused row (e/c/d) are greyed out when the pane is
+// empty, since pressing them is a no-op there.
+func (c *ConfigMode) renderPaneHint() string {
+	on := lipgloss.NewStyle().Foreground(c.theme.Subtle)
+	off := lipgloss.NewStyle().Foreground(c.theme.Muted)
+	label := on.Render
+	tag := func(s string, available bool) string {
+		if available {
+			return on.Render(s)
+		}
+		return off.Render(s)
+	}
+	sep := on.Render(" · ")
+
+	switch c.focus {
+	case FocusModels:
+		has := c.hasModel()
+		return strings.Join([]string{
+			label("[Models] "),
+			tag("n new", true),
+			sep,
+			tag("e/⏎ edit", has),
+			sep,
+			tag("c clone", has),
+			sep,
+			tag("d delete", has),
+		}, "")
+	case FocusPresets:
+		has := c.hasPreset()
+		return strings.Join([]string{
+			label("[Presets] "),
+			tag("n new", c.hasModel()),
+			sep,
+			tag("e/⏎ edit", has),
+			sep,
+			tag("c clone", has),
+			sep,
+			tag("d delete", has),
+		}, "")
+	case FocusParams:
+		hasParam := false
+		if c.hasPreset() {
+			hasParam = len(c.work.Models[c.modelIdx].Presets[c.presetIdx].Params) > 0
+		}
+		return strings.Join([]string{
+			label("[Params] "),
+			tag("n new", c.hasPreset()),
+			sep,
+			tag("e/⏎ edit", hasParam),
+			sep,
+			tag("d delete", hasParam),
+		}, "")
+	}
+	return ""
+}
+
+// renderHelpOverlay is the manual surfaced by `?`: full key map plus the
+// non-obvious nuances (param edit can't rename; clone is intentionally
+// absent on Params; esc on a modified config prompts to save/discard).
+func (c *ConfigMode) renderHelpOverlay() string {
+	heading := lipgloss.NewStyle().Foreground(c.theme.Accent).Bold(true)
+	muted := lipgloss.NewStyle().Foreground(c.theme.Muted)
+	body := strings.Join([]string{
+		heading.Render("NAVIGATION"),
+		"  ↑/k  ↓/j        select item in focused pane",
+		"  ⇧↑   ⇧↓         reorder (changes argv order on next launch)",
+		"  tab / → / l     next pane",
+		"  shift+tab / ← / h   previous pane",
+		"",
+		heading.Render("MODELS / PRESETS"),
+		"  n new      e or ⏎ edit      c clone      d delete (confirms)",
+		"",
+		heading.Render("PARAMS"),
+		"  n new      e or ⏎ edit value      d delete (confirms)",
+		muted.Render("  Note: editing a param can't rename it — delete and re-add to change the key."),
+		muted.Render("  Note: clone is intentionally absent — two flags with the same key produce invalid argv."),
+		"",
+		heading.Render("GLOBAL"),
+		"  g globals      s save      esc back (prompts on unsaved changes)",
+		"",
+		muted.Render("(press any key to dismiss)"),
+	}, "\n")
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(c.theme.Accent).
+		Padding(1, 2).
+		Render(body)
 }
 
 // ---- helpers ----
