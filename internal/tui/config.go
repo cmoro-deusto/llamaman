@@ -1538,17 +1538,21 @@ func parseParamValue(s string) any {
 	return s
 }
 
+// looksNumeric reports whether s is a single, complete JSON number literal.
+// json.Unmarshal (unlike Decoder.Decode) requires the entire input to be one
+// valid JSON value, so trailing garbage like "10.0.0.30:50052" — which a
+// Decoder would happily accept by consuming only the "10.0" prefix — is
+// correctly rejected here.
 func looksNumeric(s string) bool {
+	s = strings.TrimSpace(s)
 	if s == "" {
 		return false
 	}
-	dec := json.NewDecoder(strings.NewReader(s))
-	dec.UseNumber()
 	var v any
-	if err := dec.Decode(&v); err != nil {
+	if err := json.Unmarshal([]byte(s), &v); err != nil {
 		return false
 	}
-	_, ok := v.(json.Number)
+	_, ok := v.(float64)
 	return ok
 }
 
