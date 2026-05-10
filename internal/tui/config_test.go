@@ -457,3 +457,35 @@ func TestConfigExitPromptSaveBlockedByValidationDoesNotExit(t *testing.T) {
 		t.Errorf("save with validation errors should not exit; got cmd producing %T", cmd())
 	}
 }
+
+// TestParseParamValueClassifiesStringsWithNumericPrefix guards against the
+// regression where looksNumeric used a streaming json.Decoder and accepted
+// any input whose prefix parsed as a number — so "--rpc 10.0.0.30:50052"
+// got cast to json.Number and either failed to save (invalid number literal)
+// or, when the user worked around it with quotes, kept the literal quote
+// chars in argv and broke llama-server.
+func TestParseParamValueClassifiesStringsWithNumericPrefix(t *testing.T) {
+	cases := []struct {
+		in   string
+		want any
+	}{
+		{"10.0.0.30:50052", "10.0.0.30:50052"},
+		{"127.0.0.1:50052", "127.0.0.1:50052"},
+		{"10.0.0.30", "10.0.0.30"},
+		{"1.5.6", "1.5.6"},
+		// Sanity: real numbers still come through as json.Number so they
+		// round-trip exactly through config save/load.
+		{"42", json.Number("42")},
+		{"3.14", json.Number("3.14")},
+		{"-7", json.Number("-7")},
+		{"true", true},
+		{"false", false},
+		{"plain text", "plain text"},
+	}
+	for _, tc := range cases {
+		got := parseParamValue(tc.in)
+		if got != tc.want {
+			t.Errorf("parseParamValue(%q) = %v (%T); want %v (%T)", tc.in, got, got, tc.want, tc.want)
+		}
+	}
+}
