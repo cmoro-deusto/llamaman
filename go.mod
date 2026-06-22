@@ -3,7 +3,7 @@ module github.com/cmoro-deusto/llamaman
 go 1.26.2
 
 require (
-	github.com/NVIDIA/go-nvml v0.13.1-0
+	github.com/NVIDIA/go-nvml v0.13.2-0
 	github.com/alecthomas/kong v1.15.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
