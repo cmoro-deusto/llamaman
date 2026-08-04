@@ -30,10 +30,12 @@ type propsFetchedMsg struct {
 	err  error
 }
 
-// fetchPropsRetryDelay is the gap between the initial fetch and the one
-// retry. ~250ms covers the realistic transient: server just hit the
-// ready marker but the HTTP listener wiring isn't fully up yet.
-const fetchPropsRetryDelay = 250 * time.Millisecond
+// fetchPropsRetryDelay is the gap between /props polling attempts.
+// Used only as a safety fallback — the primary readiness signal is the
+// log marker ("listening on") which fires the /props fetch at the right
+// time. If the marker is missed (log truncation, weird server build),
+// the poll loop catches it.
+const fetchPropsRetryDelay = 5 * time.Second
 
 // livePollInterval drives the run-mode header's live-data updates
 // (server panel + hardware panel). 1s matches the existing uptime
@@ -116,27 +118,36 @@ func tickHwPoll() tea.Cmd {
 	})
 }
 
-// fetchPropsCmd returns a tea.Cmd that GETs /props once, retries once
-// after fetchPropsRetryDelay on transient failure, and emits a
-// propsFetchedMsg with the result. ctx cancellation aborts both
-// attempts and any in-flight HTTP request. fetcher must be non-nil.
+// fetchPropsCmd returns a tea.Cmd that polls GET /props in a loop
+// until the server responds successfully or ctx is cancelled.
+//
+// Primary readiness path: the log marker ("listening on") detected in
+// the logChunkMsg handler fires fetchPropsCmd once the HTTP server is
+// up. That attempt succeeds immediately.
+//
+// Fallback path: if the marker is missed (log truncation, unusual
+// server build), the poll loop retries every fetchPropsRetryDelay
+// (5s) until success. Model loading (GGUF into memory, HF download)
+// can take minutes; the 5s interval avoids hammering a port nothing
+// is listening on.
+//
+// ctx cancellation (kill/detach) aborts the loop immediately.
+// fetcher must be non-nil.
 func fetchPropsCmd(ctx context.Context, fetcher Fetcher) tea.Cmd {
 	return func() tea.Msg {
-		p, err := fetcher.FetchProps(ctx)
-		if err == nil {
-			return propsFetchedMsg{nctx: p.DefaultGenerationSettings.NCtx}
+		for {
+			p, err := fetcher.FetchProps(ctx)
+			if err == nil {
+				return propsFetchedMsg{nctx: p.DefaultGenerationSettings.NCtx}
+			}
+			// Server not ready yet (model still loading, HTTP listener
+			// not up). Wait and retry. Sleep with cancellation so a
+			// kill-during-fetch returns promptly.
+			select {
+			case <-ctx.Done():
+				return propsFetchedMsg{err: ctx.Err()}
+			case <-time.After(fetchPropsRetryDelay):
+			}
 		}
-		// One retry. Sleep with cancellation so a kill-during-fetch
-		// returns promptly.
-		select {
-		case <-ctx.Done():
-			return propsFetchedMsg{err: ctx.Err()}
-		case <-time.After(fetchPropsRetryDelay):
-		}
-		p, err = fetcher.FetchProps(ctx)
-		if err == nil {
-			return propsFetchedMsg{nctx: p.DefaultGenerationSettings.NCtx}
-		}
-		return propsFetchedMsg{err: err}
 	}
 }

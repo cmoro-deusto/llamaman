@@ -42,6 +42,15 @@ type procDoneMsg struct{ err error }
 type tailerClosedMsg struct{}
 type uptimeTickMsg time.Time
 
+// readyMarker is the substring llama-server prints when its HTTP server is
+// up. Detected by scanning chunks streamed from the log file. Older builds
+// emitted "server is listening on ..."; newer builds use
+// "llama_server: listening on http://...". "listening on" covers both.
+// Used as the primary readiness signal so /props is only fetched once the
+// HTTP listener is actually accepting connections — avoids hammering a port
+// during long model loads (GGUF into memory, HF download).
+const readyMarker = "listening on"
+
 // RunMode owns (or has adopted) a llama-server child plus the viewport
 // tailing its log file. Quit prompt is per DESIGN.md §7.4: q/Ctrl+C opens
 // (k)ill / (d)etach / (c)ancel.
@@ -223,13 +232,20 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 		hwSnapshotCmd(),
 		tickHwPoll(),
 	}
-	// Reattach: the process is already running, so fire the initial
-	// /props fetch. The owner-mode path also fires here — the server
-	// may already be ready by the time the first chunk arrives.
-	// StatusStarting → StatusReady transition happens on first
-	// successful /props (handled in propsFetchedMsg), which arms
-	// the recurring live poll. This removes the dependency on log
-	// format for readiness detection.
+	// Readiness is detected by two signals, whichever arrives first:
+	//
+	//  1. Log marker (primary): "listening on" in the log means the
+	//     HTTP server is up. The logChunkMsg handler fires fetchPropsCmd
+	//     at that point — no wasted connection attempts during model load.
+	//
+	//  2. Polling fallback: fetchPropsCmd fires here immediately and
+	//     retries every 5s. Catches cases where the log marker is
+	//     missed (log truncation, unusual server build). On reattach
+	//     the server is already running so this succeeds at once.
+	//
+	// StatusStarting → StatusReady transitions on first successful
+	// /props (handled in propsFetchedMsg), which arms the recurring
+	// live poll.
 	if r.fetcher != nil {
 		cmds = append(cmds, fetchPropsCmd(r.fetchCtx, r.fetcher))
 	}
@@ -313,7 +329,19 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if atBottom {
 			r.viewport.GotoBottom()
 		}
-		return r, waitForChunk(r.tail.Chunks())
+		cmds := []tea.Cmd{waitForChunk(r.tail.Chunks())}
+		// Primary readiness signal: log marker "listening on" appears.
+		// Fire the /props fetch only after the HTTP server is confirmed
+		// up — avoids hammering a port during long model loads.
+		// The polling loop in fetchPropsCmd (fired from NewRunMode) is
+		// the fallback for cases where the marker is missed.
+		wasStarting := r.status == StatusStarting
+		if wasStarting && strings.Contains(r.buf.String(), readyMarker) {
+			if r.fetcher != nil && r.liveCtxSize == 0 {
+				cmds = append(cmds, fetchPropsCmd(r.fetchCtx, r.fetcher))
+			}
+		}
+		return r, tea.Batch(cmds...)
 
 	case tailerClosedMsg:
 		return r, nil
@@ -332,11 +360,12 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 
 	case propsFetchedMsg:
 		if m.err != nil {
-			// fetchPropsCmd already retried once. Permanent failure: log
-			// for the user's troubleshooting, no TUI flash. liveCtxSize
-			// stays 0 so the header keeps showing the preset value (or
-			// n/a). Suppress the warn for context cancellation — that's
-			// a kill-during-fetch and not actionable.
+			// fetchPropsCmd polls in a loop until success or ctx cancel.
+			// Reaching here means the context was cancelled (kill/detach)
+			// or a non-recoverable transport error occurred. Suppress the
+			// warn for context cancellation — that's a kill-during-fetch
+			// and not actionable. liveCtxSize stays 0 so the header keeps
+			// showing the preset value (or n/a).
 			if !errors.Is(m.err, context.Canceled) {
 				slog.Warn("/props fetch failed",
 					"err", m.err,
