@@ -38,8 +38,10 @@ const (
 )
 
 // readyMarker is the substring llama-server prints when its HTTP server is
-// up. Detected by scanning chunks streamed from the log file.
-const readyMarker = "server is listening"
+// up. Detected by scanning chunks streamed from the log file. Older builds
+// emitted "server is listening on ..."; newer builds use
+// "llama_server: listening on http://...". "listening on" covers both.
+const readyMarker = "listening on"
 
 type logChunkMsg string
 type procDoneMsg struct{ err error }
