@@ -13,6 +13,7 @@ import (
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
+	"github.com/cmoro-deusto/llamaman/internal/llamaapi"
 	"github.com/cmoro-deusto/llamaman/internal/server"
 )
 
@@ -270,6 +271,7 @@ func TestSnapshotRunMode(t *testing.T) {
 		Preset:  preset,
 		Argv:    proc.Argv,
 		Process: proc,
+		Fetcher: llamaapi.NewClient("127.0.0.1", 9080),
 	}
 	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
 
