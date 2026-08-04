@@ -4,8 +4,10 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -41,8 +43,53 @@ func main() {
 
 	time.Sleep(*delay)
 
-	fmt.Printf("main: server is listening on http://%s:%d\n", *host, *port)
-	fmt.Printf("main: HTTP server is listening, hostname: %s, port: %d\n", *host, *port)
+	// Start HTTP server with /props endpoint for readiness detection.
+	go func() {
+		http.HandleFunc("/props", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"default_generation_settings": map[string]any{
+					"n_ctx": float64(8192),
+				},
+				"server_info": map[string]any{
+					"server_version": "fakeserver",
+				},
+			})
+		})
+		http.HandleFunc("/slots", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"is_processing":          false,
+					"n_ctx":                  8192,
+					"n_prompt_tokens":        0,
+					"n_prompt_tokens_processed": 0,
+					"n_prompt_tokens_cache":  0,
+					"next_token":             []any{},
+				},
+			})
+		})
+		http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain")
+			fmt.Fprint(w, `llamacpp:tokens_predicted_total 0
+llamacpp:tokens_predicted_seconds_total 0
+llamacpp:prompt_tokens_total 0
+llamacpp:prompt_seconds_total 0
+llamacpp:predicted_tokens_seconds 0
+llamacpp:prompt_tokens_seconds 0
+llamacpp:requests_processing 0
+llamacpp:requests_deferred 0
+llamacpp:n_tokens_max 0
+llamacpp:n_decode_total 0
+`)
+		})
+		addr := fmt.Sprintf("%s:%d", *host, *port)
+		fmt.Printf("main: server is listening on http://%s\n", addr)
+		fmt.Printf("main: HTTP server is listening, hostname: %s, port: %d\n", *host, *port)
+		if err := http.ListenAndServe(addr, nil); err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "http: %v\n", err)
+		}
+	}()
 
 	// Trap SIGTERM/SIGINT so we exit promptly when llamaman stops us.
 	sig := make(chan os.Signal, 1)

@@ -37,12 +37,6 @@ const (
 	StatusErrored
 )
 
-// readyMarker is the substring llama-server prints when its HTTP server is
-// up. Detected by scanning chunks streamed from the log file. Older builds
-// emitted "server is listening on ..."; newer builds use
-// "llama_server: listening on http://...". "listening on" covers both.
-const readyMarker = "listening on"
-
 type logChunkMsg string
 type procDoneMsg struct{ err error }
 type tailerClosedMsg struct{}
@@ -115,6 +109,24 @@ type RunMode struct {
 	busyCount           int
 	totalSlots          int
 	queuedCount         int
+	// Context usage from /slots.
+	contextUsed       int // tokens currently in context (prompt + generated)
+	contextMax        int // total context window size
+	contextCacheHit   int // prompt tokens served from cache
+	contextPromptToks int // prompt tokens in context (for breakdown bar)
+	contextGenToks    int // generated tokens in context (for breakdown bar)
+	// Generation progress from /slots next_token.
+	genDecoded int // tokens generated so far in current response
+	genRemain  int // tokens remaining before generation limit
+	// Prompt processing progress from /slots.
+	promptToksTotal    int // total prompt tokens for current request
+	promptToksProcessed int // prompt tokens processed so far
+	// Lifetime request count from /metrics.
+	decodeTotal float64
+	// TTFT (time to first token) tracking.
+	ttftStart         time.Time // when new request started (zero = not tracking)
+	ttft              time.Duration // measured TTFT
+	ttftPrevPromptToks int // previous prompt total to detect new request
 	// tokensSeen / promptSeen latch true once we've observed the first
 	// non-zero rate. Bug 3: after the first real value, we persist the
 	// last-known rate even on subsequent zero-delta ticks (no more "—"
@@ -211,16 +223,15 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 		hwSnapshotCmd(),
 		tickHwPoll(),
 	}
-	// Reattach: the process is already running, so the readyMarker log
-	// line happened before we started tailing and we won't see a
-	// StatusStarting → StatusReady transition. Fire the fetch
-	// immediately. The owner-mode path waits for the transition (handled
-	// in the logChunkMsg case in Update) because at construction the
-	// server is still booting and /props would dial a port nothing is
-	// listening on yet.
-	if r.fetcher != nil && opts.Process != nil && !opts.Process.IsOwner() {
+	// Reattach: the process is already running, so fire the initial
+	// /props fetch. The owner-mode path also fires here — the server
+	// may already be ready by the time the first chunk arrives.
+	// StatusStarting → StatusReady transition happens on first
+	// successful /props (handled in propsFetchedMsg), which arms
+	// the recurring live poll. This removes the dependency on log
+	// format for readiness detection.
+	if r.fetcher != nil {
 		cmds = append(cmds, fetchPropsCmd(r.fetchCtx, r.fetcher))
-		cmds = append(cmds, r.startLivePoll()...)
 	}
 	return r, tea.Batch(cmds...), nil
 }
@@ -297,27 +308,12 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	switch m := msg.(type) {
 	case logChunkMsg:
 		r.buf.WriteString(string(m))
-		wasStarting := r.status == StatusStarting
-		if wasStarting && strings.Contains(r.buf.String(), readyMarker) {
-			r.status = StatusReady
-		}
 		atBottom := r.viewport.AtBottom()
 		r.viewport.SetContent(r.renderViewportContent())
 		if atBottom {
 			r.viewport.GotoBottom()
 		}
-		cmds := []tea.Cmd{waitForChunk(r.tail.Chunks())}
-		// Owner-mode kickoff: the moment we see the ready marker, /props
-		// + /metrics + /slots are reachable. Fire the one-shot props
-		// fetch and arm the recurring live poll alongside the next chunk
-		// wait. The reattach path already kicked off in NewRunMode.
-		if wasStarting && r.status == StatusReady && r.fetcher != nil {
-			if r.liveCtxSize == 0 {
-				cmds = append(cmds, fetchPropsCmd(r.fetchCtx, r.fetcher))
-			}
-			cmds = append(cmds, r.startLivePoll()...)
-		}
-		return r, tea.Batch(cmds...)
+		return r, waitForChunk(r.tail.Chunks())
 
 	case tailerClosedMsg:
 		return r, nil
@@ -356,6 +352,14 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		}
 		r.liveCtxSize = m.nctx
+		// First successful /props means the server is ready. Transition
+		// status and arm the recurring live poll. This replaces the old
+		// log-marker approach ("listening on") which was fragile across
+		// llama-server versions.
+		if r.status == StatusStarting {
+			r.status = StatusReady
+		}
+		cmds := r.startLivePoll()
 		// Disagreement diagnostic: the preset declared a value, the
 		// live server reports a different one. Most common cause is
 		// llama-server clamping a too-large request to the model's max.
@@ -369,6 +373,9 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 					"live_value", m.nctx,
 				)
 			}
+		}
+		if len(cmds) > 0 {
+			return r, tea.Batch(cmds...)
 		}
 		return r, nil
 
@@ -456,6 +463,39 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		}
 		r.busyCount = m.s.BusyCount
 		r.totalSlots = m.s.Total
+		r.contextUsed = m.s.ContextUsed
+		r.contextMax = m.s.ContextMax
+		r.contextCacheHit = m.s.ContextCacheHits
+		r.contextPromptToks = m.s.ContextPromptTokens
+		r.contextGenToks = m.s.ContextGenTokens
+		r.genDecoded = m.s.GenDecoded
+		r.genRemain = m.s.GenRemain
+		r.promptToksTotal = m.s.PromptTokensTotal
+		r.promptToksProcessed = m.s.PromptTokensProcessed
+		// TTFT tracking: detect new request when n_prompt_tokens goes from
+		// 0 → N (or changes to a new value). Measure until first token appears.
+		newRequest := m.s.PromptTokensTotal > 0 && m.s.PromptTokensTotal != r.ttftPrevPromptToks
+		if newRequest && r.ttftStart.IsZero() {
+			// New request detected. If generation already started, we
+			// missed the prompt phase — mark TTFT as <1s.
+			if m.s.GenDecoded > 0 {
+				r.ttft = -1 // sentinel for <1s
+			} else {
+				r.ttftStart = time.Now()
+			}
+		}
+		if m.s.GenDecoded > 0 && !r.ttftStart.IsZero() && r.ttft == 0 {
+			// First token appeared.
+			r.ttft = time.Since(r.ttftStart)
+		}
+		// Reset when request completes (back to idle).
+		if m.s.PromptTokensTotal == 0 && m.s.GenDecoded == 0 {
+			r.ttftStart = time.Time{}
+			r.ttft = 0
+			r.ttftPrevPromptToks = 0
+		} else {
+			r.ttftPrevPromptToks = m.s.PromptTokensTotal
+		}
 		return r, nil
 
 	case tea.KeyMsg:
@@ -562,6 +602,7 @@ func (r *RunMode) applyMetrics(m *llamaapi.Metrics) {
 	r.avgTokensPerSec = m.PredictedTokensSecondsAvg
 	r.avgPromptPerSec = m.PromptTokensSecondsAvg
 	r.queuedCount = int(m.RequestsDeferred)
+	r.decodeTotal = m.NDecodeTotal
 
 	if r.prevMetrics == nil {
 		r.prevMetrics = m
@@ -1249,7 +1290,7 @@ func (r *RunMode) renderTopStrip() string {
 	cells := []string{
 		subtle.Render("Alias:") + " " + accent.Render(r.model.Alias),
 		subtle.Render("Server:") + " " + serverVersionOrNA(r.serverVersion),
-		subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params),
+		subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params) + "  " + subtle.Render(fmt.Sprintf("(%d reqs)", int(r.decodeTotal))),
 		subtle.Render("Preset:") + " " + accent.Render(presetNameOrDash(r.preset)),
 		subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
 		statusBadge(r.statusLabel(), r.statusColor()),
@@ -1329,26 +1370,41 @@ func (r *RunMode) renderLiveBand() string {
 }
 
 // metricLabelWidth right-pads every live-band metric label
-// ("Util", "RAM", "VRAM", "Power", "Temp", "Tokens", "Prompt") to a
-// uniform column so the bar/spark viz starts at the same column on
-// every row. 5 fits the longest ("Power", "Tokens", "Prompt").
-const metricLabelWidth = 5
+// ("Util", "RAM", "VRAM", "Power", "Temp", "Tokens", "Prompt", "Process", "Context", "Breakdown", "Gen")
+// to a uniform column so the bar/spark viz starts at the same column on
+// every row. 9 fits the longest ("Breakdown").
+const metricLabelWidth = 9
 
 // renderServerPanel renders the llama-server live data box (SP3
-// shape, DESIGN.md §7.4): two content rows.
+// shape, DESIGN.md §7.4): seven content rows.
 //
 //	Tokens <spark>   80.0 /  60.0 /s avg   Busy   2/4 slots
 //	Prompt <spark> 2331.0 / 2300.0 /s avg  Queued 1
+//	Process  <bar>    45% (2.8K/6.2K)
+//	Context  <bar>    15K/80K (19%)
+//	Breakdown  <bar>    prompt(gen)empty
+//	Cache  <bar>    80%
+//	Gen    <bar>     279/16K (2%)   TTFT 1.2s
 //
 // Tokens/Prompt sparklines roll over 40s. Trailing rate cell shows
 // "current / avg /s avg" — current is the per-tick instantaneous,
 // avg is the lifetime gauge llama-server maintains. Both persist
 // last-known after the first non-zero (Bug 3); before any inference,
 // the cell reads "—". When --metrics is off, "n/a".
+// Process row shows prompt processing progress.
+// Context row shows tokens-in-context vs max context window.
+// Breakdown row shows context breakdown: prompt (purple) + gen (orange) + empty.
+// Cache row shows prompt cache hit ratio from /slots.
+// Gen row shows response progress with TTFT (time to first token).
 func (r *RunMode) renderServerPanel(width int) string {
 	rows := []string{
 		r.renderServerRow("Tokens", r.tokensHistory, r.currentTokensPerSec, r.avgTokensPerSec, r.tokensSeen, r.busyCount, r.totalSlots, true),
 		r.renderServerRow("Prompt", r.promptHistory, r.currentPromptPerSec, r.avgPromptPerSec, r.promptSeen, r.queuedCount, 0, false),
+		r.renderPromptProgressRow(),
+		r.renderContextRow(),
+		r.renderContextBreakdownRow(),
+		r.renderCacheRow(),
+		r.renderGenProgressRow(),
 	}
 	return r.renderTitledPanel("llama-server", width, padRows(rows, liveBandContentRows))
 }
@@ -1363,19 +1419,21 @@ func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, a
 
 	spark := renderSparkline(r.theme, hist.Snapshot(), MetricUtil)
 
-	// Rate cell: "<current> / <avg> tps". Fixed-width slots so
+	// Rate cell: "<current> tps / <avg> avg". Fixed-width slots so
 	// the column stays put as values transition (e.g. 99.9 → 100.0
 	// or 999 → 1000). %6.1f covers up to "9999.9" which is more
-	// than llama-server ever produces.
+	// than llama-server ever produces. Current shows "—" until the
+	// first non-zero delta; avg (from the server gauge) is available
+	// from tick 1.
 	const rateSlot = "%6.1f"
 	var rateCell string
 	switch {
 	case !r.metricsAvailable:
-		rateCell = "          n/a"
+		rateCell = "             n/a"
 	case !seen:
-		rateCell = "            —"
+		rateCell = fmt.Sprintf("     — tps / "+rateSlot+" avg", avgRate)
 	default:
-		rateCell = fmt.Sprintf(rateSlot+" / "+rateSlot+" tps", currentRate, avgRate)
+		rateCell = fmt.Sprintf(rateSlot+" tps / "+rateSlot+" avg", currentRate, avgRate)
 	}
 
 	var secondary string
@@ -1395,6 +1453,208 @@ func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, a
 		}
 	}
 	return labelCell + " " + spark + " " + rateCell + "   " + secondary
+}
+
+// renderContextRow builds the third server-panel row showing context
+// window usage.
+//
+//	Context  <bar>    15K/80K (19%)
+//
+// When no data is available (slots not fetched), shows "n/a".
+func (r *RunMode) renderContextRow() string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	labelCell := subtle.Render(padRight("Context", metricLabelWidth))
+
+	if r.contextMax == 0 {
+		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
+	}
+
+	ctxPct := float64(r.contextUsed) / float64(r.contextMax) * 100
+	if ctxPct > 100 {
+		ctxPct = 100
+	}
+	ctxBar := renderBar(r.theme, ctxPct, zoneFor(MetricUtil, ctxPct))
+
+	ctxUsedStr := formatTokenCount(r.contextUsed)
+	ctxMaxStr := formatTokenCount(r.contextMax)
+	ctxRateCell := fmt.Sprintf("%s/%s (%d%%)", ctxUsedStr, ctxMaxStr, int(ctxPct))
+
+	return labelCell + " " + ctxBar + " " + ctxRateCell
+}
+
+// renderCacheRow builds the fourth server-panel row showing prompt
+// cache hit ratio as a bar.
+//
+//	Cache  <bar>    80%
+//
+// When no data is available, shows "n/a".
+func (r *RunMode) renderCacheRow() string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	labelCell := subtle.Render(padRight("Cache", metricLabelWidth))
+
+	if r.contextUsed == 0 {
+		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
+	}
+
+	cachePct := float64(r.contextCacheHit) / float64(r.contextUsed) * 100
+	if cachePct > 100 {
+		cachePct = 100
+	}
+	// Invert: high cache hit = good (green), low = bad (red).
+	// Feed (100 - pct) to zoneFor so the color tiers flip.
+	cacheBar := renderBar(r.theme, cachePct, zoneFor(MetricMem, 100-cachePct))
+
+	cacheCell := fmt.Sprintf("%d%%", int(cachePct))
+	return labelCell + " " + cacheBar + " " + cacheCell
+}
+
+// formatTokenCount formats a token count with K/M suffix for display.
+// e.g. 15234 → "15K", 1048576 → "1M", 8192 → "8192".
+func formatTokenCount(n int) string {
+	if n >= 1000000 {
+		return fmt.Sprintf("%dM", n/1000000)
+	}
+	if n >= 10000 {
+		return fmt.Sprintf("%dK", n/1000)
+	}
+	return strconv.Itoa(n)
+}
+
+// renderGenProgressRow builds the fourth server-panel row showing
+// generation progress: tokens generated so far vs the generation
+// limit (n_decoded / (n_decoded + n_remain)).
+//
+//	Gen    <bar>    279/16K (2%)           —
+//
+// When no generation is in progress, shows the last known values
+// or "n/a" if no data.
+func (r *RunMode) renderGenProgressRow() string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	labelCell := subtle.Render(padRight("Gen", metricLabelWidth))
+
+	totalAllocated := r.genDecoded + r.genRemain
+	if totalAllocated == 0 {
+		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
+	}
+
+	genPct := float64(r.genDecoded) / float64(totalAllocated) * 100
+	if genPct > 100 {
+		genPct = 100
+	}
+	genBar := renderBar(r.theme, genPct, zoneFor(MetricUtil, genPct))
+
+	genDecodedStr := formatTokenCount(r.genDecoded)
+	genTotalStr := formatTokenCount(totalAllocated)
+	genRateCell := fmt.Sprintf("%s/%s (%d%%)", genDecodedStr, genTotalStr, int(genPct))
+
+	// TTFT display
+	var ttftCell string
+	if r.ttft < 0 {
+		// Missed the prompt phase — generation already started.
+		ttftCell = subtle.Render("TTFT ") + "<1s"
+	} else if r.ttft > 0 {
+		ttftCell = subtle.Render("TTFT ") + formatDuration(r.ttft)
+	} else {
+		ttftCell = subtle.Render("TTFT ") + "—"
+	}
+
+	return labelCell + " " + genBar + " " + genRateCell + "   " + ttftCell
+}
+
+// formatDuration formats a duration for display: "1.2s" or "250ms".
+func formatDuration(d time.Duration) string {
+	secs := float64(d) / 1000000000
+	if secs >= 1 {
+		return fmt.Sprintf("%.1fs", secs)
+	}
+	return fmt.Sprintf("%dms", d.Milliseconds())
+}
+
+// renderPromptProgressRow shows prompt processing progress.
+//
+//	Process  <bar>    45% (2.8K/6.2K)
+//
+// When no prompt is being processed, shows "n/a".
+func (r *RunMode) renderPromptProgressRow() string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	labelCell := subtle.Render(padRight("Process", metricLabelWidth))
+
+	if r.promptToksTotal == 0 {
+		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
+	}
+
+	pct := float64(r.promptToksProcessed) / float64(r.promptToksTotal) * 100
+	if pct > 100 {
+		pct = 100
+	}
+	bar := renderBar(r.theme, pct, zoneFor(MetricUtil, pct))
+
+	processedStr := formatTokenCount(r.promptToksProcessed)
+	totalStr := formatTokenCount(r.promptToksTotal)
+	rateCell := fmt.Sprintf("%s/%s (%d%%)", processedStr, totalStr, int(pct))
+
+	return labelCell + " " + bar + " " + rateCell
+}
+
+// renderContextBreakdownRow shows context usage breakdown:
+// prompt tokens (purple), generated tokens (orange), empty (dim).
+//
+//	Breakdown  <bar>  4.2K prompt 279 gen 77K free
+//
+// When no data is available, shows "n/a".
+func (r *RunMode) renderContextBreakdownRow() string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	labelCell := subtle.Render(padRight("Breakdown", metricLabelWidth))
+
+	if r.contextMax == 0 {
+		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
+	}
+
+	// Build a segmented bar: prompt (purple), gen (orange), empty (dim).
+	bar := r.renderSegmentedBar(r.contextPromptToks, r.contextGenToks, r.contextMax)
+
+	purpleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9B59B6"))
+	orangeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF8C00"))
+	promptStr := purpleStyle.Render(formatTokenCount(r.contextPromptToks))
+	genStr := orangeStyle.Render(formatTokenCount(r.contextGenToks))
+	freeToks := r.contextMax - r.contextPromptToks - r.contextGenToks
+	if freeToks < 0 {
+		freeToks = 0
+	}
+	freeStr := subtle.Render(formatTokenCount(freeToks))
+	rateCell := fmt.Sprintf("%s prompt %s gen %s free", promptStr, genStr, freeStr)
+
+	return labelCell + " " + bar + " " + rateCell
+}
+
+// renderSegmentedBar renders a bar with two colored segments:
+// segment1 (purple/prompt), segment2 (orange/generated), remainder (dim/empty).
+func (r *RunMode) renderSegmentedBar(seg1, seg2, total int) string {
+	if total == 0 {
+		return renderSparkline(r.theme, []float64{-1}, MetricUtil)
+	}
+	seg1Pct := float64(seg1) / float64(total) * 100
+	seg2Pct := float64(seg2) / float64(total) * 100
+
+	seg1Cells := int((seg1Pct/100)*liveBarWidth + 0.5)
+	seg2Cells := int((seg2Pct/100)*liveBarWidth + 0.5)
+
+	purpleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9B59B6")) // purple — prompt
+	orangeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF8C00")) // dark orange — generated
+	dimStyle := lipgloss.NewStyle().Foreground(r.theme.Muted)
+
+	var b strings.Builder
+	b.Grow(liveBarWidth * 4)
+	for i := 0; i < liveBarWidth; i++ {
+		if i < seg1Cells {
+			b.WriteString(purpleStyle.Render(barFillChar))
+		} else if i < seg1Cells+seg2Cells {
+			b.WriteString(orangeStyle.Render(barFillChar))
+		} else {
+			b.WriteString(dimStyle.Render(barEmptyChar))
+		}
+	}
+	return b.String()
 }
 
 // padRows trims or pads `rows` to exactly n entries. Keeps the
@@ -1542,7 +1802,14 @@ func (r *RunMode) hardwareDeviceRows(d hwinfo.Device) []string {
 		tempRow += "   " + subtle.Render("Fan ") + fanText
 	}
 
-	return []string{header, utilRow, memRow, powerRow, tempRow}
+	rows := []string{header, utilRow, memRow}
+	if powerRow != "" {
+		rows = append(rows, powerRow)
+	}
+	if tempRow != "" {
+		rows = append(rows, tempRow)
+	}
+	return rows
 }
 
 // joinMetricCells builds a metric row from its four cell parts:

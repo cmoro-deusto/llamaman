@@ -34,16 +34,18 @@ type Theme struct {
 }
 
 // CurrentTheme picks the palette based on terminal background.
+// Uses named colors that map well to 256-color palettes (xterm-256color
+// over SSH) while still rendering correctly in true-color terminals.
 func CurrentTheme() Theme {
 	if lipgloss.HasDarkBackground() {
 		return Theme{
 			Accent:      lipgloss.Color("#E8A33D"), // soft orange (DESIGN §10.4)
 			Subtle:      lipgloss.Color("#9A9A9A"),
 			Muted:       lipgloss.Color("#5C5C5C"),
-			StatusIdle:  lipgloss.Color("#7DC4E4"), // steel-blue / soft cyan
-			StatusReady: lipgloss.Color("#7BC96F"),
-			StatusStart: lipgloss.Color("#E8C547"),
-			StatusErr:   lipgloss.Color("#E06C75"),
+			StatusIdle:  lipgloss.Color("#87CEEB"), // sky blue — maps to 256-color 117
+			StatusReady: lipgloss.Color("#73D216"), // green — maps to 256-color 118
+			StatusStart: lipgloss.Color("#FFD700"), // gold — maps to 256-color 226
+			StatusErr:   lipgloss.Color("#FF6B6B"), // soft red — maps to 256-color 209
 			StatusGone:  lipgloss.Color("#7C7C7C"),
 			BorderFocus: lipgloss.Color("#E8A33D"),
 			Border:      lipgloss.Color("#444444"),
@@ -56,7 +58,7 @@ func CurrentTheme() Theme {
 		StatusIdle:  lipgloss.Color("#3A7AAB"), // medium blue — readable on light bg
 		StatusReady: lipgloss.Color("#1F7A28"),
 		StatusStart: lipgloss.Color("#A06B00"),
-		StatusErr:   lipgloss.Color("#B22222"),
+		StatusErr:   lipgloss.Color("#CC0000"), // strong red — maps to 256-color 196
 		StatusGone:  lipgloss.Color("#7C7C7C"),
 		BorderFocus: lipgloss.Color("#C26B11"),
 		Border:      lipgloss.Color("#BBBBBB"),
