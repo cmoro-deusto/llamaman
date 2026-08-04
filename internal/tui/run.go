@@ -37,12 +37,6 @@ const (
 	StatusErrored
 )
 
-// readyMarker is the substring llama-server prints when its HTTP server is
-// up. Detected by scanning chunks streamed from the log file. Older builds
-// emitted "server is listening on ..."; newer builds use
-// "llama_server: listening on http://...". "listening on" covers both.
-const readyMarker = "listening on"
-
 type logChunkMsg string
 type procDoneMsg struct{ err error }
 type tailerClosedMsg struct{}
@@ -115,6 +109,13 @@ type RunMode struct {
 	busyCount           int
 	totalSlots          int
 	queuedCount         int
+	// Context usage from /slots.
+	contextUsed     int // tokens currently in context (prompt + generated)
+	contextMax      int // total context window size
+	contextCacheHit int // prompt tokens served from cache
+	// Generation progress from /slots next_token.
+	genDecoded int // tokens generated so far in current response
+	genRemain  int // tokens remaining before generation limit
 	// tokensSeen / promptSeen latch true once we've observed the first
 	// non-zero rate. Bug 3: after the first real value, we persist the
 	// last-known rate even on subsequent zero-delta ticks (no more "—"
@@ -211,16 +212,15 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 		hwSnapshotCmd(),
 		tickHwPoll(),
 	}
-	// Reattach: the process is already running, so the readyMarker log
-	// line happened before we started tailing and we won't see a
-	// StatusStarting → StatusReady transition. Fire the fetch
-	// immediately. The owner-mode path waits for the transition (handled
-	// in the logChunkMsg case in Update) because at construction the
-	// server is still booting and /props would dial a port nothing is
-	// listening on yet.
-	if r.fetcher != nil && opts.Process != nil && !opts.Process.IsOwner() {
+	// Reattach: the process is already running, so fire the initial
+	// /props fetch. The owner-mode path also fires here — the server
+	// may already be ready by the time the first chunk arrives.
+	// StatusStarting → StatusReady transition happens on first
+	// successful /props (handled in propsFetchedMsg), which arms
+	// the recurring live poll. This removes the dependency on log
+	// format for readiness detection.
+	if r.fetcher != nil {
 		cmds = append(cmds, fetchPropsCmd(r.fetchCtx, r.fetcher))
-		cmds = append(cmds, r.startLivePoll()...)
 	}
 	return r, tea.Batch(cmds...), nil
 }
@@ -297,27 +297,12 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	switch m := msg.(type) {
 	case logChunkMsg:
 		r.buf.WriteString(string(m))
-		wasStarting := r.status == StatusStarting
-		if wasStarting && strings.Contains(r.buf.String(), readyMarker) {
-			r.status = StatusReady
-		}
 		atBottom := r.viewport.AtBottom()
 		r.viewport.SetContent(r.renderViewportContent())
 		if atBottom {
 			r.viewport.GotoBottom()
 		}
-		cmds := []tea.Cmd{waitForChunk(r.tail.Chunks())}
-		// Owner-mode kickoff: the moment we see the ready marker, /props
-		// + /metrics + /slots are reachable. Fire the one-shot props
-		// fetch and arm the recurring live poll alongside the next chunk
-		// wait. The reattach path already kicked off in NewRunMode.
-		if wasStarting && r.status == StatusReady && r.fetcher != nil {
-			if r.liveCtxSize == 0 {
-				cmds = append(cmds, fetchPropsCmd(r.fetchCtx, r.fetcher))
-			}
-			cmds = append(cmds, r.startLivePoll()...)
-		}
-		return r, tea.Batch(cmds...)
+		return r, waitForChunk(r.tail.Chunks())
 
 	case tailerClosedMsg:
 		return r, nil
@@ -356,6 +341,14 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		}
 		r.liveCtxSize = m.nctx
+		// First successful /props means the server is ready. Transition
+		// status and arm the recurring live poll. This replaces the old
+		// log-marker approach ("listening on") which was fragile across
+		// llama-server versions.
+		if r.status == StatusStarting {
+			r.status = StatusReady
+		}
+		cmds := r.startLivePoll()
 		// Disagreement diagnostic: the preset declared a value, the
 		// live server reports a different one. Most common cause is
 		// llama-server clamping a too-large request to the model's max.
@@ -369,6 +362,9 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 					"live_value", m.nctx,
 				)
 			}
+		}
+		if len(cmds) > 0 {
+			return r, tea.Batch(cmds...)
 		}
 		return r, nil
 
@@ -456,6 +452,11 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		}
 		r.busyCount = m.s.BusyCount
 		r.totalSlots = m.s.Total
+		r.contextUsed = m.s.ContextUsed
+		r.contextMax = m.s.ContextMax
+		r.contextCacheHit = m.s.ContextCacheHits
+		r.genDecoded = m.s.GenDecoded
+		r.genRemain = m.s.GenRemain
 		return r, nil
 
 	case tea.KeyMsg:
@@ -1329,26 +1330,36 @@ func (r *RunMode) renderLiveBand() string {
 }
 
 // metricLabelWidth right-pads every live-band metric label
-// ("Util", "RAM", "VRAM", "Power", "Temp", "Tokens", "Prompt") to a
-// uniform column so the bar/spark viz starts at the same column on
-// every row. 5 fits the longest ("Power", "Tokens", "Prompt").
-const metricLabelWidth = 5
+// ("Util", "RAM", "VRAM", "Power", "Temp", "Tokens", "Prompt", "Ctx", "Gen")
+// to a uniform column so the bar/spark viz starts at the same column on
+// every row. 6 fits the longest ("Tokens", "Prompt").
+const metricLabelWidth = 6
 
 // renderServerPanel renders the llama-server live data box (SP3
-// shape, DESIGN.md §7.4): two content rows.
+// shape, DESIGN.md §7.4): five content rows.
 //
 //	Tokens <spark>   80.0 /  60.0 /s avg   Busy   2/4 slots
 //	Prompt <spark> 2331.0 / 2300.0 /s avg  Queued 1
+//	Ctx    <bar>    15K/80K (19%)
+//	Cache  <bar>    80%
+//	Gen    <bar>     279/16K (2%)
 //
 // Tokens/Prompt sparklines roll over 40s. Trailing rate cell shows
 // "current / avg /s avg" — current is the per-tick instantaneous,
 // avg is the lifetime gauge llama-server maintains. Both persist
 // last-known after the first non-zero (Bug 3); before any inference,
 // the cell reads "—". When --metrics is off, "n/a".
+// Context row shows tokens-in-context vs max context window.
+// Cache row shows prompt cache hit ratio from /slots.
+// Generation row shows response progress: tokens generated so far
+// vs the generation limit (n_decoded / (n_decoded + n_remain)).
 func (r *RunMode) renderServerPanel(width int) string {
 	rows := []string{
 		r.renderServerRow("Tokens", r.tokensHistory, r.currentTokensPerSec, r.avgTokensPerSec, r.tokensSeen, r.busyCount, r.totalSlots, true),
 		r.renderServerRow("Prompt", r.promptHistory, r.currentPromptPerSec, r.avgPromptPerSec, r.promptSeen, r.queuedCount, 0, false),
+		r.renderContextRow(),
+		r.renderCacheRow(),
+		r.renderGenProgressRow(),
 	}
 	return r.renderTitledPanel("llama-server", width, padRows(rows, liveBandContentRows))
 }
@@ -1363,19 +1374,21 @@ func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, a
 
 	spark := renderSparkline(r.theme, hist.Snapshot(), MetricUtil)
 
-	// Rate cell: "<current> / <avg> tps". Fixed-width slots so
+	// Rate cell: "<current> tps / <avg> avg". Fixed-width slots so
 	// the column stays put as values transition (e.g. 99.9 → 100.0
 	// or 999 → 1000). %6.1f covers up to "9999.9" which is more
-	// than llama-server ever produces.
+	// than llama-server ever produces. Current shows "—" until the
+	// first non-zero delta; avg (from the server gauge) is available
+	// from tick 1.
 	const rateSlot = "%6.1f"
 	var rateCell string
 	switch {
 	case !r.metricsAvailable:
-		rateCell = "          n/a"
+		rateCell = "             n/a"
 	case !seen:
-		rateCell = "            —"
+		rateCell = fmt.Sprintf("     — tps / "+rateSlot+" avg", avgRate)
 	default:
-		rateCell = fmt.Sprintf(rateSlot+" / "+rateSlot+" tps", currentRate, avgRate)
+		rateCell = fmt.Sprintf(rateSlot+" tps / "+rateSlot+" avg", currentRate, avgRate)
 	}
 
 	var secondary string
@@ -1395,6 +1408,101 @@ func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, a
 		}
 	}
 	return labelCell + " " + spark + " " + rateCell + "   " + secondary
+}
+
+// renderContextRow builds the third server-panel row showing context
+// window usage.
+//
+//	Ctx    <bar>    15K/80K (19%)
+//
+// When no data is available (slots not fetched), shows "n/a".
+func (r *RunMode) renderContextRow() string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	labelCell := subtle.Render(padRight("Ctx", metricLabelWidth))
+
+	if r.contextMax == 0 {
+		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
+	}
+
+	ctxPct := float64(r.contextUsed) / float64(r.contextMax) * 100
+	if ctxPct > 100 {
+		ctxPct = 100
+	}
+	ctxBar := renderBar(r.theme, ctxPct, zoneFor(MetricUtil, ctxPct))
+
+	ctxUsedStr := formatTokenCount(r.contextUsed)
+	ctxMaxStr := formatTokenCount(r.contextMax)
+	ctxRateCell := fmt.Sprintf("%s/%s (%d%%)", ctxUsedStr, ctxMaxStr, int(ctxPct))
+
+	return labelCell + " " + ctxBar + " " + ctxRateCell
+}
+
+// renderCacheRow builds the fourth server-panel row showing prompt
+// cache hit ratio as a bar.
+//
+//	Cache  <bar>    80%
+//
+// When no data is available, shows "n/a".
+func (r *RunMode) renderCacheRow() string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	labelCell := subtle.Render(padRight("Cache", metricLabelWidth))
+
+	if r.contextUsed == 0 {
+		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
+	}
+
+	cachePct := float64(r.contextCacheHit) / float64(r.contextUsed) * 100
+	if cachePct > 100 {
+		cachePct = 100
+	}
+	// Invert: high cache hit = good (green), low = bad (red).
+	// Feed (100 - pct) to zoneFor so the color tiers flip.
+	cacheBar := renderBar(r.theme, cachePct, zoneFor(MetricMem, 100-cachePct))
+
+	cacheCell := fmt.Sprintf("%d%%", int(cachePct))
+	return labelCell + " " + cacheBar + "    " + cacheCell
+}
+
+// formatTokenCount formats a token count with K/M suffix for display.
+// e.g. 15234 → "15K", 1048576 → "1M", 8192 → "8192".
+func formatTokenCount(n int) string {
+	if n >= 1000000 {
+		return fmt.Sprintf("%dM", n/1000000)
+	}
+	if n >= 10000 {
+		return fmt.Sprintf("%dK", n/1000)
+	}
+	return strconv.Itoa(n)
+}
+
+// renderGenProgressRow builds the fourth server-panel row showing
+// generation progress: tokens generated so far vs the generation
+// limit (n_decoded / (n_decoded + n_remain)).
+//
+//	Gen    <bar>    279/16K (2%)           —
+//
+// When no generation is in progress, shows the last known values
+// or "n/a" if no data.
+func (r *RunMode) renderGenProgressRow() string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	labelCell := subtle.Render(padRight("Gen", metricLabelWidth))
+
+	totalAllocated := r.genDecoded + r.genRemain
+	if totalAllocated == 0 {
+		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
+	}
+
+	genPct := float64(r.genDecoded) / float64(totalAllocated) * 100
+	if genPct > 100 {
+		genPct = 100
+	}
+	genBar := renderBar(r.theme, genPct, zoneFor(MetricUtil, genPct))
+
+	genDecodedStr := formatTokenCount(r.genDecoded)
+	genTotalStr := formatTokenCount(totalAllocated)
+	genRateCell := fmt.Sprintf("%s/%s (%d%%)", genDecodedStr, genTotalStr, int(genPct))
+
+	return labelCell + " " + genBar + " " + genRateCell + "      "
 }
 
 // padRows trims or pads `rows` to exactly n entries. Keeps the

@@ -120,6 +120,7 @@ llamacpp:predicted_tokens_seconds 60.5
 llamacpp:prompt_tokens_seconds 2300
 llamacpp:requests_processing 2
 llamacpp:requests_deferred 1
+llamacpp:n_tokens_max 8192
 some_other_metric{label="x"} 99
 `
 
@@ -151,6 +152,7 @@ func TestFetchMetricsHappy(t *testing.T) {
 		{"PromptTokensSecondsAvg", got.PromptTokensSecondsAvg, 2300},
 		{"RequestsProcessing", got.RequestsProcessing, 2},
 		{"RequestsDeferred", got.RequestsDeferred, 1},
+		{"NTokensMax", got.NTokensMax, 8192},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -301,6 +303,42 @@ func TestFetchSlots5xx(t *testing.T) {
 
 	if _, err := clientFor(t, srv).FetchSlots(context.Background()); err == nil {
 		t.Fatal("expected error for 5xx")
+	}
+}
+
+// TestFetchSlotsContextUsage covers the context usage fields extracted
+// from /slots: n_prompt_tokens, n_decoded (from next_token), n_ctx,
+// and n_prompt_tokens_cache.
+func TestFetchSlotsContextUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[{"is_processing":true,"n_ctx":8192,"n_prompt_tokens":100,"n_prompt_tokens_cache":80,"next_token":[{"n_decoded":50,"n_remain":16000}]},{"is_processing":false,"n_ctx":8192,"n_prompt_tokens":0,"n_prompt_tokens_cache":0,"next_token":[]}]`))
+	}))
+	defer srv.Close()
+
+	got, err := clientFor(t, srv).FetchSlots(context.Background())
+	if err != nil {
+		t.Fatalf("FetchSlots: %v", err)
+	}
+	if got.Total != 2 {
+		t.Errorf("Total = %d, want 2", got.Total)
+	}
+	if got.BusyCount != 1 {
+		t.Errorf("BusyCount = %d, want 1", got.BusyCount)
+	}
+	if got.ContextUsed != 150 { // 100 prompt + 50 decoded
+		t.Errorf("ContextUsed = %d, want 150", got.ContextUsed)
+	}
+	if got.ContextMax != 8192 {
+		t.Errorf("ContextMax = %d, want 8192", got.ContextMax)
+	}
+	if got.ContextCacheHits != 80 {
+		t.Errorf("ContextCacheHits = %d, want 80", got.ContextCacheHits)
+	}
+	if got.GenDecoded != 50 {
+		t.Errorf("GenDecoded = %d, want 50", got.GenDecoded)
+	}
+	if got.GenRemain != 16000 {
+		t.Errorf("GenRemain = %d, want 16000", got.GenRemain)
 	}
 }
 
