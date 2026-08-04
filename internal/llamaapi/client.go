@@ -95,10 +95,11 @@ type Slots struct {
 }
 
 // ErrMetricsNotEnabled is returned by FetchMetrics when llama-server
-// responds with 404 — i.e. the server was launched without `--metrics`
-// (or the equivalent preset key). Callers should stop polling /metrics
-// on this error and surface `n/a` for derived rates.
-var ErrMetricsNotEnabled = errors.New("llamaapi: /metrics endpoint not enabled (--metrics off)")
+// responds with 404 (endpoint absent) or 501 (endpoint present but not
+// implemented — older builds returned this even with `--metrics`).
+// Callers should stop polling /metrics on this error and surface `n/a`
+// for derived rates.
+var ErrMetricsNotEnabled = errors.New("llamaapi: /metrics endpoint not available")
 
 // FetchMetrics GETs /metrics and parses the Prometheus text-exposition
 // body. We only handle the small set of `llamacpp:*` lines we care
@@ -117,7 +118,7 @@ func (c *Client) FetchMetrics(ctx context.Context) (*Metrics, error) {
 		return nil, fmt.Errorf("llamaapi: GET /metrics: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNotImplemented {
 		return nil, ErrMetricsNotEnabled
 	}
 	if resp.StatusCode/100 != 2 {

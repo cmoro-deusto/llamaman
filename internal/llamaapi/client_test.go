@@ -171,6 +171,22 @@ func TestFetchMetrics404IsSentinel(t *testing.T) {
 	}
 }
 
+// TestFetchMetrics501IsSentinel covers older llama-server builds that
+// return 501 (Not Implemented) for /metrics even when --metrics is in
+// the argv. The endpoint exists but isn't functional — same treatment
+// as 404: stop polling, show n/a.
+func TestFetchMetrics501IsSentinel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotImplemented)
+	}))
+	defer srv.Close()
+
+	_, err := clientFor(t, srv).FetchMetrics(context.Background())
+	if !errors.Is(err, ErrMetricsNotEnabled) {
+		t.Fatalf("expected ErrMetricsNotEnabled sentinel for 501; got %v", err)
+	}
+}
+
 func TestFetchMetrics5xx(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
