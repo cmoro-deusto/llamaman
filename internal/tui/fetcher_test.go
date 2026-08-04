@@ -189,10 +189,11 @@ func TestFetchPropsCmdRetryAfterTransient(t *testing.T) {
 	if got.nctx != 8192 {
 		t.Errorf("nctx = %d, want 8192", got.nctx)
 	}
+	// First call fails (errFirst), second call succeeds (props).
 	if c := fake.callCount(); c != 2 {
-		t.Errorf("FetchProps call count = %d, want 2 (one retry)", c)
+		t.Errorf("FetchProps call count = %d, want 2 (fail then succeed)", c)
 	}
-	// Sanity: the retry sleep is fetchPropsRetryDelay (250ms). Allow
+	// Sanity: the retry sleep is fetchPropsRetryDelay (5s). Allow
 	// generous slack — CI can be slow — but the retry must have
 	// actually waited.
 	if elapsed < fetchPropsRetryDelay {
@@ -201,14 +202,23 @@ func TestFetchPropsCmdRetryAfterTransient(t *testing.T) {
 }
 
 func TestFetchPropsCmdBothAttemptsFail(t *testing.T) {
+	// fetchPropsCmd polls in a loop until success or ctx cancel.
+	// With a server that always fails, it keeps retrying — we bound
+	// the test with a timeout to verify the loop eventually returns
+	// on context cancellation.
 	fake := &fakeFetcher{err: errors.New("connection refused")}
-	msg := fetchPropsCmd(context.Background(), fake)()
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	msg := fetchPropsCmd(ctx, fake)()
 	got := msg.(propsFetchedMsg)
 	if got.err == nil {
 		t.Fatal("expected err on permanent failure, got nil")
 	}
-	if c := fake.callCount(); c != 2 {
-		t.Errorf("FetchProps call count = %d, want 2 (one retry)", c)
+	// The loop should have made at least 2 attempts before the timeout
+	// (1 initial + 1 after the 5s retry delay).
+	if c := fake.callCount(); c < 2 {
+		t.Errorf("FetchProps call count = %d, want >= 2 (polling loop)", c)
 	}
 }
 
@@ -267,7 +277,7 @@ func TestFetchPropsCmdContextCancelledDuringRetry(t *testing.T) {
 		if !errors.Is(got.err, context.Canceled) {
 			t.Errorf("err = %v, want context.Canceled", got.err)
 		}
-	case <-time.After(fetchPropsRetryDelay + 200*time.Millisecond):
+	case <-time.After(200 * time.Millisecond):
 		t.Fatal("fetchPropsCmd did not return after cancel; cancellation is broken")
 	}
 }
