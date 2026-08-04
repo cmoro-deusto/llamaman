@@ -121,6 +121,7 @@ llamacpp:prompt_tokens_seconds 2300
 llamacpp:requests_processing 2
 llamacpp:requests_deferred 1
 llamacpp:n_tokens_max 8192
+llamacpp:n_decode_total 42
 some_other_metric{label="x"} 99
 `
 
@@ -153,6 +154,7 @@ func TestFetchMetricsHappy(t *testing.T) {
 		{"RequestsProcessing", got.RequestsProcessing, 2},
 		{"RequestsDeferred", got.RequestsDeferred, 1},
 		{"NTokensMax", got.NTokensMax, 8192},
+		{"NDecodeTotal", got.NDecodeTotal, 42},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -308,10 +310,10 @@ func TestFetchSlots5xx(t *testing.T) {
 
 // TestFetchSlotsContextUsage covers the context usage fields extracted
 // from /slots: n_prompt_tokens, n_decoded (from next_token), n_ctx,
-// and n_prompt_tokens_cache.
+// n_prompt_tokens_cache, n_prompt_tokens_processed, and breakdown fields.
 func TestFetchSlotsContextUsage(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`[{"is_processing":true,"n_ctx":8192,"n_prompt_tokens":100,"n_prompt_tokens_cache":80,"next_token":[{"n_decoded":50,"n_remain":16000}]},{"is_processing":false,"n_ctx":8192,"n_prompt_tokens":0,"n_prompt_tokens_cache":0,"next_token":[]}]`))
+		_, _ = w.Write([]byte(`[{"is_processing":true,"n_ctx":8192,"n_prompt_tokens":100,"n_prompt_tokens_processed":75,"n_prompt_tokens_cache":80,"next_token":[{"n_decoded":50,"n_remain":16000}]},{"is_processing":false,"n_ctx":8192,"n_prompt_tokens":0,"n_prompt_tokens_processed":0,"n_prompt_tokens_cache":0,"next_token":[]}]`))
 	}))
 	defer srv.Close()
 
@@ -334,11 +336,23 @@ func TestFetchSlotsContextUsage(t *testing.T) {
 	if got.ContextCacheHits != 80 {
 		t.Errorf("ContextCacheHits = %d, want 80", got.ContextCacheHits)
 	}
+	if got.ContextPromptTokens != 100 {
+		t.Errorf("ContextPromptTokens = %d, want 100", got.ContextPromptTokens)
+	}
+	if got.ContextGenTokens != 50 {
+		t.Errorf("ContextGenTokens = %d, want 50", got.ContextGenTokens)
+	}
 	if got.GenDecoded != 50 {
 		t.Errorf("GenDecoded = %d, want 50", got.GenDecoded)
 	}
 	if got.GenRemain != 16000 {
 		t.Errorf("GenRemain = %d, want 16000", got.GenRemain)
+	}
+	if got.PromptTokensTotal != 100 {
+		t.Errorf("PromptTokensTotal = %d, want 100", got.PromptTokensTotal)
+	}
+	if got.PromptTokensProcessed != 75 {
+		t.Errorf("PromptTokensProcessed = %d, want 75", got.PromptTokensProcessed)
 	}
 }
 

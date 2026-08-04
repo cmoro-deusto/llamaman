@@ -110,12 +110,22 @@ type RunMode struct {
 	totalSlots          int
 	queuedCount         int
 	// Context usage from /slots.
-	contextUsed     int // tokens currently in context (prompt + generated)
-	contextMax      int // total context window size
-	contextCacheHit int // prompt tokens served from cache
+	contextUsed       int // tokens currently in context (prompt + generated)
+	contextMax        int // total context window size
+	contextCacheHit   int // prompt tokens served from cache
+	contextPromptToks int // prompt tokens in context (for breakdown bar)
+	contextGenToks    int // generated tokens in context (for breakdown bar)
 	// Generation progress from /slots next_token.
 	genDecoded int // tokens generated so far in current response
 	genRemain  int // tokens remaining before generation limit
+	// Prompt processing progress from /slots.
+	promptToksTotal    int // total prompt tokens for current request
+	promptToksProcessed int // prompt tokens processed so far
+	// Lifetime request count from /metrics.
+	decodeTotal float64
+	// TTFT (time to first token) tracking.
+	ttftStart time.Time // when prompt processing started (zero = not tracking)
+	ttft      time.Duration // measured TTFT
 	// tokensSeen / promptSeen latch true once we've observed the first
 	// non-zero rate. Bug 3: after the first real value, we persist the
 	// last-known rate even on subsequent zero-delta ticks (no more "—"
@@ -455,8 +465,28 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		r.contextUsed = m.s.ContextUsed
 		r.contextMax = m.s.ContextMax
 		r.contextCacheHit = m.s.ContextCacheHits
+		r.contextPromptToks = m.s.ContextPromptTokens
+		r.contextGenToks = m.s.ContextGenTokens
 		r.genDecoded = m.s.GenDecoded
 		r.genRemain = m.s.GenRemain
+		r.promptToksTotal = m.s.PromptTokensTotal
+		r.promptToksProcessed = m.s.PromptTokensProcessed
+		// TTFT tracking: start when prompt processing begins (processed > 0,
+		// no tokens generated yet). Measure when first token appears.
+		if m.s.PromptTokensProcessed > 0 && m.s.GenDecoded == 0 {
+			if r.ttftStart.IsZero() {
+				r.ttftStart = time.Now()
+			}
+		} else if m.s.GenDecoded > 0 && r.ttftStart != (time.Time{}) {
+			if r.ttft == 0 {
+				r.ttft = time.Since(r.ttftStart)
+			}
+			// Reset for next request
+			if m.s.PromptTokensProcessed == 0 {
+				r.ttftStart = time.Time{}
+				r.ttft = 0
+			}
+		}
 		return r, nil
 
 	case tea.KeyMsg:
@@ -563,6 +593,7 @@ func (r *RunMode) applyMetrics(m *llamaapi.Metrics) {
 	r.avgTokensPerSec = m.PredictedTokensSecondsAvg
 	r.avgPromptPerSec = m.PromptTokensSecondsAvg
 	r.queuedCount = int(m.RequestsDeferred)
+	r.decodeTotal = m.NDecodeTotal
 
 	if r.prevMetrics == nil {
 		r.prevMetrics = m
@@ -1250,7 +1281,7 @@ func (r *RunMode) renderTopStrip() string {
 	cells := []string{
 		subtle.Render("Alias:") + " " + accent.Render(r.model.Alias),
 		subtle.Render("Server:") + " " + serverVersionOrNA(r.serverVersion),
-		subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params),
+		subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params) + "  " + subtle.Render(fmt.Sprintf("(%d reqs)", int(r.decodeTotal))),
 		subtle.Render("Preset:") + " " + accent.Render(presetNameOrDash(r.preset)),
 		subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
 		statusBadge(r.statusLabel(), r.statusColor()),
@@ -1336,28 +1367,33 @@ func (r *RunMode) renderLiveBand() string {
 const metricLabelWidth = 6
 
 // renderServerPanel renders the llama-server live data box (SP3
-// shape, DESIGN.md §7.4): five content rows.
+// shape, DESIGN.md §7.4): seven content rows.
 //
 //	Tokens <spark>   80.0 /  60.0 /s avg   Busy   2/4 slots
 //	Prompt <spark> 2331.0 / 2300.0 /s avg  Queued 1
+//	PrPr   <bar>    45% (2.8K/6.2K)
 //	Ctx    <bar>    15K/80K (19%)
+//	Brkdn  <bar>    prompt(gen)empty
 //	Cache  <bar>    80%
-//	Gen    <bar>     279/16K (2%)
+//	Gen    <bar>     279/16K (2%)   TTFT 1.2s
 //
 // Tokens/Prompt sparklines roll over 40s. Trailing rate cell shows
 // "current / avg /s avg" — current is the per-tick instantaneous,
 // avg is the lifetime gauge llama-server maintains. Both persist
 // last-known after the first non-zero (Bug 3); before any inference,
 // the cell reads "—". When --metrics is off, "n/a".
-// Context row shows tokens-in-context vs max context window.
+// PrPr row shows prompt processing progress.
+// Ctx row shows tokens-in-context vs max context window.
+// Brkdn row shows context breakdown: prompt (blue) + gen (green) + empty.
 // Cache row shows prompt cache hit ratio from /slots.
-// Generation row shows response progress: tokens generated so far
-// vs the generation limit (n_decoded / (n_decoded + n_remain)).
+// Gen row shows response progress with TTFT (time to first token).
 func (r *RunMode) renderServerPanel(width int) string {
 	rows := []string{
 		r.renderServerRow("Tokens", r.tokensHistory, r.currentTokensPerSec, r.avgTokensPerSec, r.tokensSeen, r.busyCount, r.totalSlots, true),
 		r.renderServerRow("Prompt", r.promptHistory, r.currentPromptPerSec, r.avgPromptPerSec, r.promptSeen, r.queuedCount, 0, false),
+		r.renderPromptProgressRow(),
 		r.renderContextRow(),
+		r.renderContextBreakdownRow(),
 		r.renderCacheRow(),
 		r.renderGenProgressRow(),
 	}
@@ -1460,7 +1496,7 @@ func (r *RunMode) renderCacheRow() string {
 	cacheBar := renderBar(r.theme, cachePct, zoneFor(MetricMem, 100-cachePct))
 
 	cacheCell := fmt.Sprintf("%d%%", int(cachePct))
-	return labelCell + " " + cacheBar + "    " + cacheCell
+	return labelCell + " " + cacheBar + " " + cacheCell
 }
 
 // formatTokenCount formats a token count with K/M suffix for display.
@@ -1502,7 +1538,111 @@ func (r *RunMode) renderGenProgressRow() string {
 	genTotalStr := formatTokenCount(totalAllocated)
 	genRateCell := fmt.Sprintf("%s/%s (%d%%)", genDecodedStr, genTotalStr, int(genPct))
 
-	return labelCell + " " + genBar + " " + genRateCell + "      "
+	// TTFT display
+	var ttftCell string
+	if r.ttft > 0 {
+		ttftCell = subtle.Render("TTFT ") + formatDuration(r.ttft)
+	} else {
+		ttftCell = subtle.Render("TTFT ") + "—"
+	}
+
+	return labelCell + " " + genBar + " " + genRateCell + "   " + ttftCell
+}
+
+// formatDuration formats a duration for display: "1.2s" or "250ms".
+func formatDuration(d time.Duration) string {
+	secs := float64(d) / 1000000000
+	if secs >= 1 {
+		return fmt.Sprintf("%.1fs", secs)
+	}
+	return fmt.Sprintf("%dms", d.Milliseconds())
+}
+
+// renderPromptProgressRow shows prompt processing progress.
+//
+//	PrPr   <bar>    45% (2.8K/6.2K)
+//
+// When no prompt is being processed, shows "n/a".
+func (r *RunMode) renderPromptProgressRow() string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	labelCell := subtle.Render(padRight("PrPr", metricLabelWidth))
+
+	if r.promptToksTotal == 0 {
+		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
+	}
+
+	pct := float64(r.promptToksProcessed) / float64(r.promptToksTotal) * 100
+	if pct > 100 {
+		pct = 100
+	}
+	bar := renderBar(r.theme, pct, zoneFor(MetricUtil, pct))
+
+	processedStr := formatTokenCount(r.promptToksProcessed)
+	totalStr := formatTokenCount(r.promptToksTotal)
+	rateCell := fmt.Sprintf("%s/%s (%d%%)", processedStr, totalStr, int(pct))
+
+	return labelCell + " " + bar + " " + rateCell
+}
+
+// renderContextBreakdownRow shows context usage breakdown:
+// prompt tokens (purple), generated tokens (orange), empty (dim).
+//
+//	Brkdn  <bar>  4.2K prompt 279 gen 77K free
+//
+// When no data is available, shows "n/a".
+func (r *RunMode) renderContextBreakdownRow() string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	labelCell := subtle.Render(padRight("Brkdn", metricLabelWidth))
+
+	if r.contextMax == 0 {
+		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
+	}
+
+	// Build a segmented bar: prompt (purple), gen (orange), empty (dim).
+	bar := r.renderSegmentedBar(r.contextPromptToks, r.contextGenToks, r.contextMax)
+
+	purpleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9B59B6"))
+	orangeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF8C00"))
+	promptStr := purpleStyle.Render(formatTokenCount(r.contextPromptToks))
+	genStr := orangeStyle.Render(formatTokenCount(r.contextGenToks))
+	freeToks := r.contextMax - r.contextPromptToks - r.contextGenToks
+	if freeToks < 0 {
+		freeToks = 0
+	}
+	freeStr := subtle.Render(formatTokenCount(freeToks))
+	rateCell := fmt.Sprintf("%s prompt %s gen %s free", promptStr, genStr, freeStr)
+
+	return labelCell + " " + bar + " " + rateCell
+}
+
+// renderSegmentedBar renders a bar with two colored segments:
+// segment1 (purple/prompt), segment2 (orange/generated), remainder (dim/empty).
+func (r *RunMode) renderSegmentedBar(seg1, seg2, total int) string {
+	if total == 0 {
+		return renderSparkline(r.theme, []float64{-1}, MetricUtil)
+	}
+	seg1Pct := float64(seg1) / float64(total) * 100
+	seg2Pct := float64(seg2) / float64(total) * 100
+
+	seg1Cells := int((seg1Pct/100)*liveBarWidth + 0.5)
+	seg2Cells := int((seg2Pct/100)*liveBarWidth + 0.5)
+
+	purpleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9B59B6")) // purple — prompt
+	orangeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF8C00")) // dark orange — generated
+	dimStyle := lipgloss.NewStyle().Foreground(r.theme.Muted)
+
+	var b strings.Builder
+	b.Grow(liveBarWidth * 4)
+	for i := 0; i < liveBarWidth; i++ {
+		if i < seg1Cells {
+			b.WriteString(purpleStyle.Render(barFillChar))
+		} else if i < seg1Cells+seg2Cells {
+			b.WriteString(orangeStyle.Render(barFillChar))
+		} else {
+			b.WriteString(dimStyle.Render(barEmptyChar))
+		}
+	}
+	return b.String()
 }
 
 // padRows trims or pads `rows` to exactly n entries. Keeps the

@@ -85,6 +85,7 @@ type Metrics struct {
 	RequestsProcessing        float64 // llamacpp:requests_processing
 	RequestsDeferred          float64 // llamacpp:requests_deferred (queued)
 	NTokensMax                float64 // llamacpp:n_tokens_max (peak tokens in a single decode)
+	NDecodeTotal              float64 // llamacpp:n_decode_total (lifetime request count)
 }
 
 // Slots is the projection of /slots that the header needs. /slots
@@ -92,13 +93,17 @@ type Metrics struct {
 // slots, context usage metrics, and generation progress for the
 // active slot.
 type Slots struct {
-	BusyCount         int
-	Total             int
-	ContextUsed       int // tokens currently in context (prompt + generated)
-	ContextMax        int // total context window size (n_ctx)
-	ContextCacheHits  int // prompt tokens served from cache
-	GenDecoded        int // tokens generated so far in current response
-	GenRemain         int // tokens remaining before generation limit
+	BusyCount              int
+	Total                  int
+	ContextUsed            int // tokens currently in context (prompt + generated)
+	ContextMax             int // total context window size (n_ctx)
+	ContextCacheHits       int // prompt tokens served from cache
+	ContextPromptTokens    int // prompt tokens in context (for breakdown bar)
+	ContextGenTokens       int // generated tokens in context (for breakdown bar)
+	GenDecoded             int // tokens generated so far in current response
+	GenRemain              int // tokens remaining before generation limit
+	PromptTokensTotal      int // total prompt tokens for current request
+	PromptTokensProcessed  int // prompt tokens processed so far (for progress bar)
 }
 
 // ErrMetricsNotEnabled is returned by FetchMetrics when llama-server
@@ -187,6 +192,8 @@ func parseMetrics(body interface{ Read([]byte) (int, error) }) (*Metrics, error)
 			m.RequestsDeferred = v
 		case "llamacpp:n_tokens_max":
 			m.NTokensMax = v
+		case "llamacpp:n_decode_total":
+			m.NDecodeTotal = v
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -219,12 +226,13 @@ func (c *Client) FetchSlots(ctx context.Context) (*Slots, error) {
 		return nil, fmt.Errorf("llamaapi: GET /slots: status %d", resp.StatusCode)
 	}
 	var raw []struct {
-		IsProcessing       bool        `json:"is_processing"`
-		State              json.Number `json:"state"`
-		NCtx               int         `json:"n_ctx"`
-		NPromptTokens      int         `json:"n_prompt_tokens"`
-		NPromptTokensCache int         `json:"n_prompt_tokens_cache"`
-		NextToken          []struct {
+		IsProcessing          bool        `json:"is_processing"`
+		State                 json.Number `json:"state"`
+		NCtx                  int         `json:"n_ctx"`
+		NPromptTokens         int         `json:"n_prompt_tokens"`
+		NPromptTokensProcessed int        `json:"n_prompt_tokens_processed"`
+		NPromptTokensCache    int         `json:"n_prompt_tokens_cache"`
+		NextToken             []struct {
 			NDecoded int `json:"n_decoded"`
 			NRemain  int `json:"n_remain"`
 		} `json:"next_token"`
@@ -249,12 +257,16 @@ func (c *Client) FetchSlots(ctx context.Context) (*Slots, error) {
 			remain += nt.NRemain
 		}
 		out.ContextUsed += s.NPromptTokens + decoded
+		out.ContextPromptTokens += s.NPromptTokens
+		out.ContextGenTokens += decoded
 		if s.NCtx > out.ContextMax {
 			out.ContextMax = s.NCtx
 		}
 		out.ContextCacheHits += s.NPromptTokensCache
 		out.GenDecoded += decoded
 		out.GenRemain += remain
+		out.PromptTokensTotal += s.NPromptTokens
+		out.PromptTokensProcessed += s.NPromptTokensProcessed
 	}
 	return out, nil
 }
