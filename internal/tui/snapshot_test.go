@@ -287,13 +287,14 @@ func TestSnapshotRunMode(t *testing.T) {
 	// (including the [Metrics] indicator) all fit without truncation.
 	root.Update(tea.WindowSizeMsg{Width: 200, Height: 40})
 
-	// Wait for the fakeserver to print the readiness line and feed it
-	// into our buffer.
+	// Wait for the fakeserver to start and /props to succeed.
+	// Readiness now triggers on /props success, not log parsing.
+	// Feed log chunks and periodically retry /props until [READY].
 	deadline := time.After(3 * time.Second)
 	for {
 		select {
 		case <-deadline:
-			t.Fatalf("never saw readiness in run mode buffer; current view:\n%s", stripANSI(root.View()))
+			t.Fatalf("never saw [READY] in run mode; current view:\n%s", stripANSI(root.View()))
 		default:
 		}
 		if root.run != nil {
@@ -305,11 +306,20 @@ func TestSnapshotRunMode(t *testing.T) {
 				}
 			default:
 			}
-			if strings.Contains(root.run.buf.String(), "server is listening") {
+			// Retry /props fetch — fakeserver HTTP server starts after
+			// a delay, so early attempts will fail.
+			if root.run.fetcher != nil {
+				if cmd := fetchPropsCmd(root.run.fetchCtx, root.run.fetcher); cmd != nil {
+					if msg := cmd(); msg != nil {
+						root.run.Update(msg)
+					}
+				}
+			}
+			if strings.Contains(stripANSI(root.View()), "[READY]") {
 				break
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	out := stripANSI(root.View())
