@@ -124,8 +124,9 @@ type RunMode struct {
 	// Lifetime request count from /metrics.
 	decodeTotal float64
 	// TTFT (time to first token) tracking.
-	ttftStart time.Time // when prompt processing started (zero = not tracking)
-	ttft      time.Duration // measured TTFT
+	ttftStart         time.Time // when new request started (zero = not tracking)
+	ttft              time.Duration // measured TTFT
+	ttftPrevPromptToks int // previous prompt total to detect new request
 	// tokensSeen / promptSeen latch true once we've observed the first
 	// non-zero rate. Bug 3: after the first real value, we persist the
 	// last-known rate even on subsequent zero-delta ticks (no more "—"
@@ -471,21 +472,29 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		r.genRemain = m.s.GenRemain
 		r.promptToksTotal = m.s.PromptTokensTotal
 		r.promptToksProcessed = m.s.PromptTokensProcessed
-		// TTFT tracking: start when prompt processing begins (processed > 0,
-		// no tokens generated yet). Measure when first token appears.
-		if m.s.PromptTokensProcessed > 0 && m.s.GenDecoded == 0 {
-			if r.ttftStart.IsZero() {
+		// TTFT tracking: detect new request when n_prompt_tokens goes from
+		// 0 → N (or changes to a new value). Measure until first token appears.
+		newRequest := m.s.PromptTokensTotal > 0 && m.s.PromptTokensTotal != r.ttftPrevPromptToks
+		if newRequest && r.ttftStart.IsZero() {
+			// New request detected. If generation already started, we
+			// missed the prompt phase — mark TTFT as <1s.
+			if m.s.GenDecoded > 0 {
+				r.ttft = -1 // sentinel for <1s
+			} else {
 				r.ttftStart = time.Now()
 			}
-		} else if m.s.GenDecoded > 0 && r.ttftStart != (time.Time{}) {
-			if r.ttft == 0 {
-				r.ttft = time.Since(r.ttftStart)
-			}
-			// Reset for next request
-			if m.s.PromptTokensProcessed == 0 {
-				r.ttftStart = time.Time{}
-				r.ttft = 0
-			}
+		}
+		if m.s.GenDecoded > 0 && !r.ttftStart.IsZero() && r.ttft == 0 {
+			// First token appeared.
+			r.ttft = time.Since(r.ttftStart)
+		}
+		// Reset when request completes (back to idle).
+		if m.s.PromptTokensTotal == 0 && m.s.GenDecoded == 0 {
+			r.ttftStart = time.Time{}
+			r.ttft = 0
+			r.ttftPrevPromptToks = 0
+		} else {
+			r.ttftPrevPromptToks = m.s.PromptTokensTotal
 		}
 		return r, nil
 
@@ -1361,19 +1370,19 @@ func (r *RunMode) renderLiveBand() string {
 }
 
 // metricLabelWidth right-pads every live-band metric label
-// ("Util", "RAM", "VRAM", "Power", "Temp", "Tokens", "Prompt", "Ctx", "Gen")
+// ("Util", "RAM", "VRAM", "Power", "Temp", "Tokens", "Prompt", "Process", "Context", "Breakdown", "Gen")
 // to a uniform column so the bar/spark viz starts at the same column on
-// every row. 6 fits the longest ("Tokens", "Prompt").
-const metricLabelWidth = 6
+// every row. 9 fits the longest ("Breakdown").
+const metricLabelWidth = 9
 
 // renderServerPanel renders the llama-server live data box (SP3
 // shape, DESIGN.md §7.4): seven content rows.
 //
 //	Tokens <spark>   80.0 /  60.0 /s avg   Busy   2/4 slots
 //	Prompt <spark> 2331.0 / 2300.0 /s avg  Queued 1
-//	PrPr   <bar>    45% (2.8K/6.2K)
-//	Ctx    <bar>    15K/80K (19%)
-//	Brkdn  <bar>    prompt(gen)empty
+//	Process  <bar>    45% (2.8K/6.2K)
+//	Context  <bar>    15K/80K (19%)
+//	Breakdown  <bar>    prompt(gen)empty
 //	Cache  <bar>    80%
 //	Gen    <bar>     279/16K (2%)   TTFT 1.2s
 //
@@ -1382,9 +1391,9 @@ const metricLabelWidth = 6
 // avg is the lifetime gauge llama-server maintains. Both persist
 // last-known after the first non-zero (Bug 3); before any inference,
 // the cell reads "—". When --metrics is off, "n/a".
-// PrPr row shows prompt processing progress.
-// Ctx row shows tokens-in-context vs max context window.
-// Brkdn row shows context breakdown: prompt (blue) + gen (green) + empty.
+// Process row shows prompt processing progress.
+// Context row shows tokens-in-context vs max context window.
+// Breakdown row shows context breakdown: prompt (purple) + gen (orange) + empty.
 // Cache row shows prompt cache hit ratio from /slots.
 // Gen row shows response progress with TTFT (time to first token).
 func (r *RunMode) renderServerPanel(width int) string {
@@ -1449,12 +1458,12 @@ func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, a
 // renderContextRow builds the third server-panel row showing context
 // window usage.
 //
-//	Ctx    <bar>    15K/80K (19%)
+//	Context  <bar>    15K/80K (19%)
 //
 // When no data is available (slots not fetched), shows "n/a".
 func (r *RunMode) renderContextRow() string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
-	labelCell := subtle.Render(padRight("Ctx", metricLabelWidth))
+	labelCell := subtle.Render(padRight("Context", metricLabelWidth))
 
 	if r.contextMax == 0 {
 		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
@@ -1540,7 +1549,10 @@ func (r *RunMode) renderGenProgressRow() string {
 
 	// TTFT display
 	var ttftCell string
-	if r.ttft > 0 {
+	if r.ttft < 0 {
+		// Missed the prompt phase — generation already started.
+		ttftCell = subtle.Render("TTFT ") + "<1s"
+	} else if r.ttft > 0 {
 		ttftCell = subtle.Render("TTFT ") + formatDuration(r.ttft)
 	} else {
 		ttftCell = subtle.Render("TTFT ") + "—"
@@ -1560,12 +1572,12 @@ func formatDuration(d time.Duration) string {
 
 // renderPromptProgressRow shows prompt processing progress.
 //
-//	PrPr   <bar>    45% (2.8K/6.2K)
+//	Process  <bar>    45% (2.8K/6.2K)
 //
 // When no prompt is being processed, shows "n/a".
 func (r *RunMode) renderPromptProgressRow() string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
-	labelCell := subtle.Render(padRight("PrPr", metricLabelWidth))
+	labelCell := subtle.Render(padRight("Process", metricLabelWidth))
 
 	if r.promptToksTotal == 0 {
 		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
@@ -1587,12 +1599,12 @@ func (r *RunMode) renderPromptProgressRow() string {
 // renderContextBreakdownRow shows context usage breakdown:
 // prompt tokens (purple), generated tokens (orange), empty (dim).
 //
-//	Brkdn  <bar>  4.2K prompt 279 gen 77K free
+//	Breakdown  <bar>  4.2K prompt 279 gen 77K free
 //
 // When no data is available, shows "n/a".
 func (r *RunMode) renderContextBreakdownRow() string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
-	labelCell := subtle.Render(padRight("Brkdn", metricLabelWidth))
+	labelCell := subtle.Render(padRight("Breakdown", metricLabelWidth))
 
 	if r.contextMax == 0 {
 		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
@@ -1790,7 +1802,14 @@ func (r *RunMode) hardwareDeviceRows(d hwinfo.Device) []string {
 		tempRow += "   " + subtle.Render("Fan ") + fanText
 	}
 
-	return []string{header, utilRow, memRow, powerRow, tempRow}
+	rows := []string{header, utilRow, memRow}
+	if powerRow != "" {
+		rows = append(rows, powerRow)
+	}
+	if tempRow != "" {
+		rows = append(rows, tempRow)
+	}
+	return rows
 }
 
 // joinMetricCells builds a metric row from its four cell parts:
