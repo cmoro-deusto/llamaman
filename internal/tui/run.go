@@ -115,6 +115,7 @@ type RunMode struct {
 	killPrompt    bool   // k-confirm overlay
 	unloadPrompt  bool   // router u-confirm overlay
 	flash         string
+	flashGen      int // guards flash auto-dismissal (older ticks can't clear newer flashes)
 
 	searchInput   textinput.Model
 	searchActive  bool
@@ -548,8 +549,7 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 
 	case modelActionMsg:
 		if m.err != nil {
-			r.flash = fmt.Sprintf("%s failed: %v", m.action, m.err)
-			return r, nil
+			return r, r.setFlash(fmt.Sprintf("%s failed: %v", m.action, m.err))
 		}
 		if m.action == "unload" {
 			// The selected model is now unloaded — drop it from the stats
@@ -562,10 +562,14 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 				}
 			}
 			r.showRouterStats = false
-			r.flash = fmt.Sprintf("unloaded %s", truncateRune(m.model, routerPanelIDMax))
-			return r, nil
+			return r, r.setFlash(fmt.Sprintf("unloaded %s", truncateRune(m.model, routerPanelIDMax)))
 		}
-		r.flash = fmt.Sprintf("loading %s", truncateRune(m.model, routerPanelIDMax))
+		return r, r.setFlash(fmt.Sprintf("loading %s", truncateRune(m.model, routerPanelIDMax)))
+
+	case flashExpiredMsg:
+		if m.gen == r.flashGen {
+			r.flash = ""
+		}
 		return r, nil
 
 	case hwTickMsg:
@@ -781,28 +785,23 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			}
 			r.denoise = !r.denoise
 			if r.denoise {
-				r.flash = "denoise on — proxy chatter hidden from log"
-			} else {
-				r.flash = "denoise off — proxy chatter shown"
+				return r, r.setFlash("denoise on — proxy chatter hidden from log")
 			}
-			return r, nil
+			return r, r.setFlash("denoise off — proxy chatter shown")
 		case "l", "u":
 			// Router mode: load / unload the selected model.
 			if r.routerFile == "" || r.routerFocus == "" {
-				r.flash = "select a model first (m)"
-				return r, nil
+				return r, r.setFlash("select a model first (m)")
 			}
 			if m.String() == "u" {
 				if r.selectedState() != "loaded" {
-					r.flash = "model is not loaded"
-					return r, nil
+					return r, r.setFlash("model is not loaded")
 				}
 				r.unloadPrompt = true
 				return r, nil
 			}
 			if r.selectedState() == "loaded" {
-				r.flash = "model already loaded"
-				return r, nil
+				return r, r.setFlash("model already loaded")
 			}
 			return r, loadModelCmd(r.fetchCtx, r.fetcher, r.routerFocus)
 		case "/":
@@ -811,11 +810,9 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			r.refreshContent()
 			return r, r.searchInput.Focus()
 		case "n":
-			r.jumpSearch(+1)
-			return r, nil
+			return r, r.jumpSearch(+1)
 		case "N":
-			r.jumpSearch(-1)
-			return r, nil
+			return r, r.jumpSearch(-1)
 		case "g":
 			r.viewport.GotoTop()
 			return r, nil
@@ -1007,9 +1004,8 @@ func (r *RunMode) handleSearchInput(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 		r.searchActive = false
 		r.searchInput.Blur()
 		r.recomputeMatches()
-		r.jumpSearch(0)
 		r.refreshContent()
-		return r, nil
+		return r, r.jumpSearch(0)
 	}
 	var cmd tea.Cmd
 	r.searchInput, cmd = r.searchInput.Update(m)
@@ -1160,11 +1156,11 @@ func (r *RunMode) recomputeMatches() {
 
 // jumpSearch advances the cursor in searchMatches by delta and scrolls
 // the viewport to the resulting line. delta=0 means "jump to current
-// match" (used right after recomputeMatches).
-func (r *RunMode) jumpSearch(delta int) {
+// match" (used right after recomputeMatches). Returns a cmd to
+// auto-dismiss the position flash.
+func (r *RunMode) jumpSearch(delta int) tea.Cmd {
 	if len(r.searchMatches) == 0 {
-		r.flash = fmt.Sprintf("no matches for %q", r.searchQuery)
-		return
+		return r.setFlash(fmt.Sprintf("no matches for %q", r.searchQuery))
 	}
 	r.searchIdx = (r.searchIdx + delta) % len(r.searchMatches)
 	if r.searchIdx < 0 {
@@ -1172,7 +1168,7 @@ func (r *RunMode) jumpSearch(delta int) {
 	}
 	target := r.searchMatches[r.searchIdx]
 	r.viewport.SetYOffset(target)
-	r.flash = fmt.Sprintf("match %d/%d", r.searchIdx+1, len(r.searchMatches))
+	return r.setFlash(fmt.Sprintf("match %d/%d", r.searchIdx+1, len(r.searchMatches)))
 }
 
 // handleQuitPrompt runs the (k)ill / (d)etach / (c)ancel decision tree
@@ -1905,6 +1901,25 @@ func (r *RunMode) selectedArgs() []string {
 	return nil
 }
 
+// flashTTL is how long an informational flash stays in the footer
+// before it auto-dismisses.
+const flashTTL = 3 * time.Second
+
+// flashExpiredMsg clears the footer flash when its TTL elapses. gen
+// guards against an older tick clearing a newer flash.
+type flashExpiredMsg struct{ gen int }
+
+// setFlash shows msg in the footer and schedules its auto-dismissal
+// (3s). A newer flash supersedes an older one.
+func (r *RunMode) setFlash(msg string) tea.Cmd {
+	r.flash = msg
+	gen := r.flashGen + 1
+	r.flashGen = gen
+	return tea.Tick(flashTTL, func(time.Time) tea.Msg {
+		return flashExpiredMsg{gen: gen}
+	})
+}
+
 // filterProxyLines removes llama.cpp router lines of the form
 // "proxying request to model <id> on port <n>" from a log chunk. Those
 // are emitted once per proxied request — including llamaman's own stats
@@ -2068,14 +2083,12 @@ func (r *RunMode) applyRouterMenu() (*RunMode, tea.Cmd) {
 	switch r.menuActions()[r.routerMenuIdx] {
 	case menuLoad:
 		if r.selectedState() == "loaded" {
-			r.flash = "model already loaded"
-			return r, nil
+			return r, r.setFlash("model already loaded")
 		}
 		return r, loadModelCmd(r.fetchCtx, r.fetcher, r.routerFocus)
 	case menuUnload:
 		if r.selectedState() != "loaded" {
-			r.flash = "model is not loaded"
-			return r, nil
+			return r, r.setFlash("model is not loaded")
 		}
 		r.unloadPrompt = true
 		return r, nil

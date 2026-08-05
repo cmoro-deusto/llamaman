@@ -1412,6 +1412,36 @@ func TestRouterFooterShowsDenoise(t *testing.T) {
 	}
 }
 
+// TestFlashAutoDismisses verifies informational flashes clear after
+// their TTL, and that an older expiry tick can't clear a newer flash.
+func TestFlashAutoDismisses(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+
+	cmd := r.setFlash("first")
+	if r.flash != "first" {
+		t.Fatalf("flash = %q", r.flash)
+	}
+	cmd2 := r.setFlash("second") // supersedes
+	if r.flash != "second" {
+		t.Fatalf("flash = %q", r.flash)
+	}
+	// The first flash's expiry (stale gen) must NOT clear the newer
+	// flash. (The ticks themselves aren't runnable in tests — tea.Tick
+	// blocks for its duration — so drive the handler directly.)
+	r.Update(flashExpiredMsg{gen: 1})
+	if r.flash != "second" {
+		t.Errorf("flash cleared by stale expiry: %q", r.flash)
+	}
+	// The second flash's expiry clears it.
+	r.Update(flashExpiredMsg{gen: 2})
+	if r.flash != "" {
+		t.Errorf("flash not cleared by its own expiry: %q", r.flash)
+	}
+	// Both ticks are armed and alive.
+	_ = cmd
+	_ = cmd2
+}
+
 // TestRunHeaderStateMachine exercises the two width breakpoints in
 // one place and pins the cell count + live-band visibility at each.
 // 6 identity cells stay in the same source order across modes; only
