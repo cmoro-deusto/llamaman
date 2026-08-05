@@ -392,9 +392,11 @@ func (c *Client) FetchProps(ctx context.Context) (*Props, error) {
 }
 
 // ModelStatus is the per-model load state reported by the router in
-// GET /models ("status.value": loaded / loading / unloaded).
+// GET /models ("status.value": loaded / loading / unloaded). Args is
+// the child llama-server's full command line while loaded.
 type ModelStatus struct {
-	Value string `json:"value"`
+	Value string   `json:"value"`
+	Args  []string `json:"args"`
 }
 
 // ModelInfo is one entry of llama-server's GET /models response

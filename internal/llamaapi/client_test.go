@@ -405,7 +405,7 @@ func TestFetchModelsStatusValue(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[
-			{"id":"m:fast","object":"model","owned_by":"llamacpp","status":{"value":"loaded"}},
+			{"id":"m:fast","object":"model","owned_by":"llamacpp","status":{"value":"loaded","args":["/opt/llama-server","--ctx-size","65535","--jinja"]}},
 			{"id":"m:slow","object":"model","owned_by":"llamacpp","status":{"value":"unloaded"}}
 		]}`))
 	}))
@@ -420,6 +420,9 @@ func TestFetchModelsStatusValue(t *testing.T) {
 	}
 	if got.Data[0].ID != "m:fast" || got.Data[0].Status.Value != "loaded" {
 		t.Errorf("data[0] = %+v", got.Data[0])
+	}
+	if len(got.Data[0].Status.Args) != 4 || got.Data[0].Status.Args[1] != "--ctx-size" {
+		t.Errorf("data[0] args = %v", got.Data[0].Status.Args)
 	}
 	if got.Data[1].Status.Value != "unloaded" {
 		t.Errorf("data[1] status = %q, want unloaded", got.Data[1].Status.Value)

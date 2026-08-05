@@ -1179,6 +1179,93 @@ func TestRouterLoadUnloadStateSemantics(t *testing.T) {
 	}
 }
 
+// TestRouterPanelFocusBorder verifies the focus-border decisions: the
+// models panel lights up (BorderFocus) when active, and the log frame
+// does while the panel is inactive. (Asserted via the color-selection
+// helpers — lipgloss strips ANSI colors in non-TTY test environments.)
+func TestRouterPanelFocusBorder(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{{ID: "m", Status: llamaapi.ModelStatus{Value: "loaded"}}}
+	r.routerFocus = "m"
+
+	// Panel border: BorderFocus when focused, Border otherwise.
+	r.routerPanelActive = true
+	if got := r.panelBorderColor(true); got != r.theme.BorderFocus {
+		t.Errorf("active panel border = %v, want BorderFocus", got)
+	}
+	r.routerPanelActive = false
+	if got := r.panelBorderColor(false); got != r.theme.Border {
+		t.Errorf("inactive panel border = %v, want Border", got)
+	}
+	// Log frame: BorderFocus while the panel is inactive in router
+	// mode; Border when the panel is active or in single-model mode.
+	r.routerPanelActive = false
+	if got := r.logBorderColor(); got != r.theme.BorderFocus {
+		t.Errorf("log border (panel inactive) = %v, want BorderFocus", got)
+	}
+	r.routerPanelActive = true
+	if got := r.logBorderColor(); got != r.theme.Border {
+		t.Errorf("log border (panel active) = %v, want Border", got)
+	}
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.routerFile = "" // single-model mode
+	r2.routerPanelActive = true
+	if got := r2.logBorderColor(); got != r.theme.Border {
+		t.Errorf("log border (single-model) = %v, want Border", got)
+	}
+}
+
+// TestRouterInfoOverlayShowsParams verifies the router info overlay
+// renders the selected model's launch params from /models status.args.
+func TestRouterInfoOverlayShowsParams(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{{
+		ID: "m:big",
+		Status: llamaapi.ModelStatus{
+			Value: "loaded",
+			Args:  []string{"/opt/llama-server", "--ctx-size", "65535", "--jinja", "--ngl", "99"},
+		},
+	}}
+	r.routerFocus = "m:big"
+	got := stripANSI(r.renderInfoOverlay())
+	for _, want := range []string{"Launch params", "--ctx-size", "65535", "--jinja", "--ngl", "99"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("info overlay missing %q; overlay:\n%s", want, got)
+		}
+	}
+}
+
+func TestFormatArgvLines(t *testing.T) {
+	lines := formatArgvLines([]string{
+		"/opt/llama-server", "--ctx-size", "65535", "--jinja", "--ngl", "99",
+	}, 12)
+	if len(lines) != 3 {
+		t.Fatalf("lines = %d, want 3 (flag+value, bare flag, flag+value)", len(lines))
+	}
+	if !strings.Contains(lines[0], "--ctx-size") || !strings.Contains(lines[0], "65535") {
+		t.Errorf("line[0] = %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "--jinja") {
+		t.Errorf("line[1] = %q (bare bool flag)", lines[1])
+	}
+	if !strings.Contains(lines[2], "--ngl") || !strings.Contains(lines[2], "99") {
+		t.Errorf("line[2] = %q", lines[2])
+	}
+	// Truncation: more flags than maxLines → ellipsis line.
+	many := make([]string, 0, 30)
+	many = append(many, "/bin/llama-server")
+	for i := 0; i < 25; i++ {
+		many = append(many, fmt.Sprintf("--flag-%02d", i))
+	}
+	trunc := formatArgvLines(many, 5)
+	if len(trunc) != 6 {
+		t.Fatalf("truncated lines = %d, want 6 (5 + ellipsis)", len(trunc))
+	}
+	if !strings.Contains(trunc[5], "more") {
+		t.Errorf("last line = %q, want ellipsis", trunc[5])
+	}
+}
+
 // TestRunHeaderStateMachine exercises the two width breakpoints in
 // one place and pins the cell count + live-band visibility at each.
 // 6 identity cells stay in the same source order across modes; only

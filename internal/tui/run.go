@@ -1192,13 +1192,7 @@ func (r *RunMode) View() string {
 	// manifests as the live band "duplicating, moving upward" with
 	// every log line.
 	logContent := truncateLines(r.viewport.View(), r.viewport.Width)
-	logFrame := lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(r.theme.Border).
-		Padding(0, 1).
-		Width(r.width - 2).
-		Render(logContent)
-	bg := lipgloss.JoinVertical(lipgloss.Left, header, logFrame, footer)
+	bg := lipgloss.JoinVertical(lipgloss.Left, header, r.renderLogFrame(logContent), footer)
 	var out string
 	switch {
 	case r.showQuit:
@@ -1384,6 +1378,13 @@ func (r *RunMode) renderInfoOverlay() string {
 		lines = append(lines, subtle.Render("State  : ")+state)
 		if st, ok := r.routerStats[id]; ok && st != nil {
 			lines = append(lines, subtle.Render("Context: ")+humanTokens(st.contextUsed)+"/"+humanTokens(st.contextMax))
+		}
+		if args := r.selectedArgs(); len(args) > 1 {
+			lines = append(lines, "")
+			lines = append(lines, accent.Render("Launch params"))
+			for _, l := range formatArgvLines(args, 12) {
+				lines = append(lines, "  "+l)
+			}
 		}
 		lines = append(lines, "")
 		lines = append(lines, subtle.Render("(any key to close)"))
@@ -1855,6 +1856,58 @@ func (r *RunMode) selectedState() string {
 	return ""
 }
 
+// selectedArgs returns the selected model's launch argv (the child
+// llama-server command reported by the router), or nil.
+func (r *RunMode) selectedArgs() []string {
+	for _, m := range r.routerModels {
+		if m.ID == r.routerFocus {
+			return m.Status.Args
+		}
+	}
+	return nil
+}
+
+// formatArgvLines renders a launch argv (binary dropped) as aligned
+// "--flag  value" pairs, capped at maxLines (an ellipsis line notes any
+// remainder). Each line is truncated to a sane width so the info box
+// stays centered and readable.
+func formatArgvLines(args []string, maxLines int) []string {
+	if len(args) <= 1 {
+		return nil
+	}
+	type kv struct{ flag, val string }
+	var pairs []kv
+	for i := 1; i < len(args); i++ { // args[0] is the binary
+		flag := args[i]
+		val := ""
+		if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			val = args[i+1]
+			i++
+		}
+		pairs = append(pairs, kv{flag: flag, val: val})
+	}
+	keyWidth := 0
+	for _, p := range pairs {
+		if w := lipgloss.Width(p.flag); w > keyWidth {
+			keyWidth = w
+		}
+	}
+	lines := make([]string, 0, min(maxLines, len(pairs)))
+	const maxLine = 66
+	for i, p := range pairs {
+		if i >= maxLines {
+			lines = append(lines, fmt.Sprintf("… and %d more", len(pairs)-maxLines))
+			break
+		}
+		line := padRight(p.flag, keyWidth)
+		if p.val != "" {
+			line += "  " + p.val
+		}
+		lines = append(lines, ansi.Truncate(line, maxLine, "…"))
+	}
+	return lines
+}
+
 // moveRouterSelection moves the selection by delta (wrapping) and
 // keeps it inside the list's visible window. Stale selections (model
 // gone) restart at the first row.
@@ -1996,6 +2049,38 @@ func (r *RunMode) renderServerRows(sv *statsView) []string {
 	}
 }
 
+// panelBorderColor picks the titled-panel border: BorderFocus when the
+// panel is the active ↑/↓ target, Border otherwise.
+func (r *RunMode) panelBorderColor(focused bool) lipgloss.Color {
+	if focused {
+		return r.theme.BorderFocus
+	}
+	return r.theme.Border
+}
+
+// logBorderColor returns the log frame border: BorderFocus while the
+// log is the active ↑/↓ target in router mode (models panel inactive),
+// Border otherwise.
+func (r *RunMode) logBorderColor() lipgloss.Color {
+	if r.routerFile != "" && !r.routerPanelActive {
+		return r.theme.BorderFocus
+	}
+	return r.theme.Border
+}
+
+// renderLogFrame wraps the pre-truncated log content in the bordered
+// log box. The border lights up (BorderFocus) in router mode while the
+// models panel is inactive — the log is the focused panel then, and
+// ↑/↓ scroll it.
+func (r *RunMode) renderLogFrame(logContent string) string {
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(r.logBorderColor()).
+		Padding(0, 1).
+		Width(r.width - 2).
+		Render(logContent)
+}
+
 // renderServerPanel renders the llama-server live data box (SP3
 // shape, DESIGN.md §7.4): seven content rows.
 //
@@ -2028,7 +2113,7 @@ func (r *RunMode) renderServerPanel(width int) string {
 		}
 		return r.renderRouterPanel(width)
 	}
-	return r.renderTitledPanel("llama-server", width, padRows(r.renderServerRows(r.singleModelStatsView()), liveBandContentRows))
+	return r.renderTitledPanel("llama-server", width, padRows(r.renderServerRows(r.singleModelStatsView()), liveBandContentRows), false)
 }
 
 // singleModelStatsView projects RunMode's single-model scalar fields
@@ -2079,7 +2164,7 @@ func (r *RunMode) renderRouterStatsPanel(width int) string {
 		// so pass the full id — no premature trimming.
 		title = "router · " + r.routerFocus
 	}
-	return r.renderTitledPanel(title, width, padRows(r.renderServerRows(sv), liveBandContentRows))
+	return r.renderTitledPanel(title, width, padRows(r.renderServerRows(sv), liveBandContentRows), r.routerPanelActive)
 }
 
 // renderRouterModelCount renders the "N total (M loaded)" header cell
@@ -2171,7 +2256,7 @@ func (r *RunMode) renderRouterPanel(width int) string {
 			rows = append(rows, sel+style.Render(mark+" "+id)+subtle.Render(stats)+"  "+subtle.Render(state))
 		}
 	}
-	return r.renderTitledPanel("router models", width, padRows(rows, liveBandContentRows))
+	return r.renderTitledPanel("router models", width, padRows(rows, liveBandContentRows), r.routerPanelActive)
 }
 
 // renderRouterMenu renders the Enter action menu for the selection:
@@ -2526,7 +2611,7 @@ func (r *RunMode) renderHardwarePanel(width int) string {
 			rows = append(rows, r.hardwareDeviceRows(d)...)
 		}
 	}
-	return r.renderTitledPanel("Hardware", width, padRows(rows, liveBandContentRows))
+	return r.renderTitledPanel("Hardware", width, padRows(rows, liveBandContentRows), false)
 }
 
 // hardwareRowsPerDevice is the row budget each Hardware device
@@ -2711,8 +2796,8 @@ func deviceKey(d hwinfo.Device) string {
 // plain border so we hand-build the four sides to keep total panel
 // height at exactly 1 (top) + len(rows) + 1 (bottom) — important for
 // liveBandHeight to stay tight against its declared value.
-func (r *RunMode) renderTitledPanel(title string, width int, contentRows []string) string {
-	border := lipgloss.NewStyle().Foreground(r.theme.Border)
+func (r *RunMode) renderTitledPanel(title string, width int, contentRows []string, focused bool) string {
+	border := lipgloss.NewStyle().Foreground(r.panelBorderColor(focused))
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 
 	if width < 8 {
