@@ -371,6 +371,146 @@ func TestTopStripColumnsAlign(t *testing.T) {
 	}
 }
 
+// newRouterTestRunMode builds a minimal router-mode RunMode mirroring
+// newHeaderTestRunMode: routerFile set, status Starting, a live fetch
+// context, and (optionally) a fakeFetcher for polling tests.
+func newRouterTestRunMode(fake *fakeFetcher) *RunMode {
+	r := &RunMode{
+		cfg:           &config.Config{Globals: config.Globals{Host: "127.0.0.1", Port: 9080}},
+		routerFile:    "models.ini",
+		proc:          &server.Process{Started: time.Now().Add(-90 * time.Second)},
+		viewport:      viewport.New(120, 30),
+		searchInput:   textinput.New(),
+		theme:         CurrentTheme(),
+		status:        StatusStarting,
+		fetcher:       fake,
+		tokensHistory: newRingBuffer(sparkBufferSamples),
+		promptHistory: newRingBuffer(sparkBufferSamples),
+		utilHistory:   map[string]*ringBuffer{},
+	}
+	r.fetchCtx, r.fetchCancel = context.WithCancel(context.Background())
+	return r
+}
+
+// TestRouterPropsNCtxZeroTransitionsReady is the regression for the
+// empty router-models panel: llama.cpp's router reports n_ctx = 0 in
+// /props by design, and the readiness gate treated nctx <= 0 as "not
+// ready", so the live poll (which fetches /models + /health) never
+// started and the panel stayed on "(no models reported)".
+func TestRouterPropsNCtxZeroTransitionsReady(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.Update(propsFetchedMsg{nctx: 0})
+	if r.status != StatusReady {
+		t.Errorf("status = %v, want Ready (router /props reports n_ctx=0 by design)", r.status)
+	}
+	if !r.livePollStarted {
+		t.Error("live poll not armed for router mode")
+	}
+}
+
+// TestSingleModelPropsNCtxZeroStaysStarting pins the single-model
+// behavior: an unpopulated n_ctx still means "not ready" there, so the
+// live poll must NOT be armed.
+func TestSingleModelPropsNCtxZeroStaysStarting(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerFile = "" // single-model mode
+	r.Update(propsFetchedMsg{nctx: 0})
+	if r.status != StatusStarting {
+		t.Errorf("status = %v, want Starting", r.status)
+	}
+	if r.livePollStarted {
+		t.Error("live poll armed although readiness never fired")
+	}
+}
+
+// TestRouterPollFetchesModelsNotSlots drives the router startup path:
+// the armed live poll must fetch /models + /health and never touch
+// /slots or /metrics (the router does not serve them; they 400).
+func TestRouterPollFetchesModelsNotSlots(t *testing.T) {
+	fake := &fakeFetcher{
+		props:  propsWithNCtx(0),
+		models: &llamaapi.Models{Data: []llamaapi.ModelInfo{{ID: "m:fast"}}},
+		health: &llamaapi.Health{Status: "ok"},
+	}
+	r := newRouterTestRunMode(fake)
+	_, cmds := r.Update(propsFetchedMsg{nctx: 0})
+	for _, sub := range collectCmds(cmds) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if fake.modelsCalls == 0 || fake.healthCalls == 0 {
+		t.Errorf("router poll must fetch /models and /health (models=%d health=%d)", fake.modelsCalls, fake.healthCalls)
+	}
+	if fake.slotsCalls != 0 || fake.metricsCalls != 0 {
+		t.Errorf("router poll must not fetch /slots or /metrics (slots=%d metrics=%d)", fake.slotsCalls, fake.metricsCalls)
+	}
+	if len(r.routerModels) != 1 || r.routerModels[0].ID != "m:fast" {
+		t.Errorf("routerModels = %+v, want [m:fast]", r.routerModels)
+	}
+}
+
+// TestRouterTickFetchesModelsNotSlots covers the per-second tick branch
+// (the code path that kept the panel fresh once ready).
+func TestRouterTickFetchesModelsNotSlots(t *testing.T) {
+	fake := &fakeFetcher{
+		props:  propsWithNCtx(0),
+		models: &llamaapi.Models{Data: []llamaapi.ModelInfo{{ID: "m:fast"}}},
+		health: &llamaapi.Health{Status: "ok"},
+	}
+	r := newRouterTestRunMode(fake)
+	r.livePollStarted = true // simulate an already-armed poll
+	_, cmd := r.Update(livePollTickMsg(time.Now()))
+	for _, sub := range collectCmds(cmd) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if fake.modelsCalls == 0 || fake.healthCalls == 0 {
+		t.Errorf("router tick must fetch /models and /health (models=%d health=%d)", fake.modelsCalls, fake.healthCalls)
+	}
+	if fake.slotsCalls != 0 || fake.metricsCalls != 0 {
+		t.Errorf("router tick must not fetch /slots or /metrics (slots=%d metrics=%d)", fake.slotsCalls, fake.metricsCalls)
+	}
+}
+
+// TestRouterPanelStatusValue verifies the panel tags each model from
+// /models "status.value" and the count uses it ("N total (M loaded)").
+func TestRouterPanelStatusValue(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "m:fast", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "m:slow", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+		{ID: "m:loading", Status: llamaapi.ModelStatus{Value: "loading"}},
+	}
+	got := stripANSI(r.renderRouterPanel(60))
+	for _, want := range []string{"● m:fast", "loaded", "○ m:slow", "unloaded", "◐ m:loading", "loading"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("panel missing %q; panel:\n%s", want, got)
+		}
+	}
+	if got := r.renderRouterModelCount(); got != "3 total (1 loaded)" {
+		t.Errorf("count = %q, want \"3 total (1 loaded)\"", got)
+	}
+}
+
+// TestRouterPanelHealthFallback covers older router builds that report
+// loaded ids via GET /health instead of per-model status.value.
+func TestRouterPanelHealthFallback(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{{ID: "m:fast"}, {ID: "m:slow"}}
+	r.routerLoaded = []string{"m:fast"}
+	got := stripANSI(r.renderRouterPanel(60))
+	for _, want := range []string{"● m:fast", "○ m:slow"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("panel missing %q; panel:\n%s", want, got)
+		}
+	}
+	if got := r.renderRouterModelCount(); got != "2 total (1 loaded)" {
+		t.Errorf("count = %q, want \"2 total (1 loaded)\"", got)
+	}
+}
+
 // TestRunHeaderStateMachine exercises the two width breakpoints in
 // one place and pins the cell count + live-band visibility at each.
 // 6 identity cells stay in the same source order across modes; only

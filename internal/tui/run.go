@@ -272,10 +272,14 @@ func (r *RunMode) startLivePoll() []tea.Cmd {
 		return nil
 	}
 	r.livePollStarted = true
-	out := []tea.Cmd{
-		fetchSlotsCmd(r.fetchCtx, r.fetcher),
-		tickLivePoll(),
+	out := []tea.Cmd{tickLivePoll()}
+	if r.routerFile != "" {
+		// Router mode: /slots and /metrics are not served (they 400);
+		// the models/health fetch feeds the router models panel.
+		out = append(out, fetchModelsCmd(r.fetchCtx, r.fetcher), fetchHealthCmd(r.fetchCtx, r.fetcher))
+		return out
 	}
+	out = append(out, fetchSlotsCmd(r.fetchCtx, r.fetcher))
 	if r.metricsAvailable {
 		out = append(out, fetchMetricsCmd(r.fetchCtx, r.fetcher))
 	}
@@ -385,11 +389,18 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		}
 		if m.nctx <= 0 {
-			// Server returned a valid /props but n_ctx wasn't populated.
-			// Treat as unavailable; do not log (no actionable signal).
-			return r, nil
+			// Router mode: /props reports n_ctx = 0 by design (the
+			// router has no single context — "model_path":"none"). A
+			// successful /props round-trip is still the readiness
+			// signal: the recurring live poll that feeds the router
+			// models panel must start. Single-model runs keep treating
+			// an unpopulated n_ctx as unavailable.
+			if r.routerFile == "" {
+				return r, nil
+			}
+		} else {
+			r.liveCtxSize = m.nctx
 		}
-		r.liveCtxSize = m.nctx
 		// First successful /props means the server is ready. Transition
 		// status and arm the recurring live poll. This replaces the old
 		// log-marker approach ("listening on") which was fragile across
@@ -428,20 +439,19 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if r.fetcher == nil {
 			return r, nil
 		}
-		cmds := []tea.Cmd{
-			fetchSlotsCmd(r.fetchCtx, r.fetcher),
-			tickLivePoll(),
-		}
-		if r.metricsAvailable {
-			cmds = append(cmds, fetchMetricsCmd(r.fetchCtx, r.fetcher))
-		}
+		cmds := []tea.Cmd{tickLivePoll()}
 		if r.routerFile != "" {
-			// Router mode: keep the model list and loaded-state
-			// panel fresh alongside the per-slot data.
+			// Router mode: /slots and /metrics are not served (400);
+			// keep the model list and loaded-state panel fresh instead.
 			cmds = append(cmds,
 				fetchModelsCmd(r.fetchCtx, r.fetcher),
 				fetchHealthCmd(r.fetchCtx, r.fetcher),
 			)
+		} else {
+			cmds = append(cmds, fetchSlotsCmd(r.fetchCtx, r.fetcher))
+			if r.metricsAvailable {
+				cmds = append(cmds, fetchMetricsCmd(r.fetchCtx, r.fetcher))
+			}
 		}
 		return r, tea.Batch(cmds...)
 
@@ -1489,38 +1499,58 @@ func (r *RunMode) renderRouterModelCount() string {
 	if r.routerModels == nil && r.routerLoaded == nil {
 		return "—"
 	}
-	return fmt.Sprintf("%d total (%d loaded)", len(r.routerModels), len(r.routerLoaded))
+	loaded := 0
+	for _, m := range r.routerModels {
+		if r.routerModelState(m.ID, m.Status.Value) == "loaded" {
+			loaded++
+		}
+	}
+	return fmt.Sprintf("%d total (%d loaded)", len(r.routerModels), loaded)
+}
+
+// routerModelState resolves one model's load state. Current llama.cpp
+// routers report it per model in GET /models ("status.value": loaded /
+// loading / unloaded); earlier builds listed loaded ids in GET /health
+// instead. Prefer the per-model field, fall back to /health.
+func (r *RunMode) routerModelState(id, status string) string {
+	if status != "" {
+		return status
+	}
+	for _, loadedID := range r.routerLoaded {
+		if loadedID == id {
+			return "loaded"
+		}
+	}
+	return "unloaded"
 }
 
 // renderRouterPanel replaces the llama-server live-data panel in router
-// runs: one row per model from GET /models, tagged loaded/unloaded from
-// GET /health.
+// runs: one row per model from GET /models, tagged loaded/loading/
+// unloaded.
 func (r *RunMode) renderRouterPanel(width int) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	loadedStyle := lipgloss.NewStyle().Foreground(r.theme.StatusReady)
 	unloadedStyle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
-
-	loaded := make(map[string]bool, len(r.routerLoaded))
-	for _, id := range r.routerLoaded {
-		loaded[id] = true
-	}
+	loadingStyle := lipgloss.NewStyle().Foreground(r.theme.Accent)
 
 	var rows []string
 	if len(r.routerModels) == 0 {
 		rows = append(rows, subtle.Render("(no models reported)"))
 	}
 	for _, m := range r.routerModels {
-		state := "unloaded"
-		style := unloadedStyle
-		if loaded[m.ID] {
-			state = "loaded"
-			style = loadedStyle
+		state := r.routerModelState(m.ID, m.Status.Value)
+		mark, style := "○", unloadedStyle
+		switch state {
+		case "loaded":
+			mark, style = "●", loadedStyle
+		case "loading":
+			mark, style = "◐", loadingStyle
 		}
 		id := m.ID
 		if id == "" {
 			id = "?"
 		}
-		rows = append(rows, style.Render("● "+id)+"  "+subtle.Render(state))
+		rows = append(rows, style.Render(mark+" "+id)+"  "+subtle.Render(state))
 	}
 	return r.renderTitledPanel("router models", width, padRows(rows, liveBandContentRows))
 }

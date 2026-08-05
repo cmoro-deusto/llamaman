@@ -395,3 +395,32 @@ func TestNewClientBaseURL(t *testing.T) {
 		})
 	}
 }
+
+func TestFetchModelsStatusValue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"m:fast","object":"model","owned_by":"llamacpp","status":{"value":"loaded"}},
+			{"id":"m:slow","object":"model","owned_by":"llamacpp","status":{"value":"unloaded"}}
+		]}`))
+	}))
+	defer srv.Close()
+
+	got, err := clientFor(t, srv).FetchModels(context.Background())
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+	if len(got.Data) != 2 {
+		t.Fatalf("data = %d, want 2", len(got.Data))
+	}
+	if got.Data[0].ID != "m:fast" || got.Data[0].Status.Value != "loaded" {
+		t.Errorf("data[0] = %+v", got.Data[0])
+	}
+	if got.Data[1].Status.Value != "unloaded" {
+		t.Errorf("data[1] status = %q, want unloaded", got.Data[1].Status.Value)
+	}
+}

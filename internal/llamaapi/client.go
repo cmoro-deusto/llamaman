@@ -309,14 +309,21 @@ func (c *Client) FetchProps(ctx context.Context) (*Props, error) {
 	return &p, nil
 }
 
+// ModelStatus is the per-model load state reported by the router in
+// GET /models ("status.value": loaded / loading / unloaded).
+type ModelStatus struct {
+	Value string `json:"value"`
+}
+
 // ModelInfo is one entry of llama-server's GET /models response
 // (OpenAI-style object list). Router mode lists every model registered
 // in the --models-preset file; non-router servers list the single
-// loaded model.
+// loaded model. Status carries the per-model load state.
 type ModelInfo struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	OwnedBy string `json:"owned_by"`
+	ID      string      `json:"id"`
+	Object  string      `json:"object"`
+	OwnedBy string      `json:"owned_by"`
+	Status  ModelStatus `json:"status"`
 	Meta    struct {
 		NCtx int `json:"n_ctx"`
 	} `json:"meta"`
