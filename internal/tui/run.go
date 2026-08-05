@@ -386,14 +386,9 @@ func (r *RunMode) chromeHeight() int {
 func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	switch m := msg.(type) {
 	case logChunkMsg:
-		// Router mode with denoise on: drop llama.cpp's per-request
-		// proxy chatter ("proxying request to model ... on port N" —
-		// emitted once per proxied request, including our own stats
-		// polls). The full log stays on disk; only the TUI view is
-		// filtered. Toggle with `d`.
-		if r.routerFile != "" && r.denoise {
-			m = logChunkMsg(filterProxyLines(string(m)))
-		}
+		// Everything lands in the buffer; the denoise filter is applied
+		// at render time (visibleLogLines), so toggling it off shows
+		// previously hidden lines at their exact positions.
 		r.buf.WriteString(string(m))
 		atBottom := r.viewport.AtBottom()
 		r.viewport.SetContent(r.renderViewportContent())
@@ -1082,7 +1077,7 @@ func (r *RunMode) effectiveQuery() string {
 // outer span. llama-server stderr is overwhelmingly plain in practice
 // so we accept this rather than tokenizing the buffer.
 func (r *RunMode) renderViewportContent() string {
-	return highlightOccurrences(r.buf.String(), r.effectiveQuery())
+	return highlightOccurrences(strings.Join(r.visibleLogLines(), "\n"), r.effectiveQuery())
 }
 
 // refreshContent re-renders the viewport, preserving auto-follow when
@@ -1137,8 +1132,10 @@ func highlightOccurrences(raw, q string) string {
 	}
 }
 
-// recomputeMatches finds line indices in buf containing the search query
-// (case-insensitive). Used by jumpSearch to navigate.
+// recomputeMatches finds line indices in the VISIBLE log (denoised
+// lines excluded) containing the search query (case-insensitive). Used
+// by jumpSearch to navigate; the indices are positions in the rendered
+// viewport content, so search and view stay in agreement.
 func (r *RunMode) recomputeMatches() {
 	r.searchMatches = nil
 	r.searchIdx = 0
@@ -1146,8 +1143,7 @@ func (r *RunMode) recomputeMatches() {
 		return
 	}
 	q := strings.ToLower(r.searchQuery)
-	lines := strings.Split(r.buf.String(), "\n")
-	for i, ln := range lines {
+	for i, ln := range r.visibleLogLines() {
 		if strings.Contains(strings.ToLower(ln), q) {
 			r.searchMatches = append(r.searchMatches, i)
 		}
@@ -1920,20 +1916,45 @@ func (r *RunMode) setFlash(msg string) tea.Cmd {
 	})
 }
 
-// filterProxyLines removes llama.cpp router lines of the form
-// "proxying request to model <id> on port <n>" from a log chunk. Those
-// are emitted once per proxied request — including llamaman's own stats
-// polls — and only clutter the log view.
+// isProxyNoise reports whether a log line is llama.cpp router chatter
+// of the form "proxying request to model <id> on port <n>" — emitted
+// once per proxied request, including llamaman's own stats polls.
+func isProxyNoise(line string) bool {
+	return strings.Contains(line, "proxying request to model")
+}
+
+// filterProxyLines removes router proxy-chatter lines from a log chunk.
+// Kept for ingest-side use; the run-mode view filters via
+// visibleLogLines instead so toggling denoise can restore lines.
 func filterProxyLines(chunk string) string {
 	lines := strings.Split(chunk, "\n")
 	kept := lines[:0]
 	for _, l := range lines {
-		if strings.Contains(l, "proxying request to model") {
+		if isProxyNoise(l) {
 			continue
 		}
 		kept = append(kept, l)
 	}
 	return strings.Join(kept, "\n")
+}
+
+// visibleLogLines returns the log buffer's lines as the view should
+// show them: with denoise on in router mode, proxy-chatter lines are
+// hidden (but stay in the buffer — toggling denoise off restores them
+// at their exact positions).
+func (r *RunMode) visibleLogLines() []string {
+	lines := strings.Split(r.buf.String(), "\n")
+	if !(r.routerFile != "" && r.denoise) {
+		return lines
+	}
+	kept := lines[:0]
+	for _, l := range lines {
+		if isProxyNoise(l) {
+			continue
+		}
+		kept = append(kept, l)
+	}
+	return kept
 }
 
 // formatArgvLines renders a launch argv (binary dropped) as aligned

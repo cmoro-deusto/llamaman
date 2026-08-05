@@ -1273,27 +1273,16 @@ func TestFilterProxyLines(t *testing.T) {
 	}
 }
 
-// TestLogChunkIngestFiltersRouterSpam verifies the ingest path drops
-// proxy lines in router mode only.
-func TestLogChunkIngestFiltersRouterSpam(t *testing.T) {
-	tail := newTestTailer(t)
+// TestLogChunkIngestKeepsEverything pins the render-time-filter
+// invariant: the buffer is always complete (router or single-model),
+// denoise only affects the view projection.
+func TestLogChunkIngestKeepsEverything(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
-	r.tail = tail
+	r.tail = newTestTailer(t)
 	r.routerFile = "models.ini"
-	r.Update(logChunkMsg("ok line\nproxying request to model X on port 1\n"))
-	if strings.Contains(r.buf.String(), "proxying request to model") {
-		t.Errorf("router buf contains proxy line: %q", r.buf.String())
-	}
-	if !strings.Contains(r.buf.String(), "ok line") {
-		t.Errorf("router buf missing ok line: %q", r.buf.String())
-	}
-	// Single-model mode keeps everything.
-	r2 := newRouterTestRunMode(&fakeFetcher{})
-	r2.tail = newTestTailer(t)
-	r2.routerFile = ""
-	r2.Update(logChunkMsg("ok\nproxying request to model X on port 1\n"))
-	if !strings.Contains(r2.buf.String(), "proxying request to model") {
-		t.Errorf("single-model buf lost proxy line: %q", r2.buf.String())
+	r.Update(logChunkMsg("ok\nproxying request to model X on port 1\n"))
+	if r.buf.String() != "ok\nproxying request to model X on port 1\n" {
+		t.Errorf("router buf not complete: %q", r.buf.String())
 	}
 }
 
@@ -1345,7 +1334,9 @@ func TestFormatArgvLines(t *testing.T) {
 }
 
 // TestRouterDenoiseToggle verifies `d` flips the proxy-log filter
-// (default on) and gates the ingest path accordingly.
+// (default on) and that the filter is a render-time projection: the
+// buffer keeps everything, so toggling off restores previously hidden
+// lines at their exact positions.
 func TestRouterDenoiseToggle(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
 	r.tail = newTestTailer(t)
@@ -1354,13 +1345,19 @@ func TestRouterDenoiseToggle(t *testing.T) {
 		t.Fatal("denoise should default to on")
 	}
 
-	// On: proxy lines dropped at ingest.
-	r.Update(logChunkMsg("ok\nproxying request to model X on port 1\n"))
-	if strings.Contains(r.buf.String(), "proxying request to model") {
-		t.Errorf("buf contains proxy line with denoise on: %q", r.buf.String())
+	// On: the buffer keeps every line, the view hides the noise.
+	r.Update(logChunkMsg("ok line\nproxying request to model X on port 1\n"))
+	if !strings.Contains(r.buf.String(), "proxying request to model X") {
+		t.Errorf("buffer must keep proxy lines (render-time filter): %q", r.buf.String())
+	}
+	if v := strings.Join(r.visibleLogLines(), "\n"); strings.Contains(v, "proxying request to model") {
+		t.Errorf("visible lines contain proxy noise: %q", v)
+	}
+	if v := stripANSI(r.renderViewportContent()); strings.Contains(v, "proxying request to model") {
+		t.Errorf("viewport content contains proxy noise: %q", v)
 	}
 
-	// d → off, flash, lines kept.
+	// d → off, flash, previously hidden lines now visible.
 	r.Update(keyMsg("d"))
 	if r.denoise {
 		t.Error("denoise still on after d")
@@ -1368,22 +1365,21 @@ func TestRouterDenoiseToggle(t *testing.T) {
 	if !strings.Contains(r.flash, "denoise off") {
 		t.Errorf("flash = %q", r.flash)
 	}
-	r.Update(logChunkMsg("proxy again\nproxying request to model Y on port 2\n"))
-	if !strings.Contains(r.buf.String(), "proxying request to model Y") {
-		t.Errorf("buf missing proxy line with denoise off: %q", r.buf.String())
+	if v := strings.Join(r.visibleLogLines(), "\n"); !strings.Contains(v, "proxying request to model X") {
+		t.Errorf("visible lines missing restored proxy line: %q", v)
 	}
 
-	// d → back on.
+	// d → back on; the noise hides again (still in the buffer).
 	r.Update(keyMsg("d"))
 	if !r.denoise {
 		t.Error("denoise still off after second d")
 	}
-	if !strings.Contains(r.flash, "denoise on") {
-		t.Errorf("flash = %q", r.flash)
-	}
 	r.Update(logChunkMsg("proxying request to model Z on port 3\n"))
-	if strings.Contains(r.buf.String(), "model Z") {
-		t.Errorf("buf contains proxy line with denoise back on: %q", r.buf.String())
+	if v := strings.Join(r.visibleLogLines(), "\n"); strings.Contains(v, "model Z") {
+		t.Errorf("visible lines contain new proxy noise: %q", v)
+	}
+	if !strings.Contains(r.buf.String(), "model Z") {
+		t.Errorf("buffer missing proxy line: %q", r.buf.String())
 	}
 
 	// d is a no-op in single-model mode.
@@ -1393,6 +1389,31 @@ func TestRouterDenoiseToggle(t *testing.T) {
 	r2.Update(keyMsg("d"))
 	if r2.denoise {
 		t.Error("d should not toggle denoise outside router mode")
+	}
+}
+
+// TestDenoiseSearchConsistency verifies search and match navigation
+// operate on the visible log: a query matching only hidden noise finds
+// no matches while denoise is on, and finds them after toggling off.
+func TestDenoiseSearchConsistency(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.tail = newTestTailer(t)
+	r.routerFile = "models.ini"
+	r.Update(logChunkMsg("clean line\nproxying request to model SECRET on port 1\n"))
+
+	// Denoise on: the noise is invisible to search too.
+	r.searchQuery = "SECRET"
+	r.recomputeMatches()
+	if len(r.searchMatches) != 0 {
+		t.Errorf("matches = %v, want none while denoised", r.searchMatches)
+	}
+
+	// Toggle off: the line is searchable at its real position (index 1
+	// in the visible lines).
+	r.Update(keyMsg("d"))
+	r.recomputeMatches()
+	if len(r.searchMatches) != 1 || r.searchMatches[0] != 1 {
+		t.Errorf("matches = %v, want [1]", r.searchMatches)
 	}
 }
 
