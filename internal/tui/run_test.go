@@ -709,9 +709,10 @@ func TestRouterPanelShowsRateOnlyWhenMetricsPresent(t *testing.T) {
 	}
 }
 
-// TestRouterFocusCyclesModels verifies `m` rotates the focused model
-// through loaded models and returns to the model list after the last
-// one (Esc stays free).
+// TestRouterFocusCyclesModels verifies `m` moves the selection through
+// ALL models (loaded and unloaded), wraps in the list view, returns to
+// the list from the stats view after the last model, and Esc closes the
+// stats panel with the selection kept.
 func TestRouterFocusCyclesModels(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
 	r.routerModels = []llamaapi.ModelInfo{
@@ -721,41 +722,74 @@ func TestRouterFocusCyclesModels(t *testing.T) {
 	}
 	r.cycleRouterFocus()
 	if r.routerFocus != "a" {
-		t.Errorf("focus after first m = %q, want a", r.routerFocus)
+		t.Errorf("selection after first m = %q, want a", r.routerFocus)
+	}
+	r.cycleRouterFocus()
+	if r.routerFocus != "b" {
+		t.Errorf("selection after second m = %q, want b (unloaded is selectable for load)", r.routerFocus)
 	}
 	r.cycleRouterFocus()
 	if r.routerFocus != "c" {
-		t.Errorf("focus after second m = %q, want c (skips unloaded b)", r.routerFocus)
+		t.Errorf("selection after third m = %q, want c", r.routerFocus)
 	}
-	r.cycleRouterFocus()
-	if r.routerFocus != "" {
-		t.Errorf("focus after third m = %q, want \"\" (rotation done → model list)", r.routerFocus)
-	}
-	// Rotation restarts from the first model.
+	// List view: wraps.
 	r.cycleRouterFocus()
 	if r.routerFocus != "a" {
-		t.Errorf("focus after fourth m = %q, want a (fresh rotation)", r.routerFocus)
+		t.Errorf("selection after wrap = %q, want a", r.routerFocus)
 	}
-	// Esc does NOT clear the focus — it stays free for search etc.
+	// Stats view: moving past the last model returns to the list.
+	r.showRouterStats = true
+	r.routerFocus = "c"
+	r.cycleRouterFocus()
+	if r.showRouterStats {
+		t.Error("stats view should close after the last model")
+	}
+	if r.routerFocus != "c" {
+		t.Errorf("selection after stats rotation = %q, want c kept", r.routerFocus)
+	}
+	// Enter opens stats; Esc closes it, selection kept.
+	r.Update(keyMsg("enter"))
+	if !r.showRouterStats {
+		t.Error("enter should open the stats panel")
+	}
 	r.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	if r.routerFocus != "a" {
-		t.Errorf("focus after Esc = %q, want unchanged (Esc stays free)", r.routerFocus)
+	if r.showRouterStats {
+		t.Error("esc should close the stats panel")
 	}
-	// No loaded models → no-op.
+	if r.routerFocus != "c" {
+		t.Errorf("selection after esc = %q, want c", r.routerFocus)
+	}
+	// No models → no-op.
 	r2 := newRouterTestRunMode(&fakeFetcher{})
-	r2.routerModels = []llamaapi.ModelInfo{{ID: "x", Status: llamaapi.ModelStatus{Value: "unloaded"}}}
 	r2.cycleRouterFocus()
 	if r2.routerFocus != "" {
-		t.Errorf("focus with no loaded model = %q, want empty", r2.routerFocus)
+		t.Errorf("selection with empty list = %q, want empty", r2.routerFocus)
 	}
-	// Focused model unloaded while focused → next m starts a fresh
-	// rotation on the remaining loaded model.
+	// Stale selection (model gone) → next m starts at the first.
 	r3 := newRouterTestRunMode(&fakeFetcher{})
 	r3.routerModels = []llamaapi.ModelInfo{{ID: "y", Status: llamaapi.ModelStatus{Value: "loaded"}}}
 	r3.routerFocus = "gone"
 	r3.cycleRouterFocus()
 	if r3.routerFocus != "y" {
-		t.Errorf("focus with stale id = %q, want y", r3.routerFocus)
+		t.Errorf("selection with stale id = %q, want y", r3.routerFocus)
+	}
+}
+
+// TestRouterListShowsSelection verifies the list renders a ▸ marker on
+// the selected row only.
+func TestRouterListShowsSelection(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "a", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "b", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+	}
+	r.routerFocus = "b"
+	got := stripANSI(r.renderRouterPanel(80))
+	if !strings.Contains(got, "▸ ○ b") {
+		t.Errorf("list missing ▸ on selected row; list:\n%s", got)
+	}
+	if strings.Contains(got, "▸ ● a") {
+		t.Errorf("unselected row shows ▸; list:\n%s", got)
 	}
 }
 
@@ -764,13 +798,13 @@ func TestRouterFocusCyclesModels(t *testing.T) {
 func TestRouterFooterShowsMHint(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
 	footer := stripANSI(r.renderFooter())
-	if !strings.Contains(footer, "m models") {
+	if !strings.Contains(footer, "m select") {
 		t.Errorf("router footer missing m hint; footer:\n%s", footer)
 	}
 	r2 := newRouterTestRunMode(&fakeFetcher{})
 	r2.routerFile = "" // single-model mode
 	footer2 := stripANSI(r2.renderFooter())
-	if strings.Contains(footer2, "m models") {
+	if strings.Contains(footer2, "m select") {
 		t.Errorf("single-model footer must not show m hint; footer:\n%s", footer2)
 	}
 }
@@ -945,7 +979,7 @@ func TestRouterUnloadConfirm(t *testing.T) {
 		t.Errorf("unload called after n: %d", fake.unloadCalls)
 	}
 
-	// y confirms → POST unload, flash, focus cleared.
+	// y confirms → POST unload, flash, back to the list (selection kept).
 	_, cmd := r.Update(keyMsg("y"))
 	if msg := safeCmd(cmd); msg != nil {
 		r, _ = r.Update(msg)
@@ -956,8 +990,11 @@ func TestRouterUnloadConfirm(t *testing.T) {
 	if !strings.Contains(r.flash, "unloaded m:a") {
 		t.Errorf("flash = %q", r.flash)
 	}
-	if r.routerFocus != "" {
-		t.Errorf("focus = %q, want cleared after unload", r.routerFocus)
+	if r.showRouterStats {
+		t.Error("stats panel should close after unload")
+	}
+	if r.routerFocus != "m:a" {
+		t.Errorf("selection = %q, want kept after unload", r.routerFocus)
 	}
 }
 
@@ -972,7 +1009,7 @@ func TestRouterLoadUnloadRequiresFocus(t *testing.T) {
 	if fake.loadCalls != 0 || fake.unloadCalls != 0 {
 		t.Errorf("calls without focus: load=%d unload=%d", fake.loadCalls, fake.unloadCalls)
 	}
-	if !strings.Contains(r.flash, "focus a model first") {
+	if !strings.Contains(r.flash, "select a model first") {
 		t.Errorf("flash = %q", r.flash)
 	}
 	// Single-model mode: also a no-op.

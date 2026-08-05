@@ -74,9 +74,11 @@ type RunMode struct {
 	// metrics endpoint disabled (spawned without --metrics), which stops
 	// the per-model metrics polling.
 	routerMetricsAvailable bool
-	// routerFocus is the model id whose full stats panel is shown
-	// instead of the model list ("" = list view). Cycled with `m`.
-	routerFocus string
+	// routerFocus is the selected model id — highlighted in the model
+	// list and targeted by l/u. showRouterStats toggles between the
+	// list and the selected model's full stats panel.
+	routerFocus     string
+	showRouterStats bool
 
 	proc          *server.Process
 	tail          *server.Tailer
@@ -521,8 +523,9 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		}
 		if m.action == "unload" {
-			// The focused model is gone; drop back to the model list.
-			r.routerFocus = ""
+			// The selected model is now unloaded — back to the list,
+			// selection kept so it can be re-loaded or swapped.
+			r.showRouterStats = false
 			r.flash = fmt.Sprintf("unloaded %s", truncateRune(m.model, routerPanelIDMax))
 			return r, nil
 		}
@@ -658,10 +661,13 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		}
 		switch m.String() {
 		case "esc":
-			// Layered Esc: on the main run screen, clear any applied
-			// query so highlights and n/N navigation drop back to a
-			// clean log. No-op when nothing is applied. (Model focus is
-			// exited by finishing the `m` rotation, keeping Esc free.)
+			// Layered Esc: close the router stats panel back to the
+			// model list (selection kept), then clear any applied search
+			// query on the main run screen.
+			if r.routerFile != "" && r.showRouterStats {
+				r.showRouterStats = false
+				return r, nil
+			}
 			if r.searchQuery != "" {
 				r.searchQuery = ""
 				r.searchMatches = nil
@@ -684,17 +690,21 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			r.showInfo = true
 			return r, nil
 		case "m":
-			// Router mode: cycle which loaded model's full stats panel
-			// is shown. No-op outside router mode or with no loaded
-			// model.
+			// Router mode: move the selection to the next model.
 			if r.routerFile != "" {
 				r.cycleRouterFocus()
 			}
 			return r, nil
+		case "enter":
+			// Router mode: open the selected model's stats panel.
+			if r.routerFile != "" && r.routerFocus != "" {
+				r.showRouterStats = true
+			}
+			return r, nil
 		case "l", "u":
-			// Router mode: load / unload the focused model.
+			// Router mode: load / unload the selected model.
 			if r.routerFile == "" || r.routerFocus == "" {
-				r.flash = "focus a model first (m)"
+				r.flash = "select a model first (m)"
 				return r, nil
 			}
 			if m.String() == "u" {
@@ -1331,8 +1341,9 @@ func (r *RunMode) renderHelp() string {
 		{"r", "restart server (confirms)"},
 		{"c", "copy launch command to clipboard"},
 		{"i", "show model & preset details"},
-		{"m", "router mode: cycle focused model's stats panel (last → list)"},
-		{"l / u", "router mode: load / unload the focused model (u confirms)"},
+		{"m", "router mode: select next model (▸ in list)"},
+		{"Enter", "router mode: open selected model's stats (Esc back)"},
+		{"l / u", "router mode: load / unload the selected model (u confirms)"},
 		{"/", "search (live highlights; Enter applies, Esc cancels)"},
 		{"n / N", "next / previous match"},
 		{"Esc", "clear active search and highlights"},
@@ -1369,7 +1380,7 @@ func (r *RunMode) renderFooter() string {
 		"q quit", "k kill", "r restart", "c copy", "i info",
 	}
 	if r.routerFile != "" {
-		tokens = append(tokens, "m models", "l/u load/unload")
+		tokens = append(tokens, "m select", "l/u load/unload")
 	}
 	tokens = append(tokens, "/ search", "? help", "g/G top/bottom", "space/b page", "↑/↓ scroll")
 	parts := make([]string, len(tokens))
@@ -1724,37 +1735,37 @@ func (r *RunMode) applyRouterMetrics(model string, m *llamaapi.Metrics) {
 	st.prevMetrics = m
 }
 
-// cycleRouterFocus moves the focused model to the next loaded/loading
-// model. After the last one, focus returns to the model list (""), so
-// `m` is a rotation: list → model1 → … → modelN → list. No-op when no
-// model is loaded.
+// cycleRouterFocus moves the selection to the next model in the list
+// (any model — loaded, loading, or unloaded; loading an unloaded model
+// needs its row selected). In the list view the selection wraps; in the
+// stats view, moving past the last model returns to the list with the
+// selection kept. No-op when the list is empty.
 func (r *RunMode) cycleRouterFocus() {
-	var focusable []string
-	for _, m := range r.routerModels {
-		if m.Status.Value == "loaded" || m.Status.Value == "loading" {
-			focusable = append(focusable, m.ID)
-		}
-	}
-	if len(focusable) == 0 {
+	if len(r.routerModels) == 0 {
 		return
 	}
 	if r.routerFocus == "" {
-		r.routerFocus = focusable[0]
+		r.routerFocus = r.routerModels[0].ID
 		return
 	}
-	for i, id := range focusable {
-		if id == r.routerFocus {
-			if i == len(focusable)-1 {
-				// Finished a full rotation — back to the model list.
-				r.routerFocus = ""
+	for i, m := range r.routerModels {
+		if m.ID == r.routerFocus {
+			if i == len(r.routerModels)-1 {
+				if r.showRouterStats {
+					// Finished the stats rotation — back to the list.
+					r.showRouterStats = false
+					return
+				}
+				// In the list, selection wraps.
+				r.routerFocus = r.routerModels[0].ID
 				return
 			}
-			r.routerFocus = focusable[i+1]
+			r.routerFocus = r.routerModels[i+1].ID
 			return
 		}
 	}
-	// Focused model is no longer loaded — start a fresh rotation.
-	r.routerFocus = focusable[0]
+	// Selected model is no longer in the list — start at the first.
+	r.routerFocus = r.routerModels[0].ID
 }
 
 // renderServerRows builds the seven server-panel content rows
@@ -1794,11 +1805,12 @@ func (r *RunMode) renderServerRows(sv *statsView) []string {
 // Cache row shows prompt cache hit ratio from /slots.
 // Gen row shows response progress with TTFT (time to first token).
 //
-// In router mode this panel becomes the model list, or — when a model
-// is focused (`m`) — that model's full seven-row stats panel.
+// In router mode this panel becomes the model list, or — when the
+// selection's stats are open (Enter) — that model's full seven-row
+// stats panel.
 func (r *RunMode) renderServerPanel(width int) string {
 	if r.routerFile != "" {
-		if r.routerFocus != "" {
+		if r.showRouterStats && r.routerFocus != "" {
 			return r.renderRouterStatsPanel(width)
 		}
 		return r.renderRouterPanel(width)
@@ -1898,6 +1910,7 @@ func (r *RunMode) renderRouterPanel(width int) string {
 	unloadedStyle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	loadingStyle := lipgloss.NewStyle().Foreground(r.theme.Accent)
 
+	selStyle := lipgloss.NewStyle().Foreground(r.theme.Accent)
 	var rows []string
 	if len(r.routerModels) == 0 {
 		rows = append(rows, subtle.Render("(no models reported)"))
@@ -1910,6 +1923,11 @@ func (r *RunMode) renderRouterPanel(width int) string {
 			mark, style = "●", loadedStyle
 		case "loading":
 			mark, style = "◐", loadingStyle
+		}
+		// Selection indicator: a leading ▸ on the selected row.
+		sel := "  "
+		if m.ID == r.routerFocus {
+			sel = selStyle.Render("▸ ") + ""
 		}
 		id := truncateRune(m.ID, routerPanelIDMax)
 		if id == "" {
@@ -1928,7 +1946,7 @@ func (r *RunMode) renderRouterPanel(width int) string {
 			parts = append(parts, activity)
 			stats = " · " + strings.Join(parts, " · ")
 		}
-		rows = append(rows, style.Render(mark+" "+id)+subtle.Render(stats)+"  "+subtle.Render(state))
+		rows = append(rows, sel+style.Render(mark+" "+id)+subtle.Render(stats)+"  "+subtle.Render(state))
 	}
 	return r.renderTitledPanel("router models", width, padRows(rows, liveBandContentRows))
 }
