@@ -146,6 +146,15 @@ func TestImportDispatchBeforeKong(t *testing.T) {
 		t.Fatalf("write ini: %v", err)
 	}
 	cfgPath := filepath.Join(dir, "new.json")
+	// Seed a config with a valid bin so the import doesn't depend on
+	// defaultGlobals() discovering a llama-server on the machine (CI
+	// runners have none — binary path is required otherwise).
+	if err := config.Save(cfgPath, &config.Config{
+		Version: config.SchemaVersion,
+		Globals: config.Globals{Bin: "/bin/true", Host: "127.0.0.1", Port: 9080},
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
 
 	withArgs(t, "llamaman", "import", iniPath, "-c", cfgPath)
 	if code := run(); code != exitOK {
