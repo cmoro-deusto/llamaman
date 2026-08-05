@@ -1975,7 +1975,7 @@ func (r *RunMode) selectedArgs() []string {
 func (r *RunMode) selectedIsCache() bool {
 	for _, m := range r.visibleRouterModels() {
 		if m.ID == r.routerFocus {
-			return m.InCache
+			return m.IsCache()
 		}
 	}
 	return false
@@ -1989,7 +1989,7 @@ func (r *RunMode) visibleRouterModels() []llamaapi.ModelInfo {
 	}
 	kept := make([]llamaapi.ModelInfo, 0, len(r.routerModels))
 	for _, m := range r.routerModels {
-		if !m.InCache {
+		if !m.IsCache() {
 			kept = append(kept, m)
 		}
 	}
@@ -2446,7 +2446,7 @@ func (r *RunMode) renderRouterPanel(width int) string {
 				stats = " · " + strings.Join(parts, " · ")
 			}
 			rows = append(rows, sel+style.Render(mark+" "+id)+subtle.Render(stats)+"  "+subtle.Render(state))
-			if m.InCache {
+			if m.IsCache() {
 				rows[len(rows)-1] += subtle.Render(" (cache)")
 			}
 		}

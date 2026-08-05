@@ -405,8 +405,8 @@ func TestFetchModelsStatusValue(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[
-			{"id":"m:fast","object":"model","owned_by":"llamacpp","status":{"value":"loaded","args":["/opt/llama-server","--ctx-size","65535","--jinja"]}},
-			{"id":"m:slow","object":"model","owned_by":"llamacpp","status":{"value":"unloaded"}}
+			{"id":"m:fast","object":"model","owned_by":"llamacpp","source":"preset","status":{"value":"loaded","args":["/opt/llama-server","--ctx-size","65535","--jinja"]}},
+			{"id":"m:slow","object":"model","owned_by":"llamacpp","source":"cache","status":{"value":"unloaded"}}
 		]}`))
 	}))
 	defer srv.Close()
@@ -423,6 +423,12 @@ func TestFetchModelsStatusValue(t *testing.T) {
 	}
 	if len(got.Data[0].Status.Args) != 4 || got.Data[0].Status.Args[1] != "--ctx-size" {
 		t.Errorf("data[0] args = %v", got.Data[0].Status.Args)
+	}
+	if got.Data[0].IsCache() {
+		t.Error("data[0] should be a preset (source=preset)")
+	}
+	if !got.Data[1].IsCache() {
+		t.Error("data[1] should be cache-only (source=cache)")
 	}
 	if got.Data[1].Status.Value != "unloaded" {
 		t.Errorf("data[1] status = %q, want unloaded", got.Data[1].Status.Value)

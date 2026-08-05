@@ -402,17 +402,26 @@ type ModelStatus struct {
 // ModelInfo is one entry of llama-server's GET /models response
 // (OpenAI-style object list). Router mode lists every model registered
 // in the --models-preset file, plus models from --models-dir and the
-// HF download cache. InCache distinguishes cache leftovers from
-// ini/models-dir entries (cache-only models can be filtered out).
+// HF download cache. Source distinguishes them ("preset" vs "cache");
+// older builds report the same distinction as in_cache. Cache-only
+// models can be filtered out of the models panel.
 type ModelInfo struct {
 	ID      string      `json:"id"`
 	Object  string      `json:"object"`
 	OwnedBy string      `json:"owned_by"`
+	Source  string      `json:"source"`
 	InCache bool        `json:"in_cache"`
 	Status  ModelStatus `json:"status"`
 	Meta    struct {
 		NCtx int `json:"n_ctx"`
 	} `json:"meta"`
+}
+
+// IsCache reports whether the model is a cache-only leftover (HF
+// download) rather than an ini/models-dir entry. Accepts both the
+// current "source":"cache" field and the older in_cache flag.
+func (m ModelInfo) IsCache() bool {
+	return m.Source == "cache" || m.InCache
 }
 
 // Models is the envelope of GET /models: {"object": "list", "data": [...]}.
