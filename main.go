@@ -52,6 +52,7 @@ type importArgs struct {
 
 type exportArgs struct {
 	Path   string `arg:"" optional:"" name:"path" help:"Output file path (default: stdout)."`
+	Output string `short:"o" name:"output" placeholder:"PATH" help:"Output file path (alternative to the positional argument)."`
 	Config string `short:"c" name:"config" placeholder:"PATH" help:"Path to alternate config file."`
 }
 
@@ -75,6 +76,15 @@ func run() int {
 		defer closer.Close()
 	}
 
+	// Subcommands operate without touching the TUI or the session manager.
+	// They must be dispatched before kong parses os.Args: kong v1 cannot
+	// mix positional args and cmd: branches on one struct, so otherwise
+	// "export" would be consumed as the positional <alias> and any
+	// subcommand flag would fail with the main parser's usage error.
+	if len(os.Args) > 1 && (os.Args[1] == "import" || os.Args[1] == "export") {
+		return runSubcommand(os.Args[1], os.Args[2:])
+	}
+
 	var cli CLI
 	parser, err := kong.New(&cli,
 		kong.Name("llamaman"),
@@ -96,13 +106,6 @@ func run() int {
 	}
 
 	slog.Debug("startup", "version", versionString(), "commit", commit, "args", os.Args[1:])
-
-	// Subcommands operate without touching the TUI or the session manager.
-	// They are dispatched before kong because kong v1 cannot mix positional
-	// args and cmd: branches on one struct.
-	if len(os.Args) > 1 && (os.Args[1] == "import" || os.Args[1] == "export") {
-		return runSubcommand(os.Args[1], os.Args[2:])
-	}
 
 	// `-i <file>` runs a my-models.ini in router mode. It works without a
 	// config (default globals) and skips the first-run flow.
@@ -727,6 +730,13 @@ func runSubcommand(name string, args []string) int {
 		if _, err := p.Parse(args); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return exitConfigErr
+		}
+		if ex.Path != "" && ex.Output != "" {
+			fmt.Fprintln(os.Stderr, "export: specify an output path either positionally or with -o, not both")
+			return exitConfigErr
+		}
+		if ex.Output != "" {
+			ex.Path = ex.Output
 		}
 		return runExport(ex.Path, ex.Config)
 	}
