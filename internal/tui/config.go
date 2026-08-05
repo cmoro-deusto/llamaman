@@ -11,8 +11,11 @@ import (
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 
+	"log/slog"
+
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
+	"github.com/cmoro-deusto/llamaman/internal/modelsini"
 )
 
 // savedFlashTTL is how long the "● saved" indicator stays in the
@@ -54,6 +57,7 @@ const (
 	formEditParam
 	formDeleteParam
 	formExitPrompt
+	formExportIni
 )
 
 // returnFromConfigMsg pops back to the previous view (main / selection).
@@ -63,11 +67,13 @@ type returnFromConfigMsg struct{}
 // input into these pointers; applyForm reads them on submit.
 type formStaging struct {
 	bin, host, port    *string
+	modelsFiles        *string // one models-file path per line
 	alias              *string
 	source             *string // "local" | "hf"; for new/edit-model forms
 	location, hf       *string // exactly one is populated based on source
 	name, desc         *string
 	paramKey, paramVal *string
+	exportPath         *string
 	confirm            *bool
 	choice             *string
 	targetIdx          *int // for clone-to-model preset form
@@ -93,7 +99,7 @@ type ConfigMode struct {
 	form        *huh.Form
 	formKind    formKind
 	formStaging formStaging
-	pendingKey  string // staged param key between PickKey and PickValue
+	pendingKey  string       // staged param key between PickKey and PickValue
 	picker      *paramPicker // active when adding a new param
 
 	saveErr error
@@ -368,6 +374,8 @@ func (c *ConfigMode) handleModelsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 		if c.hasModel() {
 			return c, c.openDeleteModelPrompt()
 		}
+	case "x":
+		return c, c.openExportIniForm()
 	}
 	return c, nil
 }
@@ -470,13 +478,34 @@ func (c *ConfigMode) openGlobalsForm() tea.Cmd {
 	bin := c.work.Globals.Bin
 	host := c.work.Globals.Host
 	port := strconv.Itoa(c.work.Globals.Port)
-	c.formStaging = formStaging{bin: &bin, host: &host, port: &port}
+	files := strings.Join(c.work.Globals.ModelsFiles, "\n")
+	c.formStaging = formStaging{bin: &bin, host: &host, port: &port, modelsFiles: &files}
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("llama-server binary").Value(&bin).Validate(nonEmpty("binary")),
 		huh.NewInput().Title("host (IPv4 / [::IPv6] / hostname)").Value(&host).Validate(hostValidator),
 		huh.NewInput().Title("port").Value(&port).Validate(numericRange(1, 65535)),
+		huh.NewText().Title("models files (my-models.ini — router sources, one per line)").
+			Placeholder("(default) "+modelsini.DefaultModelsFilePath(c.cfgPath)).
+			Value(&files),
 	))
 	return c.installForm(form, formGlobals)
+}
+
+// openExportIniForm prompts for an output path (pre-filled with the
+// derived models.ini location) and exports the working config to it.
+func (c *ConfigMode) openExportIniForm() tea.Cmd {
+	path := modelsini.DefaultModelsFilePath(c.cfgPath)
+	if path == "" {
+		path = "my-models.ini"
+	}
+	c.formStaging = formStaging{exportPath: &path}
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewInput().
+			Title("export my-models.ini to").
+			Value(&path).
+			Validate(nonEmpty("export path")),
+	))
+	return c.installForm(form, formExportIni)
 }
 
 func (c *ConfigMode) openNewModelForm() tea.Cmd {
@@ -879,7 +908,22 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		c.work.Globals.Bin = deref(c.formStaging.bin)
 		c.work.Globals.Host = deref(c.formStaging.host)
 		c.work.Globals.Port = port
+		c.work.Globals.ModelsFiles = parseLines(deref(c.formStaging.modelsFiles))
 		c.flash = "globals updated"
+	case formExportIni:
+		path := deref(c.formStaging.exportPath)
+		sections, warnings, err := modelsini.WriteTo(path, c.work)
+		if err != nil {
+			c.errorModal = fmt.Sprintf("Export failed:\n\n%v", err)
+			c.flash = ""
+			return nil, true
+		}
+		c.flash = fmt.Sprintf("exported %d sections to %s", sections, path)
+		if len(warnings) > 0 {
+			for _, w := range warnings {
+				slog.Warn("export warning", "warn", w)
+			}
+		}
 	case formNewModel:
 		m := config.Model{Alias: deref(c.formStaging.alias)}
 		applyModelSourceFromStaging(&m, c.formStaging)
@@ -1088,9 +1132,25 @@ func (c *ConfigMode) save() tea.Cmd {
 		c.flash = ""
 		return nil
 	}
+	// Derived artifact: keep <config-dir>/models.ini in sync so the
+	// Router source default stays current. Never fatal — the config
+	// save itself succeeded.
+	derivedWarnings := 0
+	if warnings, err := modelsini.WriteDerived(c.cfgPath, c.work); err != nil {
+		slog.Warn("derived models.ini write failed", "err", err)
+	} else {
+		derivedWarnings = len(warnings)
+		for _, w := range warnings {
+			slog.Warn("export warning", "warn", w)
+		}
+	}
 	c.saveErr = nil
 	c.saved = cloneConfig(c.work)
-	c.flash = "saved"
+	if derivedWarnings > 0 {
+		c.flash = fmt.Sprintf("saved (%d export warnings)", derivedWarnings)
+	} else {
+		c.flash = "saved"
+	}
 	c.savedGen++
 	gen := c.savedGen
 	return tea.Tick(savedFlashTTL, func(time.Time) tea.Msg {
@@ -1385,6 +1445,7 @@ func (c *ConfigMode) renderPaneHint() string {
 			paneShortcut("e/⏎ edit", c.theme, has),
 			paneShortcut("c clone", c.theme, has),
 			paneShortcut("d delete", c.theme, has),
+			paneShortcut("x export .ini", c.theme, true),
 		}, sep)
 	case FocusPresets:
 		has := c.hasPreset()
@@ -1455,7 +1516,7 @@ func (c *ConfigMode) renderHelpOverlay() string {
 		"  shift+tab / ← / h   previous pane",
 		"",
 		heading.Render("MODELS / PRESETS"),
-		"  n new      e or ⏎ edit      c clone      d delete (confirms)",
+		"  n new      e or ⏎ edit      c clone      d delete (confirms)      x export to .ini",
 		muted.Render("  Presets only:  k clone-to (copy preset to another model)."),
 		"",
 		heading.Render("PARAMS"),
@@ -1592,6 +1653,18 @@ func plural(n int) string {
 		return ""
 	}
 	return "s"
+}
+
+// parseLines splits a multi-line form value into trimmed, non-empty
+// entries — used for globals.models-files (one path per line).
+func parseLines(s string) []string {
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func deref(p *string) string {

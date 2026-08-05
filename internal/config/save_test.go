@@ -230,15 +230,15 @@ func TestValidHFIdentifier(t *testing.T) {
 
 func TestValidateHostFormats(t *testing.T) {
 	cases := map[string]bool{
-		"127.0.0.1":    true,
-		"0.0.0.0":      true,
-		"[::1]":        true,
-		"[::]":         true,
-		"localhost":    true,
-		"my-host.lan":  true,
-		"":             false,
-		"1 2 3":        false,
-		"weird/slash":  false,
+		"127.0.0.1":   true,
+		"0.0.0.0":     true,
+		"[::1]":       true,
+		"[::]":        true,
+		"localhost":   true,
+		"my-host.lan": true,
+		"":            false,
+		"1 2 3":       false,
+		"weird/slash": false,
 	}
 	for host, ok := range cases {
 		if got := ValidHost(host); got != ok {

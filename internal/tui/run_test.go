@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -369,6 +372,1272 @@ func TestTopStripColumnsAlign(t *testing.T) {
 				p.row1, c1, p.row2, c2, plain)
 		}
 	}
+}
+
+// newRouterTestRunMode builds a minimal router-mode RunMode mirroring
+// newHeaderTestRunMode: routerFile set, status Starting, a live fetch
+// context, and (optionally) a fakeFetcher for polling tests.
+func newRouterTestRunMode(fake *fakeFetcher) *RunMode {
+	r := &RunMode{
+		cfg:                    &config.Config{Globals: config.Globals{Host: "127.0.0.1", Port: 9080}},
+		routerFile:             "models.ini",
+		proc:                   &server.Process{Started: time.Now().Add(-90 * time.Second)},
+		viewport:               viewport.New(120, 30),
+		searchInput:            textinput.New(),
+		theme:                  CurrentTheme(),
+		status:                 StatusStarting,
+		fetcher:                fake,
+		routerMetricsAvailable: true,
+		denoise:                true,
+		tokensHistory:          newRingBuffer(sparkBufferSamples),
+		promptHistory:          newRingBuffer(sparkBufferSamples),
+		utilHistory:            map[string]*ringBuffer{},
+	}
+	r.fetchCtx, r.fetchCancel = context.WithCancel(context.Background())
+	return r
+}
+
+// TestRouterPropsNCtxZeroTransitionsReady is the regression for the
+// empty router-models panel: llama.cpp's router reports n_ctx = 0 in
+// /props by design, and the readiness gate treated nctx <= 0 as "not
+// ready", so the live poll (which fetches /models + /health) never
+// started and the panel stayed on "(no models reported)".
+func TestRouterPropsNCtxZeroTransitionsReady(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.Update(propsFetchedMsg{nctx: 0})
+	if r.status != StatusReady {
+		t.Errorf("status = %v, want Ready (router /props reports n_ctx=0 by design)", r.status)
+	}
+	if !r.livePollStarted {
+		t.Error("live poll not armed for router mode")
+	}
+}
+
+// TestSingleModelPropsNCtxZeroStaysStarting pins the single-model
+// behavior: an unpopulated n_ctx still means "not ready" there, so the
+// live poll must NOT be armed.
+func TestSingleModelPropsNCtxZeroStaysStarting(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerFile = "" // single-model mode
+	r.Update(propsFetchedMsg{nctx: 0})
+	if r.status != StatusStarting {
+		t.Errorf("status = %v, want Starting", r.status)
+	}
+	if r.livePollStarted {
+		t.Error("live poll armed although readiness never fired")
+	}
+}
+
+// TestRouterPollFetchesModelsNotSlots drives the router startup path:
+// the armed live poll must fetch /models + /health and never touch
+// /slots or /metrics (the router does not serve them; they 400).
+func TestRouterPollFetchesModelsNotSlots(t *testing.T) {
+	fake := &fakeFetcher{
+		props:  propsWithNCtx(0),
+		models: &llamaapi.Models{Data: []llamaapi.ModelInfo{{ID: "m:fast"}}},
+		health: &llamaapi.Health{Status: "ok"},
+	}
+	r := newRouterTestRunMode(fake)
+	_, cmds := r.Update(propsFetchedMsg{nctx: 0})
+	for _, sub := range collectCmds(cmds) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if fake.modelsCalls == 0 || fake.healthCalls == 0 {
+		t.Errorf("router poll must fetch /models and /health (models=%d health=%d)", fake.modelsCalls, fake.healthCalls)
+	}
+	if fake.slotsCalls != 0 || fake.metricsCalls != 0 {
+		t.Errorf("router poll must not fetch /slots or /metrics (slots=%d metrics=%d)", fake.slotsCalls, fake.metricsCalls)
+	}
+	if len(r.routerModels) != 1 || r.routerModels[0].ID != "m:fast" {
+		t.Errorf("routerModels = %+v, want [m:fast]", r.routerModels)
+	}
+}
+
+// TestRouterTickFetchesModelsNotSlots covers the per-second tick branch
+// (the code path that kept the panel fresh once ready).
+func TestRouterTickFetchesModelsNotSlots(t *testing.T) {
+	fake := &fakeFetcher{
+		props:  propsWithNCtx(0),
+		models: &llamaapi.Models{Data: []llamaapi.ModelInfo{{ID: "m:fast"}}},
+		health: &llamaapi.Health{Status: "ok"},
+	}
+	r := newRouterTestRunMode(fake)
+	r.livePollStarted = true // simulate an already-armed poll
+	_, cmd := r.Update(livePollTickMsg(time.Now()))
+	for _, sub := range collectCmds(cmd) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if fake.modelsCalls == 0 || fake.healthCalls == 0 {
+		t.Errorf("router tick must fetch /models and /health (models=%d health=%d)", fake.modelsCalls, fake.healthCalls)
+	}
+	if fake.slotsCalls != 0 || fake.metricsCalls != 0 {
+		t.Errorf("router tick must not fetch /slots or /metrics (slots=%d metrics=%d)", fake.slotsCalls, fake.metricsCalls)
+	}
+}
+
+// TestRouterPanelStatusValue verifies the panel tags each model from
+// /models "status.value" and the count uses it ("N total (M loaded)").
+func TestRouterPanelStatusValue(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "m:fast", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "m:slow", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+		{ID: "m:loading", Status: llamaapi.ModelStatus{Value: "loading"}},
+	}
+	got := stripANSI(r.renderRouterPanel(60))
+	for _, want := range []string{"● m:fast", "loaded", "○ m:slow", "unloaded", "◐ m:loading", "loading"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("panel missing %q; panel:\n%s", want, got)
+		}
+	}
+	if got := r.renderRouterModelCount(); got != "3 total (1 loaded)" {
+		t.Errorf("count = %q, want \"3 total (1 loaded)\"", got)
+	}
+}
+
+// TestRouterPanelHealthFallback covers older router builds that report
+// loaded ids via GET /health instead of per-model status.value.
+func TestRouterPanelHealthFallback(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{{ID: "m:fast"}, {ID: "m:slow"}}
+	r.routerLoaded = []string{"m:fast"}
+	got := stripANSI(r.renderRouterPanel(60))
+	for _, want := range []string{"● m:fast", "○ m:slow"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("panel missing %q; panel:\n%s", want, got)
+		}
+	}
+	if got := r.renderRouterModelCount(); got != "2 total (1 loaded)" {
+		t.Errorf("count = %q, want \"2 total (1 loaded)\"", got)
+	}
+}
+
+// TestRouterPollFetchesPerModelSlots verifies the router poll fetches
+// /slots?model=<id> for loaded models only — unloaded models have no
+// slots, and the router requires the model name on /slots.
+func TestRouterPollFetchesPerModelSlots(t *testing.T) {
+	fake := &fakeFetcher{
+		props: propsWithNCtx(0),
+		models: &llamaapi.Models{Data: []llamaapi.ModelInfo{
+			{ID: "m:loaded", Status: llamaapi.ModelStatus{Value: "loaded"}},
+			{ID: "m:unloaded", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+		}},
+		health: &llamaapi.Health{Status: "ok"},
+		slotsFor: map[string]*llamaapi.Slots{
+			"m:loaded": {ContextUsed: 4222, ContextMax: 65536, BusyCount: 1},
+		},
+	}
+	r := newRouterTestRunMode(fake)
+	// Round 1 (startup): populates the model list.
+	_, cmds := r.Update(propsFetchedMsg{nctx: 0})
+	for _, sub := range collectCmds(cmds) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if fake.slotsForCalls != 0 {
+		t.Fatalf("slots fetched in round 1 (model list not known yet): %d", fake.slotsForCalls)
+	}
+	// Round 2 (tick): per-model slots for the loaded model only.
+	_, cmd := r.Update(livePollTickMsg(time.Now()))
+	for _, sub := range collectCmds(cmd) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if fake.slotsForCalls != 1 {
+		t.Errorf("FetchSlotsFor calls = %d, want 1 (loaded model only)", fake.slotsForCalls)
+	}
+	st, ok := r.routerStats["m:loaded"]
+	if !ok || st == nil || st.contextUsed != 4222 || st.contextMax != 65536 {
+		t.Errorf("routerStats[m:loaded] = %+v, want ctx 4222/65536", st)
+	}
+}
+
+// TestRouterPanelShowsSlotStats verifies the per-model stats suffix:
+// context usage and idle/processing activity from /slots?model=<id>.
+func TestRouterPanelShowsSlotStats(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "m:busy", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "m:quiet", Status: llamaapi.ModelStatus{Value: "loaded"}},
+	}
+	r.routerStats = map[string]*modelStats{
+		"m:busy":  {statsView: statsView{contextUsed: 4222, contextMax: 65536, busyCount: 1}},
+		"m:quiet": {statsView: statsView{contextUsed: 150000, contextMax: 150000}},
+	}
+	got := stripANSI(r.renderRouterPanel(60))
+	for _, want := range []string{"4.2K/65.5K", "processing", "150K/150K", "idle"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("panel missing %q; panel:\n%s", want, got)
+		}
+	}
+}
+
+func TestTruncateRune(t *testing.T) {
+	if got := truncateRune("short", 40); got != "short" {
+		t.Errorf("truncateRune short = %q", got)
+	}
+	if got := truncateRune("abcdefghij", 5); got != "abcde…" {
+		t.Errorf("truncateRune 10->5 = %q", got)
+	}
+}
+
+func TestHumanTokens(t *testing.T) {
+	cases := map[int]string{
+		0: "0", 950: "950", 4222: "4.2K", 65536: "65.5K", 150000: "150K",
+	}
+	for in, want := range cases {
+		if got := humanTokens(in); got != want {
+			t.Errorf("humanTokens(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestRouterPollFetchesMetricsForLoadedModels verifies the router poll
+// fetches /metrics?model=<id> for loaded models while metrics are
+// available (llamaman always spawns routers with --metrics now).
+func TestRouterPollFetchesMetricsForLoadedModels(t *testing.T) {
+	fake := &fakeFetcher{
+		props: propsWithNCtx(0),
+		models: &llamaapi.Models{Data: []llamaapi.ModelInfo{
+			{ID: "m:loaded", Status: llamaapi.ModelStatus{Value: "loaded"}},
+			{ID: "m:unloaded", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+		}},
+		health: &llamaapi.Health{Status: "ok"},
+		slotsFor: map[string]*llamaapi.Slots{
+			"m:loaded": {ContextUsed: 4222, ContextMax: 65536, BusyCount: 1},
+		},
+		metricsFor: map[string]*llamaapi.Metrics{
+			"m:loaded": {PredictedTokensSecondsAvg: 12.3},
+		},
+	}
+	r := newRouterTestRunMode(fake)
+	// Round 1 (startup): populates the model list.
+	_, cmds := r.Update(propsFetchedMsg{nctx: 0})
+	for _, sub := range collectCmds(cmds) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	// Round 2 (tick): per-model slots + metrics for the loaded model.
+	_, cmd := r.Update(livePollTickMsg(time.Now()))
+	for _, sub := range collectCmds(cmd) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if fake.metricsForCalls != 1 {
+		t.Errorf("FetchMetricsFor calls = %d, want 1 (loaded model only)", fake.metricsForCalls)
+	}
+	mm, ok := r.routerStats["m:loaded"]
+	if !ok || mm == nil || mm.avgTokensPerSec != 12.3 {
+		t.Errorf("routerStats[m:loaded] = %+v", mm)
+	}
+	// Rate shows in the panel.
+	got := stripANSI(r.renderRouterPanel(60))
+	if !strings.Contains(got, "12.3 tok/s") {
+		t.Errorf("panel missing rate; panel:\n%s", got)
+	}
+}
+
+// TestRouterMetricsNotEnabledStopsPolling verifies the 501 sentinel
+// (router spawned without --metrics, e.g. an older process) stops the
+// per-model metrics polling while slots-based stats keep working.
+func TestRouterMetricsNotEnabledStopsPolling(t *testing.T) {
+	fake := &fakeFetcher{
+		props: propsWithNCtx(0),
+		models: &llamaapi.Models{Data: []llamaapi.ModelInfo{
+			{ID: "m:loaded", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		}},
+		health: &llamaapi.Health{Status: "ok"},
+		slotsFor: map[string]*llamaapi.Slots{
+			"m:loaded": {ContextUsed: 10, ContextMax: 100},
+		},
+		metricsForErr: llamaapi.ErrMetricsNotEnabled,
+	}
+	r := newRouterTestRunMode(fake)
+	_, cmds := r.Update(propsFetchedMsg{nctx: 0})
+	for _, sub := range collectCmds(cmds) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	_, cmd := r.Update(livePollTickMsg(time.Now()))
+	for _, sub := range collectCmds(cmd) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if r.routerMetricsAvailable {
+		t.Error("routerMetricsAvailable still true after ErrMetricsNotEnabled")
+	}
+	// One more tick: no further metrics fetches.
+	before := fake.metricsForCalls
+	_, cmd = r.Update(livePollTickMsg(time.Now()))
+	for _, sub := range collectCmds(cmd) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if fake.metricsForCalls != before {
+		t.Errorf("metrics fetched after sentinel: %d -> %d", before, fake.metricsForCalls)
+	}
+	if fake.slotsForCalls == 0 {
+		t.Error("slots polling must continue after metrics sentinel")
+	}
+}
+
+// TestRouterPanelShowsRateOnlyWhenMetricsPresent pins that the tok/s
+// suffix appears only when the model has metrics data.
+func TestRouterPanelShowsRateOnlyWhenMetricsPresent(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "m:with-metrics", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "m:no-metrics", Status: llamaapi.ModelStatus{Value: "loaded"}},
+	}
+	r.routerStats = map[string]*modelStats{
+		"m:with-metrics": {statsView: statsView{contextUsed: 1000, contextMax: 2000, avgTokensPerSec: 27.5}},
+		"m:no-metrics":   {statsView: statsView{contextUsed: 1000, contextMax: 2000}},
+	}
+	got := stripANSI(r.renderRouterPanel(60))
+	if !strings.Contains(got, "27.5 tok/s") {
+		t.Errorf("panel missing rate for m:with-metrics; panel:\n%s", got)
+	}
+	if strings.Count(got, "tok/s") != 1 {
+		t.Errorf("tok/s shown %d times, want 1; panel:\n%s", strings.Count(got, "tok/s"), got)
+	}
+}
+
+// TestRouterFocusCyclesModels verifies `m` moves the selection through
+// ALL models (loaded and unloaded), wraps in the list view, returns to
+// the list from the stats view after the last model, and Esc closes the
+// stats panel with the selection kept.
+// TestRouterSelectionPanel verifies the new paradigm: m toggles the
+// models panel as the ↑/↓ target, ↑/↓ move the selection through ALL
+// models (loaded and unloaded) wrapping, Esc deactivates the panel,
+// and s opens the selected model's stats.
+func TestRouterSelectionPanel(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "a", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "b", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+		{ID: "c", Status: llamaapi.ModelStatus{Value: "loaded"}},
+	}
+	// Before tab, ↑/↓ must NOT move the selection (log scrolls).
+	r.routerFocus = "a"
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if r.routerFocus != "a" {
+		t.Errorf("selection changed without panel active: %q", r.routerFocus)
+	}
+	// Tab activates the panel; ↓ selects.
+	r.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if !r.routerPanelActive {
+		t.Fatal("tab should activate the models panel")
+	}
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if r.routerFocus != "b" {
+		t.Errorf("selection after ↓ = %q, want b (unloaded selectable for load)", r.routerFocus)
+	}
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if r.routerFocus != "c" {
+		t.Errorf("selection after second ↓ = %q, want c", r.routerFocus)
+	}
+	// Wraps.
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if r.routerFocus != "a" {
+		t.Errorf("selection after wrap = %q, want a", r.routerFocus)
+	}
+	// Tab again deactivates the panel; ↑/↓ stop moving the selection.
+	r.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if r.routerPanelActive {
+		t.Error("tab should deactivate the models panel")
+	}
+	r.routerFocus = "b"
+	r.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if r.routerFocus != "b" {
+		t.Errorf("selection changed after panel deactivated: %q", r.routerFocus)
+	}
+	// s is a models-panel key: no-op while the log is focused.
+	r.routerFocus = "c"
+	r.Update(keyMsg("s"))
+	if r.showRouterStats {
+		t.Error("s must not open stats from the log panel")
+	}
+	// Re-activate the models panel; s opens the selected model's stats.
+	r.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if !r.routerPanelActive {
+		t.Fatal("tab should re-activate the models panel")
+	}
+	r.Update(keyMsg("s"))
+	if !r.showRouterStats {
+		t.Error("s should open the stats panel")
+	}
+	// Tab toggles focus to the log WITHOUT closing the stats — the
+	// stats panel stays up, only the arrows' target changes.
+	r.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if r.routerPanelActive {
+		t.Error("tab should move focus to the log")
+	}
+	if !r.showRouterStats {
+		t.Error("stats panel must stay up when focus returns to the log")
+	}
+	// Tab again returns focus to the models panel; stats still up.
+	r.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if !r.routerPanelActive {
+		t.Error("tab should move focus back to the models panel")
+	}
+	if !r.showRouterStats {
+		t.Error("stats panel must stay up when focus moves to it")
+	}
+	// Esc closes the stats (back to the model list), focus unchanged
+	// (the models panel was active).
+	r.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if r.showRouterStats {
+		t.Error("esc should close the stats panel")
+	}
+	if !r.routerPanelActive {
+		t.Error("esc must not change panel focus")
+	}
+	// Stale selection (model gone) → next ↓ starts at the first.
+	r3 := newRouterTestRunMode(&fakeFetcher{})
+	r3.routerModels = []llamaapi.ModelInfo{{ID: "y", Status: llamaapi.ModelStatus{Value: "loaded"}}}
+	r3.routerPanelActive = true
+	r3.routerFocus = "gone"
+	r3.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if r3.routerFocus != "y" {
+		t.Errorf("selection with stale id = %q, want y", r3.routerFocus)
+	}
+}
+
+// TestRouterListScrolls verifies the list scrolls so the selection
+// stays visible when the model list is longer than the panel.
+func TestRouterListScrolls(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	for i := 0; i < 30; i++ {
+		r.routerModels = append(r.routerModels, llamaapi.ModelInfo{
+			ID: fmt.Sprintf("model-%02d", i), Status: llamaapi.ModelStatus{Value: "unloaded"},
+		})
+	}
+	// Select a model deep in the list via ↓ presses (first ↓ selects
+	// row 0, so 26 presses land on model-25).
+	r.routerPanelActive = true
+	for i := 0; i < 26; i++ {
+		r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	if r.routerFocus != "model-25" {
+		t.Fatalf("selection = %q, want model-25", r.routerFocus)
+	}
+	got := stripANSI(r.renderRouterPanel(100))
+	if !strings.Contains(got, "▸ ○ model-25") {
+		t.Errorf("selected row not visible in scrolled list; list:\n%s", got)
+	}
+	if strings.Contains(got, "model-00") {
+		t.Errorf("list did not scroll (first row still shown); list:\n%s", got)
+	}
+	// Moving up keeps the selection visible too.
+	r.Update(tea.KeyMsg{Type: tea.KeyUp})
+	r.Update(tea.KeyMsg{Type: tea.KeyUp})
+	got = stripANSI(r.renderRouterPanel(100))
+	if !strings.Contains(got, "▸ ○ model-23") {
+		t.Errorf("selected row not visible after scrolling up; list:\n%s", got)
+	}
+}
+
+// TestRouterEnterMenu verifies the Enter action menu: opens, skips
+// inapplicable entries, and runs the picked action.
+func TestRouterEnterMenu(t *testing.T) {
+	fake := &fakeFetcher{}
+	r := newRouterTestRunMode(fake)
+	r.routerPanelActive = true
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "m:unloaded", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+		{ID: "m:loaded", Status: llamaapi.ModelStatus{Value: "loaded"}},
+	}
+	r.routerFocus = "m:unloaded"
+
+	// Enter opens the menu, cursor lands on the first enabled item.
+	r.Update(keyMsg("enter"))
+	if !r.routerMenu {
+		t.Fatal("enter should open the action menu")
+	}
+	// Load is enabled (model unloaded); Unload disabled → ↓ skips to
+	// Statistics.
+	before := r.routerMenuIdx
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if r.routerMenuIdx == before {
+		t.Error("↓ should move the menu cursor")
+	}
+	if !r.menuItemEnabled(r.menuActions()[r.routerMenuIdx]) {
+		t.Errorf("menu cursor on disabled item %d", r.routerMenuIdx)
+	}
+	// Menu render shows all four entries.
+	menu := stripANSI(r.renderRouterMenu())
+	for _, want := range []string{"Load", "Unload", "Statistics", "Info"} {
+		if !strings.Contains(menu, want) {
+			t.Errorf("menu missing %q; menu:\n%s", want, menu)
+		}
+	}
+
+	// Navigate back up to Load and select it → POST load.
+	for r.menuActions()[r.routerMenuIdx] != menuLoad {
+		r.Update(tea.KeyMsg{Type: tea.KeyUp})
+	}
+	_, cmd := r.Update(keyMsg("enter"))
+	if msg := safeCmd(cmd); msg != nil {
+		r, _ = r.Update(msg)
+	}
+	if fake.loadCalls != 1 {
+		t.Errorf("loadCalls = %d, want 1 (menu Load)", fake.loadCalls)
+	}
+	if r.routerMenu {
+		t.Error("menu should close after selecting an action")
+	}
+
+	// Loaded model: menu Load is disabled; Unload opens the confirm.
+	r.routerFocus = "m:loaded"
+	r.Update(keyMsg("enter"))
+	for r.menuActions()[r.routerMenuIdx] != menuUnload {
+		r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	r.Update(keyMsg("enter"))
+	if !r.unloadPrompt {
+		t.Error("menu Unload should open the unload confirm")
+	}
+	// Esc cancels the prompt.
+	r.Update(keyMsg("n"))
+	if fake.unloadCalls != 0 {
+		t.Errorf("unload called before confirm: %d", fake.unloadCalls)
+	}
+}
+
+// TestRouterMenuStatsInfo verifies the menu's Statistics and Info
+// actions.
+func TestRouterMenuStatsInfo(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerPanelActive = true
+	r.routerModels = []llamaapi.ModelInfo{{ID: "m", Status: llamaapi.ModelStatus{Value: "loaded"}}}
+	r.routerFocus = "m"
+	r.Update(keyMsg("enter"))
+	// Select Statistics.
+	for r.menuActions()[r.routerMenuIdx] != menuStats {
+		r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	r.Update(keyMsg("enter"))
+	if !r.showRouterStats {
+		t.Error("menu Statistics should open the stats panel")
+	}
+	// Select Info.
+	r.Update(keyMsg("enter"))
+	for r.menuActions()[r.routerMenuIdx] != menuInfo {
+		r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	r.Update(keyMsg("enter"))
+	if !r.showInfo {
+		t.Error("menu Info should open the info overlay")
+	}
+}
+
+// TestRouterListShowsSelection verifies the list renders a ▸ marker on
+// the selected row only.
+func TestRouterListShowsSelection(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "a", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "b", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+	}
+	r.routerFocus = "b"
+	got := stripANSI(r.renderRouterPanel(80))
+	if !strings.Contains(got, "▸ ○ b") {
+		t.Errorf("list missing ▸ on selected row; list:\n%s", got)
+	}
+	if strings.Contains(got, "▸ ● a") {
+		t.Errorf("unselected row shows ▸; list:\n%s", got)
+	}
+}
+
+// TestRouterFooterShowsMHint verifies the footer advertises `m` only in
+// router mode.
+func TestRouterFooterShowsMHint(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	// Log focused (default): the tab hint names the models panel, and
+	// log keys are shown.
+	footer := stripANSI(r.renderFooter())
+	if !strings.Contains(footer, "tab models") {
+		t.Errorf("log-focused footer missing tab models; footer:\n%s", footer)
+	}
+	if !strings.Contains(footer, "/ search") || !strings.Contains(footer, "d denoise") {
+		t.Errorf("log-focused footer missing log keys; footer:\n%s", footer)
+	}
+	// Models focused: tab names the log, models keys replace log keys.
+	r.routerPanelActive = true
+	footer = stripANSI(r.renderFooter())
+	if !strings.Contains(footer, "tab log") {
+		t.Errorf("models-focused footer missing tab log; footer:\n%s", footer)
+	}
+	for _, want := range []string{"↑/↓ select", "⏎ menu", "s stats", "l/u load/unload", "p ini-only"} {
+		if !strings.Contains(footer, want) {
+			t.Errorf("models-focused footer missing %q; footer:\n%s", want, footer)
+		}
+	}
+	if strings.Contains(footer, "/ search") || strings.Contains(footer, "d denoise") {
+		t.Errorf("models-focused footer must not show log keys; footer:\n%s", footer)
+	}
+	// Single-model mode: no tab/models keys at all.
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.routerFile = ""
+	footer2 := stripANSI(r2.renderFooter())
+	if strings.Contains(footer2, "tab ") || strings.Contains(footer2, "p ini-only") {
+		t.Errorf("single-model footer must not show router panel keys; footer:\n%s", footer2)
+	}
+}
+
+// TestRouterIniOnlyFilter verifies the p filter: cache-only models are
+// hidden (and unselectable) when on, tagged when off, and a selected
+// cache model is dropped when the filter activates.
+func TestRouterIniOnlyFilter(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "ini-a", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "cache-x", Status: llamaapi.ModelStatus{Value: "unloaded"}, InCache: true},
+		{ID: "ini-b", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+	}
+
+	// Off: everything visible, cache entries tagged (cache).
+	got := stripANSI(r.renderRouterPanel(80))
+	if !strings.Contains(got, "cache-x") || !strings.Contains(got, "(cache)") {
+		t.Errorf("unfiltered list missing cache entry/tag; list:\n%s", got)
+	}
+
+	// p (models panel) → on: cache models hidden.
+	r.routerPanelActive = true
+	r.routerFocus = "cache-x"
+	r.Update(keyMsg("p"))
+	if !r.routerIniOnly {
+		t.Fatal("p should enable the ini-only filter")
+	}
+	if r.routerFocus != "" {
+		t.Errorf("selection of hidden cache model not cleared: %q", r.routerFocus)
+	}
+	if len(r.visibleRouterModels()) != 2 {
+		t.Errorf("visible models = %d, want 2", len(r.visibleRouterModels()))
+	}
+	got = stripANSI(r.renderRouterPanel(80))
+	if strings.Contains(got, "cache-x") {
+		t.Errorf("filtered list still shows cache model; list:\n%s", got)
+	}
+	// Selection only moves among visible models.
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if r.routerFocus != "ini-a" {
+		t.Errorf("selection = %q, want ini-a (first visible)", r.routerFocus)
+	}
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if r.routerFocus != "ini-b" {
+		t.Errorf("selection = %q, want ini-b", r.routerFocus)
+	}
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if r.routerFocus != "ini-a" {
+		t.Errorf("selection after wrap = %q, want ini-a", r.routerFocus)
+	}
+
+	// p again → off: everything back.
+	r.Update(keyMsg("p"))
+	if r.routerIniOnly {
+		t.Fatal("p should disable the ini-only filter")
+	}
+	if len(r.visibleRouterModels()) != 3 {
+		t.Errorf("visible models = %d, want 3", len(r.visibleRouterModels()))
+	}
+
+	// All-cache filtered view shows the hint row.
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.routerPanelActive = true
+	r2.routerIniOnly = true
+	r2.routerModels = []llamaapi.ModelInfo{
+		{ID: "cache-y", Status: llamaapi.ModelStatus{Value: "unloaded"}, InCache: true},
+	}
+	got = stripANSI(r2.renderRouterPanel(80))
+	if !strings.Contains(got, "all models are cache-only") {
+		t.Errorf("all-cache filtered view missing hint; list:\n%s", got)
+	}
+}
+
+// TestPanelScopedKeys verifies models-panel keys are silent no-ops in
+// the log panel and vice versa.
+func TestPanelScopedKeys(t *testing.T) {
+	fake := &fakeFetcher{}
+	r := newRouterTestRunMode(fake)
+	r.routerModels = []llamaapi.ModelInfo{{ID: "m:a", Status: llamaapi.ModelStatus{Value: "loaded"}}}
+	r.routerFocus = "m:a"
+	r.tail = newTestTailer(t)
+
+	// Log panel (default): Enter / l / s / p are no-ops.
+	r.Update(keyMsg("enter"))
+	if r.routerMenu {
+		t.Error("enter must not open the menu from the log panel")
+	}
+	r.Update(keyMsg("l"))
+	if fake.loadCalls != 0 {
+		t.Errorf("l acted from the log panel: %d", fake.loadCalls)
+	}
+	r.Update(keyMsg("s"))
+	if r.showRouterStats {
+		t.Error("s must not open stats from the log panel")
+	}
+	r.Update(keyMsg("p"))
+	if r.routerIniOnly {
+		t.Error("p must not toggle the filter from the log panel")
+	}
+
+	// Models panel: / n g space b d are no-ops.
+	r.routerPanelActive = true
+	before := r.viewport.YOffset
+	r.Update(keyMsg("/"))
+	if r.searchActive {
+		t.Error("/ must not open search from the models panel")
+	}
+	r.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if r.viewport.YOffset != before {
+		t.Error("space must not page the log from the models panel")
+	}
+	r.Update(keyMsg("d"))
+	if !r.denoise {
+		t.Error("d must not toggle denoise from the models panel")
+	}
+}
+
+// TestRouterStatsPanelFullParity verifies the focused model's panel
+// renders the full seven-row statistics — full parity with the
+// single-model server panel, including TTFT and sparkline rows.
+func TestRouterStatsPanelFullParity(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	const focusID = "Qwen3.6_27B-MTP:CODING 128K New"
+	r.routerFocus = focusID
+	r.routerMetricsAvailable = true
+	st := &modelStats{statsView: statsView{
+		metricsAvailable:    true,
+		tokensHistory:       newRingBuffer(sparkBufferSamples),
+		promptHistory:       newRingBuffer(sparkBufferSamples),
+		currentTokensPerSec: 12.3,
+		avgTokensPerSec:     10.0,
+		tokensSeen:          true,
+		avgPromptPerSec:     500,
+		promptSeen:          true,
+		busyCount:           1,
+		totalSlots:          1,
+		queuedCount:         0,
+		contextUsed:         4263,
+		contextMax:          65536,
+		contextCacheHit:     4000,
+		contextPromptToks:   4222,
+		contextGenToks:      41,
+		genDecoded:          41,
+		genRemain:           100,
+		promptToksTotal:     4222,
+		promptToksProcessed: 4181,
+		ttft:                1200 * time.Millisecond,
+	}}
+	r.routerStats = map[string]*modelStats{focusID: st}
+
+	got := stripANSI(r.renderRouterStatsPanel(120))
+	// The full model id must appear in the panel title — no premature
+	// trimming while the border has room.
+	if !strings.Contains(got, "router · "+focusID) {
+		t.Errorf("title trimmed despite available space; panel:\n%s", got)
+	}
+	for _, want := range []string{
+		"Tokens", "Prompt", "Process", "Context", "Breakdown", "Cache", "Gen",
+		"12.3 tps", "10.0 avg", "500.0 avg", "Busy 1/1 slots",
+		"4181/4222", "4263/65K", "4222 prompt", "41 gen",
+		"TTFT", "1.2s",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stats panel missing %q; panel:\n%s", want, got)
+		}
+	}
+	// The list view is replaced while focused.
+	if list := stripANSI(r.renderRouterPanel(120)); !strings.Contains(list, "(no models reported)") {
+		t.Errorf("list view should be the fallback only; got:\n%s", list)
+	}
+	// At a narrow width the title is cut at the border (by
+	// renderTitledPanel), not at a fixed 24-rune cap.
+	narrow := stripANSI(r.renderRouterStatsPanel(30))
+	if strings.Contains(narrow, "router · "+focusID) {
+		t.Errorf("narrow panel title unexpectedly fits; panel:\n%s", narrow)
+	}
+}
+
+// TestRouterApplyMetricsDeltas verifies per-model current-rate deltas
+// and sparkline history accumulate exactly like the single-model path.
+func TestRouterApplyMetricsDeltas(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.applyRouterMetrics("m", &llamaapi.Metrics{
+		PredictedTokensSecondsAvg: 10,
+		TokensPredictedTotal:      1000, TokensPredictedSecondsTotal: 100,
+		PromptTokensTotal: 500, PromptSecondsTotal: 50,
+	})
+	st := r.routerStats["m"]
+	if st == nil || st.avgTokensPerSec != 10 {
+		t.Fatalf("first metrics not applied: %+v", st)
+	}
+	if st.currentTokensPerSec != 0 || len(st.tokensHistory.Snapshot()) != 0 {
+		t.Errorf("first tick must not compute deltas; current=%v", st.currentTokensPerSec)
+	}
+	r.applyRouterMetrics("m", &llamaapi.Metrics{
+		PredictedTokensSecondsAvg: 12,
+		TokensPredictedTotal:      2000, TokensPredictedSecondsTotal: 150,
+		PromptTokensTotal: 700, PromptSecondsTotal: 60,
+	})
+	if st.currentTokensPerSec != 20 { // 1000 tokens / 50 server-seconds
+		t.Errorf("currentTokensPerSec = %v, want 20", st.currentTokensPerSec)
+	}
+	if st.currentPromptPerSec != 20 { // 200 tokens / 10 server-seconds
+		t.Errorf("currentPromptPerSec = %v, want 20", st.currentPromptPerSec)
+	}
+	if !st.tokensSeen || len(st.tokensHistory.Snapshot()) == 0 || len(st.promptHistory.Snapshot()) == 0 {
+		t.Errorf("history not accumulated: tokensSeen=%v", st.tokensSeen)
+	}
+}
+
+// TestRouterApplySlotsTTFT verifies per-model TTFT tracking mirrors the
+// single-model handler: measured from request start to first token.
+func TestRouterApplySlotsTTFT(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	// Request starts: prompt tokens appear, no gen yet.
+	r.applyRouterSlots("m", &llamaapi.Slots{PromptTokensTotal: 100, PromptTokensProcessed: 0})
+	st := r.routerStats["m"]
+	if st.ttftStart.IsZero() {
+		t.Fatal("ttftStart not armed on new request")
+	}
+	// First token appears.
+	r.applyRouterSlots("m", &llamaapi.Slots{PromptTokensTotal: 100, PromptTokensProcessed: 100, GenDecoded: 1})
+	if st.ttft <= 0 {
+		t.Errorf("ttft = %v, want > 0", st.ttft)
+	}
+	// Request completes → reset.
+	r.applyRouterSlots("m", &llamaapi.Slots{})
+	if !st.ttftStart.IsZero() || st.ttft != 0 || st.ttftPrevPromptToks != 0 {
+		t.Errorf("ttft state not reset: start=%v ttft=%v prev=%d", st.ttftStart, st.ttft, st.ttftPrevPromptToks)
+	}
+}
+
+// TestRouterLoadFromFocus verifies `l` on the focused model POSTs
+// /models/load and flashes the result.
+func TestRouterLoadFromFocus(t *testing.T) {
+	fake := &fakeFetcher{}
+	r := newRouterTestRunMode(fake)
+	r.routerPanelActive = true
+	r.routerFocus = "m:a"
+
+	_, cmd := r.Update(keyMsg("l"))
+	if cmd == nil {
+		t.Fatal("l should emit a load cmd")
+	}
+	if msg := safeCmd(cmd); msg != nil {
+		r, _ = r.Update(msg)
+	}
+	if fake.loadCalls != 1 {
+		t.Errorf("loadCalls = %d, want 1", fake.loadCalls)
+	}
+	if !strings.Contains(r.flash, "loading m:a") {
+		t.Errorf("flash = %q", r.flash)
+	}
+}
+
+// TestRouterUnloadConfirm verifies `u` opens a confirm prompt (no call
+// yet), y confirms and flashes, n cancels without calling.
+func TestRouterUnloadConfirm(t *testing.T) {
+	fake := &fakeFetcher{}
+	r := newRouterTestRunMode(fake)
+	r.routerPanelActive = true
+	r.routerModels = []llamaapi.ModelInfo{{ID: "m:a", Status: llamaapi.ModelStatus{Value: "loaded"}}}
+	r.routerFocus = "m:a"
+
+	// u opens the prompt; nothing called yet.
+	if _, cmd := r.Update(keyMsg("u")); cmd != nil {
+		t.Fatal("u should not emit a cmd before confirm")
+	}
+	if !r.unloadPrompt {
+		t.Fatal("unloadPrompt not set after u")
+	}
+	if fake.unloadCalls != 0 {
+		t.Fatalf("unload called before confirm: %d", fake.unloadCalls)
+	}
+	if got := stripANSI(r.renderUnloadPrompt()); !strings.Contains(got, "Unload m:a?") {
+		t.Errorf("prompt = %q", got)
+	}
+
+	// n cancels.
+	r2 := newRouterTestRunMode(fake)
+	r2.routerPanelActive = true
+	r2.routerModels = []llamaapi.ModelInfo{{ID: "m:a", Status: llamaapi.ModelStatus{Value: "loaded"}}}
+	r2.routerFocus = "m:a"
+	r2.Update(keyMsg("u"))
+	r2.Update(keyMsg("n"))
+	if r2.unloadPrompt {
+		t.Error("unloadPrompt still set after n")
+	}
+	if fake.unloadCalls != 0 {
+		t.Errorf("unload called after n: %d", fake.unloadCalls)
+	}
+
+	// y confirms → POST unload, flash, back to the list (selection kept).
+	_, cmd := r.Update(keyMsg("y"))
+	if msg := safeCmd(cmd); msg != nil {
+		r, _ = r.Update(msg)
+	}
+	if fake.unloadCalls != 1 {
+		t.Errorf("unloadCalls = %d, want 1", fake.unloadCalls)
+	}
+	if !strings.Contains(r.flash, "unloaded m:a") {
+		t.Errorf("flash = %q", r.flash)
+	}
+	if r.showRouterStats {
+		t.Error("stats panel should close after unload")
+	}
+	if r.routerFocus != "m:a" {
+		t.Errorf("selection = %q, want kept after unload", r.routerFocus)
+	}
+}
+
+// TestRouterLoadUnloadRequiresFocus verifies l/u without a focused
+// model flash a hint instead of calling the router.
+func TestRouterLoadUnloadRequiresFocus(t *testing.T) {
+	fake := &fakeFetcher{}
+	r := newRouterTestRunMode(fake)
+	r.routerPanelActive = true
+
+	r.Update(keyMsg("l"))
+	r.Update(keyMsg("u"))
+	if fake.loadCalls != 0 || fake.unloadCalls != 0 {
+		t.Errorf("calls without focus: load=%d unload=%d", fake.loadCalls, fake.unloadCalls)
+	}
+	if !strings.Contains(r.flash, "select a model first") {
+		t.Errorf("flash = %q", r.flash)
+	}
+	// Single-model mode: also a no-op.
+	r2 := newRouterTestRunMode(fake)
+	r2.routerFile = ""
+	r2.routerFocus = "m:a"
+	r2.Update(keyMsg("l"))
+	if fake.loadCalls != 0 {
+		t.Errorf("load called in single-model mode: %d", fake.loadCalls)
+	}
+}
+
+// TestRouterLoadUnloadStateSemantics verifies l/u respect the selected
+// model's state: l on a loaded model and u on an unloaded one flash
+// instead of acting.
+func TestRouterLoadUnloadStateSemantics(t *testing.T) {
+	fake := &fakeFetcher{}
+	r := newRouterTestRunMode(fake)
+	r.routerPanelActive = true
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "m:loaded", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "m:unloaded", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+	}
+	r.routerFocus = "m:loaded"
+	r.Update(keyMsg("l"))
+	if fake.loadCalls != 0 {
+		t.Errorf("load called on loaded model: %d", fake.loadCalls)
+	}
+	if !strings.Contains(r.flash, "already loaded") {
+		t.Errorf("flash = %q", r.flash)
+	}
+	r.routerFocus = "m:unloaded"
+	r.Update(keyMsg("u"))
+	if r.unloadPrompt {
+		t.Error("unload prompt opened for unloaded model")
+	}
+	if !strings.Contains(r.flash, "not loaded") {
+		t.Errorf("flash = %q", r.flash)
+	}
+}
+
+// TestRouterPanelFocusBorder verifies the focus-border decisions: the
+// models panel lights up (BorderFocus) when active, and the log frame
+// does while the panel is inactive. (Asserted via the color-selection
+// helpers — lipgloss strips ANSI colors in non-TTY test environments.)
+func TestRouterPanelFocusBorder(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerPanelActive = true
+	r.routerModels = []llamaapi.ModelInfo{{ID: "m", Status: llamaapi.ModelStatus{Value: "loaded"}}}
+	r.routerFocus = "m"
+
+	// Panel border: BorderFocus when focused, Border otherwise.
+	r.routerPanelActive = true
+	if got := r.panelBorderColor(true); got != r.theme.BorderFocus {
+		t.Errorf("active panel border = %v, want BorderFocus", got)
+	}
+	r.routerPanelActive = false
+	if got := r.panelBorderColor(false); got != r.theme.Border {
+		t.Errorf("inactive panel border = %v, want Border", got)
+	}
+	// Log frame: BorderFocus while the panel is inactive in router
+	// mode; Border when the panel is active or in single-model mode.
+	r.routerPanelActive = false
+	if got := r.logBorderColor(); got != r.theme.BorderFocus {
+		t.Errorf("log border (panel inactive) = %v, want BorderFocus", got)
+	}
+	r.routerPanelActive = true
+	if got := r.logBorderColor(); got != r.theme.Border {
+		t.Errorf("log border (panel active) = %v, want Border", got)
+	}
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.routerFile = "" // single-model mode
+	r2.routerPanelActive = true
+	if got := r2.logBorderColor(); got != r.theme.Border {
+		t.Errorf("log border (single-model) = %v, want Border", got)
+	}
+}
+
+// TestRouterInfoOverlayShowsParams verifies the router info overlay
+// renders the selected model's launch params from /models status.args,
+// filling the viewport (no arbitrary cap).
+func TestRouterInfoOverlayShowsParams(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.SetSize(120, 40)
+	r.routerModels = []llamaapi.ModelInfo{{
+		ID: "m:big",
+		Status: llamaapi.ModelStatus{
+			Value: "loaded",
+			Args:  []string{"/opt/llama-server", "--ctx-size", "65535", "--jinja", "--ngl", "99"},
+		},
+	}}
+	r.routerFocus = "m:big"
+	got := stripANSI(r.renderInfoOverlay())
+	for _, want := range []string{"Launch params", "--ctx-size", "65535", "--jinja", "--ngl", "99"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("info overlay missing %q; overlay:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "more") {
+		t.Errorf("no truncation expected on a tall viewport; overlay:\n%s", got)
+	}
+
+	// Tiny viewport → the params are capped to fit, with an ellipsis.
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.SetSize(120, 12)
+	r2.routerModels = r.routerModels
+	r2.routerFocus = "m:big"
+	got2 := stripANSI(r2.renderInfoOverlay())
+	if !strings.Contains(got2, "more") {
+		t.Errorf("expected truncation on a short viewport; overlay:\n%s", got2)
+	}
+}
+
+// TestFilterProxyLines verifies router proxy chatter is dropped from
+// the log view while everything else passes.
+func TestFilterProxyLines(t *testing.T) {
+	chunk := "some line\n68.17.107.375 I srv  proxy_reques: proxying request to model Jack on port 45927\nmore\n"
+	got := filterProxyLines(chunk)
+	if strings.Contains(got, "proxying request to model") {
+		t.Errorf("proxy line not filtered: %q", got)
+	}
+	for _, want := range []string{"some line", "more"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("filtered chunk missing %q: %q", want, got)
+		}
+	}
+	// Non-router chunks pass through unchanged.
+	plain := "a\nb\n"
+	if got := filterProxyLines(plain); got != plain {
+		t.Errorf("plain chunk altered: %q", got)
+	}
+}
+
+// TestLogChunkIngestKeepsEverything pins the render-time-filter
+// invariant: the buffer is always complete (router or single-model),
+// denoise only affects the view projection.
+func TestLogChunkIngestKeepsEverything(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.tail = newTestTailer(t)
+	r.routerFile = "models.ini"
+	r.Update(logChunkMsg("ok\nproxying request to model X on port 1\n"))
+	if r.buf.String() != "ok\nproxying request to model X on port 1\n" {
+		t.Errorf("router buf not complete: %q", r.buf.String())
+	}
+}
+
+// newTestTailer builds a Tailer over a scratch file so RunMode handlers
+// that re-arm the chunk wait can run in tests.
+func newTestTailer(t *testing.T) *server.Tailer {
+	t.Helper()
+	logPath := filepath.Join(t.TempDir(), "llama.log")
+	if err := os.WriteFile(logPath, []byte("seed\n"), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	tl, err := server.NewTailer(logPath)
+	if err != nil {
+		t.Fatalf("NewTailer: %v", err)
+	}
+	t.Cleanup(func() { tl.Close() })
+	return tl
+}
+
+func TestFormatArgvLines(t *testing.T) {
+	lines := formatArgvLines([]string{
+		"/opt/llama-server", "--ctx-size", "65535", "--jinja", "--ngl", "99",
+	}, 12, 66)
+	if len(lines) != 3 {
+		t.Fatalf("lines = %d, want 3 (flag+value, bare flag, flag+value)", len(lines))
+	}
+	if !strings.Contains(lines[0], "--ctx-size") || !strings.Contains(lines[0], "65535") {
+		t.Errorf("line[0] = %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "--jinja") {
+		t.Errorf("line[1] = %q (bare bool flag)", lines[1])
+	}
+	if !strings.Contains(lines[2], "--ngl") || !strings.Contains(lines[2], "99") {
+		t.Errorf("line[2] = %q", lines[2])
+	}
+	// Truncation: more flags than maxLines → ellipsis line.
+	many := make([]string, 0, 30)
+	many = append(many, "/bin/llama-server")
+	for i := 0; i < 25; i++ {
+		many = append(many, fmt.Sprintf("--flag-%02d", i))
+	}
+	trunc := formatArgvLines(many, 5, 66)
+	if len(trunc) != 6 {
+		t.Fatalf("truncated lines = %d, want 6 (5 + ellipsis)", len(trunc))
+	}
+	if !strings.Contains(trunc[5], "more") {
+		t.Errorf("last line = %q, want ellipsis", trunc[5])
+	}
+}
+
+// TestRouterDenoiseToggle verifies `d` flips the proxy-log filter
+// (default on) and that the filter is a render-time projection: the
+// buffer keeps everything, so toggling off restores previously hidden
+// lines at their exact positions.
+func TestRouterDenoiseToggle(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.tail = newTestTailer(t)
+	r.routerFile = "models.ini"
+	if !r.denoise {
+		t.Fatal("denoise should default to on")
+	}
+
+	// On: the buffer keeps every line, the view hides the noise.
+	r.Update(logChunkMsg("ok line\nproxying request to model X on port 1\n"))
+	if !strings.Contains(r.buf.String(), "proxying request to model X") {
+		t.Errorf("buffer must keep proxy lines (render-time filter): %q", r.buf.String())
+	}
+	if v := strings.Join(r.visibleLogLines(), "\n"); strings.Contains(v, "proxying request to model") {
+		t.Errorf("visible lines contain proxy noise: %q", v)
+	}
+	if v := stripANSI(r.renderViewportContent()); strings.Contains(v, "proxying request to model") {
+		t.Errorf("viewport content contains proxy noise: %q", v)
+	}
+
+	// d → off, flash, previously hidden lines now visible.
+	r.Update(keyMsg("d"))
+	if r.denoise {
+		t.Error("denoise still on after d")
+	}
+	if !strings.Contains(r.flash, "denoise off") {
+		t.Errorf("flash = %q", r.flash)
+	}
+	if v := strings.Join(r.visibleLogLines(), "\n"); !strings.Contains(v, "proxying request to model X") {
+		t.Errorf("visible lines missing restored proxy line: %q", v)
+	}
+
+	// d → back on; the noise hides again (still in the buffer).
+	r.Update(keyMsg("d"))
+	if !r.denoise {
+		t.Error("denoise still off after second d")
+	}
+	r.Update(logChunkMsg("proxying request to model Z on port 3\n"))
+	if v := strings.Join(r.visibleLogLines(), "\n"); strings.Contains(v, "model Z") {
+		t.Errorf("visible lines contain new proxy noise: %q", v)
+	}
+	if !strings.Contains(r.buf.String(), "model Z") {
+		t.Errorf("buffer missing proxy line: %q", r.buf.String())
+	}
+
+	// d is a no-op in single-model mode.
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.routerFile = ""
+	r2.denoise = false
+	r2.Update(keyMsg("d"))
+	if r2.denoise {
+		t.Error("d should not toggle denoise outside router mode")
+	}
+}
+
+// TestDenoiseSearchConsistency verifies search and match navigation
+// operate on the visible log: a query matching only hidden noise finds
+// no matches while denoise is on, and finds them after toggling off.
+func TestDenoiseSearchConsistency(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.tail = newTestTailer(t)
+	r.routerFile = "models.ini"
+	r.Update(logChunkMsg("clean line\nproxying request to model SECRET on port 1\n"))
+
+	// Denoise on: the noise is invisible to search too.
+	r.searchQuery = "SECRET"
+	r.recomputeMatches()
+	if len(r.searchMatches) != 0 {
+		t.Errorf("matches = %v, want none while denoised", r.searchMatches)
+	}
+
+	// Toggle off: the line is searchable at its real position (index 1
+	// in the visible lines).
+	r.Update(keyMsg("d"))
+	r.recomputeMatches()
+	if len(r.searchMatches) != 1 || r.searchMatches[0] != 1 {
+		t.Errorf("matches = %v, want [1]", r.searchMatches)
+	}
+}
+
+// TestRouterFooterShowsDenoise verifies the footer advertises d denoise
+// in router mode only.
+func TestRouterFooterShowsDenoise(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	footer := stripANSI(r.renderFooter())
+	if !strings.Contains(footer, "d denoise") {
+		t.Errorf("router footer missing d denoise; footer:\n%s", footer)
+	}
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.routerFile = "" // single-model mode
+	footer2 := stripANSI(r2.renderFooter())
+	if strings.Contains(footer2, "d denoise") {
+		t.Errorf("single-model footer must not show d denoise; footer:\n%s", footer2)
+	}
+}
+
+// TestFlashAutoDismisses verifies informational flashes clear after
+// their TTL, and that an older expiry tick can't clear a newer flash.
+func TestFlashAutoDismisses(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+
+	cmd := r.setFlash("first")
+	if r.flash != "first" {
+		t.Fatalf("flash = %q", r.flash)
+	}
+	cmd2 := r.setFlash("second") // supersedes
+	if r.flash != "second" {
+		t.Fatalf("flash = %q", r.flash)
+	}
+	// The first flash's expiry (stale gen) must NOT clear the newer
+	// flash. (The ticks themselves aren't runnable in tests — tea.Tick
+	// blocks for its duration — so drive the handler directly.)
+	r.Update(flashExpiredMsg{gen: 1})
+	if r.flash != "second" {
+		t.Errorf("flash cleared by stale expiry: %q", r.flash)
+	}
+	// The second flash's expiry clears it.
+	r.Update(flashExpiredMsg{gen: 2})
+	if r.flash != "" {
+		t.Errorf("flash not cleared by its own expiry: %q", r.flash)
+	}
+	// Both ticks are armed and alive.
+	_ = cmd
+	_ = cmd2
 }
 
 // TestRunHeaderStateMachine exercises the two width breakpoints in

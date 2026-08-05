@@ -2,6 +2,7 @@ package llamaapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -393,5 +394,156 @@ func TestNewClientBaseURL(t *testing.T) {
 				t.Errorf("base = %q, want %q", got.base, c.want)
 			}
 		})
+	}
+}
+
+func TestFetchModelsStatusValue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[
+			{"id":"m:fast","object":"model","owned_by":"llamacpp","source":"preset","status":{"value":"loaded","args":["/opt/llama-server","--ctx-size","65535","--jinja"]}},
+			{"id":"m:slow","object":"model","owned_by":"llamacpp","source":"cache","status":{"value":"unloaded"}}
+		]}`))
+	}))
+	defer srv.Close()
+
+	got, err := clientFor(t, srv).FetchModels(context.Background())
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+	if len(got.Data) != 2 {
+		t.Fatalf("data = %d, want 2", len(got.Data))
+	}
+	if got.Data[0].ID != "m:fast" || got.Data[0].Status.Value != "loaded" {
+		t.Errorf("data[0] = %+v", got.Data[0])
+	}
+	if len(got.Data[0].Status.Args) != 4 || got.Data[0].Status.Args[1] != "--ctx-size" {
+		t.Errorf("data[0] args = %v", got.Data[0].Status.Args)
+	}
+	if got.Data[0].IsCache() {
+		t.Error("data[0] should be a preset (source=preset)")
+	}
+	if !got.Data[1].IsCache() {
+		t.Error("data[1] should be cache-only (source=cache)")
+	}
+	if got.Data[1].Status.Value != "unloaded" {
+		t.Errorf("data[1] status = %q, want unloaded", got.Data[1].Status.Value)
+	}
+}
+
+func TestFetchSlotsForQueriesModel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/slots" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.URL.Query().Get("model"); got != "m:a:b" {
+			t.Errorf("model query = %q, want m:a:b (url-escaped)", got)
+		}
+		if got := r.URL.Query().Get("autoload"); got != "false" {
+			t.Errorf("autoload query = %q, want false (stats polling must never load)", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"is_processing":true,"n_ctx":65536,"n_prompt_tokens":4222,"n_prompt_tokens_processed":4181,"n_prompt_tokens_cache":0,"next_token":[{"n_decoded":41,"n_remain":100}]}]`))
+	}))
+	defer srv.Close()
+
+	got, err := clientFor(t, srv).FetchSlotsFor(context.Background(), "m:a:b")
+	if err != nil {
+		t.Fatalf("FetchSlotsFor: %v", err)
+	}
+	if got.BusyCount != 1 || got.Total != 1 {
+		t.Errorf("busy/total = %d/%d, want 1/1", got.BusyCount, got.Total)
+	}
+	if got.ContextUsed != 4263 || got.ContextMax != 65536 { // 4222 prompt + 41 decoded
+		t.Errorf("context = %d/%d, want 4263/65536", got.ContextUsed, got.ContextMax)
+	}
+}
+
+func TestFetchMetricsForQueriesModel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.URL.Query().Get("model"); got != "m:a:b" {
+			t.Errorf("model query = %q, want m:a:b (url-escaped)", got)
+		}
+		if got := r.URL.Query().Get("autoload"); got != "false" {
+			t.Errorf("autoload query = %q, want false (stats polling must never load)", got)
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(`# TYPE llamacpp:predicted_tokens_seconds gauge
+llamacpp:predicted_tokens_seconds 12.3
+# TYPE llamacpp:prompt_tokens_seconds gauge
+llamacpp:prompt_tokens_seconds 500
+`))
+	}))
+	defer srv.Close()
+
+	got, err := clientFor(t, srv).FetchMetricsFor(context.Background(), "m:a:b")
+	if err != nil {
+		t.Fatalf("FetchMetricsFor: %v", err)
+	}
+	if got.PredictedTokensSecondsAvg != 12.3 || got.PromptTokensSecondsAvg != 500 {
+		t.Errorf("averages = %v/%v, want 12.3/500", got.PredictedTokensSecondsAvg, got.PromptTokensSecondsAvg)
+	}
+}
+
+func TestLoadModelAndUnloadModel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models/load":
+			if r.Method != http.MethodPost {
+				t.Errorf("load method = %s", r.Method)
+			}
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["model"] != "m:a" {
+				t.Errorf("load body = %v", body)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true}`))
+		case "/models/unload":
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["model"] != "m:b" {
+				t.Errorf("unload body = %v", body)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := clientFor(t, srv)
+	if err := c.LoadModel(context.Background(), "m:a"); err != nil {
+		t.Errorf("LoadModel: %v", err)
+	}
+	if err := c.UnloadModel(context.Background(), "m:b"); err != nil {
+		t.Errorf("UnloadModel: %v", err)
+	}
+}
+
+func TestModelActionErrorParsesBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"code":400,"message":"model is not running","type":"invalid_request_error"}}`))
+	}))
+	defer srv.Close()
+
+	err := clientFor(t, srv).UnloadModel(context.Background(), "m:x")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "model is not running") {
+		t.Errorf("error = %q, want parsed server message", err)
 	}
 }

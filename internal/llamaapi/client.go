@@ -6,12 +6,14 @@ package llamaapi
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -93,17 +95,17 @@ type Metrics struct {
 // slots, context usage metrics, and generation progress for the
 // active slot.
 type Slots struct {
-	BusyCount              int
-	Total                  int
-	ContextUsed            int // tokens currently in context (prompt + generated)
-	ContextMax             int // total context window size (n_ctx)
-	ContextCacheHits       int // prompt tokens served from cache
-	ContextPromptTokens    int // prompt tokens in context (for breakdown bar)
-	ContextGenTokens       int // generated tokens in context (for breakdown bar)
-	GenDecoded             int // tokens generated so far in current response
-	GenRemain              int // tokens remaining before generation limit
-	PromptTokensTotal      int // total prompt tokens for current request
-	PromptTokensProcessed  int // prompt tokens processed so far (for progress bar)
+	BusyCount             int
+	Total                 int
+	ContextUsed           int // tokens currently in context (prompt + generated)
+	ContextMax            int // total context window size (n_ctx)
+	ContextCacheHits      int // prompt tokens served from cache
+	ContextPromptTokens   int // prompt tokens in context (for breakdown bar)
+	ContextGenTokens      int // generated tokens in context (for breakdown bar)
+	GenDecoded            int // tokens generated so far in current response
+	GenRemain             int // tokens remaining before generation limit
+	PromptTokensTotal     int // total prompt tokens for current request
+	PromptTokensProcessed int // prompt tokens processed so far (for progress bar)
 }
 
 // ErrMetricsNotEnabled is returned by FetchMetrics when llama-server
@@ -121,7 +123,23 @@ var ErrMetricsNotEnabled = errors.New("llamaapi: /metrics endpoint not available
 // caller can stop polling. Other non-2xx responses + transport errors
 // surface as a generic error.
 func (c *Client) FetchMetrics(ctx context.Context) (*Metrics, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/metrics", nil)
+	return c.fetchMetrics(ctx, "")
+}
+
+// FetchMetricsFor GETs /metrics?model=<id> — the router-mode variant,
+// which requires the model name and reports that model's metrics only.
+func (c *Client) FetchMetricsFor(ctx context.Context, model string) (*Metrics, error) {
+	return c.fetchMetrics(ctx, model)
+}
+
+func (c *Client) fetchMetrics(ctx context.Context, model string) (*Metrics, error) {
+	u := c.base + "/metrics"
+	if model != "" {
+		// autoload=false: a stats poll must never load a model (see
+		// fetchSlots).
+		u += "?model=" + url.QueryEscape(model) + "&autoload=false"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("llamaapi: build request: %w", err)
 	}
@@ -202,6 +220,54 @@ func parseMetrics(body interface{ Read([]byte) (int, error) }) (*Metrics, error)
 	return m, nil
 }
 
+// LoadModel POSTs /models/load {"model": id} — the router-mode load
+// action. The router returns before the child is ready; the model then
+// transitions through loading → loaded as observed via GET /models.
+func (c *Client) LoadModel(ctx context.Context, model string) error {
+	return c.postModelAction(ctx, "/models/load", model)
+}
+
+// UnloadModel POSTs /models/unload {"model": id} — the router-mode
+// unload action. In-flight work drains up to the preset's stop-timeout
+// before the child is killed.
+func (c *Client) UnloadModel(ctx context.Context, model string) error {
+	return c.postModelAction(ctx, "/models/unload", model)
+}
+
+// postModelAction POSTs a router model action and returns a readable
+// error (parsed from the OpenAI-style {"error":{"message":...}} body)
+// on non-2xx responses.
+func (c *Client) postModelAction(ctx context.Context, path, model string) error {
+	body, err := json.Marshal(map[string]string{"model": model})
+	if err != nil {
+		return fmt.Errorf("llamaapi: %s: %w", path, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("llamaapi: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("llamaapi: POST %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 == 2 {
+		return nil
+	}
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&e)
+	msg := e.Error.Message
+	if msg == "" {
+		msg = http.StatusText(resp.StatusCode)
+	}
+	return fmt.Errorf("llamaapi: POST %s: %s (status %d)", path, msg, resp.StatusCode)
+}
+
 // FetchSlots GETs /slots and extracts busy count, total slots, and
 // context usage metrics. The response is a JSON array of per-slot
 // objects; llama-server has shipped two flavors of the busy field
@@ -213,7 +279,23 @@ func parseMetrics(body interface{ Read([]byte) (int, error) }) (*Metrics, error)
 // takes the max n_ctx across slots, and ContextCacheHits sums
 // n_prompt_tokens_cache.
 func (c *Client) FetchSlots(ctx context.Context) (*Slots, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/slots", nil)
+	return c.fetchSlots(ctx, "")
+}
+
+// FetchSlotsFor GETs /slots?model=<id> — the router-mode variant, which
+// requires the model name and reports that model's slots only.
+func (c *Client) FetchSlotsFor(ctx context.Context, model string) (*Slots, error) {
+	return c.fetchSlots(ctx, model)
+}
+
+func (c *Client) fetchSlots(ctx context.Context, model string) (*Slots, error) {
+	u := c.base + "/slots"
+	if model != "" {
+		// autoload=false: a stats poll must never load a model (the
+		// router would otherwise reload an unloaded model every second).
+		u += "?model=" + url.QueryEscape(model) + "&autoload=false"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("llamaapi: build request: %w", err)
 	}
@@ -226,13 +308,13 @@ func (c *Client) FetchSlots(ctx context.Context) (*Slots, error) {
 		return nil, fmt.Errorf("llamaapi: GET /slots: status %d", resp.StatusCode)
 	}
 	var raw []struct {
-		IsProcessing          bool        `json:"is_processing"`
-		State                 json.Number `json:"state"`
-		NCtx                  int         `json:"n_ctx"`
-		NPromptTokens         int         `json:"n_prompt_tokens"`
-		NPromptTokensProcessed int        `json:"n_prompt_tokens_processed"`
-		NPromptTokensCache    int         `json:"n_prompt_tokens_cache"`
-		NextToken             []struct {
+		IsProcessing           bool        `json:"is_processing"`
+		State                  json.Number `json:"state"`
+		NCtx                   int         `json:"n_ctx"`
+		NPromptTokens          int         `json:"n_prompt_tokens"`
+		NPromptTokensProcessed int         `json:"n_prompt_tokens_processed"`
+		NPromptTokensCache     int         `json:"n_prompt_tokens_cache"`
+		NextToken              []struct {
 			NDecoded int `json:"n_decoded"`
 			NRemain  int `json:"n_remain"`
 		} `json:"next_token"`
@@ -307,4 +389,93 @@ func (c *Client) FetchProps(ctx context.Context) (*Props, error) {
 		return nil, fmt.Errorf("llamaapi: decode default_generation_settings: %w", err)
 	}
 	return &p, nil
+}
+
+// ModelStatus is the per-model load state reported by the router in
+// GET /models ("status.value": loaded / loading / unloaded). Args is
+// the child llama-server's full command line while loaded.
+type ModelStatus struct {
+	Value string   `json:"value"`
+	Args  []string `json:"args"`
+}
+
+// ModelInfo is one entry of llama-server's GET /models response
+// (OpenAI-style object list). Router mode lists every model registered
+// in the --models-preset file, plus models from --models-dir and the
+// HF download cache. Source distinguishes them ("preset" vs "cache");
+// older builds report the same distinction as in_cache. Cache-only
+// models can be filtered out of the models panel.
+type ModelInfo struct {
+	ID      string      `json:"id"`
+	Object  string      `json:"object"`
+	OwnedBy string      `json:"owned_by"`
+	Source  string      `json:"source"`
+	InCache bool        `json:"in_cache"`
+	Status  ModelStatus `json:"status"`
+	Meta    struct {
+		NCtx int `json:"n_ctx"`
+	} `json:"meta"`
+}
+
+// IsCache reports whether the model is a cache-only leftover (HF
+// download) rather than an ini/models-dir entry. Accepts both the
+// current "source":"cache" field and the older in_cache flag.
+func (m ModelInfo) IsCache() bool {
+	return m.Source == "cache" || m.InCache
+}
+
+// Models is the envelope of GET /models: {"object": "list", "data": [...]}.
+type Models struct {
+	Object string      `json:"object"`
+	Data   []ModelInfo `json:"data"`
+}
+
+// FetchModels GETs /models and returns the model list.
+func (c *Client) FetchModels(ctx context.Context) (*Models, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/models", nil)
+	if err != nil {
+		return nil, fmt.Errorf("llamaapi: build request: %w", err)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("llamaapi: GET /models: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("llamaapi: GET /models: status %d", resp.StatusCode)
+	}
+	var m Models
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		return nil, fmt.Errorf("llamaapi: decode /models: %w", err)
+	}
+	return &m, nil
+}
+
+// Health is the projection of GET /health. Router mode lists the
+// currently loaded model ids; non-router servers return a single
+// element list.
+type Health struct {
+	Status string   `json:"status"`
+	Models []string `json:"models"`
+}
+
+// FetchHealth GETs /health.
+func (c *Client) FetchHealth(ctx context.Context) (*Health, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/health", nil)
+	if err != nil {
+		return nil, fmt.Errorf("llamaapi: build request: %w", err)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("llamaapi: GET /health: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("llamaapi: GET /health: status %d", resp.StatusCode)
+	}
+	var h Health
+	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
+		return nil, fmt.Errorf("llamaapi: decode /health: %w", err)
+	}
+	return &h, nil
 }

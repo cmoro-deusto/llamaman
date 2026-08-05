@@ -55,11 +55,45 @@ const readyMarker = "listening on"
 // tailing its log file. Quit prompt is per DESIGN.md §7.4: q/Ctrl+C opens
 // (k)ill / (d)etach / (c)ancel.
 type RunMode struct {
-	cfg      *config.Config
-	model    config.Model
-	preset   config.Preset
-	argv     []string
-	warnings []string
+	cfg        *config.Config
+	model      config.Model
+	preset     config.Preset
+	argv       []string
+	routerFile string // my-models.ini path for router-mode runs; "" otherwise
+	warnings   []string
+
+	// Router-mode live state (only populated when routerFile != ""):
+	// the model list from GET /models and the loaded-model ids from
+	// GET /health.
+	routerModels []llamaapi.ModelInfo
+	routerLoaded []string
+	// routerStats holds each loaded model's live statistics (slots +
+	// metrics deltas, sparkline history, TTFT), keyed by model id.
+	routerStats map[string]*modelStats
+	// routerMetricsAvailable goes false when the router reports the
+	// metrics endpoint disabled (spawned without --metrics), which stops
+	// the per-model metrics polling.
+	routerMetricsAvailable bool
+	// routerFocus is the selected model id — highlighted in the model
+	// list and targeted by l/u/s/Enter. showRouterStats toggles between
+	// the list and the selected model's full stats panel.
+	// routerPanelActive makes ↑/↓ move the selection instead of
+	// scrolling the log; routerListStart is the list's scroll window.
+	// routerMenu is the Enter action menu (idx = highlighted item).
+	routerFocus       string
+	showRouterStats   bool
+	routerPanelActive bool
+	routerListStart   int
+	routerMenu        bool
+	routerMenuIdx     int
+	// denoise hides llama.cpp's per-request router chatter
+	// ("proxying request to model ...") from the log view. Default on;
+	// toggled with `d` in the log panel (router mode for now; the flag
+	// is generic so future log filters can apply in single-model mode).
+	denoise bool
+	// routerIniOnly hides cache-only models (llama.cpp HF download
+	// leftovers, InCache) from the models panel. Toggled with `p`.
+	routerIniOnly bool
 
 	proc          *server.Process
 	tail          *server.Tailer
@@ -77,13 +111,15 @@ type RunMode struct {
 	keys          Keymap
 	theme         Theme
 
-	showQuit      bool // quit prompt overlay active
+	showQuit      bool   // quit prompt overlay active
 	showHelp      bool   // help overlay active
 	showInfo      bool   // i-info overlay active (model + preset detail)
 	copyResult    string // when non-empty, a centered "command copied" modal is shown; any key dismisses
-	restartPrompt bool // r-confirm overlay
-	killPrompt    bool // k-confirm overlay
+	restartPrompt bool   // r-confirm overlay
+	killPrompt    bool   // k-confirm overlay
+	unloadPrompt  bool   // router u-confirm overlay
 	flash         string
+	flashGen      int // guards flash auto-dismissal (older ticks can't clear newer flashes)
 
 	searchInput   textinput.Model
 	searchActive  bool
@@ -128,14 +164,14 @@ type RunMode struct {
 	genDecoded int // tokens generated so far in current response
 	genRemain  int // tokens remaining before generation limit
 	// Prompt processing progress from /slots.
-	promptToksTotal    int // total prompt tokens for current request
+	promptToksTotal     int // total prompt tokens for current request
 	promptToksProcessed int // prompt tokens processed so far
 	// Lifetime request count from /metrics.
 	decodeTotal float64
 	// TTFT (time to first token) tracking.
-	ttftStart         time.Time // when new request started (zero = not tracking)
-	ttft              time.Duration // measured TTFT
-	ttftPrevPromptToks int // previous prompt total to detect new request
+	ttftStart          time.Time     // when new request started (zero = not tracking)
+	ttft               time.Duration // measured TTFT
+	ttftPrevPromptToks int           // previous prompt total to detect new request
 	// tokensSeen / promptSeen latch true once we've observed the first
 	// non-zero rate. Bug 3: after the first real value, we persist the
 	// last-known rate even on subsequent zero-delta ticks (no more "—"
@@ -166,6 +202,7 @@ type RunModeOpts struct {
 	Cfg        *config.Config
 	Model      config.Model
 	Preset     config.Preset
+	RouterFile string // non-empty for router-mode runs (my-models.ini path)
 	Argv       []string
 	Warnings   []string
 	Process    *server.Process
@@ -201,26 +238,29 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 	}
 
 	r := &RunMode{
-		cfg:           opts.Cfg,
-		model:         opts.Model,
-		preset:        opts.Preset,
-		argv:          opts.Argv,
-		warnings:      opts.Warnings,
-		proc:          opts.Process,
-		tail:          tail,
-		sessionMgr:    opts.SessionMgr,
-		registry:      opts.Registry,
-		viewport:      vp,
-		status:        StatusStarting,
-		keys:          DefaultKeymap(),
-		theme:         CurrentTheme(),
-		searchInput:   ti,
-		serverVersion:    loadServerVersion(opts.Cfg.Globals.Bin),
-		fetcher:          opts.Fetcher,
-		metricsAvailable: true,
-		tokensHistory:    newRingBuffer(sparkBufferSamples),
-		promptHistory:    newRingBuffer(sparkBufferSamples),
-		utilHistory:      map[string]*ringBuffer{},
+		cfg:                    opts.Cfg,
+		model:                  opts.Model,
+		preset:                 opts.Preset,
+		routerFile:             opts.RouterFile,
+		argv:                   opts.Argv,
+		warnings:               opts.Warnings,
+		proc:                   opts.Process,
+		tail:                   tail,
+		sessionMgr:             opts.SessionMgr,
+		registry:               opts.Registry,
+		viewport:               vp,
+		status:                 StatusStarting,
+		keys:                   DefaultKeymap(),
+		theme:                  CurrentTheme(),
+		searchInput:            ti,
+		serverVersion:          loadServerVersion(opts.Cfg.Globals.Bin),
+		fetcher:                opts.Fetcher,
+		metricsAvailable:       true,
+		routerMetricsAvailable: true,
+		denoise:                true,
+		tokensHistory:          newRingBuffer(sparkBufferSamples),
+		promptHistory:          newRingBuffer(sparkBufferSamples),
+		utilHistory:            map[string]*ringBuffer{},
 	}
 	r.fetchCtx, r.fetchCancel = context.WithCancel(context.Background())
 	cmds := []tea.Cmd{
@@ -263,14 +303,42 @@ func (r *RunMode) startLivePoll() []tea.Cmd {
 		return nil
 	}
 	r.livePollStarted = true
-	out := []tea.Cmd{
-		fetchSlotsCmd(r.fetchCtx, r.fetcher),
-		tickLivePoll(),
+	out := []tea.Cmd{tickLivePoll()}
+	if r.routerFile != "" {
+		// Router mode: /slots and /metrics are not served without a
+		// model name; per-model slots feed the router models panel.
+		out = append(out, r.routerPollCmds()...)
+		return out
 	}
+	out = append(out, fetchSlotsCmd(r.fetchCtx, r.fetcher))
 	if r.metricsAvailable {
 		out = append(out, fetchMetricsCmd(r.fetchCtx, r.fetcher))
 	}
 	return out
+}
+
+// routerPollCmds returns the router-mode fetches for one poll round:
+// the model list, the loaded ids, and per-model /slots for every model
+// actually in memory (the router serves /slots only with a model name,
+// and unloaded models have no slots to report).
+func (r *RunMode) routerPollCmds() []tea.Cmd {
+	cmds := []tea.Cmd{
+		fetchModelsCmd(r.fetchCtx, r.fetcher),
+		fetchHealthCmd(r.fetchCtx, r.fetcher),
+	}
+	for _, m := range r.visibleRouterModels() {
+		// Only models confirmed loaded get stats polling — unloaded and
+		// loading models are skipped (and the endpoints carry
+		// autoload=false, so a stray request can never reload a model).
+		// Hidden cache-only models are not polled either.
+		if m.Status.Value == "loaded" {
+			cmds = append(cmds, fetchRouterSlotsCmd(r.fetchCtx, r.fetcher, m.ID))
+			if r.routerMetricsAvailable {
+				cmds = append(cmds, fetchRouterMetricsCmd(r.fetchCtx, r.fetcher, m.ID))
+			}
+		}
+	}
+	return cmds
 }
 
 // wordmarkMinWidth is the minimum terminal width at which the
@@ -323,6 +391,9 @@ func (r *RunMode) chromeHeight() int {
 func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	switch m := msg.(type) {
 	case logChunkMsg:
+		// Everything lands in the buffer; the denoise filter is applied
+		// at render time (visibleLogLines), so toggling it off shows
+		// previously hidden lines at their exact positions.
 		r.buf.WriteString(string(m))
 		atBottom := r.viewport.AtBottom()
 		r.viewport.SetContent(r.renderViewportContent())
@@ -376,11 +447,18 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		}
 		if m.nctx <= 0 {
-			// Server returned a valid /props but n_ctx wasn't populated.
-			// Treat as unavailable; do not log (no actionable signal).
-			return r, nil
+			// Router mode: /props reports n_ctx = 0 by design (the
+			// router has no single context — "model_path":"none"). A
+			// successful /props round-trip is still the readiness
+			// signal: the recurring live poll that feeds the router
+			// models panel must start. Single-model runs keep treating
+			// an unpopulated n_ctx as unavailable.
+			if r.routerFile == "" {
+				return r, nil
+			}
+		} else {
+			r.liveCtxSize = m.nctx
 		}
-		r.liveCtxSize = m.nctx
 		// First successful /props means the server is ready. Transition
 		// status and arm the recurring live poll. This replaces the old
 		// log-marker approach ("listening on") which was fragile across
@@ -419,14 +497,80 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if r.fetcher == nil {
 			return r, nil
 		}
-		cmds := []tea.Cmd{
-			fetchSlotsCmd(r.fetchCtx, r.fetcher),
-			tickLivePoll(),
-		}
-		if r.metricsAvailable {
-			cmds = append(cmds, fetchMetricsCmd(r.fetchCtx, r.fetcher))
+		cmds := []tea.Cmd{tickLivePoll()}
+		if r.routerFile != "" {
+			// Router mode: /slots and /metrics are not served without a
+			// model name; per-model slots keep the panel fresh instead.
+			cmds = append(cmds, r.routerPollCmds()...)
+		} else {
+			cmds = append(cmds, fetchSlotsCmd(r.fetchCtx, r.fetcher))
+			if r.metricsAvailable {
+				cmds = append(cmds, fetchMetricsCmd(r.fetchCtx, r.fetcher))
+			}
 		}
 		return r, tea.Batch(cmds...)
+
+	case modelsFetchedMsg:
+		if m.err == nil && m.m != nil {
+			r.routerModels = m.m.Data
+			// Keep the selection and scroll window valid as the list
+			// changes (a selected model may disappear).
+			r.clampRouterList(-1)
+			if r.selectedIdx() < 0 {
+				r.routerFocus = ""
+			}
+		}
+		return r, nil
+
+	case healthFetchedMsg:
+		if m.err == nil && m.h != nil {
+			r.routerLoaded = m.h.Models
+		}
+		return r, nil
+
+	case routerSlotsMsg:
+		if m.err == nil && m.s != nil {
+			r.applyRouterSlots(m.model, m.s)
+		}
+		return r, nil
+
+	case routerMetricsMsg:
+		if errors.Is(m.err, llamaapi.ErrMetricsNotEnabled) {
+			// Router spawned without --metrics (e.g. reattached to a
+			// process started by an older llamaman): stop the metrics
+			// polling, keep the slots-based stats.
+			r.routerMetricsAvailable = false
+			return r, nil
+		}
+		if m.err == nil && m.m != nil {
+			r.applyRouterMetrics(m.model, m.m)
+		}
+		return r, nil
+
+	case modelActionMsg:
+		if m.err != nil {
+			return r, r.setFlash(fmt.Sprintf("%s failed: %v", m.action, m.err))
+		}
+		if m.action == "unload" {
+			// The selected model is now unloaded — drop it from the stats
+			// poll immediately (marking it unloaded here stops the next
+			// poll round; autoload=false on the endpoints stops any
+			// in-flight one from reloading it), then back to the list.
+			for i := range r.routerModels {
+				if r.routerModels[i].ID == m.model {
+					r.routerModels[i].Status.Value = "unloaded"
+				}
+			}
+			r.showRouterStats = false
+			return r, r.setFlash(fmt.Sprintf("unloaded %s", truncateRune(m.model, routerPanelIDMax)))
+		}
+		return r, r.setFlash(fmt.Sprintf("loading %s", truncateRune(m.model, routerPanelIDMax)))
+
+	case flashExpiredMsg:
+		if m.gen == r.flashGen {
+			r.flash = ""
+		}
+		return r, nil
 
 	case hwTickMsg:
 		// Independent hardware-poll cadence: starts at RunMode
@@ -537,6 +681,9 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if r.killPrompt {
 			return r.handleKillPrompt(m)
 		}
+		if r.unloadPrompt {
+			return r.handleUnloadPrompt(m)
+		}
 		if r.searchActive {
 			return r.handleSearchInput(m)
 		}
@@ -552,11 +699,33 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			r.copyResult = ""
 			return r, nil
 		}
+		if r.routerMenu {
+			return r.handleRouterMenuKey(m)
+		}
 		switch m.String() {
+		case "up", "down":
+			// Models panel focused: move the selection. Otherwise fall
+			// through to the viewport (log scrolling).
+			if r.routerFile != "" && r.routerPanelActive {
+				delta := -1
+				if m.String() == "down" {
+					delta = 1
+				}
+				r.moveRouterSelection(delta)
+				return r, nil
+			}
 		case "esc":
-			// Layered Esc: on the main run screen, clear any applied
-			// query so highlights and n/N navigation drop back to a
-			// clean log. No-op when nothing is applied.
+			// Layered Esc: close the action menu, then the router stats
+			// panel (back to the model list), then clear any applied
+			// search query. Panel focus is toggled with Tab, not Esc.
+			if r.routerFile != "" && r.routerMenu {
+				r.routerMenu = false
+				return r, nil
+			}
+			if r.routerFile != "" && r.showRouterStats {
+				r.showRouterStats = false
+				return r, nil
+			}
 			if r.searchQuery != "" {
 				r.searchQuery = ""
 				r.searchMatches = nil
@@ -578,27 +747,120 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		case "i":
 			r.showInfo = true
 			return r, nil
+		case "tab":
+			// Router mode: toggle which panel the ↑/↓ arrows control
+			// (log vs models). Never changes what the left panel shows
+			// — stats stay up when focus returns to the log.
+			if r.routerFile != "" {
+				r.routerPanelActive = !r.routerPanelActive
+			}
+			return r, nil
+		case "enter":
+			// Models panel: open the action menu for the selection.
+			// Silent no-op in the log panel.
+			if r.routerFile != "" && r.routerPanelActive && r.routerFocus != "" {
+				r.routerMenu = true
+				r.routerMenuIdx = 0
+				for i, a := range r.menuActions() {
+					if r.menuItemEnabled(a) {
+						r.routerMenuIdx = i
+						break
+					}
+				}
+			}
+			return r, nil
+		case "s":
+			// Models panel: show the selected model's stats.
+			if r.routerFile != "" && r.routerPanelActive && r.routerFocus != "" {
+				r.showRouterStats = true
+			}
+			return r, nil
+		case "p":
+			// Models panel: toggle the ini-only filter (hide cache
+			// leftovers). Silent no-op in the log panel.
+			if r.routerFile != "" && r.routerPanelActive {
+				r.routerIniOnly = !r.routerIniOnly
+				if r.selectedIdx() < 0 {
+					r.routerFocus = ""
+				}
+				if r.routerIniOnly {
+					return r, r.setFlash("presets only — cache models hidden")
+				}
+				return r, r.setFlash("all models shown")
+			}
+			return r, nil
+		case "d":
+			// Log panel (router mode): toggle the proxy-log denoise
+			// filter. The flag is generic so future log filters can
+			// apply in single-model mode too.
+			if r.routerFile != "" && !r.routerPanelActive {
+				r.denoise = !r.denoise
+				if r.denoise {
+					return r, r.setFlash("denoise on — proxy chatter hidden from log")
+				}
+				return r, r.setFlash("denoise off — proxy chatter shown")
+			}
+			return r, nil
+		case "l", "u":
+			// Models panel: load / unload the selected model.
+			if r.routerFile == "" || !r.routerPanelActive {
+				return r, nil
+			}
+			if r.routerFocus == "" {
+				return r, r.setFlash("select a model first (tab, ↑/↓)")
+			}
+			if m.String() == "u" {
+				if r.selectedState() != "loaded" {
+					return r, r.setFlash("model is not loaded")
+				}
+				r.unloadPrompt = true
+				return r, nil
+			}
+			if r.selectedState() == "loaded" {
+				return r, r.setFlash("model already loaded")
+			}
+			return r, loadModelCmd(r.fetchCtx, r.fetcher, r.routerFocus)
 		case "/":
+			// Log panel: search. No-op in the models panel.
+			if r.routerPanelActive {
+				return r, nil
+			}
 			r.searchActive = true
 			r.searchInput.SetValue("")
 			r.refreshContent()
 			return r, r.searchInput.Focus()
 		case "n":
-			r.jumpSearch(+1)
-			return r, nil
+			if r.routerPanelActive {
+				return r, nil
+			}
+			return r, r.jumpSearch(+1)
 		case "N":
-			r.jumpSearch(-1)
-			return r, nil
+			if r.routerPanelActive {
+				return r, nil
+			}
+			return r, r.jumpSearch(-1)
 		case "g":
+			if r.routerPanelActive {
+				return r, nil
+			}
 			r.viewport.GotoTop()
 			return r, nil
 		case "G":
+			if r.routerPanelActive {
+				return r, nil
+			}
 			r.viewport.GotoBottom()
 			return r, nil
 		case " ", "space":
+			if r.routerPanelActive {
+				return r, nil
+			}
 			r.viewport.HalfPageDown()
 			return r, nil
 		case "b":
+			if r.routerPanelActive {
+				return r, nil
+			}
 			r.viewport.HalfPageUp()
 			return r, nil
 		case "c":
@@ -676,6 +938,11 @@ func (r *RunMode) applyMetrics(m *llamaapi.Metrics) {
 	r.prevMetrics = m
 }
 
+// IsRouter reports whether this run mode serves a router session
+// (my-models.ini file) rather than a single model. Used by Root when a
+// session ends to return to the matching main-menu mode.
+func (r *RunMode) IsRouter() bool { return r.routerFile != "" }
+
 // killServer performs the cleanup shared by every kill path: stop the
 // child, close the tailer, remove its log, and clear the session
 // record. Callers decide whether to return to main mode or quit
@@ -735,6 +1002,23 @@ func (r *RunMode) handleKillPrompt(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 	return r, nil
 }
 
+// handleUnloadPrompt reads the confirm/cancel keys for the router
+// `u` (unload focused model) action.
+func (r *RunMode) handleUnloadPrompt(m tea.KeyMsg) (*RunMode, tea.Cmd) {
+	switch m.String() {
+	case "y", "enter", "u":
+		r.unloadPrompt = false
+		if r.routerFocus == "" {
+			return r, nil
+		}
+		return r, unloadModelCmd(r.fetchCtx, r.fetcher, r.routerFocus)
+	case "n", "esc", "c":
+		r.unloadPrompt = false
+		return r, nil
+	}
+	return r, nil
+}
+
 // handleSearchInput routes keystrokes while the search prompt is open.
 // Esc layers: with text in the input it just cancels typing; with empty
 // input AND an applied query, it also clears the applied query so a
@@ -758,9 +1042,8 @@ func (r *RunMode) handleSearchInput(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 		r.searchActive = false
 		r.searchInput.Blur()
 		r.recomputeMatches()
-		r.jumpSearch(0)
 		r.refreshContent()
-		return r, nil
+		return r, r.jumpSearch(0)
 	}
 	var cmd tea.Cmd
 	r.searchInput, cmd = r.searchInput.Update(m)
@@ -837,7 +1120,7 @@ func (r *RunMode) effectiveQuery() string {
 // outer span. llama-server stderr is overwhelmingly plain in practice
 // so we accept this rather than tokenizing the buffer.
 func (r *RunMode) renderViewportContent() string {
-	return highlightOccurrences(r.buf.String(), r.effectiveQuery())
+	return highlightOccurrences(strings.Join(r.visibleLogLines(), "\n"), r.effectiveQuery())
 }
 
 // refreshContent re-renders the viewport, preserving auto-follow when
@@ -892,8 +1175,10 @@ func highlightOccurrences(raw, q string) string {
 	}
 }
 
-// recomputeMatches finds line indices in buf containing the search query
-// (case-insensitive). Used by jumpSearch to navigate.
+// recomputeMatches finds line indices in the VISIBLE log (denoised
+// lines excluded) containing the search query (case-insensitive). Used
+// by jumpSearch to navigate; the indices are positions in the rendered
+// viewport content, so search and view stay in agreement.
 func (r *RunMode) recomputeMatches() {
 	r.searchMatches = nil
 	r.searchIdx = 0
@@ -901,8 +1186,7 @@ func (r *RunMode) recomputeMatches() {
 		return
 	}
 	q := strings.ToLower(r.searchQuery)
-	lines := strings.Split(r.buf.String(), "\n")
-	for i, ln := range lines {
+	for i, ln := range r.visibleLogLines() {
 		if strings.Contains(strings.ToLower(ln), q) {
 			r.searchMatches = append(r.searchMatches, i)
 		}
@@ -911,11 +1195,11 @@ func (r *RunMode) recomputeMatches() {
 
 // jumpSearch advances the cursor in searchMatches by delta and scrolls
 // the viewport to the resulting line. delta=0 means "jump to current
-// match" (used right after recomputeMatches).
-func (r *RunMode) jumpSearch(delta int) {
+// match" (used right after recomputeMatches). Returns a cmd to
+// auto-dismiss the position flash.
+func (r *RunMode) jumpSearch(delta int) tea.Cmd {
 	if len(r.searchMatches) == 0 {
-		r.flash = fmt.Sprintf("no matches for %q", r.searchQuery)
-		return
+		return r.setFlash(fmt.Sprintf("no matches for %q", r.searchQuery))
 	}
 	r.searchIdx = (r.searchIdx + delta) % len(r.searchMatches)
 	if r.searchIdx < 0 {
@@ -923,7 +1207,7 @@ func (r *RunMode) jumpSearch(delta int) {
 	}
 	target := r.searchMatches[r.searchIdx]
 	r.viewport.SetYOffset(target)
-	r.flash = fmt.Sprintf("match %d/%d", r.searchIdx+1, len(r.searchMatches))
+	return r.setFlash(fmt.Sprintf("match %d/%d", r.searchIdx+1, len(r.searchMatches)))
 }
 
 // handleQuitPrompt runs the (k)ill / (d)etach / (c)ancel decision tree
@@ -968,13 +1252,7 @@ func (r *RunMode) View() string {
 	// manifests as the live band "duplicating, moving upward" with
 	// every log line.
 	logContent := truncateLines(r.viewport.View(), r.viewport.Width)
-	logFrame := lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(r.theme.Border).
-		Padding(0, 1).
-		Width(r.width - 2).
-		Render(logContent)
-	bg := lipgloss.JoinVertical(lipgloss.Left, header, logFrame, footer)
+	bg := lipgloss.JoinVertical(lipgloss.Left, header, r.renderLogFrame(logContent), footer)
 	var out string
 	switch {
 	case r.showQuit:
@@ -983,6 +1261,10 @@ func (r *RunMode) View() string {
 		out = overlayCenter(bg, r.renderRestartPrompt(), r.width, r.height)
 	case r.killPrompt:
 		out = overlayCenter(bg, r.renderKillPrompt(), r.width, r.height)
+	case r.unloadPrompt:
+		out = overlayCenter(bg, r.renderUnloadPrompt(), r.width, r.height)
+	case r.routerMenu:
+		out = overlayCenter(bg, r.renderRouterMenu(), r.width, r.height)
 	case r.showHelp:
 		out = overlayCenter(bg, r.renderHelp(), r.width, r.height)
 	case r.showInfo:
@@ -1114,6 +1396,21 @@ func (r *RunMode) renderKillPrompt() string {
 	return r.promptBox().Render(body)
 }
 
+// renderUnloadPrompt asks to unload the focused router model (frees
+// its VRAM; autoload will reload it on the next request).
+func (r *RunMode) renderUnloadPrompt() string {
+	id := r.routerFocus
+	if id == "" {
+		id = "?"
+	}
+	title := fmt.Sprintf("Unload %s?", truncateRune(id, routerPanelIDMax))
+	body := title + "\n\n  " + r.promptShortcuts(
+		"y yes",
+		"n no",
+	)
+	return r.promptBox().Render(body)
+}
+
 // renderInfoOverlay renders the `i`-toggled overlay: model identity
 // (alias + Source/HF) followed by the preset name + every preset
 // param in source order. The full param list — which the header
@@ -1124,7 +1421,58 @@ func (r *RunMode) renderInfoOverlay() string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	accent := lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true)
 
-	lines := []string{accent.Render("Model & preset")}
+	var lines []string
+	if r.routerFile != "" {
+		// Router mode: the selection is the model in question.
+		id := r.routerFocus
+		if id == "" {
+			id = "(no selection)"
+		}
+		state := r.selectedState()
+		if state == "" {
+			state = "?"
+		}
+		lines = []string{accent.Render("Router model")}
+		lines = append(lines, "")
+		lines = append(lines, subtle.Render("Model  : ")+id)
+		lines = append(lines, subtle.Render("State  : ")+state)
+		src := "ini / models-dir"
+		if r.selectedIsCache() {
+			src = "download cache"
+		}
+		lines = append(lines, subtle.Render("Source : ")+src)
+		if st, ok := r.routerStats[id]; ok && st != nil {
+			lines = append(lines, subtle.Render("Context: ")+humanTokens(st.contextUsed)+"/"+humanTokens(st.contextMax))
+		}
+		if args := r.selectedArgs(); len(args) > 1 {
+			lines = append(lines, "")
+			lines = append(lines, accent.Render("Launch params"))
+			// Fill the viewport: cap the params only when the popup
+			// would grow taller than the screen.
+			budget := r.height - 8 // box chrome + margin
+			budget -= len(lines)   // fixed rows above (incl. the header)
+			budget -= 2            // trailing blank + "(any key to close)"
+			if budget < 1 {
+				budget = 1
+			}
+			maxLine := r.width - 12
+			if maxLine < 40 {
+				maxLine = 40
+			}
+			for _, l := range formatArgvLines(args, budget, maxLine) {
+				lines = append(lines, "  "+l)
+			}
+		}
+		lines = append(lines, "")
+		lines = append(lines, subtle.Render("(any key to close)"))
+		box := lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(r.theme.Accent).
+			Padding(1, 3)
+		return box.Render(strings.Join(lines, "\n"))
+	}
+
+	lines = []string{accent.Render("Model & preset")}
 	lines = append(lines, "")
 	lines = append(lines, subtle.Render("Alias  : ")+r.model.Alias)
 	switch {
@@ -1168,12 +1516,24 @@ func (r *RunMode) renderHelp() string {
 		{"r", "restart server (confirms)"},
 		{"c", "copy launch command to clipboard"},
 		{"i", "show model & preset details"},
+		{"tab", "router mode: switch panel ↑/↓ target (log ↔ models)"},
+		{"", ""},
+		{"— log panel —", ""},
+		{"↑ / ↓", "scroll"},
 		{"/", "search (live highlights; Enter applies, Esc cancels)"},
 		{"n / N", "next / previous match"},
-		{"Esc", "clear active search and highlights"},
 		{"g / G", "jump to top / bottom"},
 		{"space / b", "page down / up"},
-		{"↑ / ↓", "scroll one line"},
+		{"d", "router mode: toggle proxy-log denoise (default on)"},
+		{"", ""},
+		{"— models panel —", "router mode only"},
+		{"↑ / ↓", "move selection"},
+		{"Enter", "action menu (Load/Unload/Stats/Info)"},
+		{"s", "show selected model's stats (Esc back)"},
+		{"l / u", "load / unload the selected model (u confirms)"},
+		{"p", "toggle ini-only filter (hide cache leftovers)"},
+		{"", ""},
+		{"Esc", "layered: close menu → close stats → clear search"},
 		{"?", "toggle this help"},
 	}
 	keyW := 0
@@ -1202,8 +1562,29 @@ func (r *RunMode) renderFooter() string {
 	sep := subtle.Render(" · ")
 	tokens := []string{
 		"q quit", "k kill", "r restart", "c copy", "i info",
-		"/ search", "? help", "g/G top/bottom", "space/b page", "↑/↓ scroll",
 	}
+	if r.routerFile != "" {
+		// The tab hint names the panel you'd switch TO.
+		if r.routerPanelActive {
+			tokens = append(tokens, "tab log")
+		} else {
+			tokens = append(tokens, "tab models")
+		}
+	}
+	if r.routerPanelActive {
+		// Models panel focused: models-panel keys.
+		tokens = append(tokens, "↑/↓ select", "⏎ menu", "s stats", "l/u load/unload")
+		if r.routerFile != "" {
+			tokens = append(tokens, "p ini-only")
+		}
+	} else {
+		// Log panel focused: log keys.
+		tokens = append(tokens, "/ search", "g/G top/bottom", "space/b page", "↑/↓ scroll")
+		if r.routerFile != "" {
+			tokens = append(tokens, "d denoise")
+		}
+	}
+	tokens = append(tokens, "? help")
 	parts := make([]string, len(tokens))
 	for i, t := range tokens {
 		parts[i] = paneShortcut(t, r.theme, true)
@@ -1316,13 +1697,25 @@ func (r *RunMode) renderTopStrip() string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	accent := lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true)
 
-	cells := []string{
-		subtle.Render("Alias:") + " " + accent.Render(r.model.Alias),
-		subtle.Render("Server:") + " " + serverVersionOrNA(r.serverVersion),
-		subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params) + "  " + subtle.Render(fmt.Sprintf("(%d reqs)", int(r.decodeTotal))),
-		subtle.Render("Preset:") + " " + accent.Render(presetNameOrDash(r.preset)),
-		subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
-		statusBadge(r.statusLabel(), r.statusColor()),
+	var cells []string
+	if r.routerFile != "" {
+		cells = []string{
+			subtle.Render("File:") + " " + accent.Render(filepath.Base(r.routerFile)),
+			subtle.Render("Server:") + " " + serverVersionOrNA(r.serverVersion),
+			subtle.Render("Models:") + " " + r.renderRouterModelCount(),
+			subtle.Render("Mode:") + " " + accent.Render("router"),
+			subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
+			statusBadge(r.statusLabel(), r.statusColor()),
+		}
+	} else {
+		cells = []string{
+			subtle.Render("Alias:") + " " + accent.Render(r.model.Alias),
+			subtle.Render("Server:") + " " + serverVersionOrNA(r.serverVersion),
+			subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params) + "  " + subtle.Render(fmt.Sprintf("(%d reqs)", int(r.decodeTotal))),
+			subtle.Render("Preset:") + " " + accent.Render(presetNameOrDash(r.preset)),
+			subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
+			statusBadge(r.statusLabel(), r.statusColor()),
+		}
 	}
 
 	// Right-pad each cell to its column's max width so the second
@@ -1404,6 +1797,477 @@ func (r *RunMode) renderLiveBand() string {
 // every row. 9 fits the longest ("Breakdown").
 const metricLabelWidth = 9
 
+// statsView is the read-only projection of live llama-server statistics
+// the server panel renders. Single-model mode fills it from RunMode's
+// scalar fields; router mode fills it from a model's modelStats. The
+// renderers only read through this struct so both modes share one panel
+// implementation.
+type statsView struct {
+	metricsAvailable    bool
+	tokensHistory       *ringBuffer
+	currentTokensPerSec float64
+	avgTokensPerSec     float64
+	tokensSeen          bool
+	promptHistory       *ringBuffer
+	currentPromptPerSec float64
+	avgPromptPerSec     float64
+	promptSeen          bool
+	busyCount           int
+	totalSlots          int
+	queuedCount         int
+	decodeTotal         float64
+	contextUsed         int
+	contextMax          int
+	contextCacheHit     int
+	contextPromptToks   int
+	contextGenToks      int
+	genDecoded          int
+	genRemain           int
+	promptToksTotal     int
+	promptToksProcessed int
+	ttft                time.Duration
+}
+
+// modelStats is one router model's accumulated live statistics: the
+// renderable statsView plus the deltas/TTFT bookkeeping that update it.
+type modelStats struct {
+	statsView
+	prevMetrics        *llamaapi.Metrics
+	ttftStart          time.Time
+	ttftPrevPromptToks int
+}
+
+// statsFor returns (creating if needed) the modelStats for a router
+// model id.
+func (r *RunMode) statsFor(model string) *modelStats {
+	if r.routerStats == nil {
+		r.routerStats = make(map[string]*modelStats)
+	}
+	st, ok := r.routerStats[model]
+	if !ok {
+		st = &modelStats{statsView: statsView{
+			tokensHistory: newRingBuffer(sparkBufferSamples),
+			promptHistory: newRingBuffer(sparkBufferSamples),
+		}}
+		r.routerStats[model] = st
+	}
+	return st
+}
+
+// applyRouterSlots folds one /slots?model=<id> snapshot into the
+// model's stats — bars, busy/queued counts, and TTFT tracking. Mirrors
+// the single-model slotsFetchedMsg handler.
+func (r *RunMode) applyRouterSlots(model string, s *llamaapi.Slots) {
+	st := r.statsFor(model)
+	st.busyCount = s.BusyCount
+	st.totalSlots = s.Total
+	st.contextUsed = s.ContextUsed
+	st.contextMax = s.ContextMax
+	st.contextCacheHit = s.ContextCacheHits
+	st.contextPromptToks = s.ContextPromptTokens
+	st.contextGenToks = s.ContextGenTokens
+	st.genDecoded = s.GenDecoded
+	st.genRemain = s.GenRemain
+	st.promptToksTotal = s.PromptTokensTotal
+	st.promptToksProcessed = s.PromptTokensProcessed
+	// TTFT tracking: detect new request when n_prompt_tokens goes from
+	// 0 → N (or changes). Measure until the first token appears.
+	newRequest := s.PromptTokensTotal > 0 && s.PromptTokensTotal != st.ttftPrevPromptToks
+	if newRequest && st.ttftStart.IsZero() {
+		if s.GenDecoded > 0 {
+			st.ttft = -1 // sentinel for <1s (missed the prompt phase)
+		} else {
+			st.ttftStart = time.Now()
+		}
+	}
+	if s.GenDecoded > 0 && !st.ttftStart.IsZero() && st.ttft == 0 {
+		st.ttft = time.Since(st.ttftStart)
+	}
+	if s.PromptTokensTotal == 0 && s.GenDecoded == 0 {
+		st.ttftStart = time.Time{}
+		st.ttft = 0
+		st.ttftPrevPromptToks = 0
+	} else {
+		st.ttftPrevPromptToks = s.PromptTokensTotal
+	}
+}
+
+// applyRouterMetrics folds one /metrics?model=<id> snapshot into the
+// model's stats — lifetime averages plus current-rate deltas and
+// sparkline history. Mirrors the single-model applyMetrics.
+func (r *RunMode) applyRouterMetrics(model string, m *llamaapi.Metrics) {
+	st := r.statsFor(model)
+	st.avgTokensPerSec = m.PredictedTokensSecondsAvg
+	st.avgPromptPerSec = m.PromptTokensSecondsAvg
+	st.queuedCount = int(m.RequestsDeferred)
+	st.decodeTotal = m.NDecodeTotal
+
+	if st.prevMetrics == nil {
+		st.prevMetrics = m
+		return
+	}
+	prev := st.prevMetrics
+	dTokens := m.TokensPredictedTotal - prev.TokensPredictedTotal
+	dTokenSecs := m.TokensPredictedSecondsTotal - prev.TokensPredictedSecondsTotal
+	tickTokensRate := 0.0
+	if dTokens > 0 {
+		if dTokenSecs > 0 {
+			tickTokensRate = dTokens / dTokenSecs
+		} else {
+			tickTokensRate = dTokens / livePollInterval.Seconds()
+		}
+		st.currentTokensPerSec = tickTokensRate
+		st.tokensSeen = true
+	}
+	st.tokensHistory.Append(tickTokensRate)
+
+	dPrompt := m.PromptTokensTotal - prev.PromptTokensTotal
+	dPromptSecs := m.PromptSecondsTotal - prev.PromptSecondsTotal
+	tickPromptRate := 0.0
+	if dPrompt > 0 {
+		if dPromptSecs > 0 {
+			tickPromptRate = dPrompt / dPromptSecs
+		} else {
+			tickPromptRate = dPrompt / livePollInterval.Seconds()
+		}
+		st.currentPromptPerSec = tickPromptRate
+		st.promptSeen = true
+	}
+	st.promptHistory.Append(tickPromptRate)
+	st.prevMetrics = m
+}
+
+// selectedIdx returns the index of the selected model in the VISIBLE
+// list (ini-only filter applied), or -1 when it is not present.
+func (r *RunMode) selectedIdx() int {
+	for i, m := range r.visibleRouterModels() {
+		if m.ID == r.routerFocus {
+			return i
+		}
+	}
+	return -1
+}
+
+// selectedState returns the selected model's load state ("" when no
+// valid selection).
+func (r *RunMode) selectedState() string {
+	for _, m := range r.visibleRouterModels() {
+		if m.ID == r.routerFocus {
+			return r.routerModelState(m.ID, m.Status.Value)
+		}
+	}
+	return ""
+}
+
+// selectedArgs returns the selected model's launch argv (the child
+// llama-server command reported by the router), or nil.
+func (r *RunMode) selectedArgs() []string {
+	for _, m := range r.visibleRouterModels() {
+		if m.ID == r.routerFocus {
+			return m.Status.Args
+		}
+	}
+	return nil
+}
+
+// selectedIsCache reports whether the selected model is a cache-only
+// leftover (InCache) rather than an ini/models-dir entry.
+func (r *RunMode) selectedIsCache() bool {
+	for _, m := range r.visibleRouterModels() {
+		if m.ID == r.routerFocus {
+			return m.IsCache()
+		}
+	}
+	return false
+}
+
+// visibleRouterModels returns the models panel's list: all router
+// models, minus cache-only leftovers when the ini-only filter is on.
+func (r *RunMode) visibleRouterModels() []llamaapi.ModelInfo {
+	if !r.routerIniOnly {
+		return r.routerModels
+	}
+	kept := make([]llamaapi.ModelInfo, 0, len(r.routerModels))
+	for _, m := range r.routerModels {
+		if !m.IsCache() {
+			kept = append(kept, m)
+		}
+	}
+	return kept
+}
+
+// flashTTL is how long an informational flash stays in the footer
+// before it auto-dismisses.
+const flashTTL = 3 * time.Second
+
+// flashExpiredMsg clears the footer flash when its TTL elapses. gen
+// guards against an older tick clearing a newer flash.
+type flashExpiredMsg struct{ gen int }
+
+// setFlash shows msg in the footer and schedules its auto-dismissal
+// (3s). A newer flash supersedes an older one.
+func (r *RunMode) setFlash(msg string) tea.Cmd {
+	r.flash = msg
+	gen := r.flashGen + 1
+	r.flashGen = gen
+	return tea.Tick(flashTTL, func(time.Time) tea.Msg {
+		return flashExpiredMsg{gen: gen}
+	})
+}
+
+// isProxyNoise reports whether a log line is llama.cpp router chatter
+// of the form "proxying request to model <id> on port <n>" — emitted
+// once per proxied request, including llamaman's own stats polls.
+func isProxyNoise(line string) bool {
+	return strings.Contains(line, "proxying request to model")
+}
+
+// filterProxyLines removes router proxy-chatter lines from a log chunk.
+// Kept for ingest-side use; the run-mode view filters via
+// visibleLogLines instead so toggling denoise can restore lines.
+func filterProxyLines(chunk string) string {
+	lines := strings.Split(chunk, "\n")
+	kept := lines[:0]
+	for _, l := range lines {
+		if isProxyNoise(l) {
+			continue
+		}
+		kept = append(kept, l)
+	}
+	return strings.Join(kept, "\n")
+}
+
+// visibleLogLines returns the log buffer's lines as the view should
+// show them: with denoise on in router mode, proxy-chatter lines are
+// hidden (but stay in the buffer — toggling denoise off restores them
+// at their exact positions).
+func (r *RunMode) visibleLogLines() []string {
+	lines := strings.Split(r.buf.String(), "\n")
+	if !(r.routerFile != "" && r.denoise) {
+		return lines
+	}
+	kept := lines[:0]
+	for _, l := range lines {
+		if isProxyNoise(l) {
+			continue
+		}
+		kept = append(kept, l)
+	}
+	return kept
+}
+
+// formatArgvLines renders a launch argv (binary dropped) as aligned
+// "--flag  value" pairs, capped at maxLines (an ellipsis line notes any
+// remainder). Each line is truncated to maxLineWidth so the info box
+// stays within the viewport.
+func formatArgvLines(args []string, maxLines, maxLineWidth int) []string {
+	if len(args) <= 1 {
+		return nil
+	}
+	type kv struct{ flag, val string }
+	var pairs []kv
+	for i := 1; i < len(args); i++ { // args[0] is the binary
+		flag := args[i]
+		val := ""
+		if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			val = args[i+1]
+			i++
+		}
+		pairs = append(pairs, kv{flag: flag, val: val})
+	}
+	keyWidth := 0
+	for _, p := range pairs {
+		if w := lipgloss.Width(p.flag); w > keyWidth {
+			keyWidth = w
+		}
+	}
+	lines := make([]string, 0, min(maxLines, len(pairs)))
+	for i, p := range pairs {
+		if i >= maxLines {
+			lines = append(lines, fmt.Sprintf("… and %d more", len(pairs)-maxLines))
+			break
+		}
+		line := padRight(p.flag, keyWidth)
+		if p.val != "" {
+			line += "  " + p.val
+		}
+		lines = append(lines, ansi.Truncate(line, maxLineWidth, "…"))
+	}
+	return lines
+}
+
+// moveRouterSelection moves the selection by delta (wrapping) and
+// keeps it inside the list's visible window. Stale selections (model
+// gone) restart at the first row.
+func (r *RunMode) moveRouterSelection(delta int) {
+	models := r.visibleRouterModels()
+	if len(models) == 0 {
+		return
+	}
+	idx := r.selectedIdx()
+	if idx < 0 {
+		idx = 0
+	} else {
+		idx = (idx + delta + len(models)) % len(models)
+	}
+	r.routerFocus = models[idx].ID
+	r.clampRouterList(idx)
+}
+
+// clampRouterList keeps the scroll window valid: the selection stays
+// visible, and the window stays inside the list. selIdx < 0 re-derives
+// it from the current selection.
+func (r *RunMode) clampRouterList(selIdx int) {
+	if selIdx < 0 {
+		selIdx = r.selectedIdx()
+	}
+	if selIdx < 0 {
+		r.routerListStart = 0
+		return
+	}
+	visible := liveBandContentRows
+	if selIdx < r.routerListStart {
+		r.routerListStart = selIdx
+	}
+	if selIdx >= r.routerListStart+visible {
+		r.routerListStart = selIdx - visible + 1
+	}
+	if max := len(r.visibleRouterModels()) - visible; r.routerListStart > max {
+		if max < 0 {
+			max = 0
+		}
+		r.routerListStart = max
+	}
+	if r.routerListStart < 0 {
+		r.routerListStart = 0
+	}
+}
+
+// routerMenuAction is one entry of the Enter action menu.
+type routerMenuAction int
+
+const (
+	menuLoad routerMenuAction = iota
+	menuUnload
+	menuStats
+	menuInfo
+)
+
+// menuActions lists the four menu entries in display order.
+func (r *RunMode) menuActions() []routerMenuAction {
+	return []routerMenuAction{menuLoad, menuUnload, menuStats, menuInfo}
+}
+
+// menuItemEnabled reports whether an action applies to the current
+// selection (Load needs unloaded, Unload needs loaded).
+func (r *RunMode) menuItemEnabled(a routerMenuAction) bool {
+	switch a {
+	case menuLoad:
+		return r.selectedState() != "loaded"
+	case menuUnload:
+		return r.selectedState() == "loaded"
+	default:
+		return true
+	}
+}
+
+// handleRouterMenuKey navigates the Enter action menu (↑/↓ skip
+// inapplicable entries, Enter runs, Esc dismisses).
+func (r *RunMode) handleRouterMenuKey(m tea.KeyMsg) (*RunMode, tea.Cmd) {
+	switch m.String() {
+	case "up", "down":
+		delta := -1
+		if m.String() == "down" {
+			delta = 1
+		}
+		actions := r.menuActions()
+		for i := 0; i < len(actions); i++ {
+			r.routerMenuIdx = (r.routerMenuIdx + delta + len(actions)) % len(actions)
+			if r.menuItemEnabled(actions[r.routerMenuIdx]) {
+				break
+			}
+		}
+	case "enter":
+		return r.applyRouterMenu()
+	case "esc", "c", "q":
+		r.routerMenu = false
+	}
+	return r, nil
+}
+
+// applyRouterMenu runs the highlighted menu action.
+func (r *RunMode) applyRouterMenu() (*RunMode, tea.Cmd) {
+	r.routerMenu = false
+	if r.routerFocus == "" {
+		return r, nil
+	}
+	switch r.menuActions()[r.routerMenuIdx] {
+	case menuLoad:
+		if r.selectedState() == "loaded" {
+			return r, r.setFlash("model already loaded")
+		}
+		return r, loadModelCmd(r.fetchCtx, r.fetcher, r.routerFocus)
+	case menuUnload:
+		if r.selectedState() != "loaded" {
+			return r, r.setFlash("model is not loaded")
+		}
+		r.unloadPrompt = true
+		return r, nil
+	case menuStats:
+		r.showRouterStats = true
+	case menuInfo:
+		r.showInfo = true
+	}
+	return r, nil
+}
+
+// renderServerRows builds the seven server-panel content rows
+// (Tokens / Prompt / Process / Context / Breakdown / Cache / Gen) from
+// a statsView. Shared by single-model and router focus views.
+func (r *RunMode) renderServerRows(sv *statsView) []string {
+	return []string{
+		r.renderServerRow(sv, "Tokens", sv.tokensHistory, sv.currentTokensPerSec, sv.avgTokensPerSec, sv.tokensSeen, sv.busyCount, sv.totalSlots, true),
+		r.renderServerRow(sv, "Prompt", sv.promptHistory, sv.currentPromptPerSec, sv.avgPromptPerSec, sv.promptSeen, sv.queuedCount, 0, false),
+		r.renderPromptProgressRow(sv),
+		r.renderContextRow(sv),
+		r.renderContextBreakdownRow(sv),
+		r.renderCacheRow(sv),
+		r.renderGenProgressRow(sv),
+	}
+}
+
+// panelBorderColor picks the titled-panel border: BorderFocus when the
+// panel is the active ↑/↓ target, Border otherwise.
+func (r *RunMode) panelBorderColor(focused bool) lipgloss.Color {
+	if focused {
+		return r.theme.BorderFocus
+	}
+	return r.theme.Border
+}
+
+// logBorderColor returns the log frame border: BorderFocus while the
+// log is the active ↑/↓ target in router mode (models panel inactive),
+// Border otherwise.
+func (r *RunMode) logBorderColor() lipgloss.Color {
+	if r.routerFile != "" && !r.routerPanelActive {
+		return r.theme.BorderFocus
+	}
+	return r.theme.Border
+}
+
+// renderLogFrame wraps the pre-truncated log content in the bordered
+// log box. The border lights up (BorderFocus) in router mode while the
+// models panel is inactive — the log is the focused panel then, and
+// ↑/↓ scroll it.
+func (r *RunMode) renderLogFrame(logContent string) string {
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(r.logBorderColor()).
+		Padding(0, 1).
+		Width(r.width - 2).
+		Render(logContent)
+}
+
 // renderServerPanel renders the llama-server live data box (SP3
 // shape, DESIGN.md §7.4): seven content rows.
 //
@@ -1425,24 +2289,237 @@ const metricLabelWidth = 9
 // Breakdown row shows context breakdown: prompt (purple) + gen (orange) + empty.
 // Cache row shows prompt cache hit ratio from /slots.
 // Gen row shows response progress with TTFT (time to first token).
+//
+// In router mode this panel becomes the model list, or — when the
+// selection's stats are open (Enter) — that model's full seven-row
+// stats panel.
 func (r *RunMode) renderServerPanel(width int) string {
-	rows := []string{
-		r.renderServerRow("Tokens", r.tokensHistory, r.currentTokensPerSec, r.avgTokensPerSec, r.tokensSeen, r.busyCount, r.totalSlots, true),
-		r.renderServerRow("Prompt", r.promptHistory, r.currentPromptPerSec, r.avgPromptPerSec, r.promptSeen, r.queuedCount, 0, false),
-		r.renderPromptProgressRow(),
-		r.renderContextRow(),
-		r.renderContextBreakdownRow(),
-		r.renderCacheRow(),
-		r.renderGenProgressRow(),
+	if r.routerFile != "" {
+		if r.showRouterStats && r.routerFocus != "" {
+			return r.renderRouterStatsPanel(width)
+		}
+		return r.renderRouterPanel(width)
 	}
-	return r.renderTitledPanel("llama-server", width, padRows(rows, liveBandContentRows))
+	return r.renderTitledPanel("llama-server", width, padRows(r.renderServerRows(r.singleModelStatsView()), liveBandContentRows), false)
+}
+
+// singleModelStatsView projects RunMode's single-model scalar fields
+// into a statsView for the shared panel renderers.
+func (r *RunMode) singleModelStatsView() *statsView {
+	return &statsView{
+		metricsAvailable:    r.metricsAvailable,
+		tokensHistory:       r.tokensHistory,
+		currentTokensPerSec: r.currentTokensPerSec,
+		avgTokensPerSec:     r.avgTokensPerSec,
+		tokensSeen:          r.tokensSeen,
+		promptHistory:       r.promptHistory,
+		currentPromptPerSec: r.currentPromptPerSec,
+		avgPromptPerSec:     r.avgPromptPerSec,
+		promptSeen:          r.promptSeen,
+		busyCount:           r.busyCount,
+		totalSlots:          r.totalSlots,
+		queuedCount:         r.queuedCount,
+		decodeTotal:         r.decodeTotal,
+		contextUsed:         r.contextUsed,
+		contextMax:          r.contextMax,
+		contextCacheHit:     r.contextCacheHit,
+		contextPromptToks:   r.contextPromptToks,
+		contextGenToks:      r.contextGenToks,
+		genDecoded:          r.genDecoded,
+		genRemain:           r.genRemain,
+		promptToksTotal:     r.promptToksTotal,
+		promptToksProcessed: r.promptToksProcessed,
+		ttft:                r.ttft,
+	}
+}
+
+// renderRouterStatsPanel shows the focused router model's full
+// seven-row stats panel — full parity with the single-model view.
+func (r *RunMode) renderRouterStatsPanel(width int) string {
+	sv := &statsView{
+		metricsAvailable: r.routerMetricsAvailable,
+		tokensHistory:    newRingBuffer(sparkBufferSamples),
+		promptHistory:    newRingBuffer(sparkBufferSamples),
+	}
+	if st, ok := r.routerStats[r.routerFocus]; ok && st != nil {
+		sv = &st.statsView
+		sv.metricsAvailable = r.routerMetricsAvailable
+	}
+	title := "router stats"
+	if r.routerFocus != "" {
+		// renderTitledPanel truncates the title to the panel border,
+		// so pass the full id — no premature trimming.
+		title = "router · " + r.routerFocus
+	}
+	return r.renderTitledPanel(title, width, padRows(r.renderServerRows(sv), liveBandContentRows), r.routerPanelActive)
+}
+
+// renderRouterModelCount renders the "N total (M loaded)" header cell
+// for router runs: model count from GET /models, loaded count from
+// GET /health. "—" until the first successful fetch.
+func (r *RunMode) renderRouterModelCount() string {
+	if r.routerModels == nil && r.routerLoaded == nil {
+		return "—"
+	}
+	loaded := 0
+	for _, m := range r.routerModels {
+		if r.routerModelState(m.ID, m.Status.Value) == "loaded" {
+			loaded++
+		}
+	}
+	return fmt.Sprintf("%d total (%d loaded)", len(r.routerModels), loaded)
+}
+
+// routerModelState resolves one model's load state. Current llama.cpp
+// routers report it per model in GET /models ("status.value": loaded /
+// loading / unloaded); earlier builds listed loaded ids in GET /health
+// instead. Prefer the per-model field, fall back to /health.
+func (r *RunMode) routerModelState(id, status string) string {
+	if status != "" {
+		return status
+	}
+	for _, loadedID := range r.routerLoaded {
+		if loadedID == id {
+			return "loaded"
+		}
+	}
+	return "unloaded"
+}
+
+// renderRouterPanel replaces the llama-server live-data panel in router
+// runs: one row per model from GET /models, tagged loaded/loading/
+// unloaded.
+func (r *RunMode) renderRouterPanel(width int) string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	loadedStyle := lipgloss.NewStyle().Foreground(r.theme.StatusReady)
+	unloadedStyle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	loadingStyle := lipgloss.NewStyle().Foreground(r.theme.Accent)
+
+	selStyle := lipgloss.NewStyle().Foreground(r.theme.Accent)
+	models := r.visibleRouterModels()
+	var rows []string
+	if len(models) == 0 {
+		if len(r.routerModels) == 0 {
+			rows = append(rows, subtle.Render("(no models reported)"))
+		} else {
+			rows = append(rows, subtle.Render("(all models are cache-only — p to show)"))
+		}
+	} else {
+		// Scroll window: render only the rows around the selection so a
+		// long list stays navigable and the selection is always visible.
+		r.clampRouterList(-1)
+		visible := liveBandContentRows
+		start := r.routerListStart
+		end := start + visible
+		if end > len(models) {
+			end = len(models)
+		}
+		for _, m := range models[start:end] {
+			state := r.routerModelState(m.ID, m.Status.Value)
+			mark, style := "○", unloadedStyle
+			switch state {
+			case "loaded":
+				mark, style = "●", loadedStyle
+			case "loading":
+				mark, style = "◐", loadingStyle
+			}
+			// Selection indicator: a leading ▸ on the selected row.
+			sel := "  "
+			if m.ID == r.routerFocus {
+				sel = selStyle.Render("▸ ") + ""
+			}
+			id := truncateRune(m.ID, routerPanelIDMax)
+			if id == "" {
+				id = "?"
+			}
+			stats := ""
+			if st, ok := r.routerStats[m.ID]; ok && st != nil {
+				activity := "idle"
+				if st.busyCount > 0 {
+					activity = "processing"
+				}
+				parts := []string{humanTokens(st.contextUsed) + "/" + humanTokens(st.contextMax)}
+				if st.avgTokensPerSec > 0 {
+					parts = append(parts, fmt.Sprintf("%.1f tok/s", st.avgTokensPerSec))
+				}
+				parts = append(parts, activity)
+				stats = " · " + strings.Join(parts, " · ")
+			}
+			rows = append(rows, sel+style.Render(mark+" "+id)+subtle.Render(stats)+"  "+subtle.Render(state))
+			if m.IsCache() {
+				rows[len(rows)-1] += subtle.Render(" (cache)")
+			}
+		}
+	}
+	return r.renderTitledPanel("router models", width, padRows(rows, liveBandContentRows), r.routerPanelActive)
+}
+
+// renderRouterMenu renders the Enter action menu for the selection:
+// Load / Unload / Statistics / Info, inapplicable entries grayed.
+func (r *RunMode) renderRouterMenu() string {
+	title := truncateRune(r.routerFocus, routerPanelIDMax)
+	if title == "" {
+		title = "?"
+	}
+	accent := lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true)
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	muted := lipgloss.NewStyle().Foreground(r.theme.Muted)
+
+	items := []struct {
+		name    string
+		enabled bool
+	}{
+		{"Load", r.menuItemEnabled(menuLoad)},
+		{"Unload", r.menuItemEnabled(menuUnload)},
+		{"Statistics", true},
+		{"Info", true},
+	}
+	lines := make([]string, 0, len(items))
+	for i, it := range items {
+		mark := "  "
+		if i == r.routerMenuIdx {
+			mark = accent.Render("▸ ")
+		}
+		style := subtle
+		if !it.enabled {
+			style = muted
+		}
+		lines = append(lines, mark+style.Render(it.name))
+	}
+	body := title + "\n\n" + strings.Join(lines, "\n") + "\n\n  " +
+		r.promptShortcuts("↑/↓ move", "⏎ select", "esc cancel")
+	return r.promptBox().Render(body)
+}
+
+// routerPanelIDMax truncates long model ids in the router panel so the
+// per-model stats suffix (ctx, tok/s, activity) stays visible on a
+// half-width panel.
+const routerPanelIDMax = 34
+
+// truncateRune shortens s to at most max runes, appending "…".
+func truncateRune(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
+}
+
+// humanTokens renders a token count compactly: 950 → "950", 4222 →
+// "4.2K", 65536 → "65.5K", 150000 → "150K".
+func humanTokens(n int) string {
+	if n < 1000 {
+		return strconv.Itoa(n)
+	}
+	s := strings.TrimSuffix(fmt.Sprintf("%.1f", float64(n)/1000), ".0")
+	return s + "K"
 }
 
 // renderServerRow builds one row of the server panel: label + spark
 // + rate cell ("current / avg /s") + secondary scalar (Busy or
 // Queued). When the rate has never been seen, the cell renders as
 // "—" (Bug 3 persistence). When metrics are disabled, "n/a".
-func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, avgRate float64, seen bool, sec1, sec2 int, isBusyRow bool) string {
+func (r *RunMode) renderServerRow(sv *statsView, label string, hist *ringBuffer, currentRate, avgRate float64, seen bool, sec1, sec2 int, isBusyRow bool) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight(label, metricLabelWidth))
 
@@ -1457,7 +2534,7 @@ func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, a
 	const rateSlot = "%6.1f"
 	var rateCell string
 	switch {
-	case !r.metricsAvailable:
+	case !sv.metricsAvailable:
 		rateCell = "             n/a"
 	case !seen:
 		rateCell = fmt.Sprintf("     — tps / "+rateSlot+" avg", avgRate)
@@ -1475,7 +2552,7 @@ func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, a
 		}
 	} else {
 		// Queued: "Queued <n>", or n/a when /metrics disabled.
-		if r.metricsAvailable {
+		if sv.metricsAvailable {
 			secondary = subtle.Render("Queued ") + strconv.Itoa(sec1)
 		} else {
 			secondary = subtle.Render("Queued ") + "n/a"
@@ -1490,22 +2567,22 @@ func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, a
 //	Context  <bar>    15K/80K (19%)
 //
 // When no data is available (slots not fetched), shows "n/a".
-func (r *RunMode) renderContextRow() string {
+func (r *RunMode) renderContextRow(sv *statsView) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight("Context", metricLabelWidth))
 
-	if r.contextMax == 0 {
+	if sv.contextMax == 0 {
 		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
 	}
 
-	ctxPct := float64(r.contextUsed) / float64(r.contextMax) * 100
+	ctxPct := float64(sv.contextUsed) / float64(sv.contextMax) * 100
 	if ctxPct > 100 {
 		ctxPct = 100
 	}
 	ctxBar := renderBar(r.theme, ctxPct, zoneFor(MetricUtil, ctxPct))
 
-	ctxUsedStr := formatTokenCount(r.contextUsed)
-	ctxMaxStr := formatTokenCount(r.contextMax)
+	ctxUsedStr := formatTokenCount(sv.contextUsed)
+	ctxMaxStr := formatTokenCount(sv.contextMax)
 	ctxRateCell := fmt.Sprintf("%s/%s (%d%%)", ctxUsedStr, ctxMaxStr, int(ctxPct))
 
 	return labelCell + " " + ctxBar + " " + ctxRateCell
@@ -1517,15 +2594,15 @@ func (r *RunMode) renderContextRow() string {
 //	Cache  <bar>    80%
 //
 // When no data is available, shows "n/a".
-func (r *RunMode) renderCacheRow() string {
+func (r *RunMode) renderCacheRow(sv *statsView) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight("Cache", metricLabelWidth))
 
-	if r.contextUsed == 0 {
+	if sv.contextUsed == 0 {
 		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
 	}
 
-	cachePct := float64(r.contextCacheHit) / float64(r.contextUsed) * 100
+	cachePct := float64(sv.contextCacheHit) / float64(sv.contextUsed) * 100
 	if cachePct > 100 {
 		cachePct = 100
 	}
@@ -1557,32 +2634,32 @@ func formatTokenCount(n int) string {
 //
 // When no generation is in progress, shows the last known values
 // or "n/a" if no data.
-func (r *RunMode) renderGenProgressRow() string {
+func (r *RunMode) renderGenProgressRow(sv *statsView) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight("Gen", metricLabelWidth))
 
-	totalAllocated := r.genDecoded + r.genRemain
+	totalAllocated := sv.genDecoded + sv.genRemain
 	if totalAllocated == 0 {
 		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
 	}
 
-	genPct := float64(r.genDecoded) / float64(totalAllocated) * 100
+	genPct := float64(sv.genDecoded) / float64(totalAllocated) * 100
 	if genPct > 100 {
 		genPct = 100
 	}
 	genBar := renderBar(r.theme, genPct, zoneFor(MetricUtil, genPct))
 
-	genDecodedStr := formatTokenCount(r.genDecoded)
+	genDecodedStr := formatTokenCount(sv.genDecoded)
 	genTotalStr := formatTokenCount(totalAllocated)
 	genRateCell := fmt.Sprintf("%s/%s (%d%%)", genDecodedStr, genTotalStr, int(genPct))
 
 	// TTFT display
 	var ttftCell string
-	if r.ttft < 0 {
+	if sv.ttft < 0 {
 		// Missed the prompt phase — generation already started.
 		ttftCell = subtle.Render("TTFT ") + "<1s"
-	} else if r.ttft > 0 {
-		ttftCell = subtle.Render("TTFT ") + formatDuration(r.ttft)
+	} else if sv.ttft > 0 {
+		ttftCell = subtle.Render("TTFT ") + formatDuration(sv.ttft)
 	} else {
 		ttftCell = subtle.Render("TTFT ") + "—"
 	}
@@ -1604,22 +2681,22 @@ func formatDuration(d time.Duration) string {
 //	Process  <bar>    45% (2.8K/6.2K)
 //
 // When no prompt is being processed, shows "n/a".
-func (r *RunMode) renderPromptProgressRow() string {
+func (r *RunMode) renderPromptProgressRow(sv *statsView) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight("Process", metricLabelWidth))
 
-	if r.promptToksTotal == 0 {
+	if sv.promptToksTotal == 0 {
 		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
 	}
 
-	pct := float64(r.promptToksProcessed) / float64(r.promptToksTotal) * 100
+	pct := float64(sv.promptToksProcessed) / float64(sv.promptToksTotal) * 100
 	if pct > 100 {
 		pct = 100
 	}
 	bar := renderBar(r.theme, pct, zoneFor(MetricUtil, pct))
 
-	processedStr := formatTokenCount(r.promptToksProcessed)
-	totalStr := formatTokenCount(r.promptToksTotal)
+	processedStr := formatTokenCount(sv.promptToksProcessed)
+	totalStr := formatTokenCount(sv.promptToksTotal)
 	rateCell := fmt.Sprintf("%s/%s (%d%%)", processedStr, totalStr, int(pct))
 
 	return labelCell + " " + bar + " " + rateCell
@@ -1631,22 +2708,22 @@ func (r *RunMode) renderPromptProgressRow() string {
 //	Breakdown  <bar>  4.2K prompt 279 gen 77K free
 //
 // When no data is available, shows "n/a".
-func (r *RunMode) renderContextBreakdownRow() string {
+func (r *RunMode) renderContextBreakdownRow(sv *statsView) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight("Breakdown", metricLabelWidth))
 
-	if r.contextMax == 0 {
+	if sv.contextMax == 0 {
 		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
 	}
 
 	// Build a segmented bar: prompt (purple), gen (orange), empty (dim).
-	bar := r.renderSegmentedBar(r.contextPromptToks, r.contextGenToks, r.contextMax)
+	bar := r.renderSegmentedBar(sv.contextPromptToks, sv.contextGenToks, sv.contextMax)
 
 	purpleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9B59B6"))
 	orangeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF8C00"))
-	promptStr := purpleStyle.Render(formatTokenCount(r.contextPromptToks))
-	genStr := orangeStyle.Render(formatTokenCount(r.contextGenToks))
-	freeToks := r.contextMax - r.contextPromptToks - r.contextGenToks
+	promptStr := purpleStyle.Render(formatTokenCount(sv.contextPromptToks))
+	genStr := orangeStyle.Render(formatTokenCount(sv.contextGenToks))
+	freeToks := sv.contextMax - sv.contextPromptToks - sv.contextGenToks
 	if freeToks < 0 {
 		freeToks = 0
 	}
@@ -1729,7 +2806,7 @@ func (r *RunMode) renderHardwarePanel(width int) string {
 			rows = append(rows, r.hardwareDeviceRows(d)...)
 		}
 	}
-	return r.renderTitledPanel("Hardware", width, padRows(rows, liveBandContentRows))
+	return r.renderTitledPanel("Hardware", width, padRows(rows, liveBandContentRows), false)
 }
 
 // hardwareRowsPerDevice is the row budget each Hardware device
@@ -1844,7 +2921,9 @@ func (r *RunMode) hardwareDeviceRows(d hwinfo.Device) []string {
 // joinMetricCells builds a metric row from its four cell parts:
 // label + viz + value + trailing-%. Cells are joined by fixed
 // separators so the column positions are deterministic across rows.
-//   "    LABEL VIZ    VALUE  PCT"
+//
+//	"    LABEL VIZ    VALUE  PCT"
+//
 // Separator spacing matches the user's "value to the right of bar,
 // to the left of %, all aligned" directive (last grilling round).
 func joinMetricCells(label, viz, value, pct string) string {
@@ -1912,8 +2991,8 @@ func deviceKey(d hwinfo.Device) string {
 // plain border so we hand-build the four sides to keep total panel
 // height at exactly 1 (top) + len(rows) + 1 (bottom) — important for
 // liveBandHeight to stay tight against its declared value.
-func (r *RunMode) renderTitledPanel(title string, width int, contentRows []string) string {
-	border := lipgloss.NewStyle().Foreground(r.theme.Border)
+func (r *RunMode) renderTitledPanel(title string, width int, contentRows []string, focused bool) string {
+	border := lipgloss.NewStyle().Foreground(r.panelBorderColor(focused))
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 
 	if width < 8 {

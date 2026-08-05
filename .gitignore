@@ -3,3 +3,4 @@
 /docs/
 *.log
 .claude/
+reasonix.toml

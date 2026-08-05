@@ -128,6 +128,8 @@ Resolved values are used for all subsequent operations and error messages.
 
 ```
 llamaman [options] [<alias> [<preset>]]
+llamaman import <file> [-c PATH]
+llamaman export [<path>] [-c PATH]
 ```
 
 ### 4.2 Flags
@@ -140,6 +142,13 @@ llamaman [options] [<alias> [<preset>]]
 | `-p` | `--presets` | With a following `<alias>`, print that model's presets to stdout. Exit 0. |
 | `-c` | `--config` | Path to alternate config file. |
 | | `--completion` | Takes `bash`, `zsh`, or `fish`; prints completion script to stdout, exit 0. |
+
+Subcommands (dispatched before the positional dispatch table; see §13):
+
+| Command | Action |
+|---|---|
+| `import <file>` | Merge a my-models.ini file into the config as models/presets (bootstrap the config if it does not exist). |
+| `export [<path>]` | Serialize the config as a my-models.ini file (stdout when no path given). |
 
 The help banner's first line: `llamaman vX.Y.Z llama-server manager` (per spec line 94).
 
@@ -683,7 +692,6 @@ Explicitly deferred:
 - `--detach` / `--no-tui` flags.
 - Auto-restart on crash.
 - Browser-open shortcut from run mode.
-- Config import / export / sharing.
 - Telemetry of any kind.
 - Themes beyond auto light/dark.
 - Search / sort options beyond filter + alphabetical.
@@ -729,3 +737,94 @@ Items that are not in the current scope but are planned for a future release. Li
 - `?` help overlay stays the canonical keybinding reference.
 
 **Non-goals**: no server-side state changes (this is purely a presentation rework), no new TUI mode (Main remains the model-selection mode), no persistent per-user UI preferences as part of this rework.
+
+---
+
+## 13. llama.cpp model presets (my-models.ini)
+
+llama.cpp (from mid-Dec 2025, PR #17859) ships a "model presets" feature:
+INI files consumed by `llama-server`'s multi-model router mode via
+`--models-preset PATH` (env `LLAMA_ARG_MODELS_PRESET`). llamaman treats
+these files as a first-class alternative to its own `config.json`:
+
+- **Import** (`llamaman import <file>`): my-models.ini → config.json
+  models/presets.
+- **Export** (`llamaman export [<path>]`): config.json → my-models.ini.
+- **Router runs** (Phase 3+ of this feature): INI files registered in
+  `globals.models-files` (or passed with `-i/--ini PATH`) become runnable
+  entries that spawn `llama-server --models-preset <file>` — one process
+  hosting every model in the file.
+
+The format, parser, and serializer live in `internal/modelsini/`. The
+grammar mirrors llama.cpp's own PEG parser in `common/preset.cpp`.
+
+### 13.1 The INI format (as llama.cpp defines it)
+
+- `[name]` sections; keys are CLI arg names without leading dashes
+  (`ctx-size`, `ngl`, `hf`); values are raw strings.
+- `[*]` is a global section applied to every model; `[default]` is the
+  fallback for unmatched model ids. Keys before any header belong to
+  `[default]`.
+- Comments: `;` or `#` — a comment starts at the first `;`/`#` character
+  in a line (whitespace-prefixed or glued to the value).
+- Bools accept `true/false`, `on/off`, `enabled/disabled`, `1/0`
+  (exact table from `common/arg.cpp`); a negated key (`no-mmap`) inverts.
+- Structural errors (malformed lines, unknown keys) abort llama.cpp's
+  parser. llamaman's parser errors on malformed structure only; unknown
+  *keys* become warnings at import time (forward compatibility with newer
+  llama-server flags).
+- No quoting/escaping exists; `common_preset::to_ini` escapes newlines as
+  backslash + newline, which is inherently lossy.
+
+### 13.2 Import mapping (INI → config.json)
+
+- Every section except `[*]` and `[default]` becomes one `Model`.
+- Alias = first comma-part of the `alias` key, else the section name.
+- `model`/`m` → `location`; `hf`/`hf-repo` → `hf`; a section setting both
+  uses `hf` (llama.cpp prefers `hf_repo`) with a warning.
+- Sections without either source key are skipped with a warning.
+- `[*]` params are merged into every preset (section params win — the
+  same cascade order llama.cpp applies).
+- A section named `<alias>:<preset>` with an explicit alias key imports
+  as preset `<preset>` (the exporter's multi-preset convention);
+  otherwise the preset is named `default`.
+- Values are typed via the flag registry: bool flags use the truthiness
+  table, numeric flags become `json.Number`, everything else is a string.
+  Invalid values for a bool/numeric flag are dropped with a warning.
+- `version` (reserved) and preset-only keys (`load-on-startup`,
+  `stop-timeout`) are dropped — the latter with a warning; they are not
+  llama-server CLI flags.
+- Collisions: an imported alias that already exists in config.json is
+  renamed with an `-ini` provenance suffix (`foo` → `foo-ini` →
+  `foo-ini-2`). Sections *within one import* that share an alias merge as
+  additional presets on one model — this is what makes export of
+  multi-preset models round-trip.
+- Descriptions are recovered from `; description: <text>` comments (the
+  exporter's convention).
+
+### 13.3 Export mapping (config.json → INI)
+
+- One section per (model, preset): `[alias]` for single-preset models,
+  `[alias:preset]` when a model has several.
+- Every section carries explicit `model`/`hf` and `alias` keys so import
+  is unambiguous regardless of the section name (which is decorative for
+  llamaman round-trips and a model id for llama.cpp's router).
+- Preset descriptions become `; description:` comments — llama.cpp
+  rejects unknown keys, so this is the only lossless channel.
+- Bools are emitted explicitly (`true`/`false`); numbers as literals;
+  strings raw. Lossy string values (whitespace, `;`/`#`, newlines) are
+  emitted with a warning.
+- Round-trip guarantee: `export` → `import` into a fresh config → `export`
+  is byte-identical (verified by tests).
+
+### 13.4 CLI surface
+
+- `llamaman import <file> [-c PATH]` — parses, maps, merges, validates,
+  saves. Bootstraps a config (autodetected binary, `127.0.0.1:9080`)
+  when none exists. Warnings go to stderr; exit 2 on parse/validation
+  errors.
+- `llamaman export [<path>] [-c PATH]` — writes the file (stdout when no
+  path), warnings to stderr.
+- Subcommands are dispatched before kong's positional dispatch and have
+  their own kong parser (kong v1 cannot mix positional args and `cmd:`
+  branches on one struct).

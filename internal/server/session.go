@@ -15,6 +15,14 @@ import (
 	"github.com/cmoro-deusto/llamaman/internal/paths"
 )
 
+// Session kinds stored in the `kind` field. KindSingle ("") is a legacy
+// single-model session; KindRouter hosts a whole my-models.ini file via
+// llama-server --models-preset.
+const (
+	KindSingle = ""
+	KindRouter = "router"
+)
+
 // Session is the on-disk record at $XDG_RUNTIME_DIR/llamaman/session.json
 // (DESIGN.md §5.2). Reattaching processes parse it to find the live child;
 // owners overwrite it on every spawn.
@@ -22,12 +30,17 @@ type Session struct {
 	PID       int       `json:"pid"`
 	Alias     string    `json:"alias"`
 	Preset    string    `json:"preset"`
+	Kind      string    `json:"kind,omitempty"`
 	Host      string    `json:"host"`
 	Port      int       `json:"port"`
 	StartedAt time.Time `json:"started_at"`
 	Command   []string  `json:"command"`
 	LogPath   string    `json:"log_path"`
 }
+
+// IsRouter reports whether this session runs llama-server in router mode
+// (one process hosting every model of a my-models.ini file).
+func (s Session) IsRouter() bool { return s.Kind == KindRouter }
 
 // SessionManager mediates access to session.json. Reads are unlocked.
 // Writes are gated by an exclusive flock on the file itself, so racing

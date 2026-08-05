@@ -14,6 +14,7 @@ import (
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
 	"github.com/cmoro-deusto/llamaman/internal/llamaapi"
+	"github.com/cmoro-deusto/llamaman/internal/modelsini"
 	"github.com/cmoro-deusto/llamaman/internal/server"
 )
 
@@ -22,6 +23,9 @@ import (
 type stubSpawner struct{ runningAlias string }
 
 func (s stubSpawner) Spawn(config.Model, config.Preset) (RunModeOpts, error) {
+	return RunModeOpts{}, errStubSpawn
+}
+func (s stubSpawner) SpawnRouter(string) (RunModeOpts, error) {
 	return RunModeOpts{}, errStubSpawn
 }
 func (s stubSpawner) Reattach() (*RunModeOpts, error) { return nil, nil }
@@ -227,6 +231,169 @@ func TestSnapshotMainModePivotsToPresetSubList(t *testing.T) {
 	}
 }
 
+// TestSnapshotMainModeRouterEmptyState verifies Router mode without any
+// registered sources renders guidance instead of a blank screen: it must
+// point at config mode's "models files" globals field and at the CLI
+// escapes (llamaman -i / import).
+// TestSnapshotMainModeRouterDefaultSource verifies Router mode with no
+// explicit globals.models-files shows the derived <config-dir>/models.ini
+// as the default source (0 models when the ini doesn't exist yet).
+func TestSnapshotMainModeRouterDefaultSource(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	cfg.Globals.ModelsFiles = nil
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	root := NewRoot(cfg, cfgPath, stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		tea.KeyMsg{Type: tea.KeyTab}, // Single → Router
+	)
+
+	want := filepath.Join(dir, modelsini.DefaultModelsIniName)
+	if !strings.Contains(out, want) {
+		t.Errorf("router view missing derived default source %q; out:\n%s", want, out)
+	}
+	if strings.Contains(out, "alpha") {
+		t.Errorf("router view should not list config models; out:\n%s", out)
+	}
+}
+
+// TestMainModeRouterEmptyStateDirect pins the empty-state guidance that
+// shows when no derived default can be computed (no config path) —
+// still reachable code, e.g. for MainMode constructed without a path.
+func TestMainModeRouterEmptyStateDirect(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	cfg.Globals.ModelsFiles = nil
+	m := NewMainMode(cfg, "v0.0.0-test") // no cfgPath → no default source
+	m.SetSize(120, 40)
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	out := stripANSI(m.View())
+	for _, want := range []string{
+		"No router sources yet",
+		"models files",
+		"llamaman -i <file>",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("router empty state missing %q; out:\n%s", want, out)
+		}
+	}
+}
+
+// TestSnapshotMainModeEmptyModels verifies Single mode with a model-less
+// config (legal, e.g. after an empty import) points at config mode.
+func TestSnapshotMainModeEmptyModels(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	cfg.Models = nil
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+	)
+
+	for _, want := range []string{
+		"No models configured yet",
+		"Press c to open config mode",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("single-mode empty state missing %q; out:\n%s", want, out)
+		}
+	}
+}
+
+// TestSnapshotMainModeRouterView covers the Router mode picker: tab
+// switches from the model list to the globals.models-files entries,
+// each showing its parsed section count.
+func TestSnapshotMainModeRouterView(t *testing.T) {
+	dir := t.TempDir()
+	ini := filepath.Join(dir, "my-models.ini")
+	if err := os.WriteFile(ini, []byte("[a]\nmodel = a.gguf\n[b]\nhf = org/repo:Q4_0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := sampleSnapshotConfig()
+	cfg.Globals.ModelsFiles = []string{ini}
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		tea.KeyMsg{Type: tea.KeyTab}, // Single → Router
+	)
+
+	if !strings.Contains(out, "my-models.ini") {
+		t.Errorf("router view missing file entry; out:\n%s", out)
+	}
+	if !strings.Contains(out, "router · 2 models") {
+		t.Errorf("router view missing section count; out:\n%s", out)
+	}
+	if strings.Contains(out, "alpha") {
+		t.Errorf("router view should not list config models, found alpha; out:\n%s", out)
+	}
+}
+
+// TestMainModeRouterToggleCycles verifies tab toggles between the model
+// picker and the router picker, and that a parse-failing models-file
+// still renders with a parse-error description.
+func TestMainModeRouterToggleCycles(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.ini")
+	if err := os.WriteFile(good, []byte("[m]\nmodel = m.gguf\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := sampleSnapshotConfig()
+	cfg.Globals.ModelsFiles = []string{good, filepath.Join(dir, "broken.ini")}
+	m := NewMainMode(cfg, "v0.0.0-test")
+	m.SetSize(120, 40)
+
+	// Default: single model mode shows model aliases.
+	out := stripANSI(m.View())
+	if !strings.Contains(out, "alpha") {
+		t.Errorf("single mode missing model list; out:\n%s", out)
+	}
+
+	// tab → router mode.
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	out = stripANSI(m.View())
+	if !strings.Contains(out, "good.ini") || !strings.Contains(out, "parse error") {
+		t.Errorf("router mode missing entries/parse error; out:\n%s", out)
+	}
+
+	// tab → back to single mode.
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	out = stripANSI(m.View())
+	if !strings.Contains(out, "alpha") {
+		t.Errorf("second tab did not return to single mode; out:\n%s", out)
+	}
+}
+
+// TestMainModeRouterEnterEmitsRouterSpawnRequest verifies Enter in
+// Router mode emits RouterSpawnRequestMsg with the selected file path.
+func TestMainModeRouterEnterEmitsRouterSpawnRequest(t *testing.T) {
+	dir := t.TempDir()
+	ini := filepath.Join(dir, "my-models.ini")
+	if err := os.WriteFile(ini, []byte("[m]\nmodel = m.gguf\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := sampleSnapshotConfig()
+	cfg.Globals.ModelsFiles = []string{ini}
+	m := NewMainMode(cfg, "v0.0.0-test")
+	m.SetSize(120, 40)
+
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab}) // router mode
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter in router mode produced no command")
+	}
+	msg := cmd()
+	rs, ok := msg.(RouterSpawnRequestMsg)
+	if !ok {
+		t.Fatalf("Enter produced %T, want RouterSpawnRequestMsg", msg)
+	}
+	if rs.File != ini {
+		t.Errorf("RouterSpawnRequestMsg.File = %q, want %q", rs.File, ini)
+	}
+}
+
 func TestSnapshotConfigMode(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
@@ -348,6 +515,9 @@ type failingSpawner struct{ msg string }
 func (f failingSpawner) Spawn(config.Model, config.Preset) (RunModeOpts, error) {
 	return RunModeOpts{}, failingSpawnError{f.msg}
 }
+func (f failingSpawner) SpawnRouter(string) (RunModeOpts, error) {
+	return RunModeOpts{}, failingSpawnError{f.msg}
+}
 func (failingSpawner) Reattach() (*RunModeOpts, error)     { return nil, nil }
 func (failingSpawner) RunningAlias() (string, string, int) { return "", "", 0 }
 
@@ -461,6 +631,67 @@ func TestRunModeDirectKillReturnsToMain(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("y did not stop the child")
 	}
+}
+
+// TestRunModeKillReturnsToMatchingMainMode is the regression for the
+// reattach-kill bug: killing a router session must return the main menu
+// to Router mode even when the session was attached from Single mode
+// (and vice versa), not whatever mode the toggle happened to be in.
+func TestRunModeKillReturnsToMatchingMainMode(t *testing.T) {
+	bin := filepath.Join(repoRoot(t), "bin", "llamaman-fakeserver")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("fakeserver not built: %v", err)
+	}
+	cfg := sampleSnapshotConfig()
+
+	t.Run("router session returns to router mode", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "llama.log")
+		proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+		opts := RunModeOpts{
+			Cfg: cfg, RouterFile: "models.ini", Argv: proc.Argv, Process: proc,
+		}
+		root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
+		driveRoot(t, root, tea.WindowSizeMsg{Width: 140, Height: 40})
+		root.mainMode.SetMode(modeSingle) // simulate reattaching from Single mode
+
+		driveRoot(t, root, keyMsg("k"), keyMsg("y"))
+		if root.view != ViewMain {
+			t.Fatalf("view = %d, want ViewMain", root.view)
+		}
+		if root.mainMode.mode != modeRouter {
+			t.Errorf("main mode = %v, want modeRouter after killing a router session", root.mainMode.mode)
+		}
+	})
+
+	t.Run("single session returns to single mode", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "llama.log")
+		proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+		opts := RunModeOpts{
+			Cfg: cfg, Model: cfg.Models[0], Preset: cfg.Models[0].Presets[0],
+			Argv: proc.Argv, Process: proc,
+		}
+		root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
+		driveRoot(t, root, tea.WindowSizeMsg{Width: 140, Height: 40})
+		root.mainMode.SetMode(modeRouter) // simulate reattaching from Router mode
+
+		driveRoot(t, root, keyMsg("k"), keyMsg("y"))
+		if root.view != ViewMain {
+			t.Fatalf("view = %d, want ViewMain", root.view)
+		}
+		if root.mainMode.mode != modeSingle {
+			t.Errorf("main mode = %v, want modeSingle after killing a single-model session", root.mainMode.mode)
+		}
+	})
 }
 
 // TestRunModeQuitPromptKillQuitsLlamaman verifies the q→k path: the
@@ -600,8 +831,8 @@ func TestParamPickerShowsNamesWithoutDashesAndDescriptions(t *testing.T) {
 	out := stripANSI(p.View(CurrentTheme()))
 
 	for _, want := range []string{
-		"threads",                    // bare name (no --)
-		"number of CPU threads",      // description
+		"threads",               // bare name (no --)
+		"number of CPU threads", // description
 		"jinja",
 		"use jinja templates",
 		"flash-attn",

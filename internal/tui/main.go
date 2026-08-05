@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -10,6 +11,17 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
+	"github.com/cmoro-deusto/llamaman/internal/modelsini"
+)
+
+// mainMode selects which picker the landing screen shows: single-model
+// launches from config.json, or router-mode launches from my-models.ini
+// files registered in globals.models-files.
+type mainMode int
+
+const (
+	modeSingle mainMode = iota
+	modeRouter
 )
 
 // MainMode is the centered landing screen described in DESIGN.md §7.2.
@@ -18,8 +30,13 @@ import (
 // the shortcut row. When the config is empty (first-run or after a
 // model delete), the list is hidden and the screen reverts to its bare
 // "configure to begin" form.
+//
+// `tab` toggles between Single Model mode (config.json models) and
+// Router mode (globals.models-files entries — each spawns one
+// llama-server hosting every model in the file).
 type MainMode struct {
 	cfg     *config.Config
+	cfgPath string // config file path; drives the derived models.ini default
 	keys    Keymap
 	theme   Theme
 	width   int
@@ -33,8 +50,11 @@ type MainMode struct {
 	flash    string
 	showHelp bool
 
+	mode mainMode
+
 	models      list.Model
 	presets     list.Model
+	routerFiles list.Model
 	showPresets bool // multi-preset pivot state
 }
 
@@ -47,6 +67,7 @@ func NewMainMode(cfg *config.Config, version string) MainMode {
 		version: version,
 	}
 	m.rebuildModels()
+	m.rebuildRouterFiles()
 	return m
 }
 
@@ -57,22 +78,45 @@ func (m *MainMode) SetSize(w, h int) {
 }
 
 // SetCfg replaces the underlying config (after a save in config mode)
-// and rebuilds the inline list. The current pivot state is reset
-// because the model the user was looking at may no longer exist.
+// and rebuilds both pickers. The current pivot state is reset because
+// the model the user was looking at may no longer exist.
 func (m *MainMode) SetCfg(cfg *config.Config) {
 	m.cfg = cfg
 	m.showPresets = false
 	m.rebuildModels()
+	m.rebuildRouterFiles()
+	m.applyListSize()
+}
+
+// SetCfgPath records the config file path, which drives the derived
+// models.ini default for the Router source list. Called by Root after
+// construction and on first-run completion.
+func (m *MainMode) SetCfgPath(cfgPath string) {
+	m.cfgPath = cfgPath
+	m.rebuildRouterFiles()
 	m.applyListSize()
 }
 
 // SetRunning updates the "▶ Detached" line. Called by Root after session
-// state changes. Empty alias hides the line and disables `a`.
+// state changes. Empty alias hides the line and disables `a`. Router
+// sessions report the models-file path as their alias, so the marker
+// lights up in Router mode.
 func (m *MainMode) SetRunning(alias, preset string, port int) {
 	m.runningAlias = alias
 	m.runningPreset = preset
 	m.runningPort = port
 	m.rebuildModels()
+	m.rebuildRouterFiles()
+}
+
+// SetMode switches the Single Model / Router toggle and clears any
+// preset pivot. Used by Root when a run session ends so the main menu
+// lands on the mode the session belonged to (a killed router returns
+// to Router mode even when it was reattached from Single mode).
+func (m *MainMode) SetMode(mode mainMode) {
+	m.mode = mode
+	m.showPresets = false
+	m.applyListSize()
 }
 
 // IsSessionRunning reports whether main mode currently shows the detached
@@ -84,9 +128,15 @@ func (m MainMode) IsSessionRunning() bool { return m.runningAlias != "" }
 // surface spawn errors.
 func (m *MainMode) SetFlash(msg string) { m.flash = msg }
 
-// HasModels reports whether the inline selection list is rendered.
-// Root uses this to gate the no-args Enter→spawn shortcut.
-func (m MainMode) HasModels() bool { return len(m.cfg.Models) > 0 }
+// HasModels reports whether the inline selection list is rendered in
+// the current mode (models in Single mode, router sources in Router
+// mode). Root uses this to gate the no-args Enter→spawn shortcut.
+func (m MainMode) HasModels() bool {
+	if m.mode == modeRouter {
+		return len(modelsini.EffectiveModelsFiles(m.cfg, m.cfgPath)) > 0
+	}
+	return len(m.cfg.Models) > 0
+}
 
 // ---- list construction ----
 
@@ -140,8 +190,8 @@ type inlineDelegate struct {
 	theme Theme
 }
 
-func (d inlineDelegate) Height() int                               { return 1 }
-func (d inlineDelegate) Spacing() int                              { return 0 }
+func (d inlineDelegate) Height() int                             { return 1 }
+func (d inlineDelegate) Spacing() int                            { return 0 }
 func (d inlineDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
 
 func (d inlineDelegate) Render(w io.Writer, lm list.Model, index int, item list.Item) {
@@ -181,6 +231,59 @@ func (m *MainMode) rebuildModels() {
 		m.models = l
 	} else {
 		m.models.SetItems(items)
+	}
+}
+
+// routerItem implements list.Item for the Router-mode picker: one entry
+// per globals.models-files path. The section count comes from parsing
+// the file; parse failures surface as a warning instead of hiding the
+// entry.
+type routerItem struct {
+	path         string
+	runningAlias string
+	sectionCount int
+	parseErr     string
+}
+
+func (r routerItem) Title() string {
+	suffix := ""
+	if r.path == r.runningAlias && r.runningAlias != "" {
+		suffix = " (running)"
+	}
+	return filepath.Base(r.path) + suffix
+}
+
+func (r routerItem) Description() string {
+	if r.parseErr != "" {
+		return "parse error — " + r.path
+	}
+	return fmt.Sprintf("router · %d model%s — %s", r.sectionCount, plural(r.sectionCount), r.path)
+}
+
+func (r routerItem) FilterValue() string { return r.path }
+
+func (m *MainMode) rebuildRouterFiles() {
+	files := modelsini.EffectiveModelsFiles(m.cfg, m.cfgPath)
+	items := make([]list.Item, len(files))
+	for i, path := range files {
+		it := routerItem{path: path, runningAlias: m.runningAlias}
+		if f, err := modelsini.ParseFile(path); err == nil {
+			it.sectionCount = len(f.Sections)
+		} else {
+			it.parseErr = err.Error()
+		}
+		items[i] = it
+	}
+	if m.routerFiles.Items() == nil {
+		l := list.New(items, inlineDelegate{theme: m.theme}, 0, 0)
+		l.SetShowTitle(false)
+		l.SetShowHelp(false)
+		l.SetShowStatusBar(false)
+		l.SetFilteringEnabled(false)
+		l.SetShowPagination(false)
+		m.routerFiles = l
+	} else {
+		m.routerFiles.SetItems(items)
 	}
 }
 
@@ -236,6 +339,10 @@ func (m *MainMode) applyListSize() {
 		}
 		return h
 	}
+	if m.mode == modeRouter {
+		m.routerFiles.SetSize(w, height(len(m.cfg.Globals.ModelsFiles)))
+		return
+	}
 	m.models.SetSize(w, height(len(m.cfg.Models)))
 	if m.showPresets {
 		if it, ok := m.models.SelectedItem().(modelItem); ok {
@@ -272,6 +379,8 @@ func (m MainMode) View() string {
 	hasModels := m.HasModels()
 	if hasModels {
 		parts = append(parts, "", m.renderListBox())
+	} else {
+		parts = append(parts, "", m.renderEmptyState())
 	}
 
 	if hasModels && m.flash != "" {
@@ -295,6 +404,11 @@ func (m MainMode) renderShortcuts() string {
 		parts = append(parts, shortcut("↑/↓", "navigate", m.theme))
 		parts = append(parts, shortcut("Enter", "select", m.theme))
 	}
+	modeLabel := "router"
+	if m.mode == modeRouter {
+		modeLabel = "single"
+	}
+	parts = append(parts, shortcut("tab", modeLabel, m.theme))
 	parts = append(parts, shortcut("c", "configure", m.theme))
 	parts = append(parts, shortcut("?", "help", m.theme))
 	parts = append(parts, shortcut("q", "quit", m.theme))
@@ -309,10 +423,45 @@ func (m MainMode) renderListBox() string {
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(m.theme.Border).
 		Padding(0, 1)
+	if m.mode == modeRouter {
+		return box.Render(m.routerFiles.View())
+	}
 	if m.showPresets {
 		return box.Render(m.presets.View())
 	}
 	return box.Render(m.models.View())
+}
+
+// renderEmptyState is shown when the current mode has nothing to list.
+// It must lead the user to the next step instead of leaving a blank
+// screen: Router mode points at globals "models files" (config mode)
+// and the CLI escapes hatch; Single mode points at config mode.
+func (m MainMode) renderEmptyState() string {
+	var lines []string
+	if m.mode == modeRouter {
+		lines = []string{
+			"No router sources yet.",
+			"",
+			"A router source is a my-models.ini file (llama.cpp model presets).",
+			"Add one in config mode: press c, then edit \"models files\" under globals",
+			"(one file path per line).",
+			"",
+			"Or run a file ad-hoc without registering it:  llamaman -i <file>",
+			"Or ingest one as single-model presets:     llamaman import <file>",
+		}
+	} else {
+		lines = []string{
+			"No models configured yet.",
+			"",
+			"Press c to open config mode and add a model.",
+		}
+	}
+	box := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.theme.Border).
+		Padding(0, 1)
+	body := lipgloss.NewStyle().Foreground(m.theme.Subtle).Render(strings.Join(lines, "\n"))
+	return box.Render(body)
 }
 
 func (m MainMode) renderFlash() string {
@@ -338,6 +487,7 @@ func (m MainMode) renderHelp() string {
 	keys := []string{
 		"↑ / ↓       move selection",
 		"Enter       run selected model (pivot to preset list when 2+)",
+		"tab         toggle Single Model / Router mode",
 		"Esc         back out of preset pivot",
 		"c           open configuration mode",
 		"a           attach to running session (only when one exists)",
@@ -374,6 +524,15 @@ func (m MainMode) Update(msg tea.Msg) (MainMode, tea.Cmd) {
 		case "?":
 			m.showHelp = true
 			return m, nil
+		case "tab":
+			m.showPresets = false
+			if m.mode == modeRouter {
+				m.mode = modeSingle
+			} else {
+				m.mode = modeRouter
+			}
+			m.applyListSize()
+			return m, nil
 		case "esc":
 			if m.showPresets {
 				m.showPresets = false
@@ -389,6 +548,11 @@ func (m MainMode) Update(msg tea.Msg) (MainMode, tea.Cmd) {
 	}
 	if !m.HasModels() {
 		return m, nil
+	}
+	if m.mode == modeRouter {
+		var cmd tea.Cmd
+		m.routerFiles, cmd = m.routerFiles.Update(msg)
+		return m, cmd
 	}
 	if m.showPresets {
 		var cmd tea.Cmd
@@ -406,6 +570,15 @@ func (m MainMode) Update(msg tea.Msg) (MainMode, tea.Cmd) {
 // sub-list. Mirrors the previous selection-mode behavior so users with
 // existing muscle memory aren't surprised.
 func (m MainMode) handleEnter() (MainMode, tea.Cmd) {
+	if m.mode == modeRouter {
+		it, ok := m.routerFiles.SelectedItem().(routerItem)
+		if !ok {
+			return m, nil
+		}
+		return m, func() tea.Msg {
+			return RouterSpawnRequestMsg{File: it.path}
+		}
+	}
 	if m.showPresets {
 		parent, parentOK := m.models.SelectedItem().(modelItem)
 		it, ok := m.presets.SelectedItem().(presetItem)

@@ -103,6 +103,28 @@ type fakeFetcher struct {
 	slotsErr      error
 	slotsCalls    int
 	metricsScript []*llamaapi.Metrics // when non-nil, serve consecutive entries
+
+	// Router-mode responders (GET /models + GET /health).
+	models      *llamaapi.Models
+	modelsErr   error
+	modelsCalls int
+	health      *llamaapi.Health
+	healthErr   error
+	healthCalls int
+	// Per-model slots (router mode): one Slots per requested model id,
+	// plus a counter for the number of FetchSlotsFor calls.
+	slotsFor      map[string]*llamaapi.Slots
+	slotsForErr   error
+	slotsForCalls int
+	// Per-model metrics (router mode): one Metrics per model id.
+	metricsFor      map[string]*llamaapi.Metrics
+	metricsForErr   error
+	metricsForCalls int
+	// Router model actions (POST /models/load|unload).
+	loadErr     error
+	unloadErr   error
+	loadCalls   int
+	unloadCalls int
 }
 
 func (f *fakeFetcher) FetchProps(ctx context.Context) (*llamaapi.Props, error) {
@@ -142,6 +164,54 @@ func (f *fakeFetcher) FetchSlots(_ context.Context) (*llamaapi.Slots, error) {
 	defer f.mu.Unlock()
 	f.slotsCalls++
 	return f.slots, f.slotsErr
+}
+
+func (f *fakeFetcher) FetchModels(_ context.Context) (*llamaapi.Models, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.modelsCalls++
+	return f.models, f.modelsErr
+}
+
+func (f *fakeFetcher) FetchHealth(_ context.Context) (*llamaapi.Health, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.healthCalls++
+	return f.health, f.healthErr
+}
+
+func (f *fakeFetcher) FetchSlotsFor(_ context.Context, model string) (*llamaapi.Slots, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.slotsForCalls++
+	if f.slotsForErr != nil {
+		return nil, f.slotsForErr
+	}
+	return f.slotsFor[model], nil
+}
+
+func (f *fakeFetcher) FetchMetricsFor(_ context.Context, model string) (*llamaapi.Metrics, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.metricsForCalls++
+	if f.metricsForErr != nil {
+		return nil, f.metricsForErr
+	}
+	return f.metricsFor[model], nil
+}
+
+func (f *fakeFetcher) LoadModel(_ context.Context, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.loadCalls++
+	return f.loadErr
+}
+
+func (f *fakeFetcher) UnloadModel(_ context.Context, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unloadCalls++
+	return f.unloadErr
 }
 
 func (f *fakeFetcher) callCount() int {

@@ -146,6 +146,19 @@ func validateGlobals(g Globals) Issues {
 		out = append(out, Issue{Severity: Error, Path: "globals.port",
 			Message: fmt.Sprintf("port %d out of range 1..65535", g.Port)})
 	}
+	for i, mf := range g.ModelsFiles {
+		if strings.TrimSpace(mf) == "" {
+			out = append(out, Issue{Severity: Error, Path: fmt.Sprintf("globals.models-files[%d]", i),
+				Message: "models file path is required"})
+			continue
+		}
+		if _, err := os.Stat(mf); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				out = append(out, Issue{Severity: Warning, Path: fmt.Sprintf("globals.models-files[%d]", i),
+					Message: fmt.Sprintf("models file does not exist: %s", mf)})
+			}
+		}
+	}
 	return out
 }
 

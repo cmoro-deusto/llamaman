@@ -32,6 +32,13 @@ func Load(path string) (*Config, error) {
 	if cfg.Globals.Bin, err = paths.ExpandPath(cfg.Globals.Bin); err != nil {
 		return nil, fmt.Errorf("expand globals.llama-server-bin: %w", err)
 	}
+	for i := range cfg.Globals.ModelsFiles {
+		expanded, err := paths.ExpandPath(cfg.Globals.ModelsFiles[i])
+		if err != nil {
+			return nil, fmt.Errorf("expand globals.models-files[%d]: %w", i, err)
+		}
+		cfg.Globals.ModelsFiles[i] = expanded
+	}
 	for i := range cfg.Models {
 		expanded, err := paths.ExpandPath(cfg.Models[i].Location)
 		if err != nil {

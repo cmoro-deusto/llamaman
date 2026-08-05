@@ -18,6 +18,18 @@ type Fetcher interface {
 	FetchProps(ctx context.Context) (*llamaapi.Props, error)
 	FetchMetrics(ctx context.Context) (*llamaapi.Metrics, error)
 	FetchSlots(ctx context.Context) (*llamaapi.Slots, error)
+	// Router-mode endpoints. FetchModels returns the model list of
+	// GET /models; FetchHealth the loaded-model ids of GET /health.
+	// FetchSlotsFor / FetchMetricsFor return one model's stats via
+	// /slots?model=<id> and /metrics?model=<id> (the router requires
+	// the model name on these endpoints). LoadModel / UnloadModel
+	// POST /models/load|unload.
+	FetchModels(ctx context.Context) (*llamaapi.Models, error)
+	FetchHealth(ctx context.Context) (*llamaapi.Health, error)
+	FetchSlotsFor(ctx context.Context, model string) (*llamaapi.Slots, error)
+	FetchMetricsFor(ctx context.Context, model string) (*llamaapi.Metrics, error)
+	LoadModel(ctx context.Context, model string) error
+	UnloadModel(ctx context.Context, model string) error
 }
 
 // propsFetchedMsg carries the result of a one-shot /props fetch back
@@ -57,6 +69,18 @@ type slotsFetchedMsg struct {
 	err error
 }
 
+// modelsFetchedMsg / healthFetchedMsg carry router-mode endpoint
+// results (GET /models and GET /health) back into the Update loop.
+type modelsFetchedMsg struct {
+	m   *llamaapi.Models
+	err error
+}
+
+type healthFetchedMsg struct {
+	h   *llamaapi.Health
+	err error
+}
+
 // hwSnapshotMsg carries the result of a periodic hwinfo.Snapshot.
 // Defined here next to the other live-poll msgs so RunMode wires them
 // through the same Update branch.
@@ -85,6 +109,76 @@ func fetchSlotsCmd(ctx context.Context, fetcher Fetcher) tea.Cmd {
 	return func() tea.Msg {
 		s, err := fetcher.FetchSlots(ctx)
 		return slotsFetchedMsg{s: s, err: err}
+	}
+}
+
+// fetchModelsCmd is a single one-shot GET /models (router mode).
+func fetchModelsCmd(ctx context.Context, fetcher Fetcher) tea.Cmd {
+	return func() tea.Msg {
+		m, err := fetcher.FetchModels(ctx)
+		return modelsFetchedMsg{m: m, err: err}
+	}
+}
+
+// fetchHealthCmd is a single one-shot GET /health (router mode).
+func fetchHealthCmd(ctx context.Context, fetcher Fetcher) tea.Cmd {
+	return func() tea.Msg {
+		h, err := fetcher.FetchHealth(ctx)
+		return healthFetchedMsg{h: h, err: err}
+	}
+}
+
+// routerSlotsMsg carries one model's /slots?model=<id> result.
+type routerSlotsMsg struct {
+	model string
+	s     *llamaapi.Slots
+	err   error
+}
+
+// fetchRouterSlotsCmd is a single one-shot per-model GET /slots
+// (router mode; the router requires the model name on /slots).
+func fetchRouterSlotsCmd(ctx context.Context, fetcher Fetcher, model string) tea.Cmd {
+	return func() tea.Msg {
+		s, err := fetcher.FetchSlotsFor(ctx, model)
+		return routerSlotsMsg{model: model, s: s, err: err}
+	}
+}
+
+// routerMetricsMsg carries one model's /metrics?model=<id> result.
+type routerMetricsMsg struct {
+	model string
+	m     *llamaapi.Metrics
+	err   error
+}
+
+// fetchRouterMetricsCmd is a single one-shot per-model GET /metrics
+// (router mode). ErrMetricsNotEnabled (router started without
+// --metrics) is handled by the RunMode handler, which stops polling.
+func fetchRouterMetricsCmd(ctx context.Context, fetcher Fetcher, model string) tea.Cmd {
+	return func() tea.Msg {
+		m, err := fetcher.FetchMetricsFor(ctx, model)
+		return routerMetricsMsg{model: model, m: m, err: err}
+	}
+}
+
+// modelActionMsg carries the result of a POST /models/load|unload.
+type modelActionMsg struct {
+	model  string
+	action string // "load" | "unload"
+	err    error
+}
+
+// loadModelCmd POSTs /models/load for the given model.
+func loadModelCmd(ctx context.Context, fetcher Fetcher, model string) tea.Cmd {
+	return func() tea.Msg {
+		return modelActionMsg{model: model, action: "load", err: fetcher.LoadModel(ctx, model)}
+	}
+}
+
+// unloadModelCmd POSTs /models/unload for the given model.
+func unloadModelCmd(ctx context.Context, fetcher Fetcher, model string) tea.Cmd {
+	return func() tea.Msg {
+		return modelActionMsg{model: model, action: "unload", err: fetcher.UnloadModel(ctx, model)}
 	}
 }
 

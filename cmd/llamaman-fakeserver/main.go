@@ -20,6 +20,7 @@ func main() {
 	port := flag.Int("port", 9080, "")
 	model := flag.String("m", "", "")
 	alias := flag.String("alias", "", "")
+	preset := flag.String("models-preset", "", "path to a my-models.ini; enables router mode")
 	delay := flag.Duration("ready-delay", 500*time.Millisecond, "delay before emitting the 'server is listening' line")
 	flag.CommandLine.SetOutput(os.Stderr)
 	flag.CommandLine.Init("llamaman-fakeserver", flag.ContinueOnError)
@@ -35,6 +36,17 @@ func main() {
 	}
 	if *alias != "" {
 		fmt.Printf("alias: %s\n", *alias)
+	}
+	if *preset != "" {
+		n := 0
+		if data, err := os.ReadFile(*preset); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "[") {
+					n++
+				}
+			}
+		}
+		fmt.Printf("server: router mode with %d models from %s\n", n, *preset)
 	}
 	fmt.Println("llm_load_print_meta: format          = GGUF v3 (fake)")
 	fmt.Println("llm_load_print_meta: arch            = qwen3moe")
@@ -56,16 +68,36 @@ func main() {
 				},
 			})
 		})
+		http.HandleFunc("/models", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			models := []map[string]any{
+				{"id": "model-a", "object": "model", "owned_by": "llamaman-fakeserver"},
+				{"id": "model-b", "object": "model", "owned_by": "llamaman-fakeserver"},
+			}
+			if *preset == "" {
+				models = models[:1]
+				models[0]["id"] = *alias
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": models})
+		})
+		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			models := []string{"model-a", "model-b"}
+			if *preset == "" {
+				models = []string{*alias}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "models": models})
+		})
 		http.HandleFunc("/slots", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode([]map[string]any{
 				{
-					"is_processing":          false,
-					"n_ctx":                  8192,
-					"n_prompt_tokens":        0,
+					"is_processing":             false,
+					"n_ctx":                     8192,
+					"n_prompt_tokens":           0,
 					"n_prompt_tokens_processed": 0,
-					"n_prompt_tokens_cache":  0,
-					"next_token":             []any{},
+					"n_prompt_tokens_cache":     0,
+					"next_token":                []any{},
 				},
 			})
 		})
@@ -116,13 +148,14 @@ llamacpp:n_decode_total 0
 // rest so an authentic argv vector doesn't blow up flag.Parse.
 func tolerantParse(in []string) []string {
 	known := map[string]bool{
-		"-host":        true,
-		"--host":       true,
-		"-port":        true,
-		"--port":       true,
-		"-m":           true,
-		"--alias":      true,
-		"-ready-delay": true,
+		"-host":           true,
+		"--host":          true,
+		"-port":           true,
+		"--port":          true,
+		"-m":              true,
+		"--alias":         true,
+		"--models-preset": true,
+		"-ready-delay":    true,
 	}
 	out := make([]string, 0, len(in))
 	for i := 0; i < len(in); i++ {
