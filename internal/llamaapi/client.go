@@ -401,12 +401,14 @@ type ModelStatus struct {
 
 // ModelInfo is one entry of llama-server's GET /models response
 // (OpenAI-style object list). Router mode lists every model registered
-// in the --models-preset file; non-router servers list the single
-// loaded model. Status carries the per-model load state.
+// in the --models-preset file, plus models from --models-dir and the
+// HF download cache. InCache distinguishes cache leftovers from
+// ini/models-dir entries (cache-only models can be filtered out).
 type ModelInfo struct {
 	ID      string      `json:"id"`
 	Object  string      `json:"object"`
 	OwnedBy string      `json:"owned_by"`
+	InCache bool        `json:"in_cache"`
 	Status  ModelStatus `json:"status"`
 	Meta    struct {
 		NCtx int `json:"n_ctx"`

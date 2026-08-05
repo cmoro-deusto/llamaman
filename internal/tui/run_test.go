@@ -762,38 +762,45 @@ func TestRouterSelectionPanel(t *testing.T) {
 	if r.routerFocus != "b" {
 		t.Errorf("selection changed after panel deactivated: %q", r.routerFocus)
 	}
-	// s opens the selected model's stats (focus unchanged: log).
+	// s is a models-panel key: no-op while the log is focused.
 	r.routerFocus = "c"
+	r.Update(keyMsg("s"))
+	if r.showRouterStats {
+		t.Error("s must not open stats from the log panel")
+	}
+	// Re-activate the models panel; s opens the selected model's stats.
+	r.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if !r.routerPanelActive {
+		t.Fatal("tab should re-activate the models panel")
+	}
 	r.Update(keyMsg("s"))
 	if !r.showRouterStats {
 		t.Error("s should open the stats panel")
 	}
-	if r.routerPanelActive {
-		t.Error("s should not change panel focus")
-	}
-	// Tab toggles focus to the models panel WITHOUT closing the stats —
-	// the stats panel stays up, only the arrows' target changes.
-	r.Update(tea.KeyMsg{Type: tea.KeyTab})
-	if !r.routerPanelActive {
-		t.Error("tab should move focus to the models panel")
-	}
-	if !r.showRouterStats {
-		t.Error("stats panel must stay up when focus moves to it")
-	}
-	// Tab again returns focus to the log; stats still up.
+	// Tab toggles focus to the log WITHOUT closing the stats — the
+	// stats panel stays up, only the arrows' target changes.
 	r.Update(tea.KeyMsg{Type: tea.KeyTab})
 	if r.routerPanelActive {
-		t.Error("tab should move focus back to the log")
+		t.Error("tab should move focus to the log")
 	}
 	if !r.showRouterStats {
 		t.Error("stats panel must stay up when focus returns to the log")
 	}
-	// Esc closes the stats (back to the model list), focus unchanged.
+	// Tab again returns focus to the models panel; stats still up.
+	r.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if !r.routerPanelActive {
+		t.Error("tab should move focus back to the models panel")
+	}
+	if !r.showRouterStats {
+		t.Error("stats panel must stay up when focus moves to it")
+	}
+	// Esc closes the stats (back to the model list), focus unchanged
+	// (the models panel was active).
 	r.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	if r.showRouterStats {
 		t.Error("esc should close the stats panel")
 	}
-	if r.routerPanelActive {
+	if !r.routerPanelActive {
 		t.Error("esc must not change panel focus")
 	}
 	// Stale selection (model gone) → next ↓ starts at the first.
@@ -846,6 +853,7 @@ func TestRouterListScrolls(t *testing.T) {
 func TestRouterEnterMenu(t *testing.T) {
 	fake := &fakeFetcher{}
 	r := newRouterTestRunMode(fake)
+	r.routerPanelActive = true
 	r.routerModels = []llamaapi.ModelInfo{
 		{ID: "m:unloaded", Status: llamaapi.ModelStatus{Value: "unloaded"}},
 		{ID: "m:loaded", Status: llamaapi.ModelStatus{Value: "loaded"}},
@@ -911,6 +919,7 @@ func TestRouterEnterMenu(t *testing.T) {
 // actions.
 func TestRouterMenuStatsInfo(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerPanelActive = true
 	r.routerModels = []llamaapi.ModelInfo{{ID: "m", Status: llamaapi.ModelStatus{Value: "loaded"}}}
 	r.routerFocus = "m"
 	r.Update(keyMsg("enter"))
@@ -955,15 +964,149 @@ func TestRouterListShowsSelection(t *testing.T) {
 // router mode.
 func TestRouterFooterShowsMHint(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
+	// Log focused (default): the tab hint names the models panel, and
+	// log keys are shown.
 	footer := stripANSI(r.renderFooter())
-	if !strings.Contains(footer, "tab panel") {
-		t.Errorf("router footer missing tab hint; footer:\n%s", footer)
+	if !strings.Contains(footer, "tab models") {
+		t.Errorf("log-focused footer missing tab models; footer:\n%s", footer)
 	}
+	if !strings.Contains(footer, "/ search") || !strings.Contains(footer, "d denoise") {
+		t.Errorf("log-focused footer missing log keys; footer:\n%s", footer)
+	}
+	// Models focused: tab names the log, models keys replace log keys.
+	r.routerPanelActive = true
+	footer = stripANSI(r.renderFooter())
+	if !strings.Contains(footer, "tab log") {
+		t.Errorf("models-focused footer missing tab log; footer:\n%s", footer)
+	}
+	for _, want := range []string{"↑/↓ select", "⏎ menu", "s stats", "l/u load/unload", "p ini-only"} {
+		if !strings.Contains(footer, want) {
+			t.Errorf("models-focused footer missing %q; footer:\n%s", want, footer)
+		}
+	}
+	if strings.Contains(footer, "/ search") || strings.Contains(footer, "d denoise") {
+		t.Errorf("models-focused footer must not show log keys; footer:\n%s", footer)
+	}
+	// Single-model mode: no tab/models keys at all.
 	r2 := newRouterTestRunMode(&fakeFetcher{})
-	r2.routerFile = "" // single-model mode
+	r2.routerFile = ""
 	footer2 := stripANSI(r2.renderFooter())
-	if strings.Contains(footer2, "tab panel") {
-		t.Errorf("single-model footer must not show tab hint; footer:\n%s", footer2)
+	if strings.Contains(footer2, "tab ") || strings.Contains(footer2, "p ini-only") {
+		t.Errorf("single-model footer must not show router panel keys; footer:\n%s", footer2)
+	}
+}
+
+// TestRouterIniOnlyFilter verifies the p filter: cache-only models are
+// hidden (and unselectable) when on, tagged when off, and a selected
+// cache model is dropped when the filter activates.
+func TestRouterIniOnlyFilter(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "ini-a", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "cache-x", Status: llamaapi.ModelStatus{Value: "unloaded"}, InCache: true},
+		{ID: "ini-b", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+	}
+
+	// Off: everything visible, cache entries tagged (cache).
+	got := stripANSI(r.renderRouterPanel(80))
+	if !strings.Contains(got, "cache-x") || !strings.Contains(got, "(cache)") {
+		t.Errorf("unfiltered list missing cache entry/tag; list:\n%s", got)
+	}
+
+	// p (models panel) → on: cache models hidden.
+	r.routerPanelActive = true
+	r.routerFocus = "cache-x"
+	r.Update(keyMsg("p"))
+	if !r.routerIniOnly {
+		t.Fatal("p should enable the ini-only filter")
+	}
+	if r.routerFocus != "" {
+		t.Errorf("selection of hidden cache model not cleared: %q", r.routerFocus)
+	}
+	if len(r.visibleRouterModels()) != 2 {
+		t.Errorf("visible models = %d, want 2", len(r.visibleRouterModels()))
+	}
+	got = stripANSI(r.renderRouterPanel(80))
+	if strings.Contains(got, "cache-x") {
+		t.Errorf("filtered list still shows cache model; list:\n%s", got)
+	}
+	// Selection only moves among visible models.
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if r.routerFocus != "ini-a" {
+		t.Errorf("selection = %q, want ini-a (first visible)", r.routerFocus)
+	}
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if r.routerFocus != "ini-b" {
+		t.Errorf("selection = %q, want ini-b", r.routerFocus)
+	}
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if r.routerFocus != "ini-a" {
+		t.Errorf("selection after wrap = %q, want ini-a", r.routerFocus)
+	}
+
+	// p again → off: everything back.
+	r.Update(keyMsg("p"))
+	if r.routerIniOnly {
+		t.Fatal("p should disable the ini-only filter")
+	}
+	if len(r.visibleRouterModels()) != 3 {
+		t.Errorf("visible models = %d, want 3", len(r.visibleRouterModels()))
+	}
+
+	// All-cache filtered view shows the hint row.
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.routerPanelActive = true
+	r2.routerIniOnly = true
+	r2.routerModels = []llamaapi.ModelInfo{
+		{ID: "cache-y", Status: llamaapi.ModelStatus{Value: "unloaded"}, InCache: true},
+	}
+	got = stripANSI(r2.renderRouterPanel(80))
+	if !strings.Contains(got, "all models are cache-only") {
+		t.Errorf("all-cache filtered view missing hint; list:\n%s", got)
+	}
+}
+
+// TestPanelScopedKeys verifies models-panel keys are silent no-ops in
+// the log panel and vice versa.
+func TestPanelScopedKeys(t *testing.T) {
+	fake := &fakeFetcher{}
+	r := newRouterTestRunMode(fake)
+	r.routerModels = []llamaapi.ModelInfo{{ID: "m:a", Status: llamaapi.ModelStatus{Value: "loaded"}}}
+	r.routerFocus = "m:a"
+	r.tail = newTestTailer(t)
+
+	// Log panel (default): Enter / l / s / p are no-ops.
+	r.Update(keyMsg("enter"))
+	if r.routerMenu {
+		t.Error("enter must not open the menu from the log panel")
+	}
+	r.Update(keyMsg("l"))
+	if fake.loadCalls != 0 {
+		t.Errorf("l acted from the log panel: %d", fake.loadCalls)
+	}
+	r.Update(keyMsg("s"))
+	if r.showRouterStats {
+		t.Error("s must not open stats from the log panel")
+	}
+	r.Update(keyMsg("p"))
+	if r.routerIniOnly {
+		t.Error("p must not toggle the filter from the log panel")
+	}
+
+	// Models panel: / n g space b d are no-ops.
+	r.routerPanelActive = true
+	before := r.viewport.YOffset
+	r.Update(keyMsg("/"))
+	if r.searchActive {
+		t.Error("/ must not open search from the models panel")
+	}
+	r.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if r.viewport.YOffset != before {
+		t.Error("space must not page the log from the models panel")
+	}
+	r.Update(keyMsg("d"))
+	if !r.denoise {
+		t.Error("d must not toggle denoise from the models panel")
 	}
 }
 
@@ -1087,6 +1230,7 @@ func TestRouterApplySlotsTTFT(t *testing.T) {
 func TestRouterLoadFromFocus(t *testing.T) {
 	fake := &fakeFetcher{}
 	r := newRouterTestRunMode(fake)
+	r.routerPanelActive = true
 	r.routerFocus = "m:a"
 
 	_, cmd := r.Update(keyMsg("l"))
@@ -1109,6 +1253,7 @@ func TestRouterLoadFromFocus(t *testing.T) {
 func TestRouterUnloadConfirm(t *testing.T) {
 	fake := &fakeFetcher{}
 	r := newRouterTestRunMode(fake)
+	r.routerPanelActive = true
 	r.routerModels = []llamaapi.ModelInfo{{ID: "m:a", Status: llamaapi.ModelStatus{Value: "loaded"}}}
 	r.routerFocus = "m:a"
 
@@ -1128,6 +1273,7 @@ func TestRouterUnloadConfirm(t *testing.T) {
 
 	// n cancels.
 	r2 := newRouterTestRunMode(fake)
+	r2.routerPanelActive = true
 	r2.routerModels = []llamaapi.ModelInfo{{ID: "m:a", Status: llamaapi.ModelStatus{Value: "loaded"}}}
 	r2.routerFocus = "m:a"
 	r2.Update(keyMsg("u"))
@@ -1163,6 +1309,7 @@ func TestRouterUnloadConfirm(t *testing.T) {
 func TestRouterLoadUnloadRequiresFocus(t *testing.T) {
 	fake := &fakeFetcher{}
 	r := newRouterTestRunMode(fake)
+	r.routerPanelActive = true
 
 	r.Update(keyMsg("l"))
 	r.Update(keyMsg("u"))
@@ -1188,6 +1335,7 @@ func TestRouterLoadUnloadRequiresFocus(t *testing.T) {
 func TestRouterLoadUnloadStateSemantics(t *testing.T) {
 	fake := &fakeFetcher{}
 	r := newRouterTestRunMode(fake)
+	r.routerPanelActive = true
 	r.routerModels = []llamaapi.ModelInfo{
 		{ID: "m:loaded", Status: llamaapi.ModelStatus{Value: "loaded"}},
 		{ID: "m:unloaded", Status: llamaapi.ModelStatus{Value: "unloaded"}},
@@ -1216,6 +1364,7 @@ func TestRouterLoadUnloadStateSemantics(t *testing.T) {
 // helpers — lipgloss strips ANSI colors in non-TTY test environments.)
 func TestRouterPanelFocusBorder(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerPanelActive = true
 	r.routerModels = []llamaapi.ModelInfo{{ID: "m", Status: llamaapi.ModelStatus{Value: "loaded"}}}
 	r.routerFocus = "m"
 

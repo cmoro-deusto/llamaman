@@ -88,8 +88,12 @@ type RunMode struct {
 	routerMenuIdx     int
 	// denoise hides llama.cpp's per-request router chatter
 	// ("proxying request to model ...") from the log view. Default on;
-	// toggled with `d` in router mode.
+	// toggled with `d` in the log panel (router mode for now; the flag
+	// is generic so future log filters can apply in single-model mode).
 	denoise bool
+	// routerIniOnly hides cache-only models (llama.cpp HF download
+	// leftovers, InCache) from the models panel. Toggled with `p`.
+	routerIniOnly bool
 
 	proc          *server.Process
 	tail          *server.Tailer
@@ -322,10 +326,11 @@ func (r *RunMode) routerPollCmds() []tea.Cmd {
 		fetchModelsCmd(r.fetchCtx, r.fetcher),
 		fetchHealthCmd(r.fetchCtx, r.fetcher),
 	}
-	for _, m := range r.routerModels {
+	for _, m := range r.visibleRouterModels() {
 		// Only models confirmed loaded get stats polling — unloaded and
 		// loading models are skipped (and the endpoints carry
 		// autoload=false, so a stray request can never reload a model).
+		// Hidden cache-only models are not polled either.
 		if m.Status.Value == "loaded" {
 			cmds = append(cmds, fetchRouterSlotsCmd(r.fetchCtx, r.fetcher, m.ID))
 			if r.routerMetricsAvailable {
@@ -699,9 +704,8 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		}
 		switch m.String() {
 		case "up", "down":
-			// Router mode with the models panel active: move the
-			// selection. Otherwise fall through to the viewport (log
-			// scrolling).
+			// Models panel focused: move the selection. Otherwise fall
+			// through to the viewport (log scrolling).
 			if r.routerFile != "" && r.routerPanelActive {
 				delta := -1
 				if m.String() == "down" {
@@ -752,8 +756,9 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			}
 			return r, nil
 		case "enter":
-			// Router mode: open the action menu for the selection.
-			if r.routerFile != "" && r.routerFocus != "" {
+			// Models panel: open the action menu for the selection.
+			// Silent no-op in the log panel.
+			if r.routerFile != "" && r.routerPanelActive && r.routerFocus != "" {
 				r.routerMenu = true
 				r.routerMenuIdx = 0
 				for i, a := range r.menuActions() {
@@ -765,24 +770,43 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			}
 			return r, nil
 		case "s":
-			// Router mode: open the selected model's stats panel.
-			if r.routerFile != "" && r.routerFocus != "" {
+			// Models panel: show the selected model's stats.
+			if r.routerFile != "" && r.routerPanelActive && r.routerFocus != "" {
 				r.showRouterStats = true
 			}
 			return r, nil
+		case "p":
+			// Models panel: toggle the ini-only filter (hide cache
+			// leftovers). Silent no-op in the log panel.
+			if r.routerFile != "" && r.routerPanelActive {
+				r.routerIniOnly = !r.routerIniOnly
+				if r.selectedIdx() < 0 {
+					r.routerFocus = ""
+				}
+				if r.routerIniOnly {
+					return r, r.setFlash("presets only — cache models hidden")
+				}
+				return r, r.setFlash("all models shown")
+			}
+			return r, nil
 		case "d":
-			// Router mode: toggle the proxy-log denoise filter.
-			if r.routerFile == "" {
+			// Log panel (router mode): toggle the proxy-log denoise
+			// filter. The flag is generic so future log filters can
+			// apply in single-model mode too.
+			if r.routerFile != "" && !r.routerPanelActive {
+				r.denoise = !r.denoise
+				if r.denoise {
+					return r, r.setFlash("denoise on — proxy chatter hidden from log")
+				}
+				return r, r.setFlash("denoise off — proxy chatter shown")
+			}
+			return r, nil
+		case "l", "u":
+			// Models panel: load / unload the selected model.
+			if r.routerFile == "" || !r.routerPanelActive {
 				return r, nil
 			}
-			r.denoise = !r.denoise
-			if r.denoise {
-				return r, r.setFlash("denoise on — proxy chatter hidden from log")
-			}
-			return r, r.setFlash("denoise off — proxy chatter shown")
-		case "l", "u":
-			// Router mode: load / unload the selected model.
-			if r.routerFile == "" || r.routerFocus == "" {
+			if r.routerFocus == "" {
 				return r, r.setFlash("select a model first (tab, ↑/↓)")
 			}
 			if m.String() == "u" {
@@ -797,24 +821,46 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			}
 			return r, loadModelCmd(r.fetchCtx, r.fetcher, r.routerFocus)
 		case "/":
+			// Log panel: search. No-op in the models panel.
+			if r.routerPanelActive {
+				return r, nil
+			}
 			r.searchActive = true
 			r.searchInput.SetValue("")
 			r.refreshContent()
 			return r, r.searchInput.Focus()
 		case "n":
+			if r.routerPanelActive {
+				return r, nil
+			}
 			return r, r.jumpSearch(+1)
 		case "N":
+			if r.routerPanelActive {
+				return r, nil
+			}
 			return r, r.jumpSearch(-1)
 		case "g":
+			if r.routerPanelActive {
+				return r, nil
+			}
 			r.viewport.GotoTop()
 			return r, nil
 		case "G":
+			if r.routerPanelActive {
+				return r, nil
+			}
 			r.viewport.GotoBottom()
 			return r, nil
 		case " ", "space":
+			if r.routerPanelActive {
+				return r, nil
+			}
 			r.viewport.HalfPageDown()
 			return r, nil
 		case "b":
+			if r.routerPanelActive {
+				return r, nil
+			}
 			r.viewport.HalfPageUp()
 			return r, nil
 		case "c":
@@ -1390,6 +1436,11 @@ func (r *RunMode) renderInfoOverlay() string {
 		lines = append(lines, "")
 		lines = append(lines, subtle.Render("Model  : ")+id)
 		lines = append(lines, subtle.Render("State  : ")+state)
+		src := "ini / models-dir"
+		if r.selectedIsCache() {
+			src = "download cache"
+		}
+		lines = append(lines, subtle.Render("Source : ")+src)
 		if st, ok := r.routerStats[id]; ok && st != nil {
 			lines = append(lines, subtle.Render("Context: ")+humanTokens(st.contextUsed)+"/"+humanTokens(st.contextMax))
 		}
@@ -1466,16 +1517,23 @@ func (r *RunMode) renderHelp() string {
 		{"c", "copy launch command to clipboard"},
 		{"i", "show model & preset details"},
 		{"tab", "router mode: switch panel ↑/↓ target (log ↔ models)"},
-		{"Enter", "router mode: action menu (Load/Unload/Stats/Info)"},
-		{"s", "router mode: show selected model's stats (Esc back)"},
-		{"l / u", "router mode: load / unload the selected model (u confirms)"},
-		{"d", "router mode: toggle proxy-log denoise (default on)"},
+		{"", ""},
+		{"— log panel —", ""},
+		{"↑ / ↓", "scroll"},
 		{"/", "search (live highlights; Enter applies, Esc cancels)"},
 		{"n / N", "next / previous match"},
-		{"Esc", "clear active search and highlights"},
 		{"g / G", "jump to top / bottom"},
 		{"space / b", "page down / up"},
-		{"↑ / ↓", "scroll one line"},
+		{"d", "router mode: toggle proxy-log denoise (default on)"},
+		{"", ""},
+		{"— models panel —", "router mode only"},
+		{"↑ / ↓", "move selection"},
+		{"Enter", "action menu (Load/Unload/Stats/Info)"},
+		{"s", "show selected model's stats (Esc back)"},
+		{"l / u", "load / unload the selected model (u confirms)"},
+		{"p", "toggle ini-only filter (hide cache leftovers)"},
+		{"", ""},
+		{"Esc", "layered: close menu → close stats → clear search"},
 		{"?", "toggle this help"},
 	}
 	keyW := 0
@@ -1506,9 +1564,27 @@ func (r *RunMode) renderFooter() string {
 		"q quit", "k kill", "r restart", "c copy", "i info",
 	}
 	if r.routerFile != "" {
-		tokens = append(tokens, "tab panel", "l/u load/unload", "d denoise")
+		// The tab hint names the panel you'd switch TO.
+		if r.routerPanelActive {
+			tokens = append(tokens, "tab log")
+		} else {
+			tokens = append(tokens, "tab models")
+		}
 	}
-	tokens = append(tokens, "/ search", "? help", "g/G top/bottom", "space/b page", "↑/↓ scroll")
+	if r.routerPanelActive {
+		// Models panel focused: models-panel keys.
+		tokens = append(tokens, "↑/↓ select", "⏎ menu", "s stats", "l/u load/unload")
+		if r.routerFile != "" {
+			tokens = append(tokens, "p ini-only")
+		}
+	} else {
+		// Log panel focused: log keys.
+		tokens = append(tokens, "/ search", "g/G top/bottom", "space/b page", "↑/↓ scroll")
+		if r.routerFile != "" {
+			tokens = append(tokens, "d denoise")
+		}
+	}
+	tokens = append(tokens, "? help")
 	parts := make([]string, len(tokens))
 	for i, t := range tokens {
 		parts[i] = paneShortcut(t, r.theme, true)
@@ -1861,10 +1937,10 @@ func (r *RunMode) applyRouterMetrics(model string, m *llamaapi.Metrics) {
 	st.prevMetrics = m
 }
 
-// selectedIdx returns the index of the selected model in the list, or
-// -1 when it is not present.
+// selectedIdx returns the index of the selected model in the VISIBLE
+// list (ini-only filter applied), or -1 when it is not present.
 func (r *RunMode) selectedIdx() int {
-	for i, m := range r.routerModels {
+	for i, m := range r.visibleRouterModels() {
 		if m.ID == r.routerFocus {
 			return i
 		}
@@ -1875,7 +1951,7 @@ func (r *RunMode) selectedIdx() int {
 // selectedState returns the selected model's load state ("" when no
 // valid selection).
 func (r *RunMode) selectedState() string {
-	for _, m := range r.routerModels {
+	for _, m := range r.visibleRouterModels() {
 		if m.ID == r.routerFocus {
 			return r.routerModelState(m.ID, m.Status.Value)
 		}
@@ -1886,12 +1962,38 @@ func (r *RunMode) selectedState() string {
 // selectedArgs returns the selected model's launch argv (the child
 // llama-server command reported by the router), or nil.
 func (r *RunMode) selectedArgs() []string {
-	for _, m := range r.routerModels {
+	for _, m := range r.visibleRouterModels() {
 		if m.ID == r.routerFocus {
 			return m.Status.Args
 		}
 	}
 	return nil
+}
+
+// selectedIsCache reports whether the selected model is a cache-only
+// leftover (InCache) rather than an ini/models-dir entry.
+func (r *RunMode) selectedIsCache() bool {
+	for _, m := range r.visibleRouterModels() {
+		if m.ID == r.routerFocus {
+			return m.InCache
+		}
+	}
+	return false
+}
+
+// visibleRouterModels returns the models panel's list: all router
+// models, minus cache-only leftovers when the ini-only filter is on.
+func (r *RunMode) visibleRouterModels() []llamaapi.ModelInfo {
+	if !r.routerIniOnly {
+		return r.routerModels
+	}
+	kept := make([]llamaapi.ModelInfo, 0, len(r.routerModels))
+	for _, m := range r.routerModels {
+		if !m.InCache {
+			kept = append(kept, m)
+		}
+	}
+	return kept
 }
 
 // flashTTL is how long an informational flash stays in the footer
@@ -1998,16 +2100,17 @@ func formatArgvLines(args []string, maxLines, maxLineWidth int) []string {
 // keeps it inside the list's visible window. Stale selections (model
 // gone) restart at the first row.
 func (r *RunMode) moveRouterSelection(delta int) {
-	if len(r.routerModels) == 0 {
+	models := r.visibleRouterModels()
+	if len(models) == 0 {
 		return
 	}
 	idx := r.selectedIdx()
 	if idx < 0 {
 		idx = 0
 	} else {
-		idx = (idx + delta + len(r.routerModels)) % len(r.routerModels)
+		idx = (idx + delta + len(models)) % len(models)
 	}
-	r.routerFocus = r.routerModels[idx].ID
+	r.routerFocus = models[idx].ID
 	r.clampRouterList(idx)
 }
 
@@ -2029,7 +2132,7 @@ func (r *RunMode) clampRouterList(selIdx int) {
 	if selIdx >= r.routerListStart+visible {
 		r.routerListStart = selIdx - visible + 1
 	}
-	if max := len(r.routerModels) - visible; r.routerListStart > max {
+	if max := len(r.visibleRouterModels()) - visible; r.routerListStart > max {
 		if max < 0 {
 			max = 0
 		}
@@ -2293,9 +2396,14 @@ func (r *RunMode) renderRouterPanel(width int) string {
 	loadingStyle := lipgloss.NewStyle().Foreground(r.theme.Accent)
 
 	selStyle := lipgloss.NewStyle().Foreground(r.theme.Accent)
+	models := r.visibleRouterModels()
 	var rows []string
-	if len(r.routerModels) == 0 {
-		rows = append(rows, subtle.Render("(no models reported)"))
+	if len(models) == 0 {
+		if len(r.routerModels) == 0 {
+			rows = append(rows, subtle.Render("(no models reported)"))
+		} else {
+			rows = append(rows, subtle.Render("(all models are cache-only — p to show)"))
+		}
 	} else {
 		// Scroll window: render only the rows around the selection so a
 		// long list stays navigable and the selection is always visible.
@@ -2303,10 +2411,10 @@ func (r *RunMode) renderRouterPanel(width int) string {
 		visible := liveBandContentRows
 		start := r.routerListStart
 		end := start + visible
-		if end > len(r.routerModels) {
-			end = len(r.routerModels)
+		if end > len(models) {
+			end = len(models)
 		}
-		for _, m := range r.routerModels[start:end] {
+		for _, m := range models[start:end] {
 			state := r.routerModelState(m.ID, m.Status.Value)
 			mark, style := "○", unloadedStyle
 			switch state {
@@ -2338,6 +2446,9 @@ func (r *RunMode) renderRouterPanel(width int) string {
 				stats = " · " + strings.Join(parts, " · ")
 			}
 			rows = append(rows, sel+style.Render(mark+" "+id)+subtle.Render(stats)+"  "+subtle.Render(state))
+			if m.InCache {
+				rows[len(rows)-1] += subtle.Render(" (cache)")
+			}
 		}
 	}
 	return r.renderTitledPanel("router models", width, padRows(rows, liveBandContentRows), r.routerPanelActive)
