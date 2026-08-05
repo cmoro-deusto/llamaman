@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1216,9 +1218,11 @@ func TestRouterPanelFocusBorder(t *testing.T) {
 }
 
 // TestRouterInfoOverlayShowsParams verifies the router info overlay
-// renders the selected model's launch params from /models status.args.
+// renders the selected model's launch params from /models status.args,
+// filling the viewport (no arbitrary cap).
 func TestRouterInfoOverlayShowsParams(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
+	r.SetSize(120, 40)
 	r.routerModels = []llamaapi.ModelInfo{{
 		ID: "m:big",
 		Status: llamaapi.ModelStatus{
@@ -1233,12 +1237,85 @@ func TestRouterInfoOverlayShowsParams(t *testing.T) {
 			t.Errorf("info overlay missing %q; overlay:\n%s", want, got)
 		}
 	}
+	if strings.Contains(got, "more") {
+		t.Errorf("no truncation expected on a tall viewport; overlay:\n%s", got)
+	}
+
+	// Tiny viewport → the params are capped to fit, with an ellipsis.
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.SetSize(120, 12)
+	r2.routerModels = r.routerModels
+	r2.routerFocus = "m:big"
+	got2 := stripANSI(r2.renderInfoOverlay())
+	if !strings.Contains(got2, "more") {
+		t.Errorf("expected truncation on a short viewport; overlay:\n%s", got2)
+	}
+}
+
+// TestFilterProxyLines verifies router proxy chatter is dropped from
+// the log view while everything else passes.
+func TestFilterProxyLines(t *testing.T) {
+	chunk := "some line\n68.17.107.375 I srv  proxy_reques: proxying request to model Jack on port 45927\nmore\n"
+	got := filterProxyLines(chunk)
+	if strings.Contains(got, "proxying request to model") {
+		t.Errorf("proxy line not filtered: %q", got)
+	}
+	for _, want := range []string{"some line", "more"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("filtered chunk missing %q: %q", want, got)
+		}
+	}
+	// Non-router chunks pass through unchanged.
+	plain := "a\nb\n"
+	if got := filterProxyLines(plain); got != plain {
+		t.Errorf("plain chunk altered: %q", got)
+	}
+}
+
+// TestLogChunkIngestFiltersRouterSpam verifies the ingest path drops
+// proxy lines in router mode only.
+func TestLogChunkIngestFiltersRouterSpam(t *testing.T) {
+	tail := newTestTailer(t)
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.tail = tail
+	r.routerFile = "models.ini"
+	r.Update(logChunkMsg("ok line\nproxying request to model X on port 1\n"))
+	if strings.Contains(r.buf.String(), "proxying request to model") {
+		t.Errorf("router buf contains proxy line: %q", r.buf.String())
+	}
+	if !strings.Contains(r.buf.String(), "ok line") {
+		t.Errorf("router buf missing ok line: %q", r.buf.String())
+	}
+	// Single-model mode keeps everything.
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.tail = newTestTailer(t)
+	r2.routerFile = ""
+	r2.Update(logChunkMsg("ok\nproxying request to model X on port 1\n"))
+	if !strings.Contains(r2.buf.String(), "proxying request to model") {
+		t.Errorf("single-model buf lost proxy line: %q", r2.buf.String())
+	}
+}
+
+// newTestTailer builds a Tailer over a scratch file so RunMode handlers
+// that re-arm the chunk wait can run in tests.
+func newTestTailer(t *testing.T) *server.Tailer {
+	t.Helper()
+	logPath := filepath.Join(t.TempDir(), "llama.log")
+	if err := os.WriteFile(logPath, []byte("seed\n"), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	tl, err := server.NewTailer(logPath)
+	if err != nil {
+		t.Fatalf("NewTailer: %v", err)
+	}
+	t.Cleanup(func() { tl.Close() })
+	return tl
 }
 
 func TestFormatArgvLines(t *testing.T) {
 	lines := formatArgvLines([]string{
 		"/opt/llama-server", "--ctx-size", "65535", "--jinja", "--ngl", "99",
-	}, 12)
+	}, 12, 66)
 	if len(lines) != 3 {
 		t.Fatalf("lines = %d, want 3 (flag+value, bare flag, flag+value)", len(lines))
 	}
@@ -1257,7 +1334,7 @@ func TestFormatArgvLines(t *testing.T) {
 	for i := 0; i < 25; i++ {
 		many = append(many, fmt.Sprintf("--flag-%02d", i))
 	}
-	trunc := formatArgvLines(many, 5)
+	trunc := formatArgvLines(many, 5, 66)
 	if len(trunc) != 6 {
 		t.Fatalf("truncated lines = %d, want 6 (5 + ellipsis)", len(trunc))
 	}

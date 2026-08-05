@@ -380,6 +380,13 @@ func (r *RunMode) chromeHeight() int {
 func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	switch m := msg.(type) {
 	case logChunkMsg:
+		// Router mode: drop llama.cpp's per-request proxy chatter
+		// ("proxying request to model ... on port N" — emitted once per
+		// proxied request, including our own stats polls). The full log
+		// stays on disk; only the TUI view is filtered.
+		if r.routerFile != "" {
+			m = logChunkMsg(filterProxyLines(string(m)))
+		}
 		r.buf.WriteString(string(m))
 		atBottom := r.viewport.AtBottom()
 		r.viewport.SetContent(r.renderViewportContent())
@@ -1382,7 +1389,19 @@ func (r *RunMode) renderInfoOverlay() string {
 		if args := r.selectedArgs(); len(args) > 1 {
 			lines = append(lines, "")
 			lines = append(lines, accent.Render("Launch params"))
-			for _, l := range formatArgvLines(args, 12) {
+			// Fill the viewport: cap the params only when the popup
+			// would grow taller than the screen.
+			budget := r.height - 8 // box chrome + margin
+			budget -= len(lines)   // fixed rows above (incl. the header)
+			budget -= 2            // trailing blank + "(any key to close)"
+			if budget < 1 {
+				budget = 1
+			}
+			maxLine := r.width - 12
+			if maxLine < 40 {
+				maxLine = 40
+			}
+			for _, l := range formatArgvLines(args, budget, maxLine) {
 				lines = append(lines, "  "+l)
 			}
 		}
@@ -1867,11 +1886,27 @@ func (r *RunMode) selectedArgs() []string {
 	return nil
 }
 
+// filterProxyLines removes llama.cpp router lines of the form
+// "proxying request to model <id> on port <n>" from a log chunk. Those
+// are emitted once per proxied request — including llamaman's own stats
+// polls — and only clutter the log view.
+func filterProxyLines(chunk string) string {
+	lines := strings.Split(chunk, "\n")
+	kept := lines[:0]
+	for _, l := range lines {
+		if strings.Contains(l, "proxying request to model") {
+			continue
+		}
+		kept = append(kept, l)
+	}
+	return strings.Join(kept, "\n")
+}
+
 // formatArgvLines renders a launch argv (binary dropped) as aligned
 // "--flag  value" pairs, capped at maxLines (an ellipsis line notes any
-// remainder). Each line is truncated to a sane width so the info box
-// stays centered and readable.
-func formatArgvLines(args []string, maxLines int) []string {
+// remainder). Each line is truncated to maxLineWidth so the info box
+// stays within the viewport.
+func formatArgvLines(args []string, maxLines, maxLineWidth int) []string {
 	if len(args) <= 1 {
 		return nil
 	}
@@ -1893,7 +1928,6 @@ func formatArgvLines(args []string, maxLines int) []string {
 		}
 	}
 	lines := make([]string, 0, min(maxLines, len(pairs)))
-	const maxLine = 66
 	for i, p := range pairs {
 		if i >= maxLines {
 			lines = append(lines, fmt.Sprintf("… and %d more", len(pairs)-maxLines))
@@ -1903,7 +1937,7 @@ func formatArgvLines(args []string, maxLines int) []string {
 		if p.val != "" {
 			line += "  " + p.val
 		}
-		lines = append(lines, ansi.Truncate(line, maxLine, "…"))
+		lines = append(lines, ansi.Truncate(line, maxLineWidth, "…"))
 	}
 	return lines
 }
