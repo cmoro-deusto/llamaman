@@ -70,7 +70,7 @@ completion.go                    Shell completion scripts (bash/zsh/fish)
 - Internal packages are flat under `internal/` — no sub-packages.
 - Each package groups related `.go` files by concern (e.g., `config/load.go`, `config/save.go`, `config/validate.go`).
 - Tests co-located: `*_test.go` alongside source.
-- TUI snapshot tests use `charmbracelet/x/exp/teatest`.
+- TUI snapshot tests render the Bubble Tea model in-process with a stub spawner — no `teatest` dependency (`internal/tui/snapshot_test.go`); teatest is NOT in go.mod despite mentions in README/DESIGN.
 - Exit codes are documented constants in `main.go` (§4.4 of DESIGN.md): 0=OK, 1=generic, 2=config, 3=prereq, 4=port-in-use, 130=interrupted.
 
 ### Config schema
@@ -155,6 +155,7 @@ Releases are automated via GoReleaser on `v*` tags pushed to `main`. See `.gorel
 | Change config schema | `internal/config/types.go`, `internal/config/validate.go`, `internal/config/save.go` |
 | Modify TUI main mode | `internal/tui/main.go` |
 | Modify TUI run mode | `internal/tui/run.go` |
+| Run-mode helpers (live log bar, /props fetch, overlay, zones) | `internal/tui/livebar.go`, `fetcher.go`, `overlay.go`, `zones.go` |
 | Modify TUI config mode | `internal/tui/config.go` |
 | Change param translation | `internal/translate/translate.go` |
 | Change flag parsing from --help | `internal/flags/parser.go`, `internal/flags/fallback.go` |
@@ -169,8 +170,8 @@ Releases are automated via GoReleaser on `v*` tags pushed to `main`. See `.gorel
 
 - Unit tests cover config load/save/validate, flag parsing, translation, paths, server session, and TUI snapshot rendering.
 - Integration tests use `cmd/llamaman-fakeserver` — a minimal HTTP server mimicking llama-server's `/props` endpoint.
-- TUI snapshot tests use `charmbracelet/x/exp/teatest` for deterministic screen capture.
-- Run `go test ./...` to execute the full suite. The fakeserver binary must be built first (`CGO_ENABLED=0 go build -o bin/llamaman-fakeserver ./cmd/llamaman-fakeserver`).
+- TUI snapshot tests render models in-process (stub spawner) plus spawn-the-fakeserver integration tests for run-mode tail/reattach.
+- Run `go test ./...` to execute the full suite. Fakeserver-dependent tests `t.Skipf` when `bin/llamaman-fakeserver` is absent, so build it first for full coverage (`CGO_ENABLED=0 go build -o bin/llamaman-fakeserver ./cmd/llamaman-fakeserver`).
 
 ---
 

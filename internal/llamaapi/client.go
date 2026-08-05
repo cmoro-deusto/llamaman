@@ -93,17 +93,17 @@ type Metrics struct {
 // slots, context usage metrics, and generation progress for the
 // active slot.
 type Slots struct {
-	BusyCount              int
-	Total                  int
-	ContextUsed            int // tokens currently in context (prompt + generated)
-	ContextMax             int // total context window size (n_ctx)
-	ContextCacheHits       int // prompt tokens served from cache
-	ContextPromptTokens    int // prompt tokens in context (for breakdown bar)
-	ContextGenTokens       int // generated tokens in context (for breakdown bar)
-	GenDecoded             int // tokens generated so far in current response
-	GenRemain              int // tokens remaining before generation limit
-	PromptTokensTotal      int // total prompt tokens for current request
-	PromptTokensProcessed  int // prompt tokens processed so far (for progress bar)
+	BusyCount             int
+	Total                 int
+	ContextUsed           int // tokens currently in context (prompt + generated)
+	ContextMax            int // total context window size (n_ctx)
+	ContextCacheHits      int // prompt tokens served from cache
+	ContextPromptTokens   int // prompt tokens in context (for breakdown bar)
+	ContextGenTokens      int // generated tokens in context (for breakdown bar)
+	GenDecoded            int // tokens generated so far in current response
+	GenRemain             int // tokens remaining before generation limit
+	PromptTokensTotal     int // total prompt tokens for current request
+	PromptTokensProcessed int // prompt tokens processed so far (for progress bar)
 }
 
 // ErrMetricsNotEnabled is returned by FetchMetrics when llama-server
@@ -226,13 +226,13 @@ func (c *Client) FetchSlots(ctx context.Context) (*Slots, error) {
 		return nil, fmt.Errorf("llamaapi: GET /slots: status %d", resp.StatusCode)
 	}
 	var raw []struct {
-		IsProcessing          bool        `json:"is_processing"`
-		State                 json.Number `json:"state"`
-		NCtx                  int         `json:"n_ctx"`
-		NPromptTokens         int         `json:"n_prompt_tokens"`
-		NPromptTokensProcessed int        `json:"n_prompt_tokens_processed"`
-		NPromptTokensCache    int         `json:"n_prompt_tokens_cache"`
-		NextToken             []struct {
+		IsProcessing           bool        `json:"is_processing"`
+		State                  json.Number `json:"state"`
+		NCtx                   int         `json:"n_ctx"`
+		NPromptTokens          int         `json:"n_prompt_tokens"`
+		NPromptTokensProcessed int         `json:"n_prompt_tokens_processed"`
+		NPromptTokensCache     int         `json:"n_prompt_tokens_cache"`
+		NextToken              []struct {
 			NDecoded int `json:"n_decoded"`
 			NRemain  int `json:"n_remain"`
 		} `json:"next_token"`
@@ -307,4 +307,73 @@ func (c *Client) FetchProps(ctx context.Context) (*Props, error) {
 		return nil, fmt.Errorf("llamaapi: decode default_generation_settings: %w", err)
 	}
 	return &p, nil
+}
+
+// ModelInfo is one entry of llama-server's GET /models response
+// (OpenAI-style object list). Router mode lists every model registered
+// in the --models-preset file; non-router servers list the single
+// loaded model.
+type ModelInfo struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	OwnedBy string `json:"owned_by"`
+	Meta    struct {
+		NCtx int `json:"n_ctx"`
+	} `json:"meta"`
+}
+
+// Models is the envelope of GET /models: {"object": "list", "data": [...]}.
+type Models struct {
+	Object string      `json:"object"`
+	Data   []ModelInfo `json:"data"`
+}
+
+// FetchModels GETs /models and returns the model list.
+func (c *Client) FetchModels(ctx context.Context) (*Models, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/models", nil)
+	if err != nil {
+		return nil, fmt.Errorf("llamaapi: build request: %w", err)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("llamaapi: GET /models: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("llamaapi: GET /models: status %d", resp.StatusCode)
+	}
+	var m Models
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		return nil, fmt.Errorf("llamaapi: decode /models: %w", err)
+	}
+	return &m, nil
+}
+
+// Health is the projection of GET /health. Router mode lists the
+// currently loaded model ids; non-router servers return a single
+// element list.
+type Health struct {
+	Status string   `json:"status"`
+	Models []string `json:"models"`
+}
+
+// FetchHealth GETs /health.
+func (c *Client) FetchHealth(ctx context.Context) (*Health, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/health", nil)
+	if err != nil {
+		return nil, fmt.Errorf("llamaapi: build request: %w", err)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("llamaapi: GET /health: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return nil, fmt.Errorf("llamaapi: GET /health: status %d", resp.StatusCode)
+	}
+	var h Health
+	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
+		return nil, fmt.Errorf("llamaapi: decode /health: %w", err)
+	}
+	return &h, nil
 }

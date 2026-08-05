@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -139,4 +140,65 @@ func pickDeadPID(t *testing.T) int {
 		t.Fatal(err)
 	}
 	return cmd.ProcessState.Pid()
+}
+
+func TestSessionKindRoundTrip(t *testing.T) {
+	m := newManagerInTempDir(t)
+	rec := &Session{
+		PID:       os.Getpid(),
+		Alias:     "/home/me/my-models.ini",
+		Kind:      KindRouter,
+		Host:      "127.0.0.1",
+		Port:      9080,
+		StartedAt: time.Now().UTC(),
+		Command:   []string{"/bin/llama-server", "--models-preset", "/home/me/my-models.ini"},
+		LogPath:   "/tmp/x.log",
+	}
+	if _, err := m.AcquireStart(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.WriteAndUnlock(rec); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.Read()
+	if err != nil || got == nil {
+		t.Fatalf("Read: %v, %v", got, err)
+	}
+	if !got.IsRouter() {
+		t.Errorf("IsRouter() = false for Kind=%q", got.Kind)
+	}
+	if got.Alias != rec.Alias {
+		t.Errorf("Alias = %q, want %q", got.Alias, rec.Alias)
+	}
+}
+
+// TestSessionLegacyWithoutKind verifies old session.json files (written
+// before the kind field existed) still parse as single-model sessions.
+func TestSessionLegacyWithoutKind(t *testing.T) {
+	m := newManagerInTempDir(t)
+	legacy := `{"pid": ` + strconv.Itoa(os.Getpid()) + `, "alias": "qwen", "preset": "default", "host": "127.0.0.1", "port": 9080, "started_at": "2026-01-01T00:00:00Z", "command": ["/bin/llama-server", "-m", "m.gguf"], "log_path": "/tmp/x.log"}`
+	if _, err := m.AcquireStart(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.lock.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.lock.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.lock.Write([]byte(legacy)); err != nil {
+		t.Fatal(err)
+	}
+	m.releaseLock()
+
+	got, err := m.Read()
+	if err != nil || got == nil {
+		t.Fatalf("Read: %v, %v", got, err)
+	}
+	if got.IsRouter() {
+		t.Error("legacy session without kind must not be treated as router")
+	}
+	if got.Alias != "qwen" || got.Kind != KindSingle {
+		t.Errorf("Alias/Kind = %q/%q", got.Alias, got.Kind)
+	}
 }

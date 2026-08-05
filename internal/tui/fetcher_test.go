@@ -103,6 +103,14 @@ type fakeFetcher struct {
 	slotsErr      error
 	slotsCalls    int
 	metricsScript []*llamaapi.Metrics // when non-nil, serve consecutive entries
+
+	// Router-mode responders (GET /models + GET /health).
+	models     *llamaapi.Models
+	modelsErr  error
+	modelsCalls int
+	health     *llamaapi.Health
+	healthErr  error
+	healthCalls int
 }
 
 func (f *fakeFetcher) FetchProps(ctx context.Context) (*llamaapi.Props, error) {
@@ -142,6 +150,20 @@ func (f *fakeFetcher) FetchSlots(_ context.Context) (*llamaapi.Slots, error) {
 	defer f.mu.Unlock()
 	f.slotsCalls++
 	return f.slots, f.slotsErr
+}
+
+func (f *fakeFetcher) FetchModels(_ context.Context) (*llamaapi.Models, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.modelsCalls++
+	return f.models, f.modelsErr
+}
+
+func (f *fakeFetcher) FetchHealth(_ context.Context) (*llamaapi.Health, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.healthCalls++
+	return f.health, f.healthErr
 }
 
 func (f *fakeFetcher) callCount() int {

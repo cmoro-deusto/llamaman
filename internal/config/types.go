@@ -16,10 +16,15 @@ type Config struct {
 // the host is `ip_address` for compatibility with the user's draft schema,
 // but the Go field is named Host because the value can be a hostname or an
 // IPv6 literal too.
+//
+// ModelsFiles lists my-models.ini files (llama.cpp model-presets) that
+// appear as router-mode run entries in the TUI. Each is a llama-server
+// `--models-preset` source, one process hosting every model in the file.
 type Globals struct {
-	Bin  string `json:"llama-server-bin"`
-	Host string `json:"ip_address"`
-	Port int    `json:"port"`
+	Bin         string   `json:"llama-server-bin"`
+	Host        string   `json:"ip_address"`
+	Port        int      `json:"port"`
+	ModelsFiles []string `json:"models-files,omitempty"`
 }
 
 // Model is a single named model with its launch presets. Exactly one

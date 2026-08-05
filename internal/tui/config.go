@@ -63,6 +63,7 @@ type returnFromConfigMsg struct{}
 // input into these pointers; applyForm reads them on submit.
 type formStaging struct {
 	bin, host, port    *string
+	modelsFiles        *string // one models-file path per line
 	alias              *string
 	source             *string // "local" | "hf"; for new/edit-model forms
 	location, hf       *string // exactly one is populated based on source
@@ -93,7 +94,7 @@ type ConfigMode struct {
 	form        *huh.Form
 	formKind    formKind
 	formStaging formStaging
-	pendingKey  string // staged param key between PickKey and PickValue
+	pendingKey  string       // staged param key between PickKey and PickValue
 	picker      *paramPicker // active when adding a new param
 
 	saveErr error
@@ -470,11 +471,13 @@ func (c *ConfigMode) openGlobalsForm() tea.Cmd {
 	bin := c.work.Globals.Bin
 	host := c.work.Globals.Host
 	port := strconv.Itoa(c.work.Globals.Port)
-	c.formStaging = formStaging{bin: &bin, host: &host, port: &port}
+	files := strings.Join(c.work.Globals.ModelsFiles, "\n")
+	c.formStaging = formStaging{bin: &bin, host: &host, port: &port, modelsFiles: &files}
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("llama-server binary").Value(&bin).Validate(nonEmpty("binary")),
 		huh.NewInput().Title("host (IPv4 / [::IPv6] / hostname)").Value(&host).Validate(hostValidator),
 		huh.NewInput().Title("port").Value(&port).Validate(numericRange(1, 65535)),
+		huh.NewText().Title("models files (my-models.ini — router sources, one per line)").Value(&files),
 	))
 	return c.installForm(form, formGlobals)
 }
@@ -879,6 +882,7 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		c.work.Globals.Bin = deref(c.formStaging.bin)
 		c.work.Globals.Host = deref(c.formStaging.host)
 		c.work.Globals.Port = port
+		c.work.Globals.ModelsFiles = parseLines(deref(c.formStaging.modelsFiles))
 		c.flash = "globals updated"
 	case formNewModel:
 		m := config.Model{Alias: deref(c.formStaging.alias)}
@@ -1592,6 +1596,18 @@ func plural(n int) string {
 		return ""
 	}
 	return "s"
+}
+
+// parseLines splits a multi-line form value into trimmed, non-empty
+// entries — used for globals.models-files (one path per line).
+func parseLines(s string) []string {
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func deref(p *string) string {

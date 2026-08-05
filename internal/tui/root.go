@@ -26,6 +26,13 @@ type SpawnRequestMsg struct {
 	Preset config.Preset
 }
 
+// RouterSpawnRequestMsg asks the root to spawn llama-server in router
+// mode for a my-models.ini file (one process hosting every model in the
+// file). Main mode's Router view emits this on Enter.
+type RouterSpawnRequestMsg struct {
+	File string
+}
+
 // returnToMainMsg is dispatched when the user backs out of run mode.
 type returnToMainMsg struct{}
 
@@ -38,6 +45,9 @@ type reattachRequestMsg struct{}
 // implements this; the TUI only knows it can ask for a launched Process.
 type Spawner interface {
 	Spawn(model config.Model, preset config.Preset) (RunModeOpts, error)
+	// SpawnRouter launches llama-server in router mode for a my-models.ini
+	// file (one process hosting every model in the file).
+	SpawnRouter(file string) (RunModeOpts, error)
 	// Reattach inspects session.json. If a session is live, returns
 	// RunModeOpts that adopt it. Returns (nil, nil) when no session is
 	// running. Errors propagate to the caller's error path.
@@ -160,6 +170,9 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case SpawnRequestMsg:
 		return r.handleSpawn(msg)
+
+	case RouterSpawnRequestMsg:
+		return r.handleRouterSpawn(msg)
 
 	case reattachRequestMsg:
 		return r.handleReattach()
@@ -284,6 +297,27 @@ func (r *Root) handleSpawn(msg SpawnRequestMsg) (tea.Model, tea.Cmd) {
 		r.flashSpawnError(err)
 		return r, nil
 	}
+	return r.enterRunMode(opts)
+}
+
+// handleRouterSpawn mirrors handleSpawn for RouterSpawnRequestMsg: it
+// asks the spawner to launch router mode and transitions to run mode.
+func (r *Root) handleRouterSpawn(msg RouterSpawnRequestMsg) (tea.Model, tea.Cmd) {
+	if r.spawner == nil {
+		r.flashSpawnError(errSpawnerMissing)
+		return r, nil
+	}
+	opts, err := r.spawner.SpawnRouter(msg.File)
+	if err != nil {
+		r.flashSpawnError(err)
+		return r, nil
+	}
+	return r.enterRunMode(opts)
+}
+
+// enterRunMode wraps an already-spawned process in a RunMode and flips
+// the view. Shared by the single-model and router spawn paths.
+func (r *Root) enterRunMode(opts RunModeOpts) (tea.Model, tea.Cmd) {
 	run, cmd, err := NewRunMode(opts)
 	if err != nil {
 		r.flashSpawnError(err)

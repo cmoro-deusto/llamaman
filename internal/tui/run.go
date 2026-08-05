@@ -55,11 +55,18 @@ const readyMarker = "listening on"
 // tailing its log file. Quit prompt is per DESIGN.md §7.4: q/Ctrl+C opens
 // (k)ill / (d)etach / (c)ancel.
 type RunMode struct {
-	cfg      *config.Config
-	model    config.Model
-	preset   config.Preset
-	argv     []string
-	warnings []string
+	cfg        *config.Config
+	model      config.Model
+	preset     config.Preset
+	argv       []string
+	routerFile string // my-models.ini path for router-mode runs; "" otherwise
+	warnings   []string
+
+	// Router-mode live state (only populated when routerFile != ""):
+	// the model list from GET /models and the loaded-model ids from
+	// GET /health.
+	routerModels []llamaapi.ModelInfo
+	routerLoaded []string
 
 	proc          *server.Process
 	tail          *server.Tailer
@@ -77,12 +84,12 @@ type RunMode struct {
 	keys          Keymap
 	theme         Theme
 
-	showQuit      bool // quit prompt overlay active
+	showQuit      bool   // quit prompt overlay active
 	showHelp      bool   // help overlay active
 	showInfo      bool   // i-info overlay active (model + preset detail)
 	copyResult    string // when non-empty, a centered "command copied" modal is shown; any key dismisses
-	restartPrompt bool // r-confirm overlay
-	killPrompt    bool // k-confirm overlay
+	restartPrompt bool   // r-confirm overlay
+	killPrompt    bool   // k-confirm overlay
 	flash         string
 
 	searchInput   textinput.Model
@@ -128,14 +135,14 @@ type RunMode struct {
 	genDecoded int // tokens generated so far in current response
 	genRemain  int // tokens remaining before generation limit
 	// Prompt processing progress from /slots.
-	promptToksTotal    int // total prompt tokens for current request
+	promptToksTotal     int // total prompt tokens for current request
 	promptToksProcessed int // prompt tokens processed so far
 	// Lifetime request count from /metrics.
 	decodeTotal float64
 	// TTFT (time to first token) tracking.
-	ttftStart         time.Time // when new request started (zero = not tracking)
-	ttft              time.Duration // measured TTFT
-	ttftPrevPromptToks int // previous prompt total to detect new request
+	ttftStart          time.Time     // when new request started (zero = not tracking)
+	ttft               time.Duration // measured TTFT
+	ttftPrevPromptToks int           // previous prompt total to detect new request
 	// tokensSeen / promptSeen latch true once we've observed the first
 	// non-zero rate. Bug 3: after the first real value, we persist the
 	// last-known rate even on subsequent zero-delta ticks (no more "—"
@@ -166,6 +173,7 @@ type RunModeOpts struct {
 	Cfg        *config.Config
 	Model      config.Model
 	Preset     config.Preset
+	RouterFile string // non-empty for router-mode runs (my-models.ini path)
 	Argv       []string
 	Warnings   []string
 	Process    *server.Process
@@ -201,20 +209,21 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 	}
 
 	r := &RunMode{
-		cfg:           opts.Cfg,
-		model:         opts.Model,
-		preset:        opts.Preset,
-		argv:          opts.Argv,
-		warnings:      opts.Warnings,
-		proc:          opts.Process,
-		tail:          tail,
-		sessionMgr:    opts.SessionMgr,
-		registry:      opts.Registry,
-		viewport:      vp,
-		status:        StatusStarting,
-		keys:          DefaultKeymap(),
-		theme:         CurrentTheme(),
-		searchInput:   ti,
+		cfg:              opts.Cfg,
+		model:            opts.Model,
+		preset:           opts.Preset,
+		routerFile:       opts.RouterFile,
+		argv:             opts.Argv,
+		warnings:         opts.Warnings,
+		proc:             opts.Process,
+		tail:             tail,
+		sessionMgr:       opts.SessionMgr,
+		registry:         opts.Registry,
+		viewport:         vp,
+		status:           StatusStarting,
+		keys:             DefaultKeymap(),
+		theme:            CurrentTheme(),
+		searchInput:      ti,
 		serverVersion:    loadServerVersion(opts.Cfg.Globals.Bin),
 		fetcher:          opts.Fetcher,
 		metricsAvailable: true,
@@ -426,7 +435,27 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if r.metricsAvailable {
 			cmds = append(cmds, fetchMetricsCmd(r.fetchCtx, r.fetcher))
 		}
+		if r.routerFile != "" {
+			// Router mode: keep the model list and loaded-state
+			// panel fresh alongside the per-slot data.
+			cmds = append(cmds,
+				fetchModelsCmd(r.fetchCtx, r.fetcher),
+				fetchHealthCmd(r.fetchCtx, r.fetcher),
+			)
+		}
 		return r, tea.Batch(cmds...)
+
+	case modelsFetchedMsg:
+		if m.err == nil && m.m != nil {
+			r.routerModels = m.m.Data
+		}
+		return r, nil
+
+	case healthFetchedMsg:
+		if m.err == nil && m.h != nil {
+			r.routerLoaded = m.h.Models
+		}
+		return r, nil
 
 	case hwTickMsg:
 		// Independent hardware-poll cadence: starts at RunMode
@@ -1316,13 +1345,25 @@ func (r *RunMode) renderTopStrip() string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	accent := lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true)
 
-	cells := []string{
-		subtle.Render("Alias:") + " " + accent.Render(r.model.Alias),
-		subtle.Render("Server:") + " " + serverVersionOrNA(r.serverVersion),
-		subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params) + "  " + subtle.Render(fmt.Sprintf("(%d reqs)", int(r.decodeTotal))),
-		subtle.Render("Preset:") + " " + accent.Render(presetNameOrDash(r.preset)),
-		subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
-		statusBadge(r.statusLabel(), r.statusColor()),
+	var cells []string
+	if r.routerFile != "" {
+		cells = []string{
+			subtle.Render("File:") + " " + accent.Render(filepath.Base(r.routerFile)),
+			subtle.Render("Server:") + " " + serverVersionOrNA(r.serverVersion),
+			subtle.Render("Models:") + " " + r.renderRouterModelCount(),
+			subtle.Render("Mode:") + " " + accent.Render("router"),
+			subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
+			statusBadge(r.statusLabel(), r.statusColor()),
+		}
+	} else {
+		cells = []string{
+			subtle.Render("Alias:") + " " + accent.Render(r.model.Alias),
+			subtle.Render("Server:") + " " + serverVersionOrNA(r.serverVersion),
+			subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params) + "  " + subtle.Render(fmt.Sprintf("(%d reqs)", int(r.decodeTotal))),
+			subtle.Render("Preset:") + " " + accent.Render(presetNameOrDash(r.preset)),
+			subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
+			statusBadge(r.statusLabel(), r.statusColor()),
+		}
 	}
 
 	// Right-pad each cell to its column's max width so the second
@@ -1426,6 +1467,9 @@ const metricLabelWidth = 9
 // Cache row shows prompt cache hit ratio from /slots.
 // Gen row shows response progress with TTFT (time to first token).
 func (r *RunMode) renderServerPanel(width int) string {
+	if r.routerFile != "" {
+		return r.renderRouterPanel(width)
+	}
 	rows := []string{
 		r.renderServerRow("Tokens", r.tokensHistory, r.currentTokensPerSec, r.avgTokensPerSec, r.tokensSeen, r.busyCount, r.totalSlots, true),
 		r.renderServerRow("Prompt", r.promptHistory, r.currentPromptPerSec, r.avgPromptPerSec, r.promptSeen, r.queuedCount, 0, false),
@@ -1436,6 +1480,49 @@ func (r *RunMode) renderServerPanel(width int) string {
 		r.renderGenProgressRow(),
 	}
 	return r.renderTitledPanel("llama-server", width, padRows(rows, liveBandContentRows))
+}
+
+// renderRouterModelCount renders the "N total (M loaded)" header cell
+// for router runs: model count from GET /models, loaded count from
+// GET /health. "—" until the first successful fetch.
+func (r *RunMode) renderRouterModelCount() string {
+	if r.routerModels == nil && r.routerLoaded == nil {
+		return "—"
+	}
+	return fmt.Sprintf("%d total (%d loaded)", len(r.routerModels), len(r.routerLoaded))
+}
+
+// renderRouterPanel replaces the llama-server live-data panel in router
+// runs: one row per model from GET /models, tagged loaded/unloaded from
+// GET /health.
+func (r *RunMode) renderRouterPanel(width int) string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	loadedStyle := lipgloss.NewStyle().Foreground(r.theme.StatusReady)
+	unloadedStyle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+
+	loaded := make(map[string]bool, len(r.routerLoaded))
+	for _, id := range r.routerLoaded {
+		loaded[id] = true
+	}
+
+	var rows []string
+	if len(r.routerModels) == 0 {
+		rows = append(rows, subtle.Render("(no models reported)"))
+	}
+	for _, m := range r.routerModels {
+		state := "unloaded"
+		style := unloadedStyle
+		if loaded[m.ID] {
+			state = "loaded"
+			style = loadedStyle
+		}
+		id := m.ID
+		if id == "" {
+			id = "?"
+		}
+		rows = append(rows, style.Render("● "+id)+"  "+subtle.Render(state))
+	}
+	return r.renderTitledPanel("router models", width, padRows(rows, liveBandContentRows))
 }
 
 // renderServerRow builds one row of the server panel: label + spark
@@ -1844,7 +1931,9 @@ func (r *RunMode) hardwareDeviceRows(d hwinfo.Device) []string {
 // joinMetricCells builds a metric row from its four cell parts:
 // label + viz + value + trailing-%. Cells are joined by fixed
 // separators so the column positions are deterministic across rows.
-//   "    LABEL VIZ    VALUE  PCT"
+//
+//	"    LABEL VIZ    VALUE  PCT"
+//
 // Separator spacing matches the user's "value to the right of bar,
 // to the left of %, all aligned" directive (last grilling round).
 func joinMetricCells(label, viz, value, pct string) string {

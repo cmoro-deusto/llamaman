@@ -24,6 +24,9 @@ type stubSpawner struct{ runningAlias string }
 func (s stubSpawner) Spawn(config.Model, config.Preset) (RunModeOpts, error) {
 	return RunModeOpts{}, errStubSpawn
 }
+func (s stubSpawner) SpawnRouter(string) (RunModeOpts, error) {
+	return RunModeOpts{}, errStubSpawn
+}
 func (s stubSpawner) Reattach() (*RunModeOpts, error) { return nil, nil }
 func (s stubSpawner) RunningAlias() (string, string, int) {
 	if s.runningAlias == "" {
@@ -227,6 +230,98 @@ func TestSnapshotMainModePivotsToPresetSubList(t *testing.T) {
 	}
 }
 
+// TestSnapshotMainModeRouterView covers the Router mode picker: tab
+// switches from the model list to the globals.models-files entries,
+// each showing its parsed section count.
+func TestSnapshotMainModeRouterView(t *testing.T) {
+	dir := t.TempDir()
+	ini := filepath.Join(dir, "my-models.ini")
+	if err := os.WriteFile(ini, []byte("[a]\nmodel = a.gguf\n[b]\nhf = org/repo:Q4_0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := sampleSnapshotConfig()
+	cfg.Globals.ModelsFiles = []string{ini}
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		tea.KeyMsg{Type: tea.KeyTab}, // Single → Router
+	)
+
+	if !strings.Contains(out, "my-models.ini") {
+		t.Errorf("router view missing file entry; out:\n%s", out)
+	}
+	if !strings.Contains(out, "router · 2 models") {
+		t.Errorf("router view missing section count; out:\n%s", out)
+	}
+	if strings.Contains(out, "alpha") {
+		t.Errorf("router view should not list config models, found alpha; out:\n%s", out)
+	}
+}
+
+// TestMainModeRouterToggleCycles verifies tab toggles between the model
+// picker and the router picker, and that a parse-failing models-file
+// still renders with a parse-error description.
+func TestMainModeRouterToggleCycles(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.ini")
+	if err := os.WriteFile(good, []byte("[m]\nmodel = m.gguf\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := sampleSnapshotConfig()
+	cfg.Globals.ModelsFiles = []string{good, filepath.Join(dir, "broken.ini")}
+	m := NewMainMode(cfg, "v0.0.0-test")
+	m.SetSize(120, 40)
+
+	// Default: single model mode shows model aliases.
+	out := stripANSI(m.View())
+	if !strings.Contains(out, "alpha") {
+		t.Errorf("single mode missing model list; out:\n%s", out)
+	}
+
+	// tab → router mode.
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	out = stripANSI(m.View())
+	if !strings.Contains(out, "good.ini") || !strings.Contains(out, "parse error") {
+		t.Errorf("router mode missing entries/parse error; out:\n%s", out)
+	}
+
+	// tab → back to single mode.
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	out = stripANSI(m.View())
+	if !strings.Contains(out, "alpha") {
+		t.Errorf("second tab did not return to single mode; out:\n%s", out)
+	}
+}
+
+// TestMainModeRouterEnterEmitsRouterSpawnRequest verifies Enter in
+// Router mode emits RouterSpawnRequestMsg with the selected file path.
+func TestMainModeRouterEnterEmitsRouterSpawnRequest(t *testing.T) {
+	dir := t.TempDir()
+	ini := filepath.Join(dir, "my-models.ini")
+	if err := os.WriteFile(ini, []byte("[m]\nmodel = m.gguf\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := sampleSnapshotConfig()
+	cfg.Globals.ModelsFiles = []string{ini}
+	m := NewMainMode(cfg, "v0.0.0-test")
+	m.SetSize(120, 40)
+
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab}) // router mode
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter in router mode produced no command")
+	}
+	msg := cmd()
+	rs, ok := msg.(RouterSpawnRequestMsg)
+	if !ok {
+		t.Fatalf("Enter produced %T, want RouterSpawnRequestMsg", msg)
+	}
+	if rs.File != ini {
+		t.Errorf("RouterSpawnRequestMsg.File = %q, want %q", rs.File, ini)
+	}
+}
+
 func TestSnapshotConfigMode(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
@@ -346,6 +441,9 @@ func TestSnapshotRunMode(t *testing.T) {
 type failingSpawner struct{ msg string }
 
 func (f failingSpawner) Spawn(config.Model, config.Preset) (RunModeOpts, error) {
+	return RunModeOpts{}, failingSpawnError{f.msg}
+}
+func (f failingSpawner) SpawnRouter(string) (RunModeOpts, error) {
 	return RunModeOpts{}, failingSpawnError{f.msg}
 }
 func (failingSpawner) Reattach() (*RunModeOpts, error)     { return nil, nil }
@@ -600,8 +698,8 @@ func TestParamPickerShowsNamesWithoutDashesAndDescriptions(t *testing.T) {
 	out := stripANSI(p.View(CurrentTheme()))
 
 	for _, want := range []string{
-		"threads",                    // bare name (no --)
-		"number of CPU threads",      // description
+		"threads",               // bare name (no --)
+		"number of CPU threads", // description
 		"jinja",
 		"use jinja templates",
 		"flash-attn",

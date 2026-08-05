@@ -15,7 +15,7 @@ func TestZoneForUtil(t *testing.T) {
 		{84.9, ZoneWarn},
 		{85, ZoneDanger},
 		{100, ZoneDanger},
-		{-5, ZoneIdle},  // clamps low
+		{-5, ZoneIdle},    // clamps low
 		{120, ZoneDanger}, // clamps high
 	}
 	for _, c := range cases {

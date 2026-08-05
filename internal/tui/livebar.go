@@ -146,4 +146,3 @@ func (r *ringBuffer) Snapshot() []float64 {
 	copy(out, r.data)
 	return out
 }
-
