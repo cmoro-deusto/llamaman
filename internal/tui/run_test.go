@@ -728,16 +728,16 @@ func TestRouterSelectionPanel(t *testing.T) {
 		{ID: "b", Status: llamaapi.ModelStatus{Value: "unloaded"}},
 		{ID: "c", Status: llamaapi.ModelStatus{Value: "loaded"}},
 	}
-	// Before m, ↑/↓ must NOT move the selection (log scrolls).
+	// Before tab, ↑/↓ must NOT move the selection (log scrolls).
 	r.routerFocus = "a"
 	r.Update(tea.KeyMsg{Type: tea.KeyDown})
 	if r.routerFocus != "a" {
 		t.Errorf("selection changed without panel active: %q", r.routerFocus)
 	}
-	// m activates the panel; ↓ selects.
-	r.Update(keyMsg("m"))
+	// Tab activates the panel; ↓ selects.
+	r.Update(tea.KeyMsg{Type: tea.KeyTab})
 	if !r.routerPanelActive {
-		t.Fatal("m should activate the models panel")
+		t.Fatal("tab should activate the models panel")
 	}
 	r.Update(tea.KeyMsg{Type: tea.KeyDown})
 	if r.routerFocus != "b" {
@@ -752,21 +752,49 @@ func TestRouterSelectionPanel(t *testing.T) {
 	if r.routerFocus != "a" {
 		t.Errorf("selection after wrap = %q, want a", r.routerFocus)
 	}
-	// Esc deactivates the panel; ↑/↓ stop moving the selection.
-	r.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	// Tab again deactivates the panel; ↑/↓ stop moving the selection.
+	r.Update(tea.KeyMsg{Type: tea.KeyTab})
 	if r.routerPanelActive {
-		t.Error("esc should deactivate the models panel")
+		t.Error("tab should deactivate the models panel")
 	}
 	r.routerFocus = "b"
 	r.Update(tea.KeyMsg{Type: tea.KeyUp})
 	if r.routerFocus != "b" {
 		t.Errorf("selection changed after panel deactivated: %q", r.routerFocus)
 	}
-	// s opens the selected model's stats.
+	// s opens the selected model's stats (focus unchanged: log).
 	r.routerFocus = "c"
 	r.Update(keyMsg("s"))
 	if !r.showRouterStats {
 		t.Error("s should open the stats panel")
+	}
+	if r.routerPanelActive {
+		t.Error("s should not change panel focus")
+	}
+	// Tab toggles focus to the models panel WITHOUT closing the stats —
+	// the stats panel stays up, only the arrows' target changes.
+	r.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if !r.routerPanelActive {
+		t.Error("tab should move focus to the models panel")
+	}
+	if !r.showRouterStats {
+		t.Error("stats panel must stay up when focus moves to it")
+	}
+	// Tab again returns focus to the log; stats still up.
+	r.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if r.routerPanelActive {
+		t.Error("tab should move focus back to the log")
+	}
+	if !r.showRouterStats {
+		t.Error("stats panel must stay up when focus returns to the log")
+	}
+	// Esc closes the stats (back to the model list), focus unchanged.
+	r.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if r.showRouterStats {
+		t.Error("esc should close the stats panel")
+	}
+	if r.routerPanelActive {
+		t.Error("esc must not change panel focus")
 	}
 	// Stale selection (model gone) → next ↓ starts at the first.
 	r3 := newRouterTestRunMode(&fakeFetcher{})
@@ -928,14 +956,14 @@ func TestRouterListShowsSelection(t *testing.T) {
 func TestRouterFooterShowsMHint(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
 	footer := stripANSI(r.renderFooter())
-	if !strings.Contains(footer, "m panel") {
-		t.Errorf("router footer missing m hint; footer:\n%s", footer)
+	if !strings.Contains(footer, "tab panel") {
+		t.Errorf("router footer missing tab hint; footer:\n%s", footer)
 	}
 	r2 := newRouterTestRunMode(&fakeFetcher{})
 	r2.routerFile = "" // single-model mode
 	footer2 := stripANSI(r2.renderFooter())
-	if strings.Contains(footer2, "m panel") {
-		t.Errorf("single-model footer must not show m hint; footer:\n%s", footer2)
+	if strings.Contains(footer2, "tab panel") {
+		t.Errorf("single-model footer must not show tab hint; footer:\n%s", footer2)
 	}
 }
 

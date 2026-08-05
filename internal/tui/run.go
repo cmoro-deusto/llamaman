@@ -712,18 +712,14 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			}
 		case "esc":
 			// Layered Esc: close the action menu, then the router stats
-			// panel, then leave the models panel (↑/↓ back to log
-			// scrolling), then clear any applied search query.
+			// panel (back to the model list), then clear any applied
+			// search query. Panel focus is toggled with Tab, not Esc.
 			if r.routerFile != "" && r.routerMenu {
 				r.routerMenu = false
 				return r, nil
 			}
 			if r.routerFile != "" && r.showRouterStats {
 				r.showRouterStats = false
-				return r, nil
-			}
-			if r.routerFile != "" && r.routerPanelActive {
-				r.routerPanelActive = false
 				return r, nil
 			}
 			if r.searchQuery != "" {
@@ -747,10 +743,11 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		case "i":
 			r.showInfo = true
 			return r, nil
-		case "m":
-			// Router mode: toggle the models panel as the ↑/↓ target.
+		case "tab":
+			// Router mode: toggle which panel the ↑/↓ arrows control
+			// (log vs models). Never changes what the left panel shows
+			// — stats stay up when focus returns to the log.
 			if r.routerFile != "" {
-				r.showRouterStats = false
 				r.routerPanelActive = !r.routerPanelActive
 			}
 			return r, nil
@@ -786,7 +783,7 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		case "l", "u":
 			// Router mode: load / unload the selected model.
 			if r.routerFile == "" || r.routerFocus == "" {
-				return r, r.setFlash("select a model first (m)")
+				return r, r.setFlash("select a model first (tab, ↑/↓)")
 			}
 			if m.String() == "u" {
 				if r.selectedState() != "loaded" {
@@ -1468,9 +1465,9 @@ func (r *RunMode) renderHelp() string {
 		{"r", "restart server (confirms)"},
 		{"c", "copy launch command to clipboard"},
 		{"i", "show model & preset details"},
-		{"m", "router mode: models panel on/off (↑/↓ select)"},
+		{"tab", "router mode: switch panel ↑/↓ target (log ↔ models)"},
 		{"Enter", "router mode: action menu (Load/Unload/Stats/Info)"},
-		{"s", "router mode: open selected model's stats"},
+		{"s", "router mode: show selected model's stats (Esc back)"},
 		{"l / u", "router mode: load / unload the selected model (u confirms)"},
 		{"d", "router mode: toggle proxy-log denoise (default on)"},
 		{"/", "search (live highlights; Enter applies, Esc cancels)"},
@@ -1509,7 +1506,7 @@ func (r *RunMode) renderFooter() string {
 		"q quit", "k kill", "r restart", "c copy", "i info",
 	}
 	if r.routerFile != "" {
-		tokens = append(tokens, "m panel", "l/u load/unload", "d denoise")
+		tokens = append(tokens, "tab panel", "l/u load/unload", "d denoise")
 	}
 	tokens = append(tokens, "/ search", "? help", "g/G top/bottom", "space/b page", "↑/↓ scroll")
 	parts := make([]string, len(tokens))
