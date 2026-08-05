@@ -72,8 +72,20 @@ func Import(f *File, existing []config.Model, reg flags.Registry) ([]config.Mode
 
 		alias, fromKey := aliasOf(s)
 		presetName := "default"
-		if fromKey {
-			// "[alias:preset]" convention used by our exporter.
+		if exported, ok := exportedModelAlias(s); ok {
+			// Our exporter's unique-alias format: the model alias rides in
+			// the "; llamaman-model:" comment and the preset name in the
+			// alias-key suffix ("X:preset").
+			alias = exported
+			if fromKey {
+				if v, _ := s.Get("alias"); v != "" {
+					if rest, ok := strings.CutPrefix(v, exported+":"); ok && rest != "" {
+						presetName = rest
+					}
+				}
+			}
+		} else if fromKey {
+			// "[alias:preset]" section-name convention (plain exports).
 			if rest, ok := strings.CutPrefix(s.Name, alias+":"); ok && rest != "" {
 				presetName = rest
 			}
@@ -153,6 +165,22 @@ func descriptionOf(s *Section) string {
 		}
 	}
 	return ""
+}
+
+// exportedModelAlias returns the authoritative model alias recorded by
+// our exporter in the "; llamaman-model:" comment, when present. The
+// comment exists exactly when the export had to make the section's
+// alias unique (multi-preset models); without it, the alias key itself
+// is the model alias.
+func exportedModelAlias(s *Section) (string, bool) {
+	for i := len(s.Comment) - 1; i >= 0; i-- {
+		if rest, ok := strings.CutPrefix(s.Comment[i], "; llamaman-model:"); ok {
+			if alias := strings.TrimSpace(rest); alias != "" {
+				return alias, true
+			}
+		}
+	}
+	return "", false
 }
 
 // importParams builds the ordered param list for one section: "[*]"

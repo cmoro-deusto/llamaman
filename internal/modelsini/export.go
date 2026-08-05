@@ -44,7 +44,20 @@ func Export(cfg *config.Config) (*File, []string) {
 			} else {
 				s.Set("model", model.Location)
 			}
-			s.Set("alias", model.Alias)
+			if len(model.Presets) > 1 {
+				// Each preset is its own model section for llama.cpp's
+				// router, which requires unique aliases across sections —
+				// a repeated model alias aborts router startup. The alias
+				// therefore carries the preset suffix (matching the
+				// section name), and the original model alias is recorded
+				// in a "; llamaman-model:" comment so import can still
+				// merge the presets back onto one model. llama.cpp treats
+				// the comment as noise, so the file stays router-valid.
+				s.Comment = append(s.Comment, "; llamaman-model: "+model.Alias)
+				s.Set("alias", model.Alias+":"+preset.Name)
+			} else {
+				s.Set("alias", model.Alias)
+			}
 			if strings.Contains(model.Alias, ",") {
 				warnings = append(warnings, fmt.Sprintf("model %q: alias contains a comma — llama.cpp will read it as a list of routing aliases", model.Alias))
 			}

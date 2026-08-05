@@ -338,8 +338,12 @@ func acquireAndSpawn(cfg *config.Config, registry flags.Registry, sessMgr *serve
 func acquireAndSpawnRouter(cfg *config.Config, registry flags.Registry, registryReal bool, sessMgr *server.SessionManager, file string) (*tui.RunModeOpts, error) {
 	// Validate the file up front so a typo'd path fails fast, before the
 	// spawn dance.
-	if _, err := modelsini.ParseFile(file); err != nil {
+	f, err := modelsini.ParseFile(file)
+	if err != nil {
 		return nil, fmt.Errorf("router models file: %w", err)
+	}
+	if err := f.ValidateRouterAliases(); err != nil {
+		return nil, fmt.Errorf("router models file %s: %w (llamaman export writes unique aliases — re-export or edit the file)", file, err)
 	}
 	if registryReal {
 		if _, ok := registry.Lookup("models-preset"); !ok {

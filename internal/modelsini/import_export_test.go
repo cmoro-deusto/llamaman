@@ -322,6 +322,168 @@ func TestExportMultiPresetSections(t *testing.T) {
 		if v, _ := s.Get("hf"); v != "org/repo:Q8_0" {
 			t.Errorf("section %q hf = %q", s.Name, v)
 		}
+		// Multi-preset sections must NOT repeat the model alias: the
+		// router requires unique aliases and aborts startup otherwise.
+		// The alias carries the preset suffix; the original model alias
+		// is preserved in the "; llamaman-model:" comment.
+		if v, _ := s.Get("alias"); v != s.Name {
+			t.Errorf("section %q alias = %q, want its own section name (unique)", s.Name, v)
+		}
+		if !containsComment(s, "; llamaman-model: m") {
+			t.Errorf("section %q missing llamaman-model comment; comments = %v", s.Name, s.Comment)
+		}
+	}
+}
+
+// TestExportRouterAliasesUnique guarantees an exported file is valid
+// input for llama-server --models-preset: every section's alias must be
+// unique, and the file must pass ValidateRouterAliases.
+func TestExportRouterAliasesUnique(t *testing.T) {
+	cfg := &config.Config{
+		Version: config.SchemaVersion,
+		Models: []config.Model{
+			{
+				Alias: "m", Location: "/m.gguf",
+				Presets: []config.Preset{
+					{Name: "a", Params: config.Params{{Key: "ngl", Value: json.Number("99")}}},
+					{Name: "b", Params: config.Params{{Key: "ngl", Value: json.Number("32")}}},
+				},
+			},
+			{
+				Alias: "single", HF: "org/repo:Q4_0",
+				Presets: []config.Preset{{Name: "default"}},
+			},
+		},
+	}
+	f, _ := Export(cfg)
+	// Serialize and re-parse so the check runs over the real file bytes.
+	reparsed, err := Parse([]byte(f.String()))
+	if err != nil {
+		t.Fatalf("re-parse exported file: %v", err)
+	}
+	if err := reparsed.ValidateRouterAliases(); err != nil {
+		t.Errorf("exported file is not router-valid: %v\n%s", err, f.String())
+	}
+	seen := map[string]string{}
+	for _, s := range reparsed.Sections {
+		v, _ := s.Get("alias")
+		if owner, dup := seen[v]; dup {
+			t.Errorf("alias %q used by both [%s] and [%s]", v, owner, s.Name)
+		}
+		seen[v] = s.Name
+	}
+}
+
+// TestImportExportedUniqueAliasComment verifies the exporter's
+// unique-alias format round-trips: sections whose aliases carry a preset
+// suffix must merge back onto the model named in the "; llamaman-model:"
+// comment, with preset names recovered from the alias-key suffix.
+func TestImportExportedUniqueAliasComment(t *testing.T) {
+	const ini = `; description: balanced preset
+; llamaman-model: m
+[m:balanced]
+model = /models/m.gguf
+alias = m:balanced
+ngl = 99
+
+; description: fast preset
+; llamaman-model: m
+[m:fast]
+model = /models/m.gguf
+alias = m:fast
+ngl = 32
+`
+	f, err := Parse([]byte(ini))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	models, warnings := Import(f, nil, testRegistry(t))
+	if len(warnings) != 0 {
+		t.Fatalf("import warnings: %v", warnings)
+	}
+	if len(models) != 1 {
+		t.Fatalf("got %d models, want 1 (merged)", len(models))
+	}
+	m := models[0]
+	if m.Alias != "m" {
+		t.Errorf("alias = %q, want m", m.Alias)
+	}
+	if len(m.Presets) != 2 {
+		t.Fatalf("presets = %d, want 2", len(m.Presets))
+	}
+	if m.Presets[0].Name != "balanced" || m.Presets[0].Description != "balanced preset" {
+		t.Errorf("preset[0] = %+v", m.Presets[0])
+	}
+	if m.Presets[1].Name != "fast" || m.Presets[1].Description != "fast preset" {
+		t.Errorf("preset[1] = %+v", m.Presets[1])
+	}
+}
+
+// TestValidateRouterAliases exercises the pre-spawn duplicate-alias
+// check that mirrors llama.cpp's router startup validation.
+func TestValidateRouterAliases(t *testing.T) {
+	cases := []struct {
+		name    string
+		ini     string
+		wantErr bool
+	}{
+		{
+			name: "unique aliases pass",
+			ini: `[a]
+model = /a.gguf
+alias = a,extra
+[b]
+model = /b.gguf
+alias = b
+`,
+		},
+		{
+			name: "repeated alias fails",
+			ini: `[a]
+model = /a.gguf
+alias = shared
+[b]
+model = /b.gguf
+alias = shared
+`,
+			wantErr: true,
+		},
+		{
+			name: "section-name fallback collides",
+			ini: `[shared]
+model = /a.gguf
+[other]
+model = /b.gguf
+alias = shared
+`,
+			wantErr: true, // [shared]'s fallback name clashes with [other]'s alias
+		},
+		{
+			name: "global and default ignored",
+			ini: `[*]
+ctx-size = 8192
+[default]
+temp = 0.5
+[a]
+model = /a.gguf
+alias = a
+`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := Parse([]byte(tc.ini))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			err = f.ValidateRouterAliases()
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected conflict error, got none")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 
@@ -408,4 +570,13 @@ func TestExportImportRoundTrip(t *testing.T) {
 	if ini2 := f2.String(); ini2 != ini1 {
 		t.Errorf("round-trip not stable:\n--- first export ---\n%s\n--- re-export ---\n%s", ini1, ini2)
 	}
+}
+
+func containsComment(s Section, want string) bool {
+	for _, c := range s.Comment {
+		if c == want {
+			return true
+		}
+	}
+	return false
 }
