@@ -15,6 +15,7 @@ func TestRouterBuildArgv(t *testing.T) {
 		"--models-preset", "/home/me/my-models.ini",
 		"--host", "127.0.0.1",
 		"--port", "9080",
+		"--metrics",
 	}
 	if !reflect.DeepEqual(res.Argv, want) {
 		t.Errorf("RouterBuild argv = %v, want %v", res.Argv, want)

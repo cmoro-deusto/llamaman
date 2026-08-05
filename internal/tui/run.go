@@ -70,6 +70,12 @@ type RunMode struct {
 	// routerSlots holds each loaded model's /slots?model=<id> stats,
 	// keyed by model id.
 	routerSlots map[string]*llamaapi.Slots
+	// routerMetrics holds each loaded model's /metrics?model=<id>
+	// averages, keyed by model id. routerMetricsAvailable goes false
+	// when the router reports the metrics endpoint disabled (spawned
+	// without --metrics), which stops the per-model metrics polling.
+	routerMetrics          map[string]*llamaapi.Metrics
+	routerMetricsAvailable bool
 
 	proc          *server.Process
 	tail          *server.Tailer
@@ -212,27 +218,28 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 	}
 
 	r := &RunMode{
-		cfg:              opts.Cfg,
-		model:            opts.Model,
-		preset:           opts.Preset,
-		routerFile:       opts.RouterFile,
-		argv:             opts.Argv,
-		warnings:         opts.Warnings,
-		proc:             opts.Process,
-		tail:             tail,
-		sessionMgr:       opts.SessionMgr,
-		registry:         opts.Registry,
-		viewport:         vp,
-		status:           StatusStarting,
-		keys:             DefaultKeymap(),
-		theme:            CurrentTheme(),
-		searchInput:      ti,
-		serverVersion:    loadServerVersion(opts.Cfg.Globals.Bin),
-		fetcher:          opts.Fetcher,
-		metricsAvailable: true,
-		tokensHistory:    newRingBuffer(sparkBufferSamples),
-		promptHistory:    newRingBuffer(sparkBufferSamples),
-		utilHistory:      map[string]*ringBuffer{},
+		cfg:                    opts.Cfg,
+		model:                  opts.Model,
+		preset:                 opts.Preset,
+		routerFile:             opts.RouterFile,
+		argv:                   opts.Argv,
+		warnings:               opts.Warnings,
+		proc:                   opts.Process,
+		tail:                   tail,
+		sessionMgr:             opts.SessionMgr,
+		registry:               opts.Registry,
+		viewport:               vp,
+		status:                 StatusStarting,
+		keys:                   DefaultKeymap(),
+		theme:                  CurrentTheme(),
+		searchInput:            ti,
+		serverVersion:          loadServerVersion(opts.Cfg.Globals.Bin),
+		fetcher:                opts.Fetcher,
+		metricsAvailable:       true,
+		routerMetricsAvailable: true,
+		tokensHistory:          newRingBuffer(sparkBufferSamples),
+		promptHistory:          newRingBuffer(sparkBufferSamples),
+		utilHistory:            map[string]*ringBuffer{},
 	}
 	r.fetchCtx, r.fetchCancel = context.WithCancel(context.Background())
 	cmds := []tea.Cmd{
@@ -301,6 +308,9 @@ func (r *RunMode) routerPollCmds() []tea.Cmd {
 	for _, m := range r.routerModels {
 		if m.Status.Value == "loaded" || m.Status.Value == "loading" {
 			cmds = append(cmds, fetchRouterSlotsCmd(r.fetchCtx, r.fetcher, m.ID))
+			if r.routerMetricsAvailable {
+				cmds = append(cmds, fetchRouterMetricsCmd(r.fetchCtx, r.fetcher, m.ID))
+			}
 		}
 	}
 	return cmds
@@ -490,6 +500,22 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 				r.routerSlots = make(map[string]*llamaapi.Slots)
 			}
 			r.routerSlots[m.model] = m.s
+		}
+		return r, nil
+
+	case routerMetricsMsg:
+		if errors.Is(m.err, llamaapi.ErrMetricsNotEnabled) {
+			// Router spawned without --metrics (e.g. reattached to a
+			// process started by an older llamaman): stop the metrics
+			// polling, keep the slots-based stats.
+			r.routerMetricsAvailable = false
+			return r, nil
+		}
+		if m.err == nil && m.m != nil {
+			if r.routerMetrics == nil {
+				r.routerMetrics = make(map[string]*llamaapi.Metrics)
+			}
+			r.routerMetrics[m.model] = m.m
 		}
 		return r, nil
 
@@ -1582,7 +1608,12 @@ func (r *RunMode) renderRouterPanel(width int) string {
 			if s.BusyCount > 0 {
 				activity = "processing"
 			}
-			stats = " · " + humanTokens(s.ContextUsed) + "/" + humanTokens(s.ContextMax) + " · " + activity
+			parts := []string{humanTokens(s.ContextUsed) + "/" + humanTokens(s.ContextMax)}
+			if mm, ok := r.routerMetrics[m.ID]; ok && mm != nil && mm.PredictedTokensSecondsAvg > 0 {
+				parts = append(parts, fmt.Sprintf("%.1f tok/s", mm.PredictedTokensSecondsAvg))
+			}
+			parts = append(parts, activity)
+			stats = " · " + strings.Join(parts, " · ")
 		}
 		rows = append(rows, style.Render(mark+" "+id)+subtle.Render(stats)+"  "+subtle.Render(state))
 	}
@@ -1590,8 +1621,9 @@ func (r *RunMode) renderRouterPanel(width int) string {
 }
 
 // routerPanelIDMax truncates long model ids in the router panel so the
-// per-model stats suffix stays visible on a half-width panel.
-const routerPanelIDMax = 40
+// per-model stats suffix (ctx, tok/s, activity) stays visible on a
+// half-width panel.
+const routerPanelIDMax = 34
 
 // truncateRune shortens s to at most max runes, appending "…".
 func truncateRune(s string, max int) string {

@@ -450,3 +450,30 @@ func TestFetchSlotsForQueriesModel(t *testing.T) {
 		t.Errorf("context = %d/%d, want 4263/65536", got.ContextUsed, got.ContextMax)
 	}
 }
+
+func TestFetchMetricsForQueriesModel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.URL.Query().Get("model"); got != "m:a:b" {
+			t.Errorf("model query = %q, want m:a:b (url-escaped)", got)
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(`# TYPE llamacpp:predicted_tokens_seconds gauge
+llamacpp:predicted_tokens_seconds 12.3
+# TYPE llamacpp:prompt_tokens_seconds gauge
+llamacpp:prompt_tokens_seconds 500
+`))
+	}))
+	defer srv.Close()
+
+	got, err := clientFor(t, srv).FetchMetricsFor(context.Background(), "m:a:b")
+	if err != nil {
+		t.Fatalf("FetchMetricsFor: %v", err)
+	}
+	if got.PredictedTokensSecondsAvg != 12.3 || got.PromptTokensSecondsAvg != 500 {
+		t.Errorf("averages = %v/%v, want 12.3/500", got.PredictedTokensSecondsAvg, got.PromptTokensSecondsAvg)
+	}
+}

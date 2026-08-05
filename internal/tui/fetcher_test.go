@@ -116,6 +116,10 @@ type fakeFetcher struct {
 	slotsFor      map[string]*llamaapi.Slots
 	slotsForErr   error
 	slotsForCalls int
+	// Per-model metrics (router mode): one Metrics per model id.
+	metricsFor      map[string]*llamaapi.Metrics
+	metricsForErr   error
+	metricsForCalls int
 }
 
 func (f *fakeFetcher) FetchProps(ctx context.Context) (*llamaapi.Props, error) {
@@ -179,6 +183,16 @@ func (f *fakeFetcher) FetchSlotsFor(_ context.Context, model string) (*llamaapi.
 		return nil, f.slotsForErr
 	}
 	return f.slotsFor[model], nil
+}
+
+func (f *fakeFetcher) FetchMetricsFor(_ context.Context, model string) (*llamaapi.Metrics, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.metricsForCalls++
+	if f.metricsForErr != nil {
+		return nil, f.metricsForErr
+	}
+	return f.metricsFor[model], nil
 }
 
 func (f *fakeFetcher) callCount() int {

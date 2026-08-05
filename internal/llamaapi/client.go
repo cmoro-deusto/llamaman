@@ -122,7 +122,21 @@ var ErrMetricsNotEnabled = errors.New("llamaapi: /metrics endpoint not available
 // caller can stop polling. Other non-2xx responses + transport errors
 // surface as a generic error.
 func (c *Client) FetchMetrics(ctx context.Context) (*Metrics, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/metrics", nil)
+	return c.fetchMetrics(ctx, "")
+}
+
+// FetchMetricsFor GETs /metrics?model=<id> — the router-mode variant,
+// which requires the model name and reports that model's metrics only.
+func (c *Client) FetchMetricsFor(ctx context.Context, model string) (*Metrics, error) {
+	return c.fetchMetrics(ctx, model)
+}
+
+func (c *Client) fetchMetrics(ctx context.Context, model string) (*Metrics, error) {
+	u := c.base + "/metrics"
+	if model != "" {
+		u += "?model=" + url.QueryEscape(model)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("llamaapi: build request: %w", err)
 	}

@@ -376,17 +376,18 @@ func TestTopStripColumnsAlign(t *testing.T) {
 // context, and (optionally) a fakeFetcher for polling tests.
 func newRouterTestRunMode(fake *fakeFetcher) *RunMode {
 	r := &RunMode{
-		cfg:           &config.Config{Globals: config.Globals{Host: "127.0.0.1", Port: 9080}},
-		routerFile:    "models.ini",
-		proc:          &server.Process{Started: time.Now().Add(-90 * time.Second)},
-		viewport:      viewport.New(120, 30),
-		searchInput:   textinput.New(),
-		theme:         CurrentTheme(),
-		status:        StatusStarting,
-		fetcher:       fake,
-		tokensHistory: newRingBuffer(sparkBufferSamples),
-		promptHistory: newRingBuffer(sparkBufferSamples),
-		utilHistory:   map[string]*ringBuffer{},
+		cfg:                    &config.Config{Globals: config.Globals{Host: "127.0.0.1", Port: 9080}},
+		routerFile:             "models.ini",
+		proc:                   &server.Process{Started: time.Now().Add(-90 * time.Second)},
+		viewport:               viewport.New(120, 30),
+		searchInput:            textinput.New(),
+		theme:                  CurrentTheme(),
+		status:                 StatusStarting,
+		fetcher:                fake,
+		routerMetricsAvailable: true,
+		tokensHistory:          newRingBuffer(sparkBufferSamples),
+		promptHistory:          newRingBuffer(sparkBufferSamples),
+		utilHistory:            map[string]*ringBuffer{},
 	}
 	r.fetchCtx, r.fetchCancel = context.WithCancel(context.Background())
 	return r
@@ -590,6 +591,124 @@ func TestHumanTokens(t *testing.T) {
 		if got := humanTokens(in); got != want {
 			t.Errorf("humanTokens(%d) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestRouterPollFetchesMetricsForLoadedModels verifies the router poll
+// fetches /metrics?model=<id> for loaded models while metrics are
+// available (llamaman always spawns routers with --metrics now).
+func TestRouterPollFetchesMetricsForLoadedModels(t *testing.T) {
+	fake := &fakeFetcher{
+		props: propsWithNCtx(0),
+		models: &llamaapi.Models{Data: []llamaapi.ModelInfo{
+			{ID: "m:loaded", Status: llamaapi.ModelStatus{Value: "loaded"}},
+			{ID: "m:unloaded", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+		}},
+		health: &llamaapi.Health{Status: "ok"},
+		slotsFor: map[string]*llamaapi.Slots{
+			"m:loaded": {ContextUsed: 4222, ContextMax: 65536, BusyCount: 1},
+		},
+		metricsFor: map[string]*llamaapi.Metrics{
+			"m:loaded": {PredictedTokensSecondsAvg: 12.3},
+		},
+	}
+	r := newRouterTestRunMode(fake)
+	// Round 1 (startup): populates the model list.
+	_, cmds := r.Update(propsFetchedMsg{nctx: 0})
+	for _, sub := range collectCmds(cmds) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	// Round 2 (tick): per-model slots + metrics for the loaded model.
+	_, cmd := r.Update(livePollTickMsg(time.Now()))
+	for _, sub := range collectCmds(cmd) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if fake.metricsForCalls != 1 {
+		t.Errorf("FetchMetricsFor calls = %d, want 1 (loaded model only)", fake.metricsForCalls)
+	}
+	mm, ok := r.routerMetrics["m:loaded"]
+	if !ok || mm == nil || mm.PredictedTokensSecondsAvg != 12.3 {
+		t.Errorf("routerMetrics[m:loaded] = %+v", mm)
+	}
+	// Rate shows in the panel.
+	got := stripANSI(r.renderRouterPanel(60))
+	if !strings.Contains(got, "12.3 tok/s") {
+		t.Errorf("panel missing rate; panel:\n%s", got)
+	}
+}
+
+// TestRouterMetricsNotEnabledStopsPolling verifies the 501 sentinel
+// (router spawned without --metrics, e.g. an older process) stops the
+// per-model metrics polling while slots-based stats keep working.
+func TestRouterMetricsNotEnabledStopsPolling(t *testing.T) {
+	fake := &fakeFetcher{
+		props: propsWithNCtx(0),
+		models: &llamaapi.Models{Data: []llamaapi.ModelInfo{
+			{ID: "m:loaded", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		}},
+		health: &llamaapi.Health{Status: "ok"},
+		slotsFor: map[string]*llamaapi.Slots{
+			"m:loaded": {ContextUsed: 10, ContextMax: 100},
+		},
+		metricsForErr: llamaapi.ErrMetricsNotEnabled,
+	}
+	r := newRouterTestRunMode(fake)
+	_, cmds := r.Update(propsFetchedMsg{nctx: 0})
+	for _, sub := range collectCmds(cmds) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	_, cmd := r.Update(livePollTickMsg(time.Now()))
+	for _, sub := range collectCmds(cmd) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if r.routerMetricsAvailable {
+		t.Error("routerMetricsAvailable still true after ErrMetricsNotEnabled")
+	}
+	// One more tick: no further metrics fetches.
+	before := fake.metricsForCalls
+	_, cmd = r.Update(livePollTickMsg(time.Now()))
+	for _, sub := range collectCmds(cmd) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if fake.metricsForCalls != before {
+		t.Errorf("metrics fetched after sentinel: %d -> %d", before, fake.metricsForCalls)
+	}
+	if fake.slotsForCalls == 0 {
+		t.Error("slots polling must continue after metrics sentinel")
+	}
+}
+
+// TestRouterPanelShowsRateOnlyWhenMetricsPresent pins that the tok/s
+// suffix appears only when the model has metrics data.
+func TestRouterPanelShowsRateOnlyWhenMetricsPresent(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "m:with-metrics", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "m:no-metrics", Status: llamaapi.ModelStatus{Value: "loaded"}},
+	}
+	r.routerSlots = map[string]*llamaapi.Slots{
+		"m:with-metrics": {ContextUsed: 1000, ContextMax: 2000, BusyCount: 0},
+		"m:no-metrics":   {ContextUsed: 1000, ContextMax: 2000, BusyCount: 0},
+	}
+	r.routerMetrics = map[string]*llamaapi.Metrics{
+		"m:with-metrics": {PredictedTokensSecondsAvg: 27.5},
+	}
+	got := stripANSI(r.renderRouterPanel(60))
+	if !strings.Contains(got, "27.5 tok/s") {
+		t.Errorf("panel missing rate for m:with-metrics; panel:\n%s", got)
+	}
+	if strings.Count(got, "tok/s") != 1 {
+		t.Errorf("tok/s shown %d times, want 1; panel:\n%s", strings.Count(got, "tok/s"), got)
 	}
 }
 
