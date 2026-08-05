@@ -631,7 +631,7 @@ func findPreset(m config.Model, name string) (config.Preset, bool) {
 // currently live, followed by one line per configured router source
 // (globals.models-files) with its parsed section count.
 func runList(cfgOverride string) int {
-	cfg, _, code, missing := loadConfigOrFirstRun(cfgOverride)
+	cfg, cfgPath, code, missing := loadConfigOrFirstRun(cfgOverride)
 	if missing {
 		fmt.Fprintln(os.Stderr, "no config; run llamaman without flags to set up")
 		return exitConfigErr
@@ -653,7 +653,7 @@ func runList(cfgOverride string) int {
 		fmt.Printf("%s\t(%s)\t%d preset%s%s\n",
 			m.Alias, m.SourceLabel(), len(m.Presets), plural(len(m.Presets)), marker)
 	}
-	for _, mf := range cfg.Globals.ModelsFiles {
+	for _, mf := range modelsini.EffectiveModelsFiles(cfg, cfgPath) {
 		marker := ""
 		if mf == runningAlias {
 			marker = " (running)"
@@ -806,6 +806,14 @@ func runImport(file, cfgOverride string) int {
 	if err := config.Save(cfgPath, merged); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return exitGeneric
+	}
+	// Keep the derived models.ini in sync (Router default source).
+	if warnings, err := modelsini.WriteDerived(cfgPath, merged); err != nil {
+		fmt.Fprintln(os.Stderr, "warn: derived models.ini:", err)
+	} else {
+		for _, w := range warnings {
+			fmt.Fprintln(os.Stderr, "warn:", w)
+		}
 	}
 	fmt.Printf("imported %d model%s from %s into %s\n",
 		len(imported), plural(len(imported)), file, cfgPath)

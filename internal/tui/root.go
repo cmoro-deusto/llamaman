@@ -111,6 +111,7 @@ func NewRoot(cfg *config.Config, cfgPath string, spawner Spawner, registry flags
 		mainMode:   NewMainMode(cfg, version),
 		initialRun: initialRun,
 	}
+	r.mainMode.SetCfgPath(cfgPath)
 	if initialRun != nil {
 		r.view = ViewRun
 	}
@@ -178,6 +179,16 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return r.handleReattach()
 
 	case returnToMainMsg:
+		// Land the main menu on the mode the ended session belonged to:
+		// a killed router returns to Router mode even when it was
+		// reattached from Single mode (and vice versa).
+		if r.run != nil {
+			if r.run.IsRouter() {
+				r.mainMode.SetMode(modeRouter)
+			} else {
+				r.mainMode.SetMode(modeSingle)
+			}
+		}
 		r.run = nil
 		r.view = ViewMain
 		r.refreshSessionState()
@@ -204,6 +215,7 @@ func (r *Root) handleFirstRunCompleted(msg FirstRunCompletedMsg) (tea.Model, tea
 	r.cfgPath = msg.CfgPath
 	r.firstRun = nil
 	r.mainMode = NewMainMode(msg.Cfg, r.version)
+	r.mainMode.SetCfgPath(r.cfgPath)
 	r.mainMode.SetSize(r.width, r.height)
 	cm := NewConfigMode(msg.CfgPath, msg.Cfg)
 	cm.SetRegistry(r.registry)

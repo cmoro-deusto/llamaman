@@ -771,6 +771,11 @@ func (r *RunMode) applyMetrics(m *llamaapi.Metrics) {
 	r.prevMetrics = m
 }
 
+// IsRouter reports whether this run mode serves a router session
+// (my-models.ini file) rather than a single model. Used by Root when a
+// session ends to return to the matching main-menu mode.
+func (r *RunMode) IsRouter() bool { return r.routerFile != "" }
+
 // killServer performs the cleanup shared by every kill path: stop the
 // child, close the tailer, remove its log, and clear the session
 // record. Callers decide whether to return to main mode or quit

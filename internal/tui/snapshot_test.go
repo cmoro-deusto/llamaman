@@ -14,6 +14,7 @@ import (
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
 	"github.com/cmoro-deusto/llamaman/internal/llamaapi"
+	"github.com/cmoro-deusto/llamaman/internal/modelsini"
 	"github.com/cmoro-deusto/llamaman/internal/server"
 )
 
@@ -234,28 +235,49 @@ func TestSnapshotMainModePivotsToPresetSubList(t *testing.T) {
 // registered sources renders guidance instead of a blank screen: it must
 // point at config mode's "models files" globals field and at the CLI
 // escapes (llamaman -i / import).
-func TestSnapshotMainModeRouterEmptyState(t *testing.T) {
+// TestSnapshotMainModeRouterDefaultSource verifies Router mode with no
+// explicit globals.models-files shows the derived <config-dir>/models.ini
+// as the default source (0 models when the ini doesn't exist yet).
+func TestSnapshotMainModeRouterDefaultSource(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	cfg.Globals.ModelsFiles = nil
-	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	root := NewRoot(cfg, cfgPath, stubSpawner{}, nil, "v0.0.0-test", nil)
 
 	out := driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
 		tea.KeyMsg{Type: tea.KeyTab}, // Single → Router
 	)
 
+	want := filepath.Join(dir, modelsini.DefaultModelsIniName)
+	if !strings.Contains(out, want) {
+		t.Errorf("router view missing derived default source %q; out:\n%s", want, out)
+	}
+	if strings.Contains(out, "alpha") {
+		t.Errorf("router view should not list config models; out:\n%s", out)
+	}
+}
+
+// TestMainModeRouterEmptyStateDirect pins the empty-state guidance that
+// shows when no derived default can be computed (no config path) —
+// still reachable code, e.g. for MainMode constructed without a path.
+func TestMainModeRouterEmptyStateDirect(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	cfg.Globals.ModelsFiles = nil
+	m := NewMainMode(cfg, "v0.0.0-test") // no cfgPath → no default source
+	m.SetSize(120, 40)
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	out := stripANSI(m.View())
 	for _, want := range []string{
 		"No router sources yet",
 		"models files",
 		"llamaman -i <file>",
-		"llamaman import <file>",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("router empty state missing %q; out:\n%s", want, out)
 		}
-	}
-	if strings.Contains(out, "alpha") {
-		t.Errorf("router empty state should not list config models; out:\n%s", out)
 	}
 }
 
@@ -609,6 +631,67 @@ func TestRunModeDirectKillReturnsToMain(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("y did not stop the child")
 	}
+}
+
+// TestRunModeKillReturnsToMatchingMainMode is the regression for the
+// reattach-kill bug: killing a router session must return the main menu
+// to Router mode even when the session was attached from Single mode
+// (and vice versa), not whatever mode the toggle happened to be in.
+func TestRunModeKillReturnsToMatchingMainMode(t *testing.T) {
+	bin := filepath.Join(repoRoot(t), "bin", "llamaman-fakeserver")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("fakeserver not built: %v", err)
+	}
+	cfg := sampleSnapshotConfig()
+
+	t.Run("router session returns to router mode", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "llama.log")
+		proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+		opts := RunModeOpts{
+			Cfg: cfg, RouterFile: "models.ini", Argv: proc.Argv, Process: proc,
+		}
+		root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
+		driveRoot(t, root, tea.WindowSizeMsg{Width: 140, Height: 40})
+		root.mainMode.SetMode(modeSingle) // simulate reattaching from Single mode
+
+		driveRoot(t, root, keyMsg("k"), keyMsg("y"))
+		if root.view != ViewMain {
+			t.Fatalf("view = %d, want ViewMain", root.view)
+		}
+		if root.mainMode.mode != modeRouter {
+			t.Errorf("main mode = %v, want modeRouter after killing a router session", root.mainMode.mode)
+		}
+	})
+
+	t.Run("single session returns to single mode", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "llama.log")
+		proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+		opts := RunModeOpts{
+			Cfg: cfg, Model: cfg.Models[0], Preset: cfg.Models[0].Presets[0],
+			Argv: proc.Argv, Process: proc,
+		}
+		root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
+		driveRoot(t, root, tea.WindowSizeMsg{Width: 140, Height: 40})
+		root.mainMode.SetMode(modeRouter) // simulate reattaching from Router mode
+
+		driveRoot(t, root, keyMsg("k"), keyMsg("y"))
+		if root.view != ViewMain {
+			t.Fatalf("view = %d, want ViewMain", root.view)
+		}
+		if root.mainMode.mode != modeSingle {
+			t.Errorf("main mode = %v, want modeSingle after killing a single-model session", root.mainMode.mode)
+		}
+	})
 }
 
 // TestRunModeQuitPromptKillQuitsLlamaman verifies the q→k path: the

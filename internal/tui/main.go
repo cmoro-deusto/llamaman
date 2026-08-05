@@ -36,6 +36,7 @@ const (
 // llama-server hosting every model in the file).
 type MainMode struct {
 	cfg     *config.Config
+	cfgPath string // config file path; drives the derived models.ini default
 	keys    Keymap
 	theme   Theme
 	width   int
@@ -87,6 +88,15 @@ func (m *MainMode) SetCfg(cfg *config.Config) {
 	m.applyListSize()
 }
 
+// SetCfgPath records the config file path, which drives the derived
+// models.ini default for the Router source list. Called by Root after
+// construction and on first-run completion.
+func (m *MainMode) SetCfgPath(cfgPath string) {
+	m.cfgPath = cfgPath
+	m.rebuildRouterFiles()
+	m.applyListSize()
+}
+
 // SetRunning updates the "▶ Detached" line. Called by Root after session
 // state changes. Empty alias hides the line and disables `a`. Router
 // sessions report the models-file path as their alias, so the marker
@@ -97,6 +107,16 @@ func (m *MainMode) SetRunning(alias, preset string, port int) {
 	m.runningPort = port
 	m.rebuildModels()
 	m.rebuildRouterFiles()
+}
+
+// SetMode switches the Single Model / Router toggle and clears any
+// preset pivot. Used by Root when a run session ends so the main menu
+// lands on the mode the session belonged to (a killed router returns
+// to Router mode even when it was reattached from Single mode).
+func (m *MainMode) SetMode(mode mainMode) {
+	m.mode = mode
+	m.showPresets = false
+	m.applyListSize()
 }
 
 // IsSessionRunning reports whether main mode currently shows the detached
@@ -113,7 +133,7 @@ func (m *MainMode) SetFlash(msg string) { m.flash = msg }
 // mode). Root uses this to gate the no-args Enter→spawn shortcut.
 func (m MainMode) HasModels() bool {
 	if m.mode == modeRouter {
-		return len(m.cfg.Globals.ModelsFiles) > 0
+		return len(modelsini.EffectiveModelsFiles(m.cfg, m.cfgPath)) > 0
 	}
 	return len(m.cfg.Models) > 0
 }
@@ -243,7 +263,7 @@ func (r routerItem) Description() string {
 func (r routerItem) FilterValue() string { return r.path }
 
 func (m *MainMode) rebuildRouterFiles() {
-	files := m.cfg.Globals.ModelsFiles
+	files := modelsini.EffectiveModelsFiles(m.cfg, m.cfgPath)
 	items := make([]list.Item, len(files))
 	for i, path := range files {
 		it := routerItem{path: path, runningAlias: m.runningAlias}

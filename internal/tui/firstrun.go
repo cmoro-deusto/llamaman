@@ -11,7 +11,10 @@ import (
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 
+	"log/slog"
+
 	"github.com/cmoro-deusto/llamaman/internal/config"
+	"github.com/cmoro-deusto/llamaman/internal/modelsini"
 )
 
 // firstRunStage tracks which step of the first-run flow we're in.
@@ -133,6 +136,10 @@ func (f *FirstRunMode) finalizeGlobals() (*FirstRunMode, tea.Cmd) {
 		// Re-open the form so the user can retry.
 		f.form = f.buildGlobalsForm()
 		return f, f.form.Init()
+	}
+	// Derived artifact so Router mode has a source right away.
+	if _, err := modelsini.WriteDerived(f.cfgPath, cfg); err != nil {
+		slog.Warn("derived models.ini write failed", "err", err)
 	}
 	f.stage = frDone
 	return f, func() tea.Msg { return FirstRunCompletedMsg{Cfg: cfg, CfgPath: f.cfgPath} }

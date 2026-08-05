@@ -2,6 +2,7 @@ package tui
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -487,5 +488,45 @@ func TestParseParamValueClassifiesStringsWithNumericPrefix(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("parseParamValue(%q) = %v (%T); want %v (%T)", tc.in, got, got, tc.want, tc.want)
 		}
+	}
+}
+
+// TestConfigExportIni covers the `x` export action: it opens a path
+// prompt pre-filled with the derived models.ini location, writes the
+// ini on apply, flashes the section count, and surfaces write errors.
+func TestConfigExportIni(t *testing.T) {
+	cfg := duplicateTestConfig() // alpha (2 presets) + beta (1 preset) = 3 sections
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	c := NewConfigMode(cfgPath, cfg)
+
+	// `x` on the models pane opens the export form.
+	c.handleModelsKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if c.formKind != formExportIni {
+		t.Fatalf("formKind = %v, want formExportIni", c.formKind)
+	}
+	if got := deref(c.formStaging.exportPath); got != filepath.Join(dir, "models.ini") {
+		t.Errorf("pre-filled path = %q, want derived default", got)
+	}
+
+	// Apply with a custom path → file written, flash reports sections.
+	out := filepath.Join(dir, "out.ini")
+	c.formStaging.exportPath = strPtr(out)
+	if _, dismiss := c.applyForm(); !dismiss {
+		t.Error("export form should dismiss on success")
+	}
+	if _, err := os.Stat(out); err != nil {
+		t.Fatalf("exported file missing: %v", err)
+	}
+	if !strings.Contains(c.flash, "exported 3 sections to "+out) {
+		t.Errorf("flash = %q", c.flash)
+	}
+
+	// Unwritable path → error modal surfaces the failure.
+	c.formKind = formExportIni
+	c.formStaging.exportPath = strPtr("/nonexistent-dir/x.ini")
+	c.applyForm()
+	if c.errorModal == "" || !strings.Contains(c.errorModal, "Export failed") {
+		t.Errorf("errorModal = %q", c.errorModal)
 	}
 }
