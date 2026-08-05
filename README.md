@@ -20,6 +20,8 @@ If you've already chosen llama.cpp, you've felt the friction: every model wants 
 - Type-aware parameter editor whose autocomplete and validation come straight from `llama-server --help`.
 - Local `.gguf` files or Hugging Face identifiers (`-m` vs `-hf`) on a per-model basis.
 - Shell completions for `bash`, `zsh`, and `fish`.
+- **Router mode**: serve every model in a `my-models.ini` (llama.cpp model presets) from a single `llama-server`, with per-model load/unload and full live statistics.
+- **Import / export**: `llamaman import` ingests a `my-models.ini` as config presets; `llamaman export` / TUI `x` writes one. Every config save also keeps a derived `models.ini` in sync, which doubles as the default Router source.
 - XDG-compliant config / state / cache / log paths.
 - Single static Go binary, no runtime dependencies beyond `llama-server` itself.
 
@@ -61,6 +63,7 @@ Copy the launch command to your clipboard with `c` (Wayland's `wl-copy` first, X
   - [Adding a Hugging Face model](#adding-a-hugging-face-model)
   - [Tuning a preset](#tuning-a-preset)
   - [Detach and reattach](#detach-and-reattach)
+  - [Router mode (multi-model)](#router-mode-multi-model)
 - [TUI modes](#tui-modes)
   - [Main mode](#main-mode)
   - [Run mode](#run-mode)
@@ -88,6 +91,7 @@ Copy the launch command to your clipboard with `c` (Wayland's `wl-copy` first, X
 - **Locale**: a UTF-8 locale (`LANG=*.UTF-8`).
 - **Clipboard (optional)**: `wl-clipboard` (Wayland) or `xclip` (X11) for the `c` "copy launch command" shortcut. Without either, the shortcut becomes a no-op with a brief status flash.
 - **`llama-server`**: a working build of llama.cpp's HTTP server on `PATH` or under one of the standard prefixes (`/usr/local/bin`, `/usr/local/llama.cpp/bin`, `/opt/llama.cpp/bin`). See [Compatibility](#compatibility).
+- **Router mode (optional)**: a llama.cpp build with `--models-preset` support (the model-presets feature, Dec 2025 or later). Single-model mode works with any supported build; on an older binary, Router mode shows a clear version-gate error instead of failing to spawn.
 
 ## Install
 
@@ -193,11 +197,14 @@ rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/llamaman" \
 llamaman                # launch TUI
 llamaman <alias>        # launch a model with its default preset
 llamaman <alias> <pre>  # launch with a named preset
-llamaman -l             # list configured models
+llamaman -l             # list configured models and router sources
 llamaman -p <alias>     # list presets for a model
+llamaman -i models.ini  # run a my-models.ini in router mode
+llamaman import x.ini   # ingest a my-models.ini as config presets
+llamaman export         # write the config as my-models.ini (stdout)
 ```
 
-The first invocation with no config triggers a setup flow that writes `${XDG_CONFIG_HOME:-~/.config}/llamaman/config.json` with autodetected defaults.
+The first invocation with no config triggers a setup flow that writes `${XDG_CONFIG_HOME:-~/.config}/llamaman/config.json` with autodetected defaults. Router sources are registered in `globals.models-files`; when unset, the derived `<config-dir>/models.ini` — auto-written on every config save — is the default source, so Router mode works out of the box.
 
 ## Walkthrough
 
@@ -255,6 +262,17 @@ The flagship trick: leave the server running while you close the terminal.
 
 If `llama-server` crashes while detached, the next `llamaman` invocation finds the stale `session.json` (PID dead), silently cleans it up, and you're back at main mode.
 
+### Router mode (multi-model)
+
+llama.cpp's model presets let **one** `llama-server` host every model in a `my-models.ini` file, routing requests by model id. llamaman treats the file — not an individual section — as the run target.
+
+1. **Register a source.** Main mode → `c` → Globals → *models files* (one `my-models.ini` path per line). When the list is empty, the derived `<config-dir>/models.ini` is used by default, so there's nothing to set up. For one-off runs: `llamaman -i models.ini`.
+2. **Switch to Router mode.** In main mode, press `tab` to toggle **Single Model ↔ Router**; the list now shows your router sources with their section counts.
+3. **Launch.** `Enter` on a source. Run mode's left panel becomes the **router models list** — every model in the file with its live state (`loaded` / `loading` / `unloaded`).
+4. **Manage models.** `tab` switches which panel the arrows control. In the models panel: `↑`/`↓` select, `l` loads, `u` unloads (confirmed), `Enter` opens an action menu (Load / Unload / Statistics / Info), `s` shows that model's full seven-row statistics panel (Esc closes it), `p` hides cache-only leftovers.
+
+Models you ran outside llamaman (via `llama-cli` / `llama-server -hf`) show up here too, because the router lists HF-cache downloads as well as ini sections — they're tagged `(cache)`, and the ini-only filter (`p`) hides them. Exported files are router-valid by construction: each preset becomes its own section with a unique alias.
+
 ## TUI modes
 
 ### Main mode
@@ -263,13 +281,14 @@ A centred window: the figlet "llamaman" wordmark, version line, and an inline si
 
 > The information density and layout of this top window are an early cut. A future release will iterate on how model identity, source, presets, and run state are surfaced — see [Known limitations](#known-limitations).
 
-If a session is running, an extra line above the list reads `▶ Detached: <alias>/<preset> listening on :<port> — press a to attach`.
+If a session is running, an extra line above the list reads `▶ Detached: <alias>/<preset> listening on :<port> — press a to attach`. In Router mode (toggle with `tab`), the list shows your `my-models.ini` sources instead — see [Router mode (multi-model)](#router-mode-multi-model).
 
 If **no** models are configured (e.g. immediately after first-run setup), the list is hidden so users aren't confronted with an empty box.
 
 | Key | Action |
 |---|---|
 | `↑` / `↓` | Move selection in the inline list (only when models exist) |
+| `tab` | Toggle **Single Model ↔ Router** mode (Router shows `my-models.ini` sources) |
 | `Enter` | Run the selected model. With 2+ presets, the box pivots to a preset sub-list (Enter to confirm, Esc to back out) |
 | `Esc` | Back out of the preset sub-list to the model list |
 | `c` | Configuration mode |
@@ -326,6 +345,23 @@ Status state machine: `starting → ready → exited|error`. `ready` is detected
 | `?` | Help overlay |
 
 ANSI colour codes from `llama-server` are passed through. Scrollback is unlimited and sourced from the on-disk log file.
+
+### Router mode (run)
+
+In a router run, the left live-band panel becomes the **router models list** instead of the single-model stats, and the whole UI splits into two panels with **panel-scoped shortcuts**: `tab` moves the ↑/↓ arrows between the log and the models panel (the focused panel's border lights up, and the footer shows the active panel's keys). The orange border marks whichever panel the arrows control.
+
+| Key | Panel | Action |
+|---|---|---|
+| `tab` | global | Switch which panel ↑/↓ control (log ↔ models) |
+| `↑` / `↓` | models | Move the selection (list scrolls to keep it visible) |
+| `Enter` | models | Action menu: Load / Unload / Statistics / Info (inapplicable entries grayed) |
+| `s` | models | Show the selected model's full stats panel (Esc closes) |
+| `l` / `u` | models | Load / unload the selected model (`u` confirms) |
+| `p` | models | Toggle ini-only filter — hide `(cache)` leftovers from external `llama-cli` runs |
+| `d` | log | Toggle denoise (hides llama.cpp's per-request "proxying request to model …" chatter at render time; default on) |
+| `Esc` | global | Layered: close the action menu → close stats → clear search |
+
+The models panel rows show `●`/`○`/`◐` load state, context usage and tokens/s for loaded models, and a dimmed `(cache)` tag for HF-cache leftovers. The stats panel (`s`) is the same seven-row panel as single-model mode — rates with sparklines, Process/Context/Breakdown/Cache/Gen bars, TTFT — fed per model from `/slots?model=` and `/metrics?model=` (fetched with `autoload=false`, so monitoring can never reload an unloaded model). Press `i` on a selection for its launch argv.
 
 ### Configuration mode
 
@@ -385,7 +421,8 @@ The config file is JSON at `${XDG_CONFIG_HOME:-~/.config}/llamaman/config.json` 
   "globals": {
     "llama-server-bin": "<absolute path>",        // REQUIRED, ~ and $VAR expanded at load; warn-only if missing/non-exec
     "ip_address":       "<IPv4 | IPv6 | host>",   // REQUIRED, format-validated
-    "port":             <integer 1..65535>        // REQUIRED
+    "port":             <integer 1..65535>,        // REQUIRED
+    "models-files":     ["<path to my-models.ini>"]  // OPTIONAL router sources; unset → derived <config-dir>/models.ini
   },
 
   "models": [
@@ -481,6 +518,7 @@ This keeps llamaman forward-compatible with new llama-server flags without requi
 | `llama-server` log (current session) | `${XDG_RUNTIME_DIR:-…}/llamaman/llama-server.log` |
 | Flag-name cache | `${XDG_CACHE_HOME:-~/.cache}/llamaman/flags-<mtime>.json` |
 | Debug log | `${XDG_STATE_HOME:-~/.local/state}/llamaman/llamaman.log` |
+| Derived `my-models.ini` (auto-written on every config save) | `${XDG_CONFIG_HOME:-~/.config}/llamaman/models.ini` |
 | Config backup (rolling) | `${XDG_CONFIG_HOME:-~/.config}/llamaman/config.json.bak` |
 
 Set `LLAMAMAN_DEBUG=1` to raise the debug log level to `DEBUG`.
@@ -493,6 +531,8 @@ llamaman targets a recent build of llama.cpp's `llama-server`. Because flags are
 
 The minimum tested `llama-server` build is **`build 8994 (aab68217b)`**. Older builds will probably work for the common-case flags; very old builds (predating dynamic `--help` machine-readable structure) may fall back to llamaman's hard-coded short-form set.
 
+**Router mode** needs the model-presets feature (`--models-preset`), added in llama.cpp in Dec 2025. On older builds the spawn is blocked with a clear version-gate error; single-model mode is unaffected.
+
 ## Keybindings cheat sheet
 
 > Reference table consolidating every binding from the per-mode tables above. The per-mode sections remain the source of truth — when in doubt, check there.
@@ -500,6 +540,7 @@ The minimum tested `llama-server` build is **`build 8994 (aab68217b)`**. Older b
 | Mode | Key | Action |
 |---|---|---|
 | Main | `↑` / `↓` | Move selection in inline list |
+| Main | `tab` | Toggle Single Model ↔ Router mode |
 | Main | `Enter` | Run selected model (pivot to preset sub-list if 2+ presets) |
 | Main | `Esc` | Back out of preset sub-list |
 | Main | `c` | Open configuration mode |
@@ -517,6 +558,13 @@ The minimum tested `llama-server` build is **`build 8994 (aab68217b)`**. Older b
 | Run | `Space` / `b` | Page down / up |
 | Run | `↑` / `↓` / wheel | Scroll one line |
 | Run | `?` | Help overlay |
+| Router | `tab` | Switch which panel ↑/↓ control (log ↔ models) |
+| Router | `↑` / `↓` | Models panel: move selection (list scrolls) |
+| Router | `Enter` | Models panel: action menu (Load / Unload / Statistics / Info) |
+| Router | `s` | Models panel: show selected model's stats (Esc closes) |
+| Router | `l` / `u` | Models panel: load / unload selected model (`u` confirms) |
+| Router | `p` | Models panel: toggle ini-only filter (hide `(cache)` leftovers) |
+| Router | `d` | Log panel: toggle denoise (default on) |
 | Config | `Tab` / `Shift+Tab` | Cycle panes (also `←` / `→`, `h` / `l`) |
 | Config | `↑` / `↓` | Navigate within pane |
 | Config | `Shift+↑` / `Shift+↓` | Reorder rows |
@@ -600,6 +648,10 @@ tail -f ~/.local/state/llamaman/llamaman.log
 The debug log captures config load events, session lifecycle, `--help` parse outcomes, and errors. It does **not** capture `llama-server`'s output — that's the run-mode log file under `XDG_RUNTIME_DIR`.
 
 ## FAQ
+
+### Why do models I never configured show up in Router mode?
+
+llama.cpp's router lists models from three places: your `my-models.ini` sections, files in `--models-dir`, and the **HF download cache** — anything you've ever run with `llama-cli` / `llama-server -hf` (or llamaman itself) gets cached and enumerated by the router. Those leftovers appear in the models panel tagged `(cache)`, and the ini-only filter (`p` in the models panel) hides them. The router can delete cache-only entries via `DELETE /models?model=<id>`; llama.cpp never writes to your ini.
 
 ### Why Linux only?
 
