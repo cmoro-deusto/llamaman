@@ -435,6 +435,9 @@ func TestFetchSlotsForQueriesModel(t *testing.T) {
 		if got := r.URL.Query().Get("model"); got != "m:a:b" {
 			t.Errorf("model query = %q, want m:a:b (url-escaped)", got)
 		}
+		if got := r.URL.Query().Get("autoload"); got != "false" {
+			t.Errorf("autoload query = %q, want false (stats polling must never load)", got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[{"is_processing":true,"n_ctx":65536,"n_prompt_tokens":4222,"n_prompt_tokens_processed":4181,"n_prompt_tokens_cache":0,"next_token":[{"n_decoded":41,"n_remain":100}]}]`))
 	}))
@@ -460,6 +463,9 @@ func TestFetchMetricsForQueriesModel(t *testing.T) {
 		}
 		if got := r.URL.Query().Get("model"); got != "m:a:b" {
 			t.Errorf("model query = %q, want m:a:b (url-escaped)", got)
+		}
+		if got := r.URL.Query().Get("autoload"); got != "false" {
+			t.Errorf("autoload query = %q, want false (stats polling must never load)", got)
 		}
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte(`# TYPE llamacpp:predicted_tokens_seconds gauge

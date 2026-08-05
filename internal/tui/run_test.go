@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -713,65 +714,191 @@ func TestRouterPanelShowsRateOnlyWhenMetricsPresent(t *testing.T) {
 // ALL models (loaded and unloaded), wraps in the list view, returns to
 // the list from the stats view after the last model, and Esc closes the
 // stats panel with the selection kept.
-func TestRouterFocusCyclesModels(t *testing.T) {
+// TestRouterSelectionPanel verifies the new paradigm: m toggles the
+// models panel as the ↑/↓ target, ↑/↓ move the selection through ALL
+// models (loaded and unloaded) wrapping, Esc deactivates the panel,
+// and s opens the selected model's stats.
+func TestRouterSelectionPanel(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
 	r.routerModels = []llamaapi.ModelInfo{
 		{ID: "a", Status: llamaapi.ModelStatus{Value: "loaded"}},
 		{ID: "b", Status: llamaapi.ModelStatus{Value: "unloaded"}},
 		{ID: "c", Status: llamaapi.ModelStatus{Value: "loaded"}},
 	}
-	r.cycleRouterFocus()
+	// Before m, ↑/↓ must NOT move the selection (log scrolls).
+	r.routerFocus = "a"
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
 	if r.routerFocus != "a" {
-		t.Errorf("selection after first m = %q, want a", r.routerFocus)
+		t.Errorf("selection changed without panel active: %q", r.routerFocus)
 	}
-	r.cycleRouterFocus()
+	// m activates the panel; ↓ selects.
+	r.Update(keyMsg("m"))
+	if !r.routerPanelActive {
+		t.Fatal("m should activate the models panel")
+	}
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
 	if r.routerFocus != "b" {
-		t.Errorf("selection after second m = %q, want b (unloaded is selectable for load)", r.routerFocus)
+		t.Errorf("selection after ↓ = %q, want b (unloaded selectable for load)", r.routerFocus)
 	}
-	r.cycleRouterFocus()
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
 	if r.routerFocus != "c" {
-		t.Errorf("selection after third m = %q, want c", r.routerFocus)
+		t.Errorf("selection after second ↓ = %q, want c", r.routerFocus)
 	}
-	// List view: wraps.
-	r.cycleRouterFocus()
+	// Wraps.
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
 	if r.routerFocus != "a" {
 		t.Errorf("selection after wrap = %q, want a", r.routerFocus)
 	}
-	// Stats view: moving past the last model returns to the list.
-	r.showRouterStats = true
-	r.routerFocus = "c"
-	r.cycleRouterFocus()
-	if r.showRouterStats {
-		t.Error("stats view should close after the last model")
-	}
-	if r.routerFocus != "c" {
-		t.Errorf("selection after stats rotation = %q, want c kept", r.routerFocus)
-	}
-	// Enter opens stats; Esc closes it, selection kept.
-	r.Update(keyMsg("enter"))
-	if !r.showRouterStats {
-		t.Error("enter should open the stats panel")
-	}
+	// Esc deactivates the panel; ↑/↓ stop moving the selection.
 	r.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	if r.showRouterStats {
-		t.Error("esc should close the stats panel")
+	if r.routerPanelActive {
+		t.Error("esc should deactivate the models panel")
 	}
-	if r.routerFocus != "c" {
-		t.Errorf("selection after esc = %q, want c", r.routerFocus)
+	r.routerFocus = "b"
+	r.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if r.routerFocus != "b" {
+		t.Errorf("selection changed after panel deactivated: %q", r.routerFocus)
 	}
-	// No models → no-op.
-	r2 := newRouterTestRunMode(&fakeFetcher{})
-	r2.cycleRouterFocus()
-	if r2.routerFocus != "" {
-		t.Errorf("selection with empty list = %q, want empty", r2.routerFocus)
+	// s opens the selected model's stats.
+	r.routerFocus = "c"
+	r.Update(keyMsg("s"))
+	if !r.showRouterStats {
+		t.Error("s should open the stats panel")
 	}
-	// Stale selection (model gone) → next m starts at the first.
+	// Stale selection (model gone) → next ↓ starts at the first.
 	r3 := newRouterTestRunMode(&fakeFetcher{})
 	r3.routerModels = []llamaapi.ModelInfo{{ID: "y", Status: llamaapi.ModelStatus{Value: "loaded"}}}
+	r3.routerPanelActive = true
 	r3.routerFocus = "gone"
-	r3.cycleRouterFocus()
+	r3.Update(tea.KeyMsg{Type: tea.KeyDown})
 	if r3.routerFocus != "y" {
 		t.Errorf("selection with stale id = %q, want y", r3.routerFocus)
+	}
+}
+
+// TestRouterListScrolls verifies the list scrolls so the selection
+// stays visible when the model list is longer than the panel.
+func TestRouterListScrolls(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	for i := 0; i < 30; i++ {
+		r.routerModels = append(r.routerModels, llamaapi.ModelInfo{
+			ID: fmt.Sprintf("model-%02d", i), Status: llamaapi.ModelStatus{Value: "unloaded"},
+		})
+	}
+	// Select a model deep in the list via ↓ presses (first ↓ selects
+	// row 0, so 26 presses land on model-25).
+	r.routerPanelActive = true
+	for i := 0; i < 26; i++ {
+		r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	if r.routerFocus != "model-25" {
+		t.Fatalf("selection = %q, want model-25", r.routerFocus)
+	}
+	got := stripANSI(r.renderRouterPanel(100))
+	if !strings.Contains(got, "▸ ○ model-25") {
+		t.Errorf("selected row not visible in scrolled list; list:\n%s", got)
+	}
+	if strings.Contains(got, "model-00") {
+		t.Errorf("list did not scroll (first row still shown); list:\n%s", got)
+	}
+	// Moving up keeps the selection visible too.
+	r.Update(tea.KeyMsg{Type: tea.KeyUp})
+	r.Update(tea.KeyMsg{Type: tea.KeyUp})
+	got = stripANSI(r.renderRouterPanel(100))
+	if !strings.Contains(got, "▸ ○ model-23") {
+		t.Errorf("selected row not visible after scrolling up; list:\n%s", got)
+	}
+}
+
+// TestRouterEnterMenu verifies the Enter action menu: opens, skips
+// inapplicable entries, and runs the picked action.
+func TestRouterEnterMenu(t *testing.T) {
+	fake := &fakeFetcher{}
+	r := newRouterTestRunMode(fake)
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "m:unloaded", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+		{ID: "m:loaded", Status: llamaapi.ModelStatus{Value: "loaded"}},
+	}
+	r.routerFocus = "m:unloaded"
+
+	// Enter opens the menu, cursor lands on the first enabled item.
+	r.Update(keyMsg("enter"))
+	if !r.routerMenu {
+		t.Fatal("enter should open the action menu")
+	}
+	// Load is enabled (model unloaded); Unload disabled → ↓ skips to
+	// Statistics.
+	before := r.routerMenuIdx
+	r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if r.routerMenuIdx == before {
+		t.Error("↓ should move the menu cursor")
+	}
+	if !r.menuItemEnabled(r.menuActions()[r.routerMenuIdx]) {
+		t.Errorf("menu cursor on disabled item %d", r.routerMenuIdx)
+	}
+	// Menu render shows all four entries.
+	menu := stripANSI(r.renderRouterMenu())
+	for _, want := range []string{"Load", "Unload", "Statistics", "Info"} {
+		if !strings.Contains(menu, want) {
+			t.Errorf("menu missing %q; menu:\n%s", want, menu)
+		}
+	}
+
+	// Navigate back up to Load and select it → POST load.
+	for r.menuActions()[r.routerMenuIdx] != menuLoad {
+		r.Update(tea.KeyMsg{Type: tea.KeyUp})
+	}
+	_, cmd := r.Update(keyMsg("enter"))
+	if msg := safeCmd(cmd); msg != nil {
+		r, _ = r.Update(msg)
+	}
+	if fake.loadCalls != 1 {
+		t.Errorf("loadCalls = %d, want 1 (menu Load)", fake.loadCalls)
+	}
+	if r.routerMenu {
+		t.Error("menu should close after selecting an action")
+	}
+
+	// Loaded model: menu Load is disabled; Unload opens the confirm.
+	r.routerFocus = "m:loaded"
+	r.Update(keyMsg("enter"))
+	for r.menuActions()[r.routerMenuIdx] != menuUnload {
+		r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	r.Update(keyMsg("enter"))
+	if !r.unloadPrompt {
+		t.Error("menu Unload should open the unload confirm")
+	}
+	// Esc cancels the prompt.
+	r.Update(keyMsg("n"))
+	if fake.unloadCalls != 0 {
+		t.Errorf("unload called before confirm: %d", fake.unloadCalls)
+	}
+}
+
+// TestRouterMenuStatsInfo verifies the menu's Statistics and Info
+// actions.
+func TestRouterMenuStatsInfo(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{{ID: "m", Status: llamaapi.ModelStatus{Value: "loaded"}}}
+	r.routerFocus = "m"
+	r.Update(keyMsg("enter"))
+	// Select Statistics.
+	for r.menuActions()[r.routerMenuIdx] != menuStats {
+		r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	r.Update(keyMsg("enter"))
+	if !r.showRouterStats {
+		t.Error("menu Statistics should open the stats panel")
+	}
+	// Select Info.
+	r.Update(keyMsg("enter"))
+	for r.menuActions()[r.routerMenuIdx] != menuInfo {
+		r.Update(tea.KeyMsg{Type: tea.KeyDown})
+	}
+	r.Update(keyMsg("enter"))
+	if !r.showInfo {
+		t.Error("menu Info should open the info overlay")
 	}
 }
 
@@ -798,13 +925,13 @@ func TestRouterListShowsSelection(t *testing.T) {
 func TestRouterFooterShowsMHint(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
 	footer := stripANSI(r.renderFooter())
-	if !strings.Contains(footer, "m select") {
+	if !strings.Contains(footer, "m panel") {
 		t.Errorf("router footer missing m hint; footer:\n%s", footer)
 	}
 	r2 := newRouterTestRunMode(&fakeFetcher{})
 	r2.routerFile = "" // single-model mode
 	footer2 := stripANSI(r2.renderFooter())
-	if strings.Contains(footer2, "m select") {
+	if strings.Contains(footer2, "m panel") {
 		t.Errorf("single-model footer must not show m hint; footer:\n%s", footer2)
 	}
 }
@@ -951,6 +1078,7 @@ func TestRouterLoadFromFocus(t *testing.T) {
 func TestRouterUnloadConfirm(t *testing.T) {
 	fake := &fakeFetcher{}
 	r := newRouterTestRunMode(fake)
+	r.routerModels = []llamaapi.ModelInfo{{ID: "m:a", Status: llamaapi.ModelStatus{Value: "loaded"}}}
 	r.routerFocus = "m:a"
 
 	// u opens the prompt; nothing called yet.
@@ -969,6 +1097,7 @@ func TestRouterUnloadConfirm(t *testing.T) {
 
 	// n cancels.
 	r2 := newRouterTestRunMode(fake)
+	r2.routerModels = []llamaapi.ModelInfo{{ID: "m:a", Status: llamaapi.ModelStatus{Value: "loaded"}}}
 	r2.routerFocus = "m:a"
 	r2.Update(keyMsg("u"))
 	r2.Update(keyMsg("n"))
@@ -1019,6 +1148,34 @@ func TestRouterLoadUnloadRequiresFocus(t *testing.T) {
 	r2.Update(keyMsg("l"))
 	if fake.loadCalls != 0 {
 		t.Errorf("load called in single-model mode: %d", fake.loadCalls)
+	}
+}
+
+// TestRouterLoadUnloadStateSemantics verifies l/u respect the selected
+// model's state: l on a loaded model and u on an unloaded one flash
+// instead of acting.
+func TestRouterLoadUnloadStateSemantics(t *testing.T) {
+	fake := &fakeFetcher{}
+	r := newRouterTestRunMode(fake)
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "m:loaded", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "m:unloaded", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+	}
+	r.routerFocus = "m:loaded"
+	r.Update(keyMsg("l"))
+	if fake.loadCalls != 0 {
+		t.Errorf("load called on loaded model: %d", fake.loadCalls)
+	}
+	if !strings.Contains(r.flash, "already loaded") {
+		t.Errorf("flash = %q", r.flash)
+	}
+	r.routerFocus = "m:unloaded"
+	r.Update(keyMsg("u"))
+	if r.unloadPrompt {
+		t.Error("unload prompt opened for unloaded model")
+	}
+	if !strings.Contains(r.flash, "not loaded") {
+		t.Errorf("flash = %q", r.flash)
 	}
 }
 

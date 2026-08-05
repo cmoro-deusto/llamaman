@@ -75,10 +75,17 @@ type RunMode struct {
 	// the per-model metrics polling.
 	routerMetricsAvailable bool
 	// routerFocus is the selected model id — highlighted in the model
-	// list and targeted by l/u. showRouterStats toggles between the
-	// list and the selected model's full stats panel.
-	routerFocus     string
-	showRouterStats bool
+	// list and targeted by l/u/s/Enter. showRouterStats toggles between
+	// the list and the selected model's full stats panel.
+	// routerPanelActive makes ↑/↓ move the selection instead of
+	// scrolling the log; routerListStart is the list's scroll window.
+	// routerMenu is the Enter action menu (idx = highlighted item).
+	routerFocus       string
+	showRouterStats   bool
+	routerPanelActive bool
+	routerListStart   int
+	routerMenu        bool
+	routerMenuIdx     int
 
 	proc          *server.Process
 	tail          *server.Tailer
@@ -310,7 +317,10 @@ func (r *RunMode) routerPollCmds() []tea.Cmd {
 		fetchHealthCmd(r.fetchCtx, r.fetcher),
 	}
 	for _, m := range r.routerModels {
-		if m.Status.Value == "loaded" || m.Status.Value == "loading" {
+		// Only models confirmed loaded get stats polling — unloaded and
+		// loading models are skipped (and the endpoints carry
+		// autoload=false, so a stray request can never reload a model).
+		if m.Status.Value == "loaded" {
 			cmds = append(cmds, fetchRouterSlotsCmd(r.fetchCtx, r.fetcher, m.ID))
 			if r.routerMetricsAvailable {
 				cmds = append(cmds, fetchRouterMetricsCmd(r.fetchCtx, r.fetcher, m.ID))
@@ -489,6 +499,12 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	case modelsFetchedMsg:
 		if m.err == nil && m.m != nil {
 			r.routerModels = m.m.Data
+			// Keep the selection and scroll window valid as the list
+			// changes (a selected model may disappear).
+			r.clampRouterList(-1)
+			if r.selectedIdx() < 0 {
+				r.routerFocus = ""
+			}
 		}
 		return r, nil
 
@@ -523,8 +539,15 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		}
 		if m.action == "unload" {
-			// The selected model is now unloaded — back to the list,
-			// selection kept so it can be re-loaded or swapped.
+			// The selected model is now unloaded — drop it from the stats
+			// poll immediately (marking it unloaded here stops the next
+			// poll round; autoload=false on the endpoints stops any
+			// in-flight one from reloading it), then back to the list.
+			for i := range r.routerModels {
+				if r.routerModels[i].ID == m.model {
+					r.routerModels[i].Status.Value = "unloaded"
+				}
+			}
 			r.showRouterStats = false
 			r.flash = fmt.Sprintf("unloaded %s", truncateRune(m.model, routerPanelIDMax))
 			return r, nil
@@ -659,13 +682,36 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			r.copyResult = ""
 			return r, nil
 		}
+		if r.routerMenu {
+			return r.handleRouterMenuKey(m)
+		}
 		switch m.String() {
+		case "up", "down":
+			// Router mode with the models panel active: move the
+			// selection. Otherwise fall through to the viewport (log
+			// scrolling).
+			if r.routerFile != "" && r.routerPanelActive {
+				delta := -1
+				if m.String() == "down" {
+					delta = 1
+				}
+				r.moveRouterSelection(delta)
+				return r, nil
+			}
 		case "esc":
-			// Layered Esc: close the router stats panel back to the
-			// model list (selection kept), then clear any applied search
-			// query on the main run screen.
+			// Layered Esc: close the action menu, then the router stats
+			// panel, then leave the models panel (↑/↓ back to log
+			// scrolling), then clear any applied search query.
+			if r.routerFile != "" && r.routerMenu {
+				r.routerMenu = false
+				return r, nil
+			}
 			if r.routerFile != "" && r.showRouterStats {
 				r.showRouterStats = false
+				return r, nil
+			}
+			if r.routerFile != "" && r.routerPanelActive {
+				r.routerPanelActive = false
 				return r, nil
 			}
 			if r.searchQuery != "" {
@@ -690,12 +736,26 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			r.showInfo = true
 			return r, nil
 		case "m":
-			// Router mode: move the selection to the next model.
+			// Router mode: toggle the models panel as the ↑/↓ target.
 			if r.routerFile != "" {
-				r.cycleRouterFocus()
+				r.showRouterStats = false
+				r.routerPanelActive = !r.routerPanelActive
 			}
 			return r, nil
 		case "enter":
+			// Router mode: open the action menu for the selection.
+			if r.routerFile != "" && r.routerFocus != "" {
+				r.routerMenu = true
+				r.routerMenuIdx = 0
+				for i, a := range r.menuActions() {
+					if r.menuItemEnabled(a) {
+						r.routerMenuIdx = i
+						break
+					}
+				}
+			}
+			return r, nil
+		case "s":
 			// Router mode: open the selected model's stats panel.
 			if r.routerFile != "" && r.routerFocus != "" {
 				r.showRouterStats = true
@@ -708,7 +768,15 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 				return r, nil
 			}
 			if m.String() == "u" {
+				if r.selectedState() != "loaded" {
+					r.flash = "model is not loaded"
+					return r, nil
+				}
 				r.unloadPrompt = true
+				return r, nil
+			}
+			if r.selectedState() == "loaded" {
+				r.flash = "model already loaded"
 				return r, nil
 			}
 			return r, loadModelCmd(r.fetchCtx, r.fetcher, r.routerFocus)
@@ -1141,6 +1209,8 @@ func (r *RunMode) View() string {
 		out = overlayCenter(bg, r.renderKillPrompt(), r.width, r.height)
 	case r.unloadPrompt:
 		out = overlayCenter(bg, r.renderUnloadPrompt(), r.width, r.height)
+	case r.routerMenu:
+		out = overlayCenter(bg, r.renderRouterMenu(), r.width, r.height)
 	case r.showHelp:
 		out = overlayCenter(bg, r.renderHelp(), r.width, r.height)
 	case r.showInfo:
@@ -1297,7 +1367,34 @@ func (r *RunMode) renderInfoOverlay() string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	accent := lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true)
 
-	lines := []string{accent.Render("Model & preset")}
+	var lines []string
+	if r.routerFile != "" {
+		// Router mode: the selection is the model in question.
+		id := r.routerFocus
+		if id == "" {
+			id = "(no selection)"
+		}
+		state := r.selectedState()
+		if state == "" {
+			state = "?"
+		}
+		lines = []string{accent.Render("Router model")}
+		lines = append(lines, "")
+		lines = append(lines, subtle.Render("Model  : ")+id)
+		lines = append(lines, subtle.Render("State  : ")+state)
+		if st, ok := r.routerStats[id]; ok && st != nil {
+			lines = append(lines, subtle.Render("Context: ")+humanTokens(st.contextUsed)+"/"+humanTokens(st.contextMax))
+		}
+		lines = append(lines, "")
+		lines = append(lines, subtle.Render("(any key to close)"))
+		box := lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(r.theme.Accent).
+			Padding(1, 3)
+		return box.Render(strings.Join(lines, "\n"))
+	}
+
+	lines = []string{accent.Render("Model & preset")}
 	lines = append(lines, "")
 	lines = append(lines, subtle.Render("Alias  : ")+r.model.Alias)
 	switch {
@@ -1341,8 +1438,9 @@ func (r *RunMode) renderHelp() string {
 		{"r", "restart server (confirms)"},
 		{"c", "copy launch command to clipboard"},
 		{"i", "show model & preset details"},
-		{"m", "router mode: select next model (▸ in list)"},
-		{"Enter", "router mode: open selected model's stats (Esc back)"},
+		{"m", "router mode: models panel on/off (↑/↓ select)"},
+		{"Enter", "router mode: action menu (Load/Unload/Stats/Info)"},
+		{"s", "router mode: open selected model's stats"},
 		{"l / u", "router mode: load / unload the selected model (u confirms)"},
 		{"/", "search (live highlights; Enter applies, Esc cancels)"},
 		{"n / N", "next / previous match"},
@@ -1380,7 +1478,7 @@ func (r *RunMode) renderFooter() string {
 		"q quit", "k kill", "r restart", "c copy", "i info",
 	}
 	if r.routerFile != "" {
-		tokens = append(tokens, "m select", "l/u load/unload")
+		tokens = append(tokens, "m panel", "l/u load/unload")
 	}
 	tokens = append(tokens, "/ search", "? help", "g/G top/bottom", "space/b page", "↑/↓ scroll")
 	parts := make([]string, len(tokens))
@@ -1735,37 +1833,152 @@ func (r *RunMode) applyRouterMetrics(model string, m *llamaapi.Metrics) {
 	st.prevMetrics = m
 }
 
-// cycleRouterFocus moves the selection to the next model in the list
-// (any model — loaded, loading, or unloaded; loading an unloaded model
-// needs its row selected). In the list view the selection wraps; in the
-// stats view, moving past the last model returns to the list with the
-// selection kept. No-op when the list is empty.
-func (r *RunMode) cycleRouterFocus() {
+// selectedIdx returns the index of the selected model in the list, or
+// -1 when it is not present.
+func (r *RunMode) selectedIdx() int {
+	for i, m := range r.routerModels {
+		if m.ID == r.routerFocus {
+			return i
+		}
+	}
+	return -1
+}
+
+// selectedState returns the selected model's load state ("" when no
+// valid selection).
+func (r *RunMode) selectedState() string {
+	for _, m := range r.routerModels {
+		if m.ID == r.routerFocus {
+			return r.routerModelState(m.ID, m.Status.Value)
+		}
+	}
+	return ""
+}
+
+// moveRouterSelection moves the selection by delta (wrapping) and
+// keeps it inside the list's visible window. Stale selections (model
+// gone) restart at the first row.
+func (r *RunMode) moveRouterSelection(delta int) {
 	if len(r.routerModels) == 0 {
 		return
 	}
-	if r.routerFocus == "" {
-		r.routerFocus = r.routerModels[0].ID
+	idx := r.selectedIdx()
+	if idx < 0 {
+		idx = 0
+	} else {
+		idx = (idx + delta + len(r.routerModels)) % len(r.routerModels)
+	}
+	r.routerFocus = r.routerModels[idx].ID
+	r.clampRouterList(idx)
+}
+
+// clampRouterList keeps the scroll window valid: the selection stays
+// visible, and the window stays inside the list. selIdx < 0 re-derives
+// it from the current selection.
+func (r *RunMode) clampRouterList(selIdx int) {
+	if selIdx < 0 {
+		selIdx = r.selectedIdx()
+	}
+	if selIdx < 0 {
+		r.routerListStart = 0
 		return
 	}
-	for i, m := range r.routerModels {
-		if m.ID == r.routerFocus {
-			if i == len(r.routerModels)-1 {
-				if r.showRouterStats {
-					// Finished the stats rotation — back to the list.
-					r.showRouterStats = false
-					return
-				}
-				// In the list, selection wraps.
-				r.routerFocus = r.routerModels[0].ID
-				return
-			}
-			r.routerFocus = r.routerModels[i+1].ID
-			return
-		}
+	visible := liveBandContentRows
+	if selIdx < r.routerListStart {
+		r.routerListStart = selIdx
 	}
-	// Selected model is no longer in the list — start at the first.
-	r.routerFocus = r.routerModels[0].ID
+	if selIdx >= r.routerListStart+visible {
+		r.routerListStart = selIdx - visible + 1
+	}
+	if max := len(r.routerModels) - visible; r.routerListStart > max {
+		if max < 0 {
+			max = 0
+		}
+		r.routerListStart = max
+	}
+	if r.routerListStart < 0 {
+		r.routerListStart = 0
+	}
+}
+
+// routerMenuAction is one entry of the Enter action menu.
+type routerMenuAction int
+
+const (
+	menuLoad routerMenuAction = iota
+	menuUnload
+	menuStats
+	menuInfo
+)
+
+// menuActions lists the four menu entries in display order.
+func (r *RunMode) menuActions() []routerMenuAction {
+	return []routerMenuAction{menuLoad, menuUnload, menuStats, menuInfo}
+}
+
+// menuItemEnabled reports whether an action applies to the current
+// selection (Load needs unloaded, Unload needs loaded).
+func (r *RunMode) menuItemEnabled(a routerMenuAction) bool {
+	switch a {
+	case menuLoad:
+		return r.selectedState() != "loaded"
+	case menuUnload:
+		return r.selectedState() == "loaded"
+	default:
+		return true
+	}
+}
+
+// handleRouterMenuKey navigates the Enter action menu (↑/↓ skip
+// inapplicable entries, Enter runs, Esc dismisses).
+func (r *RunMode) handleRouterMenuKey(m tea.KeyMsg) (*RunMode, tea.Cmd) {
+	switch m.String() {
+	case "up", "down":
+		delta := -1
+		if m.String() == "down" {
+			delta = 1
+		}
+		actions := r.menuActions()
+		for i := 0; i < len(actions); i++ {
+			r.routerMenuIdx = (r.routerMenuIdx + delta + len(actions)) % len(actions)
+			if r.menuItemEnabled(actions[r.routerMenuIdx]) {
+				break
+			}
+		}
+	case "enter":
+		return r.applyRouterMenu()
+	case "esc", "c", "q":
+		r.routerMenu = false
+	}
+	return r, nil
+}
+
+// applyRouterMenu runs the highlighted menu action.
+func (r *RunMode) applyRouterMenu() (*RunMode, tea.Cmd) {
+	r.routerMenu = false
+	if r.routerFocus == "" {
+		return r, nil
+	}
+	switch r.menuActions()[r.routerMenuIdx] {
+	case menuLoad:
+		if r.selectedState() == "loaded" {
+			r.flash = "model already loaded"
+			return r, nil
+		}
+		return r, loadModelCmd(r.fetchCtx, r.fetcher, r.routerFocus)
+	case menuUnload:
+		if r.selectedState() != "loaded" {
+			r.flash = "model is not loaded"
+			return r, nil
+		}
+		r.unloadPrompt = true
+		return r, nil
+	case menuStats:
+		r.showRouterStats = true
+	case menuInfo:
+		r.showInfo = true
+	}
+	return r, nil
 }
 
 // renderServerRows builds the seven server-panel content rows
@@ -1914,41 +2127,88 @@ func (r *RunMode) renderRouterPanel(width int) string {
 	var rows []string
 	if len(r.routerModels) == 0 {
 		rows = append(rows, subtle.Render("(no models reported)"))
-	}
-	for _, m := range r.routerModels {
-		state := r.routerModelState(m.ID, m.Status.Value)
-		mark, style := "○", unloadedStyle
-		switch state {
-		case "loaded":
-			mark, style = "●", loadedStyle
-		case "loading":
-			mark, style = "◐", loadingStyle
+	} else {
+		// Scroll window: render only the rows around the selection so a
+		// long list stays navigable and the selection is always visible.
+		r.clampRouterList(-1)
+		visible := liveBandContentRows
+		start := r.routerListStart
+		end := start + visible
+		if end > len(r.routerModels) {
+			end = len(r.routerModels)
 		}
-		// Selection indicator: a leading ▸ on the selected row.
-		sel := "  "
-		if m.ID == r.routerFocus {
-			sel = selStyle.Render("▸ ") + ""
-		}
-		id := truncateRune(m.ID, routerPanelIDMax)
-		if id == "" {
-			id = "?"
-		}
-		stats := ""
-		if st, ok := r.routerStats[m.ID]; ok && st != nil {
-			activity := "idle"
-			if st.busyCount > 0 {
-				activity = "processing"
+		for _, m := range r.routerModels[start:end] {
+			state := r.routerModelState(m.ID, m.Status.Value)
+			mark, style := "○", unloadedStyle
+			switch state {
+			case "loaded":
+				mark, style = "●", loadedStyle
+			case "loading":
+				mark, style = "◐", loadingStyle
 			}
-			parts := []string{humanTokens(st.contextUsed) + "/" + humanTokens(st.contextMax)}
-			if st.avgTokensPerSec > 0 {
-				parts = append(parts, fmt.Sprintf("%.1f tok/s", st.avgTokensPerSec))
+			// Selection indicator: a leading ▸ on the selected row.
+			sel := "  "
+			if m.ID == r.routerFocus {
+				sel = selStyle.Render("▸ ") + ""
 			}
-			parts = append(parts, activity)
-			stats = " · " + strings.Join(parts, " · ")
+			id := truncateRune(m.ID, routerPanelIDMax)
+			if id == "" {
+				id = "?"
+			}
+			stats := ""
+			if st, ok := r.routerStats[m.ID]; ok && st != nil {
+				activity := "idle"
+				if st.busyCount > 0 {
+					activity = "processing"
+				}
+				parts := []string{humanTokens(st.contextUsed) + "/" + humanTokens(st.contextMax)}
+				if st.avgTokensPerSec > 0 {
+					parts = append(parts, fmt.Sprintf("%.1f tok/s", st.avgTokensPerSec))
+				}
+				parts = append(parts, activity)
+				stats = " · " + strings.Join(parts, " · ")
+			}
+			rows = append(rows, sel+style.Render(mark+" "+id)+subtle.Render(stats)+"  "+subtle.Render(state))
 		}
-		rows = append(rows, sel+style.Render(mark+" "+id)+subtle.Render(stats)+"  "+subtle.Render(state))
 	}
 	return r.renderTitledPanel("router models", width, padRows(rows, liveBandContentRows))
+}
+
+// renderRouterMenu renders the Enter action menu for the selection:
+// Load / Unload / Statistics / Info, inapplicable entries grayed.
+func (r *RunMode) renderRouterMenu() string {
+	title := truncateRune(r.routerFocus, routerPanelIDMax)
+	if title == "" {
+		title = "?"
+	}
+	accent := lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true)
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	muted := lipgloss.NewStyle().Foreground(r.theme.Muted)
+
+	items := []struct {
+		name    string
+		enabled bool
+	}{
+		{"Load", r.menuItemEnabled(menuLoad)},
+		{"Unload", r.menuItemEnabled(menuUnload)},
+		{"Statistics", true},
+		{"Info", true},
+	}
+	lines := make([]string, 0, len(items))
+	for i, it := range items {
+		mark := "  "
+		if i == r.routerMenuIdx {
+			mark = accent.Render("▸ ")
+		}
+		style := subtle
+		if !it.enabled {
+			style = muted
+		}
+		lines = append(lines, mark+style.Render(it.name))
+	}
+	body := title + "\n\n" + strings.Join(lines, "\n") + "\n\n  " +
+		r.promptShortcuts("↑/↓ move", "⏎ select", "esc cancel")
+	return r.promptBox().Render(body)
 }
 
 // routerPanelIDMax truncates long model ids in the router panel so the

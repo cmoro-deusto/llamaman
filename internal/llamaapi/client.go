@@ -135,7 +135,9 @@ func (c *Client) FetchMetricsFor(ctx context.Context, model string) (*Metrics, e
 func (c *Client) fetchMetrics(ctx context.Context, model string) (*Metrics, error) {
 	u := c.base + "/metrics"
 	if model != "" {
-		u += "?model=" + url.QueryEscape(model)
+		// autoload=false: a stats poll must never load a model (see
+		// fetchSlots).
+		u += "?model=" + url.QueryEscape(model) + "&autoload=false"
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -289,7 +291,9 @@ func (c *Client) FetchSlotsFor(ctx context.Context, model string) (*Slots, error
 func (c *Client) fetchSlots(ctx context.Context, model string) (*Slots, error) {
 	u := c.base + "/slots"
 	if model != "" {
-		u += "?model=" + url.QueryEscape(model)
+		// autoload=false: a stats poll must never load a model (the
+		// router would otherwise reload an unloaded model every second).
+		u += "?model=" + url.QueryEscape(model) + "&autoload=false"
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
