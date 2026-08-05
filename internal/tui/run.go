@@ -100,6 +100,7 @@ type RunMode struct {
 	copyResult    string // when non-empty, a centered "command copied" modal is shown; any key dismisses
 	restartPrompt bool   // r-confirm overlay
 	killPrompt    bool   // k-confirm overlay
+	unloadPrompt  bool   // router u-confirm overlay
 	flash         string
 
 	searchInput   textinput.Model
@@ -514,6 +515,20 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		}
 		return r, nil
 
+	case modelActionMsg:
+		if m.err != nil {
+			r.flash = fmt.Sprintf("%s failed: %v", m.action, m.err)
+			return r, nil
+		}
+		if m.action == "unload" {
+			// The focused model is gone; drop back to the model list.
+			r.routerFocus = ""
+			r.flash = fmt.Sprintf("unloaded %s", truncateRune(m.model, routerPanelIDMax))
+			return r, nil
+		}
+		r.flash = fmt.Sprintf("loading %s", truncateRune(m.model, routerPanelIDMax))
+		return r, nil
+
 	case hwTickMsg:
 		// Independent hardware-poll cadence: starts at RunMode
 		// birth, keeps running until the fetch context is
@@ -623,6 +638,9 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if r.killPrompt {
 			return r.handleKillPrompt(m)
 		}
+		if r.unloadPrompt {
+			return r.handleUnloadPrompt(m)
+		}
 		if r.searchActive {
 			return r.handleSearchInput(m)
 		}
@@ -673,6 +691,17 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 				r.cycleRouterFocus()
 			}
 			return r, nil
+		case "l", "u":
+			// Router mode: load / unload the focused model.
+			if r.routerFile == "" || r.routerFocus == "" {
+				r.flash = "focus a model first (m)"
+				return r, nil
+			}
+			if m.String() == "u" {
+				r.unloadPrompt = true
+				return r, nil
+			}
+			return r, loadModelCmd(r.fetchCtx, r.fetcher, r.routerFocus)
 		case "/":
 			r.searchActive = true
 			r.searchInput.SetValue("")
@@ -830,6 +859,23 @@ func (r *RunMode) handleKillPrompt(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 		return r, r.killAndReturn()
 	case "n", "esc", "c":
 		r.killPrompt = false
+		return r, nil
+	}
+	return r, nil
+}
+
+// handleUnloadPrompt reads the confirm/cancel keys for the router
+// `u` (unload focused model) action.
+func (r *RunMode) handleUnloadPrompt(m tea.KeyMsg) (*RunMode, tea.Cmd) {
+	switch m.String() {
+	case "y", "enter", "u":
+		r.unloadPrompt = false
+		if r.routerFocus == "" {
+			return r, nil
+		}
+		return r, unloadModelCmd(r.fetchCtx, r.fetcher, r.routerFocus)
+	case "n", "esc", "c":
+		r.unloadPrompt = false
 		return r, nil
 	}
 	return r, nil
@@ -1083,6 +1129,8 @@ func (r *RunMode) View() string {
 		out = overlayCenter(bg, r.renderRestartPrompt(), r.width, r.height)
 	case r.killPrompt:
 		out = overlayCenter(bg, r.renderKillPrompt(), r.width, r.height)
+	case r.unloadPrompt:
+		out = overlayCenter(bg, r.renderUnloadPrompt(), r.width, r.height)
 	case r.showHelp:
 		out = overlayCenter(bg, r.renderHelp(), r.width, r.height)
 	case r.showInfo:
@@ -1214,6 +1262,21 @@ func (r *RunMode) renderKillPrompt() string {
 	return r.promptBox().Render(body)
 }
 
+// renderUnloadPrompt asks to unload the focused router model (frees
+// its VRAM; autoload will reload it on the next request).
+func (r *RunMode) renderUnloadPrompt() string {
+	id := r.routerFocus
+	if id == "" {
+		id = "?"
+	}
+	title := fmt.Sprintf("Unload %s?", truncateRune(id, routerPanelIDMax))
+	body := title + "\n\n  " + r.promptShortcuts(
+		"y yes",
+		"n no",
+	)
+	return r.promptBox().Render(body)
+}
+
 // renderInfoOverlay renders the `i`-toggled overlay: model identity
 // (alias + Source/HF) followed by the preset name + every preset
 // param in source order. The full param list — which the header
@@ -1269,6 +1332,7 @@ func (r *RunMode) renderHelp() string {
 		{"c", "copy launch command to clipboard"},
 		{"i", "show model & preset details"},
 		{"m", "router mode: cycle focused model's stats panel (last → list)"},
+		{"l / u", "router mode: load / unload the focused model (u confirms)"},
 		{"/", "search (live highlights; Enter applies, Esc cancels)"},
 		{"n / N", "next / previous match"},
 		{"Esc", "clear active search and highlights"},
@@ -1305,7 +1369,7 @@ func (r *RunMode) renderFooter() string {
 		"q quit", "k kill", "r restart", "c copy", "i info",
 	}
 	if r.routerFile != "" {
-		tokens = append(tokens, "m models")
+		tokens = append(tokens, "m models", "l/u load/unload")
 	}
 	tokens = append(tokens, "/ search", "? help", "g/G top/bottom", "space/b page", "↑/↓ scroll")
 	parts := make([]string, len(tokens))

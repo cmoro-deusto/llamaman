@@ -890,6 +890,101 @@ func TestRouterApplySlotsTTFT(t *testing.T) {
 	}
 }
 
+// TestRouterLoadFromFocus verifies `l` on the focused model POSTs
+// /models/load and flashes the result.
+func TestRouterLoadFromFocus(t *testing.T) {
+	fake := &fakeFetcher{}
+	r := newRouterTestRunMode(fake)
+	r.routerFocus = "m:a"
+
+	_, cmd := r.Update(keyMsg("l"))
+	if cmd == nil {
+		t.Fatal("l should emit a load cmd")
+	}
+	if msg := safeCmd(cmd); msg != nil {
+		r, _ = r.Update(msg)
+	}
+	if fake.loadCalls != 1 {
+		t.Errorf("loadCalls = %d, want 1", fake.loadCalls)
+	}
+	if !strings.Contains(r.flash, "loading m:a") {
+		t.Errorf("flash = %q", r.flash)
+	}
+}
+
+// TestRouterUnloadConfirm verifies `u` opens a confirm prompt (no call
+// yet), y confirms and flashes, n cancels without calling.
+func TestRouterUnloadConfirm(t *testing.T) {
+	fake := &fakeFetcher{}
+	r := newRouterTestRunMode(fake)
+	r.routerFocus = "m:a"
+
+	// u opens the prompt; nothing called yet.
+	if _, cmd := r.Update(keyMsg("u")); cmd != nil {
+		t.Fatal("u should not emit a cmd before confirm")
+	}
+	if !r.unloadPrompt {
+		t.Fatal("unloadPrompt not set after u")
+	}
+	if fake.unloadCalls != 0 {
+		t.Fatalf("unload called before confirm: %d", fake.unloadCalls)
+	}
+	if got := stripANSI(r.renderUnloadPrompt()); !strings.Contains(got, "Unload m:a?") {
+		t.Errorf("prompt = %q", got)
+	}
+
+	// n cancels.
+	r2 := newRouterTestRunMode(fake)
+	r2.routerFocus = "m:a"
+	r2.Update(keyMsg("u"))
+	r2.Update(keyMsg("n"))
+	if r2.unloadPrompt {
+		t.Error("unloadPrompt still set after n")
+	}
+	if fake.unloadCalls != 0 {
+		t.Errorf("unload called after n: %d", fake.unloadCalls)
+	}
+
+	// y confirms → POST unload, flash, focus cleared.
+	_, cmd := r.Update(keyMsg("y"))
+	if msg := safeCmd(cmd); msg != nil {
+		r, _ = r.Update(msg)
+	}
+	if fake.unloadCalls != 1 {
+		t.Errorf("unloadCalls = %d, want 1", fake.unloadCalls)
+	}
+	if !strings.Contains(r.flash, "unloaded m:a") {
+		t.Errorf("flash = %q", r.flash)
+	}
+	if r.routerFocus != "" {
+		t.Errorf("focus = %q, want cleared after unload", r.routerFocus)
+	}
+}
+
+// TestRouterLoadUnloadRequiresFocus verifies l/u without a focused
+// model flash a hint instead of calling the router.
+func TestRouterLoadUnloadRequiresFocus(t *testing.T) {
+	fake := &fakeFetcher{}
+	r := newRouterTestRunMode(fake)
+
+	r.Update(keyMsg("l"))
+	r.Update(keyMsg("u"))
+	if fake.loadCalls != 0 || fake.unloadCalls != 0 {
+		t.Errorf("calls without focus: load=%d unload=%d", fake.loadCalls, fake.unloadCalls)
+	}
+	if !strings.Contains(r.flash, "focus a model first") {
+		t.Errorf("flash = %q", r.flash)
+	}
+	// Single-model mode: also a no-op.
+	r2 := newRouterTestRunMode(fake)
+	r2.routerFile = ""
+	r2.routerFocus = "m:a"
+	r2.Update(keyMsg("l"))
+	if fake.loadCalls != 0 {
+		t.Errorf("load called in single-model mode: %d", fake.loadCalls)
+	}
+}
+
 // TestRunHeaderStateMachine exercises the two width breakpoints in
 // one place and pins the cell count + live-band visibility at each.
 // 6 identity cells stay in the same source order across modes; only

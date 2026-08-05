@@ -2,6 +2,7 @@ package llamaapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -475,5 +476,59 @@ llamacpp:prompt_tokens_seconds 500
 	}
 	if got.PredictedTokensSecondsAvg != 12.3 || got.PromptTokensSecondsAvg != 500 {
 		t.Errorf("averages = %v/%v, want 12.3/500", got.PredictedTokensSecondsAvg, got.PromptTokensSecondsAvg)
+	}
+}
+
+func TestLoadModelAndUnloadModel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models/load":
+			if r.Method != http.MethodPost {
+				t.Errorf("load method = %s", r.Method)
+			}
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["model"] != "m:a" {
+				t.Errorf("load body = %v", body)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true}`))
+		case "/models/unload":
+			var body map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["model"] != "m:b" {
+				t.Errorf("unload body = %v", body)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"success":true}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := clientFor(t, srv)
+	if err := c.LoadModel(context.Background(), "m:a"); err != nil {
+		t.Errorf("LoadModel: %v", err)
+	}
+	if err := c.UnloadModel(context.Background(), "m:b"); err != nil {
+		t.Errorf("UnloadModel: %v", err)
+	}
+}
+
+func TestModelActionErrorParsesBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"code":400,"message":"model is not running","type":"invalid_request_error"}}`))
+	}))
+	defer srv.Close()
+
+	err := clientFor(t, srv).UnloadModel(context.Background(), "m:x")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "model is not running") {
+		t.Errorf("error = %q, want parsed server message", err)
 	}
 }

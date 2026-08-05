@@ -6,6 +6,7 @@ package llamaapi
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -215,6 +216,54 @@ func parseMetrics(body interface{ Read([]byte) (int, error) }) (*Metrics, error)
 		return nil, fmt.Errorf("llamaapi: scan /metrics: %w", err)
 	}
 	return m, nil
+}
+
+// LoadModel POSTs /models/load {"model": id} — the router-mode load
+// action. The router returns before the child is ready; the model then
+// transitions through loading → loaded as observed via GET /models.
+func (c *Client) LoadModel(ctx context.Context, model string) error {
+	return c.postModelAction(ctx, "/models/load", model)
+}
+
+// UnloadModel POSTs /models/unload {"model": id} — the router-mode
+// unload action. In-flight work drains up to the preset's stop-timeout
+// before the child is killed.
+func (c *Client) UnloadModel(ctx context.Context, model string) error {
+	return c.postModelAction(ctx, "/models/unload", model)
+}
+
+// postModelAction POSTs a router model action and returns a readable
+// error (parsed from the OpenAI-style {"error":{"message":...}} body)
+// on non-2xx responses.
+func (c *Client) postModelAction(ctx context.Context, path, model string) error {
+	body, err := json.Marshal(map[string]string{"model": model})
+	if err != nil {
+		return fmt.Errorf("llamaapi: %s: %w", path, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("llamaapi: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("llamaapi: POST %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 == 2 {
+		return nil
+	}
+	var e struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&e)
+	msg := e.Error.Message
+	if msg == "" {
+		msg = http.StatusText(resp.StatusCode)
+	}
+	return fmt.Errorf("llamaapi: POST %s: %s (status %d)", path, msg, resp.StatusCode)
 }
 
 // FetchSlots GETs /slots and extracts busy count, total slots, and

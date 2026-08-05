@@ -22,11 +22,14 @@ type Fetcher interface {
 	// GET /models; FetchHealth the loaded-model ids of GET /health.
 	// FetchSlotsFor / FetchMetricsFor return one model's stats via
 	// /slots?model=<id> and /metrics?model=<id> (the router requires
-	// the model name on these endpoints).
+	// the model name on these endpoints). LoadModel / UnloadModel
+	// POST /models/load|unload.
 	FetchModels(ctx context.Context) (*llamaapi.Models, error)
 	FetchHealth(ctx context.Context) (*llamaapi.Health, error)
 	FetchSlotsFor(ctx context.Context, model string) (*llamaapi.Slots, error)
 	FetchMetricsFor(ctx context.Context, model string) (*llamaapi.Metrics, error)
+	LoadModel(ctx context.Context, model string) error
+	UnloadModel(ctx context.Context, model string) error
 }
 
 // propsFetchedMsg carries the result of a one-shot /props fetch back
@@ -155,6 +158,27 @@ func fetchRouterMetricsCmd(ctx context.Context, fetcher Fetcher, model string) t
 	return func() tea.Msg {
 		m, err := fetcher.FetchMetricsFor(ctx, model)
 		return routerMetricsMsg{model: model, m: m, err: err}
+	}
+}
+
+// modelActionMsg carries the result of a POST /models/load|unload.
+type modelActionMsg struct {
+	model  string
+	action string // "load" | "unload"
+	err    error
+}
+
+// loadModelCmd POSTs /models/load for the given model.
+func loadModelCmd(ctx context.Context, fetcher Fetcher, model string) tea.Cmd {
+	return func() tea.Msg {
+		return modelActionMsg{model: model, action: "load", err: fetcher.LoadModel(ctx, model)}
+	}
+}
+
+// unloadModelCmd POSTs /models/unload for the given model.
+func unloadModelCmd(ctx context.Context, fetcher Fetcher, model string) tea.Cmd {
+	return func() tea.Msg {
+		return modelActionMsg{model: model, action: "unload", err: fetcher.UnloadModel(ctx, model)}
 	}
 }
 

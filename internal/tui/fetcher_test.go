@@ -120,6 +120,11 @@ type fakeFetcher struct {
 	metricsFor      map[string]*llamaapi.Metrics
 	metricsForErr   error
 	metricsForCalls int
+	// Router model actions (POST /models/load|unload).
+	loadErr     error
+	unloadErr   error
+	loadCalls   int
+	unloadCalls int
 }
 
 func (f *fakeFetcher) FetchProps(ctx context.Context) (*llamaapi.Props, error) {
@@ -193,6 +198,20 @@ func (f *fakeFetcher) FetchMetricsFor(_ context.Context, model string) (*llamaap
 		return nil, f.metricsForErr
 	}
 	return f.metricsFor[model], nil
+}
+
+func (f *fakeFetcher) LoadModel(_ context.Context, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.loadCalls++
+	return f.loadErr
+}
+
+func (f *fakeFetcher) UnloadModel(_ context.Context, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unloadCalls++
+	return f.unloadErr
 }
 
 func (f *fakeFetcher) callCount() int {
