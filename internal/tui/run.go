@@ -1781,7 +1781,9 @@ func (r *RunMode) renderRouterStatsPanel(width int) string {
 	}
 	title := "router stats"
 	if r.routerFocus != "" {
-		title = "router · " + truncateRune(r.routerFocus, 24)
+		// renderTitledPanel truncates the title to the panel border,
+		// so pass the full id — no premature trimming.
+		title = "router · " + r.routerFocus
 	}
 	return r.renderTitledPanel(title, width, padRows(r.renderServerRows(sv), liveBandContentRows))
 }

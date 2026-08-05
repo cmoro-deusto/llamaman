@@ -780,7 +780,8 @@ func TestRouterFooterShowsMHint(t *testing.T) {
 // single-model server panel, including TTFT and sparkline rows.
 func TestRouterStatsPanelFullParity(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
-	r.routerFocus = "m:big"
+	const focusID = "Qwen3.6_27B-MTP:CODING 128K New"
+	r.routerFocus = focusID
 	r.routerMetricsAvailable = true
 	st := &modelStats{statsView: statsView{
 		metricsAvailable:    true,
@@ -805,9 +806,14 @@ func TestRouterStatsPanelFullParity(t *testing.T) {
 		promptToksProcessed: 4181,
 		ttft:                1200 * time.Millisecond,
 	}}
-	r.routerStats = map[string]*modelStats{"m:big": st}
+	r.routerStats = map[string]*modelStats{focusID: st}
 
 	got := stripANSI(r.renderRouterStatsPanel(120))
+	// The full model id must appear in the panel title — no premature
+	// trimming while the border has room.
+	if !strings.Contains(got, "router · "+focusID) {
+		t.Errorf("title trimmed despite available space; panel:\n%s", got)
+	}
 	for _, want := range []string{
 		"Tokens", "Prompt", "Process", "Context", "Breakdown", "Cache", "Gen",
 		"12.3 tps", "10.0 avg", "500.0 avg", "Busy 1/1 slots",
@@ -821,6 +827,12 @@ func TestRouterStatsPanelFullParity(t *testing.T) {
 	// The list view is replaced while focused.
 	if list := stripANSI(r.renderRouterPanel(120)); !strings.Contains(list, "(no models reported)") {
 		t.Errorf("list view should be the fallback only; got:\n%s", list)
+	}
+	// At a narrow width the title is cut at the border (by
+	// renderTitledPanel), not at a fixed 24-rune cap.
+	narrow := stripANSI(r.renderRouterStatsPanel(30))
+	if strings.Contains(narrow, "router · "+focusID) {
+		t.Errorf("narrow panel title unexpectedly fits; panel:\n%s", narrow)
 	}
 }
 
