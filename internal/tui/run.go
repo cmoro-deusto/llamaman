@@ -640,12 +640,10 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		}
 		switch m.String() {
 		case "esc":
-			// Layered Esc: clear the router model focus first, then any
-			// applied search query on the main run screen.
-			if r.routerFocus != "" {
-				r.routerFocus = ""
-				return r, nil
-			}
+			// Layered Esc: on the main run screen, clear any applied
+			// query so highlights and n/N navigation drop back to a
+			// clean log. No-op when nothing is applied. (Model focus is
+			// exited by finishing the `m` rotation, keeping Esc free.)
 			if r.searchQuery != "" {
 				r.searchQuery = ""
 				r.searchMatches = nil
@@ -1265,10 +1263,10 @@ func (r *RunMode) renderHelp() string {
 		{"r", "restart server (confirms)"},
 		{"c", "copy launch command to clipboard"},
 		{"i", "show model & preset details"},
-		{"m", "router mode: cycle focused model's full stats panel"},
+		{"m", "router mode: cycle focused model's stats panel (last → list)"},
 		{"/", "search (live highlights; Enter applies, Esc cancels)"},
 		{"n / N", "next / previous match"},
-		{"Esc", "clear active search and highlights; exit model stats"},
+		{"Esc", "clear active search and highlights"},
 		{"g / G", "jump to top / bottom"},
 		{"space / b", "page down / up"},
 		{"↑ / ↓", "scroll one line"},
@@ -1300,8 +1298,11 @@ func (r *RunMode) renderFooter() string {
 	sep := subtle.Render(" · ")
 	tokens := []string{
 		"q quit", "k kill", "r restart", "c copy", "i info",
-		"/ search", "? help", "g/G top/bottom", "space/b page", "↑/↓ scroll",
 	}
+	if r.routerFile != "" {
+		tokens = append(tokens, "m models")
+	}
+	tokens = append(tokens, "/ search", "? help", "g/G top/bottom", "space/b page", "↑/↓ scroll")
 	parts := make([]string, len(tokens))
 	for i, t := range tokens {
 		parts[i] = paneShortcut(t, r.theme, true)
@@ -1655,7 +1656,9 @@ func (r *RunMode) applyRouterMetrics(model string, m *llamaapi.Metrics) {
 }
 
 // cycleRouterFocus moves the focused model to the next loaded/loading
-// model (wrapping). No-op when no model is loaded.
+// model. After the last one, focus returns to the model list (""), so
+// `m` is a rotation: list → model1 → … → modelN → list. No-op when no
+// model is loaded.
 func (r *RunMode) cycleRouterFocus() {
 	var focusable []string
 	for _, m := range r.routerModels {
@@ -1672,10 +1675,16 @@ func (r *RunMode) cycleRouterFocus() {
 	}
 	for i, id := range focusable {
 		if id == r.routerFocus {
-			r.routerFocus = focusable[(i+1)%len(focusable)]
+			if i == len(focusable)-1 {
+				// Finished a full rotation — back to the model list.
+				r.routerFocus = ""
+				return
+			}
+			r.routerFocus = focusable[i+1]
 			return
 		}
 	}
+	// Focused model is no longer loaded — start a fresh rotation.
 	r.routerFocus = focusable[0]
 }
 

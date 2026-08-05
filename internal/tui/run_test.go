@@ -709,8 +709,9 @@ func TestRouterPanelShowsRateOnlyWhenMetricsPresent(t *testing.T) {
 	}
 }
 
-// TestRouterFocusCyclesModels verifies `m` cycles the focused model
-// through loaded models (wrapping) and Esc clears the focus.
+// TestRouterFocusCyclesModels verifies `m` rotates the focused model
+// through loaded models and returns to the model list after the last
+// one (Esc stays free).
 func TestRouterFocusCyclesModels(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
 	r.routerModels = []llamaapi.ModelInfo{
@@ -727,13 +728,18 @@ func TestRouterFocusCyclesModels(t *testing.T) {
 		t.Errorf("focus after second m = %q, want c (skips unloaded b)", r.routerFocus)
 	}
 	r.cycleRouterFocus()
-	if r.routerFocus != "a" {
-		t.Errorf("focus after third m = %q, want a (wraps)", r.routerFocus)
-	}
-	// Esc clears the focus back to the model list.
-	r.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	if r.routerFocus != "" {
-		t.Errorf("focus after Esc = %q, want cleared", r.routerFocus)
+		t.Errorf("focus after third m = %q, want \"\" (rotation done → model list)", r.routerFocus)
+	}
+	// Rotation restarts from the first model.
+	r.cycleRouterFocus()
+	if r.routerFocus != "a" {
+		t.Errorf("focus after fourth m = %q, want a (fresh rotation)", r.routerFocus)
+	}
+	// Esc does NOT clear the focus — it stays free for search etc.
+	r.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if r.routerFocus != "a" {
+		t.Errorf("focus after Esc = %q, want unchanged (Esc stays free)", r.routerFocus)
 	}
 	// No loaded models → no-op.
 	r2 := newRouterTestRunMode(&fakeFetcher{})
@@ -741,6 +747,31 @@ func TestRouterFocusCyclesModels(t *testing.T) {
 	r2.cycleRouterFocus()
 	if r2.routerFocus != "" {
 		t.Errorf("focus with no loaded model = %q, want empty", r2.routerFocus)
+	}
+	// Focused model unloaded while focused → next m starts a fresh
+	// rotation on the remaining loaded model.
+	r3 := newRouterTestRunMode(&fakeFetcher{})
+	r3.routerModels = []llamaapi.ModelInfo{{ID: "y", Status: llamaapi.ModelStatus{Value: "loaded"}}}
+	r3.routerFocus = "gone"
+	r3.cycleRouterFocus()
+	if r3.routerFocus != "y" {
+		t.Errorf("focus with stale id = %q, want y", r3.routerFocus)
+	}
+}
+
+// TestRouterFooterShowsMHint verifies the footer advertises `m` only in
+// router mode.
+func TestRouterFooterShowsMHint(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	footer := stripANSI(r.renderFooter())
+	if !strings.Contains(footer, "m models") {
+		t.Errorf("router footer missing m hint; footer:\n%s", footer)
+	}
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.routerFile = "" // single-model mode
+	footer2 := stripANSI(r2.renderFooter())
+	if strings.Contains(footer2, "m models") {
+		t.Errorf("single-model footer must not show m hint; footer:\n%s", footer2)
 	}
 }
 
