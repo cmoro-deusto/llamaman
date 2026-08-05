@@ -388,6 +388,7 @@ func newRouterTestRunMode(fake *fakeFetcher) *RunMode {
 		status:                 StatusStarting,
 		fetcher:                fake,
 		routerMetricsAvailable: true,
+		denoise:                true,
 		tokensHistory:          newRingBuffer(sparkBufferSamples),
 		promptHistory:          newRingBuffer(sparkBufferSamples),
 		utilHistory:            map[string]*ringBuffer{},
@@ -1340,6 +1341,74 @@ func TestFormatArgvLines(t *testing.T) {
 	}
 	if !strings.Contains(trunc[5], "more") {
 		t.Errorf("last line = %q, want ellipsis", trunc[5])
+	}
+}
+
+// TestRouterDenoiseToggle verifies `d` flips the proxy-log filter
+// (default on) and gates the ingest path accordingly.
+func TestRouterDenoiseToggle(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.tail = newTestTailer(t)
+	r.routerFile = "models.ini"
+	if !r.denoise {
+		t.Fatal("denoise should default to on")
+	}
+
+	// On: proxy lines dropped at ingest.
+	r.Update(logChunkMsg("ok\nproxying request to model X on port 1\n"))
+	if strings.Contains(r.buf.String(), "proxying request to model") {
+		t.Errorf("buf contains proxy line with denoise on: %q", r.buf.String())
+	}
+
+	// d → off, flash, lines kept.
+	r.Update(keyMsg("d"))
+	if r.denoise {
+		t.Error("denoise still on after d")
+	}
+	if !strings.Contains(r.flash, "denoise off") {
+		t.Errorf("flash = %q", r.flash)
+	}
+	r.Update(logChunkMsg("proxy again\nproxying request to model Y on port 2\n"))
+	if !strings.Contains(r.buf.String(), "proxying request to model Y") {
+		t.Errorf("buf missing proxy line with denoise off: %q", r.buf.String())
+	}
+
+	// d → back on.
+	r.Update(keyMsg("d"))
+	if !r.denoise {
+		t.Error("denoise still off after second d")
+	}
+	if !strings.Contains(r.flash, "denoise on") {
+		t.Errorf("flash = %q", r.flash)
+	}
+	r.Update(logChunkMsg("proxying request to model Z on port 3\n"))
+	if strings.Contains(r.buf.String(), "model Z") {
+		t.Errorf("buf contains proxy line with denoise back on: %q", r.buf.String())
+	}
+
+	// d is a no-op in single-model mode.
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.routerFile = ""
+	r2.denoise = false
+	r2.Update(keyMsg("d"))
+	if r2.denoise {
+		t.Error("d should not toggle denoise outside router mode")
+	}
+}
+
+// TestRouterFooterShowsDenoise verifies the footer advertises d denoise
+// in router mode only.
+func TestRouterFooterShowsDenoise(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	footer := stripANSI(r.renderFooter())
+	if !strings.Contains(footer, "d denoise") {
+		t.Errorf("router footer missing d denoise; footer:\n%s", footer)
+	}
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.routerFile = "" // single-model mode
+	footer2 := stripANSI(r2.renderFooter())
+	if strings.Contains(footer2, "d denoise") {
+		t.Errorf("single-model footer must not show d denoise; footer:\n%s", footer2)
 	}
 }
 

@@ -86,6 +86,10 @@ type RunMode struct {
 	routerListStart   int
 	routerMenu        bool
 	routerMenuIdx     int
+	// denoise hides llama.cpp's per-request router chatter
+	// ("proxying request to model ...") from the log view. Default on;
+	// toggled with `d` in router mode.
+	denoise bool
 
 	proc          *server.Process
 	tail          *server.Tailer
@@ -248,6 +252,7 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 		fetcher:                opts.Fetcher,
 		metricsAvailable:       true,
 		routerMetricsAvailable: true,
+		denoise:                true,
 		tokensHistory:          newRingBuffer(sparkBufferSamples),
 		promptHistory:          newRingBuffer(sparkBufferSamples),
 		utilHistory:            map[string]*ringBuffer{},
@@ -380,11 +385,12 @@ func (r *RunMode) chromeHeight() int {
 func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	switch m := msg.(type) {
 	case logChunkMsg:
-		// Router mode: drop llama.cpp's per-request proxy chatter
-		// ("proxying request to model ... on port N" — emitted once per
-		// proxied request, including our own stats polls). The full log
-		// stays on disk; only the TUI view is filtered.
-		if r.routerFile != "" {
+		// Router mode with denoise on: drop llama.cpp's per-request
+		// proxy chatter ("proxying request to model ... on port N" —
+		// emitted once per proxied request, including our own stats
+		// polls). The full log stays on disk; only the TUI view is
+		// filtered. Toggle with `d`.
+		if r.routerFile != "" && r.denoise {
 			m = logChunkMsg(filterProxyLines(string(m)))
 		}
 		r.buf.WriteString(string(m))
@@ -766,6 +772,18 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			// Router mode: open the selected model's stats panel.
 			if r.routerFile != "" && r.routerFocus != "" {
 				r.showRouterStats = true
+			}
+			return r, nil
+		case "d":
+			// Router mode: toggle the proxy-log denoise filter.
+			if r.routerFile == "" {
+				return r, nil
+			}
+			r.denoise = !r.denoise
+			if r.denoise {
+				r.flash = "denoise on — proxy chatter hidden from log"
+			} else {
+				r.flash = "denoise off — proxy chatter shown"
 			}
 			return r, nil
 		case "l", "u":
@@ -1462,6 +1480,7 @@ func (r *RunMode) renderHelp() string {
 		{"Enter", "router mode: action menu (Load/Unload/Stats/Info)"},
 		{"s", "router mode: open selected model's stats"},
 		{"l / u", "router mode: load / unload the selected model (u confirms)"},
+		{"d", "router mode: toggle proxy-log denoise (default on)"},
 		{"/", "search (live highlights; Enter applies, Esc cancels)"},
 		{"n / N", "next / previous match"},
 		{"Esc", "clear active search and highlights"},
@@ -1498,7 +1517,7 @@ func (r *RunMode) renderFooter() string {
 		"q quit", "k kill", "r restart", "c copy", "i info",
 	}
 	if r.routerFile != "" {
-		tokens = append(tokens, "m panel", "l/u load/unload")
+		tokens = append(tokens, "m panel", "l/u load/unload", "d denoise")
 	}
 	tokens = append(tokens, "/ search", "? help", "g/G top/bottom", "space/b page", "↑/↓ scroll")
 	parts := make([]string, len(tokens))
