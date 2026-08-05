@@ -105,11 +105,11 @@ type fakeFetcher struct {
 	metricsScript []*llamaapi.Metrics // when non-nil, serve consecutive entries
 
 	// Router-mode responders (GET /models + GET /health).
-	models     *llamaapi.Models
-	modelsErr  error
+	models      *llamaapi.Models
+	modelsErr   error
 	modelsCalls int
-	health     *llamaapi.Health
-	healthErr  error
+	health      *llamaapi.Health
+	healthErr   error
 	healthCalls int
 }
 

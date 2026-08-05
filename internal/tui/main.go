@@ -359,6 +359,8 @@ func (m MainMode) View() string {
 	hasModels := m.HasModels()
 	if hasModels {
 		parts = append(parts, "", m.renderListBox())
+	} else {
+		parts = append(parts, "", m.renderEmptyState())
 	}
 
 	if hasModels && m.flash != "" {
@@ -408,6 +410,38 @@ func (m MainMode) renderListBox() string {
 		return box.Render(m.presets.View())
 	}
 	return box.Render(m.models.View())
+}
+
+// renderEmptyState is shown when the current mode has nothing to list.
+// It must lead the user to the next step instead of leaving a blank
+// screen: Router mode points at globals "models files" (config mode)
+// and the CLI escapes hatch; Single mode points at config mode.
+func (m MainMode) renderEmptyState() string {
+	var lines []string
+	if m.mode == modeRouter {
+		lines = []string{
+			"No router sources yet.",
+			"",
+			"A router source is a my-models.ini file (llama.cpp model presets).",
+			"Add one in config mode: press c, then edit \"models files\" under globals",
+			"(one file path per line).",
+			"",
+			"Or run a file ad-hoc without registering it:  llamaman -i <file>",
+			"Or ingest one as single-model presets:     llamaman import <file>",
+		}
+	} else {
+		lines = []string{
+			"No models configured yet.",
+			"",
+			"Press c to open config mode and add a model.",
+		}
+	}
+	box := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.theme.Border).
+		Padding(0, 1)
+	body := lipgloss.NewStyle().Foreground(m.theme.Subtle).Render(strings.Join(lines, "\n"))
+	return box.Render(body)
 }
 
 func (m MainMode) renderFlash() string {

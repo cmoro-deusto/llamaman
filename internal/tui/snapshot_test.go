@@ -230,6 +230,56 @@ func TestSnapshotMainModePivotsToPresetSubList(t *testing.T) {
 	}
 }
 
+// TestSnapshotMainModeRouterEmptyState verifies Router mode without any
+// registered sources renders guidance instead of a blank screen: it must
+// point at config mode's "models files" globals field and at the CLI
+// escapes (llamaman -i / import).
+func TestSnapshotMainModeRouterEmptyState(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	cfg.Globals.ModelsFiles = nil
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		tea.KeyMsg{Type: tea.KeyTab}, // Single → Router
+	)
+
+	for _, want := range []string{
+		"No router sources yet",
+		"models files",
+		"llamaman -i <file>",
+		"llamaman import <file>",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("router empty state missing %q; out:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "alpha") {
+		t.Errorf("router empty state should not list config models; out:\n%s", out)
+	}
+}
+
+// TestSnapshotMainModeEmptyModels verifies Single mode with a model-less
+// config (legal, e.g. after an empty import) points at config mode.
+func TestSnapshotMainModeEmptyModels(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	cfg.Models = nil
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+	)
+
+	for _, want := range []string{
+		"No models configured yet",
+		"Press c to open config mode",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("single-mode empty state missing %q; out:\n%s", want, out)
+		}
+	}
+}
+
 // TestSnapshotMainModeRouterView covers the Router mode picker: tab
 // switches from the model list to the globals.models-files entries,
 // each showing its parsed section count.
