@@ -548,9 +548,9 @@ func TestRouterPollFetchesPerModelSlots(t *testing.T) {
 	if fake.slotsForCalls != 1 {
 		t.Errorf("FetchSlotsFor calls = %d, want 1 (loaded model only)", fake.slotsForCalls)
 	}
-	s, ok := r.routerSlots["m:loaded"]
-	if !ok || s == nil || s.ContextUsed != 4222 || s.ContextMax != 65536 {
-		t.Errorf("routerSlots[m:loaded] = %+v, want ctx 4222/65536", s)
+	st, ok := r.routerStats["m:loaded"]
+	if !ok || st == nil || st.contextUsed != 4222 || st.contextMax != 65536 {
+		t.Errorf("routerStats[m:loaded] = %+v, want ctx 4222/65536", st)
 	}
 }
 
@@ -562,9 +562,9 @@ func TestRouterPanelShowsSlotStats(t *testing.T) {
 		{ID: "m:busy", Status: llamaapi.ModelStatus{Value: "loaded"}},
 		{ID: "m:quiet", Status: llamaapi.ModelStatus{Value: "loaded"}},
 	}
-	r.routerSlots = map[string]*llamaapi.Slots{
-		"m:busy":  {ContextUsed: 4222, ContextMax: 65536, BusyCount: 1},
-		"m:quiet": {ContextUsed: 150000, ContextMax: 150000, BusyCount: 0},
+	r.routerStats = map[string]*modelStats{
+		"m:busy":  {statsView: statsView{contextUsed: 4222, contextMax: 65536, busyCount: 1}},
+		"m:quiet": {statsView: statsView{contextUsed: 150000, contextMax: 150000}},
 	}
 	got := stripANSI(r.renderRouterPanel(60))
 	for _, want := range []string{"4.2K/65.5K", "processing", "150K/150K", "idle"} {
@@ -630,9 +630,9 @@ func TestRouterPollFetchesMetricsForLoadedModels(t *testing.T) {
 	if fake.metricsForCalls != 1 {
 		t.Errorf("FetchMetricsFor calls = %d, want 1 (loaded model only)", fake.metricsForCalls)
 	}
-	mm, ok := r.routerMetrics["m:loaded"]
-	if !ok || mm == nil || mm.PredictedTokensSecondsAvg != 12.3 {
-		t.Errorf("routerMetrics[m:loaded] = %+v", mm)
+	mm, ok := r.routerStats["m:loaded"]
+	if !ok || mm == nil || mm.avgTokensPerSec != 12.3 {
+		t.Errorf("routerStats[m:loaded] = %+v", mm)
 	}
 	// Rate shows in the panel.
 	got := stripANSI(r.renderRouterPanel(60))
@@ -696,12 +696,9 @@ func TestRouterPanelShowsRateOnlyWhenMetricsPresent(t *testing.T) {
 		{ID: "m:with-metrics", Status: llamaapi.ModelStatus{Value: "loaded"}},
 		{ID: "m:no-metrics", Status: llamaapi.ModelStatus{Value: "loaded"}},
 	}
-	r.routerSlots = map[string]*llamaapi.Slots{
-		"m:with-metrics": {ContextUsed: 1000, ContextMax: 2000, BusyCount: 0},
-		"m:no-metrics":   {ContextUsed: 1000, ContextMax: 2000, BusyCount: 0},
-	}
-	r.routerMetrics = map[string]*llamaapi.Metrics{
-		"m:with-metrics": {PredictedTokensSecondsAvg: 27.5},
+	r.routerStats = map[string]*modelStats{
+		"m:with-metrics": {statsView: statsView{contextUsed: 1000, contextMax: 2000, avgTokensPerSec: 27.5}},
+		"m:no-metrics":   {statsView: statsView{contextUsed: 1000, contextMax: 2000}},
 	}
 	got := stripANSI(r.renderRouterPanel(60))
 	if !strings.Contains(got, "27.5 tok/s") {
@@ -709,6 +706,144 @@ func TestRouterPanelShowsRateOnlyWhenMetricsPresent(t *testing.T) {
 	}
 	if strings.Count(got, "tok/s") != 1 {
 		t.Errorf("tok/s shown %d times, want 1; panel:\n%s", strings.Count(got, "tok/s"), got)
+	}
+}
+
+// TestRouterFocusCyclesModels verifies `m` cycles the focused model
+// through loaded models (wrapping) and Esc clears the focus.
+func TestRouterFocusCyclesModels(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "a", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "b", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+		{ID: "c", Status: llamaapi.ModelStatus{Value: "loaded"}},
+	}
+	r.cycleRouterFocus()
+	if r.routerFocus != "a" {
+		t.Errorf("focus after first m = %q, want a", r.routerFocus)
+	}
+	r.cycleRouterFocus()
+	if r.routerFocus != "c" {
+		t.Errorf("focus after second m = %q, want c (skips unloaded b)", r.routerFocus)
+	}
+	r.cycleRouterFocus()
+	if r.routerFocus != "a" {
+		t.Errorf("focus after third m = %q, want a (wraps)", r.routerFocus)
+	}
+	// Esc clears the focus back to the model list.
+	r.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if r.routerFocus != "" {
+		t.Errorf("focus after Esc = %q, want cleared", r.routerFocus)
+	}
+	// No loaded models → no-op.
+	r2 := newRouterTestRunMode(&fakeFetcher{})
+	r2.routerModels = []llamaapi.ModelInfo{{ID: "x", Status: llamaapi.ModelStatus{Value: "unloaded"}}}
+	r2.cycleRouterFocus()
+	if r2.routerFocus != "" {
+		t.Errorf("focus with no loaded model = %q, want empty", r2.routerFocus)
+	}
+}
+
+// TestRouterStatsPanelFullParity verifies the focused model's panel
+// renders the full seven-row statistics — full parity with the
+// single-model server panel, including TTFT and sparkline rows.
+func TestRouterStatsPanelFullParity(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerFocus = "m:big"
+	r.routerMetricsAvailable = true
+	st := &modelStats{statsView: statsView{
+		metricsAvailable:    true,
+		tokensHistory:       newRingBuffer(sparkBufferSamples),
+		promptHistory:       newRingBuffer(sparkBufferSamples),
+		currentTokensPerSec: 12.3,
+		avgTokensPerSec:     10.0,
+		tokensSeen:          true,
+		avgPromptPerSec:     500,
+		promptSeen:          true,
+		busyCount:           1,
+		totalSlots:          1,
+		queuedCount:         0,
+		contextUsed:         4263,
+		contextMax:          65536,
+		contextCacheHit:     4000,
+		contextPromptToks:   4222,
+		contextGenToks:      41,
+		genDecoded:          41,
+		genRemain:           100,
+		promptToksTotal:     4222,
+		promptToksProcessed: 4181,
+		ttft:                1200 * time.Millisecond,
+	}}
+	r.routerStats = map[string]*modelStats{"m:big": st}
+
+	got := stripANSI(r.renderRouterStatsPanel(120))
+	for _, want := range []string{
+		"Tokens", "Prompt", "Process", "Context", "Breakdown", "Cache", "Gen",
+		"12.3 tps", "10.0 avg", "500.0 avg", "Busy 1/1 slots",
+		"4181/4222", "4263/65K", "4222 prompt", "41 gen",
+		"TTFT", "1.2s",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stats panel missing %q; panel:\n%s", want, got)
+		}
+	}
+	// The list view is replaced while focused.
+	if list := stripANSI(r.renderRouterPanel(120)); !strings.Contains(list, "(no models reported)") {
+		t.Errorf("list view should be the fallback only; got:\n%s", list)
+	}
+}
+
+// TestRouterApplyMetricsDeltas verifies per-model current-rate deltas
+// and sparkline history accumulate exactly like the single-model path.
+func TestRouterApplyMetricsDeltas(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.applyRouterMetrics("m", &llamaapi.Metrics{
+		PredictedTokensSecondsAvg: 10,
+		TokensPredictedTotal:      1000, TokensPredictedSecondsTotal: 100,
+		PromptTokensTotal: 500, PromptSecondsTotal: 50,
+	})
+	st := r.routerStats["m"]
+	if st == nil || st.avgTokensPerSec != 10 {
+		t.Fatalf("first metrics not applied: %+v", st)
+	}
+	if st.currentTokensPerSec != 0 || len(st.tokensHistory.Snapshot()) != 0 {
+		t.Errorf("first tick must not compute deltas; current=%v", st.currentTokensPerSec)
+	}
+	r.applyRouterMetrics("m", &llamaapi.Metrics{
+		PredictedTokensSecondsAvg: 12,
+		TokensPredictedTotal:      2000, TokensPredictedSecondsTotal: 150,
+		PromptTokensTotal: 700, PromptSecondsTotal: 60,
+	})
+	if st.currentTokensPerSec != 20 { // 1000 tokens / 50 server-seconds
+		t.Errorf("currentTokensPerSec = %v, want 20", st.currentTokensPerSec)
+	}
+	if st.currentPromptPerSec != 20 { // 200 tokens / 10 server-seconds
+		t.Errorf("currentPromptPerSec = %v, want 20", st.currentPromptPerSec)
+	}
+	if !st.tokensSeen || len(st.tokensHistory.Snapshot()) == 0 || len(st.promptHistory.Snapshot()) == 0 {
+		t.Errorf("history not accumulated: tokensSeen=%v", st.tokensSeen)
+	}
+}
+
+// TestRouterApplySlotsTTFT verifies per-model TTFT tracking mirrors the
+// single-model handler: measured from request start to first token.
+func TestRouterApplySlotsTTFT(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	// Request starts: prompt tokens appear, no gen yet.
+	r.applyRouterSlots("m", &llamaapi.Slots{PromptTokensTotal: 100, PromptTokensProcessed: 0})
+	st := r.routerStats["m"]
+	if st.ttftStart.IsZero() {
+		t.Fatal("ttftStart not armed on new request")
+	}
+	// First token appears.
+	r.applyRouterSlots("m", &llamaapi.Slots{PromptTokensTotal: 100, PromptTokensProcessed: 100, GenDecoded: 1})
+	if st.ttft <= 0 {
+		t.Errorf("ttft = %v, want > 0", st.ttft)
+	}
+	// Request completes → reset.
+	r.applyRouterSlots("m", &llamaapi.Slots{})
+	if !st.ttftStart.IsZero() || st.ttft != 0 || st.ttftPrevPromptToks != 0 {
+		t.Errorf("ttft state not reset: start=%v ttft=%v prev=%d", st.ttftStart, st.ttft, st.ttftPrevPromptToks)
 	}
 }
 

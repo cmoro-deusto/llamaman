@@ -67,15 +67,16 @@ type RunMode struct {
 	// GET /health.
 	routerModels []llamaapi.ModelInfo
 	routerLoaded []string
-	// routerSlots holds each loaded model's /slots?model=<id> stats,
-	// keyed by model id.
-	routerSlots map[string]*llamaapi.Slots
-	// routerMetrics holds each loaded model's /metrics?model=<id>
-	// averages, keyed by model id. routerMetricsAvailable goes false
-	// when the router reports the metrics endpoint disabled (spawned
-	// without --metrics), which stops the per-model metrics polling.
-	routerMetrics          map[string]*llamaapi.Metrics
+	// routerStats holds each loaded model's live statistics (slots +
+	// metrics deltas, sparkline history, TTFT), keyed by model id.
+	routerStats map[string]*modelStats
+	// routerMetricsAvailable goes false when the router reports the
+	// metrics endpoint disabled (spawned without --metrics), which stops
+	// the per-model metrics polling.
 	routerMetricsAvailable bool
+	// routerFocus is the model id whose full stats panel is shown
+	// instead of the model list ("" = list view). Cycled with `m`.
+	routerFocus string
 
 	proc          *server.Process
 	tail          *server.Tailer
@@ -496,10 +497,7 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 
 	case routerSlotsMsg:
 		if m.err == nil && m.s != nil {
-			if r.routerSlots == nil {
-				r.routerSlots = make(map[string]*llamaapi.Slots)
-			}
-			r.routerSlots[m.model] = m.s
+			r.applyRouterSlots(m.model, m.s)
 		}
 		return r, nil
 
@@ -512,10 +510,7 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		}
 		if m.err == nil && m.m != nil {
-			if r.routerMetrics == nil {
-				r.routerMetrics = make(map[string]*llamaapi.Metrics)
-			}
-			r.routerMetrics[m.model] = m.m
+			r.applyRouterMetrics(m.model, m.m)
 		}
 		return r, nil
 
@@ -645,9 +640,12 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		}
 		switch m.String() {
 		case "esc":
-			// Layered Esc: on the main run screen, clear any applied
-			// query so highlights and n/N navigation drop back to a
-			// clean log. No-op when nothing is applied.
+			// Layered Esc: clear the router model focus first, then any
+			// applied search query on the main run screen.
+			if r.routerFocus != "" {
+				r.routerFocus = ""
+				return r, nil
+			}
 			if r.searchQuery != "" {
 				r.searchQuery = ""
 				r.searchMatches = nil
@@ -668,6 +666,14 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		case "i":
 			r.showInfo = true
+			return r, nil
+		case "m":
+			// Router mode: cycle which loaded model's full stats panel
+			// is shown. No-op outside router mode or with no loaded
+			// model.
+			if r.routerFile != "" {
+				r.cycleRouterFocus()
+			}
 			return r, nil
 		case "/":
 			r.searchActive = true
@@ -1259,9 +1265,10 @@ func (r *RunMode) renderHelp() string {
 		{"r", "restart server (confirms)"},
 		{"c", "copy launch command to clipboard"},
 		{"i", "show model & preset details"},
+		{"m", "router mode: cycle focused model's full stats panel"},
 		{"/", "search (live highlights; Enter applies, Esc cancels)"},
 		{"n / N", "next / previous match"},
-		{"Esc", "clear active search and highlights"},
+		{"Esc", "clear active search and highlights; exit model stats"},
 		{"g / G", "jump to top / bottom"},
 		{"space / b", "page down / up"},
 		{"↑ / ↓", "scroll one line"},
@@ -1507,6 +1514,186 @@ func (r *RunMode) renderLiveBand() string {
 // every row. 9 fits the longest ("Breakdown").
 const metricLabelWidth = 9
 
+// statsView is the read-only projection of live llama-server statistics
+// the server panel renders. Single-model mode fills it from RunMode's
+// scalar fields; router mode fills it from a model's modelStats. The
+// renderers only read through this struct so both modes share one panel
+// implementation.
+type statsView struct {
+	metricsAvailable    bool
+	tokensHistory       *ringBuffer
+	currentTokensPerSec float64
+	avgTokensPerSec     float64
+	tokensSeen          bool
+	promptHistory       *ringBuffer
+	currentPromptPerSec float64
+	avgPromptPerSec     float64
+	promptSeen          bool
+	busyCount           int
+	totalSlots          int
+	queuedCount         int
+	decodeTotal         float64
+	contextUsed         int
+	contextMax          int
+	contextCacheHit     int
+	contextPromptToks   int
+	contextGenToks      int
+	genDecoded          int
+	genRemain           int
+	promptToksTotal     int
+	promptToksProcessed int
+	ttft                time.Duration
+}
+
+// modelStats is one router model's accumulated live statistics: the
+// renderable statsView plus the deltas/TTFT bookkeeping that update it.
+type modelStats struct {
+	statsView
+	prevMetrics        *llamaapi.Metrics
+	ttftStart          time.Time
+	ttftPrevPromptToks int
+}
+
+// statsFor returns (creating if needed) the modelStats for a router
+// model id.
+func (r *RunMode) statsFor(model string) *modelStats {
+	if r.routerStats == nil {
+		r.routerStats = make(map[string]*modelStats)
+	}
+	st, ok := r.routerStats[model]
+	if !ok {
+		st = &modelStats{statsView: statsView{
+			tokensHistory: newRingBuffer(sparkBufferSamples),
+			promptHistory: newRingBuffer(sparkBufferSamples),
+		}}
+		r.routerStats[model] = st
+	}
+	return st
+}
+
+// applyRouterSlots folds one /slots?model=<id> snapshot into the
+// model's stats — bars, busy/queued counts, and TTFT tracking. Mirrors
+// the single-model slotsFetchedMsg handler.
+func (r *RunMode) applyRouterSlots(model string, s *llamaapi.Slots) {
+	st := r.statsFor(model)
+	st.busyCount = s.BusyCount
+	st.totalSlots = s.Total
+	st.contextUsed = s.ContextUsed
+	st.contextMax = s.ContextMax
+	st.contextCacheHit = s.ContextCacheHits
+	st.contextPromptToks = s.ContextPromptTokens
+	st.contextGenToks = s.ContextGenTokens
+	st.genDecoded = s.GenDecoded
+	st.genRemain = s.GenRemain
+	st.promptToksTotal = s.PromptTokensTotal
+	st.promptToksProcessed = s.PromptTokensProcessed
+	// TTFT tracking: detect new request when n_prompt_tokens goes from
+	// 0 → N (or changes). Measure until the first token appears.
+	newRequest := s.PromptTokensTotal > 0 && s.PromptTokensTotal != st.ttftPrevPromptToks
+	if newRequest && st.ttftStart.IsZero() {
+		if s.GenDecoded > 0 {
+			st.ttft = -1 // sentinel for <1s (missed the prompt phase)
+		} else {
+			st.ttftStart = time.Now()
+		}
+	}
+	if s.GenDecoded > 0 && !st.ttftStart.IsZero() && st.ttft == 0 {
+		st.ttft = time.Since(st.ttftStart)
+	}
+	if s.PromptTokensTotal == 0 && s.GenDecoded == 0 {
+		st.ttftStart = time.Time{}
+		st.ttft = 0
+		st.ttftPrevPromptToks = 0
+	} else {
+		st.ttftPrevPromptToks = s.PromptTokensTotal
+	}
+}
+
+// applyRouterMetrics folds one /metrics?model=<id> snapshot into the
+// model's stats — lifetime averages plus current-rate deltas and
+// sparkline history. Mirrors the single-model applyMetrics.
+func (r *RunMode) applyRouterMetrics(model string, m *llamaapi.Metrics) {
+	st := r.statsFor(model)
+	st.avgTokensPerSec = m.PredictedTokensSecondsAvg
+	st.avgPromptPerSec = m.PromptTokensSecondsAvg
+	st.queuedCount = int(m.RequestsDeferred)
+	st.decodeTotal = m.NDecodeTotal
+
+	if st.prevMetrics == nil {
+		st.prevMetrics = m
+		return
+	}
+	prev := st.prevMetrics
+	dTokens := m.TokensPredictedTotal - prev.TokensPredictedTotal
+	dTokenSecs := m.TokensPredictedSecondsTotal - prev.TokensPredictedSecondsTotal
+	tickTokensRate := 0.0
+	if dTokens > 0 {
+		if dTokenSecs > 0 {
+			tickTokensRate = dTokens / dTokenSecs
+		} else {
+			tickTokensRate = dTokens / livePollInterval.Seconds()
+		}
+		st.currentTokensPerSec = tickTokensRate
+		st.tokensSeen = true
+	}
+	st.tokensHistory.Append(tickTokensRate)
+
+	dPrompt := m.PromptTokensTotal - prev.PromptTokensTotal
+	dPromptSecs := m.PromptSecondsTotal - prev.PromptSecondsTotal
+	tickPromptRate := 0.0
+	if dPrompt > 0 {
+		if dPromptSecs > 0 {
+			tickPromptRate = dPrompt / dPromptSecs
+		} else {
+			tickPromptRate = dPrompt / livePollInterval.Seconds()
+		}
+		st.currentPromptPerSec = tickPromptRate
+		st.promptSeen = true
+	}
+	st.promptHistory.Append(tickPromptRate)
+	st.prevMetrics = m
+}
+
+// cycleRouterFocus moves the focused model to the next loaded/loading
+// model (wrapping). No-op when no model is loaded.
+func (r *RunMode) cycleRouterFocus() {
+	var focusable []string
+	for _, m := range r.routerModels {
+		if m.Status.Value == "loaded" || m.Status.Value == "loading" {
+			focusable = append(focusable, m.ID)
+		}
+	}
+	if len(focusable) == 0 {
+		return
+	}
+	if r.routerFocus == "" {
+		r.routerFocus = focusable[0]
+		return
+	}
+	for i, id := range focusable {
+		if id == r.routerFocus {
+			r.routerFocus = focusable[(i+1)%len(focusable)]
+			return
+		}
+	}
+	r.routerFocus = focusable[0]
+}
+
+// renderServerRows builds the seven server-panel content rows
+// (Tokens / Prompt / Process / Context / Breakdown / Cache / Gen) from
+// a statsView. Shared by single-model and router focus views.
+func (r *RunMode) renderServerRows(sv *statsView) []string {
+	return []string{
+		r.renderServerRow(sv, "Tokens", sv.tokensHistory, sv.currentTokensPerSec, sv.avgTokensPerSec, sv.tokensSeen, sv.busyCount, sv.totalSlots, true),
+		r.renderServerRow(sv, "Prompt", sv.promptHistory, sv.currentPromptPerSec, sv.avgPromptPerSec, sv.promptSeen, sv.queuedCount, 0, false),
+		r.renderPromptProgressRow(sv),
+		r.renderContextRow(sv),
+		r.renderContextBreakdownRow(sv),
+		r.renderCacheRow(sv),
+		r.renderGenProgressRow(sv),
+	}
+}
+
 // renderServerPanel renders the llama-server live data box (SP3
 // shape, DESIGN.md §7.4): seven content rows.
 //
@@ -1528,20 +1715,66 @@ const metricLabelWidth = 9
 // Breakdown row shows context breakdown: prompt (purple) + gen (orange) + empty.
 // Cache row shows prompt cache hit ratio from /slots.
 // Gen row shows response progress with TTFT (time to first token).
+//
+// In router mode this panel becomes the model list, or — when a model
+// is focused (`m`) — that model's full seven-row stats panel.
 func (r *RunMode) renderServerPanel(width int) string {
 	if r.routerFile != "" {
+		if r.routerFocus != "" {
+			return r.renderRouterStatsPanel(width)
+		}
 		return r.renderRouterPanel(width)
 	}
-	rows := []string{
-		r.renderServerRow("Tokens", r.tokensHistory, r.currentTokensPerSec, r.avgTokensPerSec, r.tokensSeen, r.busyCount, r.totalSlots, true),
-		r.renderServerRow("Prompt", r.promptHistory, r.currentPromptPerSec, r.avgPromptPerSec, r.promptSeen, r.queuedCount, 0, false),
-		r.renderPromptProgressRow(),
-		r.renderContextRow(),
-		r.renderContextBreakdownRow(),
-		r.renderCacheRow(),
-		r.renderGenProgressRow(),
+	return r.renderTitledPanel("llama-server", width, padRows(r.renderServerRows(r.singleModelStatsView()), liveBandContentRows))
+}
+
+// singleModelStatsView projects RunMode's single-model scalar fields
+// into a statsView for the shared panel renderers.
+func (r *RunMode) singleModelStatsView() *statsView {
+	return &statsView{
+		metricsAvailable:    r.metricsAvailable,
+		tokensHistory:       r.tokensHistory,
+		currentTokensPerSec: r.currentTokensPerSec,
+		avgTokensPerSec:     r.avgTokensPerSec,
+		tokensSeen:          r.tokensSeen,
+		promptHistory:       r.promptHistory,
+		currentPromptPerSec: r.currentPromptPerSec,
+		avgPromptPerSec:     r.avgPromptPerSec,
+		promptSeen:          r.promptSeen,
+		busyCount:           r.busyCount,
+		totalSlots:          r.totalSlots,
+		queuedCount:         r.queuedCount,
+		decodeTotal:         r.decodeTotal,
+		contextUsed:         r.contextUsed,
+		contextMax:          r.contextMax,
+		contextCacheHit:     r.contextCacheHit,
+		contextPromptToks:   r.contextPromptToks,
+		contextGenToks:      r.contextGenToks,
+		genDecoded:          r.genDecoded,
+		genRemain:           r.genRemain,
+		promptToksTotal:     r.promptToksTotal,
+		promptToksProcessed: r.promptToksProcessed,
+		ttft:                r.ttft,
 	}
-	return r.renderTitledPanel("llama-server", width, padRows(rows, liveBandContentRows))
+}
+
+// renderRouterStatsPanel shows the focused router model's full
+// seven-row stats panel — full parity with the single-model view.
+func (r *RunMode) renderRouterStatsPanel(width int) string {
+	sv := &statsView{
+		metricsAvailable: r.routerMetricsAvailable,
+		tokensHistory:    newRingBuffer(sparkBufferSamples),
+		promptHistory:    newRingBuffer(sparkBufferSamples),
+	}
+	if st, ok := r.routerStats[r.routerFocus]; ok && st != nil {
+		sv = &st.statsView
+		sv.metricsAvailable = r.routerMetricsAvailable
+	}
+	title := "router stats"
+	if r.routerFocus != "" {
+		title = "router · " + truncateRune(r.routerFocus, 24)
+	}
+	return r.renderTitledPanel(title, width, padRows(r.renderServerRows(sv), liveBandContentRows))
 }
 
 // renderRouterModelCount renders the "N total (M loaded)" header cell
@@ -1603,14 +1836,14 @@ func (r *RunMode) renderRouterPanel(width int) string {
 			id = "?"
 		}
 		stats := ""
-		if s, ok := r.routerSlots[m.ID]; ok && s != nil {
+		if st, ok := r.routerStats[m.ID]; ok && st != nil {
 			activity := "idle"
-			if s.BusyCount > 0 {
+			if st.busyCount > 0 {
 				activity = "processing"
 			}
-			parts := []string{humanTokens(s.ContextUsed) + "/" + humanTokens(s.ContextMax)}
-			if mm, ok := r.routerMetrics[m.ID]; ok && mm != nil && mm.PredictedTokensSecondsAvg > 0 {
-				parts = append(parts, fmt.Sprintf("%.1f tok/s", mm.PredictedTokensSecondsAvg))
+			parts := []string{humanTokens(st.contextUsed) + "/" + humanTokens(st.contextMax)}
+			if st.avgTokensPerSec > 0 {
+				parts = append(parts, fmt.Sprintf("%.1f tok/s", st.avgTokensPerSec))
 			}
 			parts = append(parts, activity)
 			stats = " · " + strings.Join(parts, " · ")
@@ -1648,7 +1881,7 @@ func humanTokens(n int) string {
 // + rate cell ("current / avg /s") + secondary scalar (Busy or
 // Queued). When the rate has never been seen, the cell renders as
 // "—" (Bug 3 persistence). When metrics are disabled, "n/a".
-func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, avgRate float64, seen bool, sec1, sec2 int, isBusyRow bool) string {
+func (r *RunMode) renderServerRow(sv *statsView, label string, hist *ringBuffer, currentRate, avgRate float64, seen bool, sec1, sec2 int, isBusyRow bool) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight(label, metricLabelWidth))
 
@@ -1663,7 +1896,7 @@ func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, a
 	const rateSlot = "%6.1f"
 	var rateCell string
 	switch {
-	case !r.metricsAvailable:
+	case !sv.metricsAvailable:
 		rateCell = "             n/a"
 	case !seen:
 		rateCell = fmt.Sprintf("     — tps / "+rateSlot+" avg", avgRate)
@@ -1681,7 +1914,7 @@ func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, a
 		}
 	} else {
 		// Queued: "Queued <n>", or n/a when /metrics disabled.
-		if r.metricsAvailable {
+		if sv.metricsAvailable {
 			secondary = subtle.Render("Queued ") + strconv.Itoa(sec1)
 		} else {
 			secondary = subtle.Render("Queued ") + "n/a"
@@ -1696,22 +1929,22 @@ func (r *RunMode) renderServerRow(label string, hist *ringBuffer, currentRate, a
 //	Context  <bar>    15K/80K (19%)
 //
 // When no data is available (slots not fetched), shows "n/a".
-func (r *RunMode) renderContextRow() string {
+func (r *RunMode) renderContextRow(sv *statsView) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight("Context", metricLabelWidth))
 
-	if r.contextMax == 0 {
+	if sv.contextMax == 0 {
 		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
 	}
 
-	ctxPct := float64(r.contextUsed) / float64(r.contextMax) * 100
+	ctxPct := float64(sv.contextUsed) / float64(sv.contextMax) * 100
 	if ctxPct > 100 {
 		ctxPct = 100
 	}
 	ctxBar := renderBar(r.theme, ctxPct, zoneFor(MetricUtil, ctxPct))
 
-	ctxUsedStr := formatTokenCount(r.contextUsed)
-	ctxMaxStr := formatTokenCount(r.contextMax)
+	ctxUsedStr := formatTokenCount(sv.contextUsed)
+	ctxMaxStr := formatTokenCount(sv.contextMax)
 	ctxRateCell := fmt.Sprintf("%s/%s (%d%%)", ctxUsedStr, ctxMaxStr, int(ctxPct))
 
 	return labelCell + " " + ctxBar + " " + ctxRateCell
@@ -1723,15 +1956,15 @@ func (r *RunMode) renderContextRow() string {
 //	Cache  <bar>    80%
 //
 // When no data is available, shows "n/a".
-func (r *RunMode) renderCacheRow() string {
+func (r *RunMode) renderCacheRow(sv *statsView) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight("Cache", metricLabelWidth))
 
-	if r.contextUsed == 0 {
+	if sv.contextUsed == 0 {
 		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
 	}
 
-	cachePct := float64(r.contextCacheHit) / float64(r.contextUsed) * 100
+	cachePct := float64(sv.contextCacheHit) / float64(sv.contextUsed) * 100
 	if cachePct > 100 {
 		cachePct = 100
 	}
@@ -1763,32 +1996,32 @@ func formatTokenCount(n int) string {
 //
 // When no generation is in progress, shows the last known values
 // or "n/a" if no data.
-func (r *RunMode) renderGenProgressRow() string {
+func (r *RunMode) renderGenProgressRow(sv *statsView) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight("Gen", metricLabelWidth))
 
-	totalAllocated := r.genDecoded + r.genRemain
+	totalAllocated := sv.genDecoded + sv.genRemain
 	if totalAllocated == 0 {
 		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
 	}
 
-	genPct := float64(r.genDecoded) / float64(totalAllocated) * 100
+	genPct := float64(sv.genDecoded) / float64(totalAllocated) * 100
 	if genPct > 100 {
 		genPct = 100
 	}
 	genBar := renderBar(r.theme, genPct, zoneFor(MetricUtil, genPct))
 
-	genDecodedStr := formatTokenCount(r.genDecoded)
+	genDecodedStr := formatTokenCount(sv.genDecoded)
 	genTotalStr := formatTokenCount(totalAllocated)
 	genRateCell := fmt.Sprintf("%s/%s (%d%%)", genDecodedStr, genTotalStr, int(genPct))
 
 	// TTFT display
 	var ttftCell string
-	if r.ttft < 0 {
+	if sv.ttft < 0 {
 		// Missed the prompt phase — generation already started.
 		ttftCell = subtle.Render("TTFT ") + "<1s"
-	} else if r.ttft > 0 {
-		ttftCell = subtle.Render("TTFT ") + formatDuration(r.ttft)
+	} else if sv.ttft > 0 {
+		ttftCell = subtle.Render("TTFT ") + formatDuration(sv.ttft)
 	} else {
 		ttftCell = subtle.Render("TTFT ") + "—"
 	}
@@ -1810,22 +2043,22 @@ func formatDuration(d time.Duration) string {
 //	Process  <bar>    45% (2.8K/6.2K)
 //
 // When no prompt is being processed, shows "n/a".
-func (r *RunMode) renderPromptProgressRow() string {
+func (r *RunMode) renderPromptProgressRow(sv *statsView) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight("Process", metricLabelWidth))
 
-	if r.promptToksTotal == 0 {
+	if sv.promptToksTotal == 0 {
 		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
 	}
 
-	pct := float64(r.promptToksProcessed) / float64(r.promptToksTotal) * 100
+	pct := float64(sv.promptToksProcessed) / float64(sv.promptToksTotal) * 100
 	if pct > 100 {
 		pct = 100
 	}
 	bar := renderBar(r.theme, pct, zoneFor(MetricUtil, pct))
 
-	processedStr := formatTokenCount(r.promptToksProcessed)
-	totalStr := formatTokenCount(r.promptToksTotal)
+	processedStr := formatTokenCount(sv.promptToksProcessed)
+	totalStr := formatTokenCount(sv.promptToksTotal)
 	rateCell := fmt.Sprintf("%s/%s (%d%%)", processedStr, totalStr, int(pct))
 
 	return labelCell + " " + bar + " " + rateCell
@@ -1837,22 +2070,22 @@ func (r *RunMode) renderPromptProgressRow() string {
 //	Breakdown  <bar>  4.2K prompt 279 gen 77K free
 //
 // When no data is available, shows "n/a".
-func (r *RunMode) renderContextBreakdownRow() string {
+func (r *RunMode) renderContextBreakdownRow(sv *statsView) string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight("Breakdown", metricLabelWidth))
 
-	if r.contextMax == 0 {
+	if sv.contextMax == 0 {
 		return labelCell + " " + renderSparkline(r.theme, []float64{-1}, MetricUtil) + "             n/a"
 	}
 
 	// Build a segmented bar: prompt (purple), gen (orange), empty (dim).
-	bar := r.renderSegmentedBar(r.contextPromptToks, r.contextGenToks, r.contextMax)
+	bar := r.renderSegmentedBar(sv.contextPromptToks, sv.contextGenToks, sv.contextMax)
 
 	purpleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9B59B6"))
 	orangeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF8C00"))
-	promptStr := purpleStyle.Render(formatTokenCount(r.contextPromptToks))
-	genStr := orangeStyle.Render(formatTokenCount(r.contextGenToks))
-	freeToks := r.contextMax - r.contextPromptToks - r.contextGenToks
+	promptStr := purpleStyle.Render(formatTokenCount(sv.contextPromptToks))
+	genStr := orangeStyle.Render(formatTokenCount(sv.contextGenToks))
+	freeToks := sv.contextMax - sv.contextPromptToks - sv.contextGenToks
 	if freeToks < 0 {
 		freeToks = 0
 	}
