@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -213,7 +214,21 @@ func parseMetrics(body interface{ Read([]byte) (int, error) }) (*Metrics, error)
 // takes the max n_ctx across slots, and ContextCacheHits sums
 // n_prompt_tokens_cache.
 func (c *Client) FetchSlots(ctx context.Context) (*Slots, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/slots", nil)
+	return c.fetchSlots(ctx, "")
+}
+
+// FetchSlotsFor GETs /slots?model=<id> — the router-mode variant, which
+// requires the model name and reports that model's slots only.
+func (c *Client) FetchSlotsFor(ctx context.Context, model string) (*Slots, error) {
+	return c.fetchSlots(ctx, model)
+}
+
+func (c *Client) fetchSlots(ctx context.Context, model string) (*Slots, error) {
+	u := c.base + "/slots"
+	if model != "" {
+		u += "?model=" + url.QueryEscape(model)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("llamaapi: build request: %w", err)
 	}

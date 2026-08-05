@@ -511,6 +511,88 @@ func TestRouterPanelHealthFallback(t *testing.T) {
 	}
 }
 
+// TestRouterPollFetchesPerModelSlots verifies the router poll fetches
+// /slots?model=<id> for loaded models only — unloaded models have no
+// slots, and the router requires the model name on /slots.
+func TestRouterPollFetchesPerModelSlots(t *testing.T) {
+	fake := &fakeFetcher{
+		props: propsWithNCtx(0),
+		models: &llamaapi.Models{Data: []llamaapi.ModelInfo{
+			{ID: "m:loaded", Status: llamaapi.ModelStatus{Value: "loaded"}},
+			{ID: "m:unloaded", Status: llamaapi.ModelStatus{Value: "unloaded"}},
+		}},
+		health: &llamaapi.Health{Status: "ok"},
+		slotsFor: map[string]*llamaapi.Slots{
+			"m:loaded": {ContextUsed: 4222, ContextMax: 65536, BusyCount: 1},
+		},
+	}
+	r := newRouterTestRunMode(fake)
+	// Round 1 (startup): populates the model list.
+	_, cmds := r.Update(propsFetchedMsg{nctx: 0})
+	for _, sub := range collectCmds(cmds) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if fake.slotsForCalls != 0 {
+		t.Fatalf("slots fetched in round 1 (model list not known yet): %d", fake.slotsForCalls)
+	}
+	// Round 2 (tick): per-model slots for the loaded model only.
+	_, cmd := r.Update(livePollTickMsg(time.Now()))
+	for _, sub := range collectCmds(cmd) {
+		if msg := safeCmd(sub); msg != nil {
+			r, _ = r.Update(msg)
+		}
+	}
+	if fake.slotsForCalls != 1 {
+		t.Errorf("FetchSlotsFor calls = %d, want 1 (loaded model only)", fake.slotsForCalls)
+	}
+	s, ok := r.routerSlots["m:loaded"]
+	if !ok || s == nil || s.ContextUsed != 4222 || s.ContextMax != 65536 {
+		t.Errorf("routerSlots[m:loaded] = %+v, want ctx 4222/65536", s)
+	}
+}
+
+// TestRouterPanelShowsSlotStats verifies the per-model stats suffix:
+// context usage and idle/processing activity from /slots?model=<id>.
+func TestRouterPanelShowsSlotStats(t *testing.T) {
+	r := newRouterTestRunMode(&fakeFetcher{})
+	r.routerModels = []llamaapi.ModelInfo{
+		{ID: "m:busy", Status: llamaapi.ModelStatus{Value: "loaded"}},
+		{ID: "m:quiet", Status: llamaapi.ModelStatus{Value: "loaded"}},
+	}
+	r.routerSlots = map[string]*llamaapi.Slots{
+		"m:busy":  {ContextUsed: 4222, ContextMax: 65536, BusyCount: 1},
+		"m:quiet": {ContextUsed: 150000, ContextMax: 150000, BusyCount: 0},
+	}
+	got := stripANSI(r.renderRouterPanel(60))
+	for _, want := range []string{"4.2K/65.5K", "processing", "150K/150K", "idle"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("panel missing %q; panel:\n%s", want, got)
+		}
+	}
+}
+
+func TestTruncateRune(t *testing.T) {
+	if got := truncateRune("short", 40); got != "short" {
+		t.Errorf("truncateRune short = %q", got)
+	}
+	if got := truncateRune("abcdefghij", 5); got != "abcde…" {
+		t.Errorf("truncateRune 10->5 = %q", got)
+	}
+}
+
+func TestHumanTokens(t *testing.T) {
+	cases := map[int]string{
+		0: "0", 950: "950", 4222: "4.2K", 65536: "65.5K", 150000: "150K",
+	}
+	for in, want := range cases {
+		if got := humanTokens(in); got != want {
+			t.Errorf("humanTokens(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestRunHeaderStateMachine exercises the two width breakpoints in
 // one place and pins the cell count + live-band visibility at each.
 // 6 identity cells stay in the same source order across modes; only

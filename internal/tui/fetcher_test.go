@@ -111,6 +111,11 @@ type fakeFetcher struct {
 	health      *llamaapi.Health
 	healthErr   error
 	healthCalls int
+	// Per-model slots (router mode): one Slots per requested model id,
+	// plus a counter for the number of FetchSlotsFor calls.
+	slotsFor      map[string]*llamaapi.Slots
+	slotsForErr   error
+	slotsForCalls int
 }
 
 func (f *fakeFetcher) FetchProps(ctx context.Context) (*llamaapi.Props, error) {
@@ -164,6 +169,16 @@ func (f *fakeFetcher) FetchHealth(_ context.Context) (*llamaapi.Health, error) {
 	defer f.mu.Unlock()
 	f.healthCalls++
 	return f.health, f.healthErr
+}
+
+func (f *fakeFetcher) FetchSlotsFor(_ context.Context, model string) (*llamaapi.Slots, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.slotsForCalls++
+	if f.slotsForErr != nil {
+		return nil, f.slotsForErr
+	}
+	return f.slotsFor[model], nil
 }
 
 func (f *fakeFetcher) callCount() int {

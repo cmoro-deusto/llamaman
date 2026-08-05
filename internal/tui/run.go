@@ -67,6 +67,9 @@ type RunMode struct {
 	// GET /health.
 	routerModels []llamaapi.ModelInfo
 	routerLoaded []string
+	// routerSlots holds each loaded model's /slots?model=<id> stats,
+	// keyed by model id.
+	routerSlots map[string]*llamaapi.Slots
 
 	proc          *server.Process
 	tail          *server.Tailer
@@ -274,9 +277,9 @@ func (r *RunMode) startLivePoll() []tea.Cmd {
 	r.livePollStarted = true
 	out := []tea.Cmd{tickLivePoll()}
 	if r.routerFile != "" {
-		// Router mode: /slots and /metrics are not served (they 400);
-		// the models/health fetch feeds the router models panel.
-		out = append(out, fetchModelsCmd(r.fetchCtx, r.fetcher), fetchHealthCmd(r.fetchCtx, r.fetcher))
+		// Router mode: /slots and /metrics are not served without a
+		// model name; per-model slots feed the router models panel.
+		out = append(out, r.routerPollCmds()...)
 		return out
 	}
 	out = append(out, fetchSlotsCmd(r.fetchCtx, r.fetcher))
@@ -284,6 +287,23 @@ func (r *RunMode) startLivePoll() []tea.Cmd {
 		out = append(out, fetchMetricsCmd(r.fetchCtx, r.fetcher))
 	}
 	return out
+}
+
+// routerPollCmds returns the router-mode fetches for one poll round:
+// the model list, the loaded ids, and per-model /slots for every model
+// actually in memory (the router serves /slots only with a model name,
+// and unloaded models have no slots to report).
+func (r *RunMode) routerPollCmds() []tea.Cmd {
+	cmds := []tea.Cmd{
+		fetchModelsCmd(r.fetchCtx, r.fetcher),
+		fetchHealthCmd(r.fetchCtx, r.fetcher),
+	}
+	for _, m := range r.routerModels {
+		if m.Status.Value == "loaded" || m.Status.Value == "loading" {
+			cmds = append(cmds, fetchRouterSlotsCmd(r.fetchCtx, r.fetcher, m.ID))
+		}
+	}
+	return cmds
 }
 
 // wordmarkMinWidth is the minimum terminal width at which the
@@ -441,12 +461,9 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		}
 		cmds := []tea.Cmd{tickLivePoll()}
 		if r.routerFile != "" {
-			// Router mode: /slots and /metrics are not served (400);
-			// keep the model list and loaded-state panel fresh instead.
-			cmds = append(cmds,
-				fetchModelsCmd(r.fetchCtx, r.fetcher),
-				fetchHealthCmd(r.fetchCtx, r.fetcher),
-			)
+			// Router mode: /slots and /metrics are not served without a
+			// model name; per-model slots keep the panel fresh instead.
+			cmds = append(cmds, r.routerPollCmds()...)
 		} else {
 			cmds = append(cmds, fetchSlotsCmd(r.fetchCtx, r.fetcher))
 			if r.metricsAvailable {
@@ -464,6 +481,15 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 	case healthFetchedMsg:
 		if m.err == nil && m.h != nil {
 			r.routerLoaded = m.h.Models
+		}
+		return r, nil
+
+	case routerSlotsMsg:
+		if m.err == nil && m.s != nil {
+			if r.routerSlots == nil {
+				r.routerSlots = make(map[string]*llamaapi.Slots)
+			}
+			r.routerSlots[m.model] = m.s
 		}
 		return r, nil
 
@@ -1546,13 +1572,44 @@ func (r *RunMode) renderRouterPanel(width int) string {
 		case "loading":
 			mark, style = "◐", loadingStyle
 		}
-		id := m.ID
+		id := truncateRune(m.ID, routerPanelIDMax)
 		if id == "" {
 			id = "?"
 		}
-		rows = append(rows, style.Render(mark+" "+id)+"  "+subtle.Render(state))
+		stats := ""
+		if s, ok := r.routerSlots[m.ID]; ok && s != nil {
+			activity := "idle"
+			if s.BusyCount > 0 {
+				activity = "processing"
+			}
+			stats = " · " + humanTokens(s.ContextUsed) + "/" + humanTokens(s.ContextMax) + " · " + activity
+		}
+		rows = append(rows, style.Render(mark+" "+id)+subtle.Render(stats)+"  "+subtle.Render(state))
 	}
 	return r.renderTitledPanel("router models", width, padRows(rows, liveBandContentRows))
+}
+
+// routerPanelIDMax truncates long model ids in the router panel so the
+// per-model stats suffix stays visible on a half-width panel.
+const routerPanelIDMax = 40
+
+// truncateRune shortens s to at most max runes, appending "…".
+func truncateRune(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
+}
+
+// humanTokens renders a token count compactly: 950 → "950", 4222 →
+// "4.2K", 65536 → "65.5K", 150000 → "150K".
+func humanTokens(n int) string {
+	if n < 1000 {
+		return strconv.Itoa(n)
+	}
+	s := strings.TrimSuffix(fmt.Sprintf("%.1f", float64(n)/1000), ".0")
+	return s + "K"
 }
 
 // renderServerRow builds one row of the server panel: label + spark

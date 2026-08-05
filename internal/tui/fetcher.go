@@ -20,8 +20,11 @@ type Fetcher interface {
 	FetchSlots(ctx context.Context) (*llamaapi.Slots, error)
 	// Router-mode endpoints. FetchModels returns the model list of
 	// GET /models; FetchHealth the loaded-model ids of GET /health.
+	// FetchSlotsFor returns one model's slots via /slots?model=<id>
+	// (the router requires the model name on these endpoints).
 	FetchModels(ctx context.Context) (*llamaapi.Models, error)
 	FetchHealth(ctx context.Context) (*llamaapi.Health, error)
+	FetchSlotsFor(ctx context.Context, model string) (*llamaapi.Slots, error)
 }
 
 // propsFetchedMsg carries the result of a one-shot /props fetch back
@@ -117,6 +120,22 @@ func fetchHealthCmd(ctx context.Context, fetcher Fetcher) tea.Cmd {
 	return func() tea.Msg {
 		h, err := fetcher.FetchHealth(ctx)
 		return healthFetchedMsg{h: h, err: err}
+	}
+}
+
+// routerSlotsMsg carries one model's /slots?model=<id> result.
+type routerSlotsMsg struct {
+	model string
+	s     *llamaapi.Slots
+	err   error
+}
+
+// fetchRouterSlotsCmd is a single one-shot per-model GET /slots
+// (router mode; the router requires the model name on /slots).
+func fetchRouterSlotsCmd(ctx context.Context, fetcher Fetcher, model string) tea.Cmd {
+	return func() tea.Msg {
+		s, err := fetcher.FetchSlotsFor(ctx, model)
+		return routerSlotsMsg{model: model, s: s, err: err}
 	}
 }
 

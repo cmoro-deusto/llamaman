@@ -424,3 +424,29 @@ func TestFetchModelsStatusValue(t *testing.T) {
 		t.Errorf("data[1] status = %q, want unloaded", got.Data[1].Status.Value)
 	}
 }
+
+func TestFetchSlotsForQueriesModel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/slots" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.URL.Query().Get("model"); got != "m:a:b" {
+			t.Errorf("model query = %q, want m:a:b (url-escaped)", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"is_processing":true,"n_ctx":65536,"n_prompt_tokens":4222,"n_prompt_tokens_processed":4181,"n_prompt_tokens_cache":0,"next_token":[{"n_decoded":41,"n_remain":100}]}]`))
+	}))
+	defer srv.Close()
+
+	got, err := clientFor(t, srv).FetchSlotsFor(context.Background(), "m:a:b")
+	if err != nil {
+		t.Fatalf("FetchSlotsFor: %v", err)
+	}
+	if got.BusyCount != 1 || got.Total != 1 {
+		t.Errorf("busy/total = %d/%d, want 1/1", got.BusyCount, got.Total)
+	}
+	if got.ContextUsed != 4263 || got.ContextMax != 65536 { // 4222 prompt + 41 decoded
+		t.Errorf("context = %d/%d, want 4263/65536", got.ContextUsed, got.ContextMax)
+	}
+}
