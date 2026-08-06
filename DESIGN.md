@@ -1278,10 +1278,13 @@ the model list can't render meaningfully before READY anyway):
 ╰─────────────────────────────────────╯
 ```
 
-- phase text in `Subtle`; progress bar in `Accent` (blocks `▓`/`░`,
-  capped ~12 cells); the bar appears only when a numeric progress is
-  known. Multiple phase lines accumulate (newest at the bottom) within
-  the block, capped to the panel height.
+- phase text and the progress bar in `Accent` (brighter — owner
+  polish; the bar uses blocks `▓`/`░`, capped ~12 cells, with a
+  `Subtle` percent suffix); a blank row sits above the block and each
+  row carries one trailing space so the text never touches the panel
+  edges. The bar appears only when a numeric progress is known.
+  Multiple phase lines accumulate (newest at the bottom) within the
+  block, capped to the panel height.
 - When starting but no phase has parsed yet, the block shows the
   static text `loading…` (§2.3 "unknown phase → static text"). On
   READY (or exit) the normal panel content returns.

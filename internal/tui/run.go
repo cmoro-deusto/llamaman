@@ -3373,12 +3373,15 @@ func (r *RunMode) showingLoadBlock() bool {
 
 // loadRows builds the panel content for the starting window (§15.4):
 // the parsed phase line(s) with the progress bar, or the static
-// "loading…" fallback when nothing has been parsed yet.
+// "loading…" fallback when nothing has been parsed yet. Owner polish:
+// a blank row above the block, one trailing space per row, and the
+// phase text in the brighter Accent color.
 func (r *RunMode) loadRows() []string {
+	accent := lipgloss.NewStyle().Foreground(r.theme.Accent)
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
-	var rows []string
+	rows := []string{""}
 	if r.loadPhase != "" {
-		rows = append(rows, subtle.Render(r.loadPhase))
+		rows = append(rows, accent.Render(r.loadPhase)+" ")
 		if r.loadProgress != nil {
 			pct := int(*r.loadProgress * 100)
 			if pct > 100 {
@@ -3388,12 +3391,10 @@ func (r *RunMode) loadRows() []string {
 				pct = 0
 			}
 			bar := progressBar(*r.loadProgress, 12)
-			rows = append(rows, lipgloss.NewStyle().
-				Foreground(r.theme.Accent).
-				Render(bar)+subtle.Render(fmt.Sprintf(" %d%%", pct)))
+			rows = append(rows, accent.Render(bar)+subtle.Render(fmt.Sprintf(" %d%%", pct))+" ")
 		}
 	} else {
-		rows = append(rows, subtle.Render("loading…"))
+		rows = append(rows, accent.Render("loading…")+" ")
 	}
 	return rows
 }
