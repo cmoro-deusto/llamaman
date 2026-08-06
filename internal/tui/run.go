@@ -1163,22 +1163,37 @@ const (
 	LineReady
 )
 
-// lineKindRules is the ordered classifier table (DESIGN §15.3). First
-// match wins; READY is checked first so "listening on" lines always get
-// the ready highlight regardless of other content. Patterns are
-// conservative: the worst case is an uncolored line, and a real
-// critical line is never rendered as plain INFO.
+// lineKindRules is the ordered keyword classifier table (DESIGN
+// §15.3). First match wins; READY is checked first so "listening on"
+// lines always get the ready highlight regardless of other content.
+// Patterns are conservative: the worst case is an uncolored line, and
+// a real critical line is never rendered as plain INFO.
 var lineKindRules = []struct {
 	kind LineKind
 	re   *regexp.Regexp
 }{
 	{LineReady, regexp.MustCompile(`listening on`)},
 	{LineError, regexp.MustCompile(`(?i)\berror\b|\bfailed\b|\bfatal\b|\baborted\b`)},
-	{LineWarn, regexp.MustCompile(`(?i)\bwarn(ing)?\b`)},
+	{LineWarn, regexp.MustCompile(`(?i)\bwarn(ing)?\b|\bdeprecated\b`)},
 	{LineTiming, regexp.MustCompile(`(?i)tokens? per second|ms per token|eval time|prompt eval time|total time|load time`)},
 }
 
+// severityPrefixRE matches llama.cpp's default logger line shape:
+// "<sec>.<ms>... <LETTER> <message>" (e.g. "0.00.177.074 W DEPRECATED:
+// ..."). The letter is the authoritative severity — checked before the
+// keyword table (owner feedback: keyword matching alone missed these).
+var severityPrefixRE = regexp.MustCompile(`^[0-9.]+ ([IWEDiwed]) `)
+
 func classifyLine(line string) LineKind {
+	if m := severityPrefixRE.FindStringSubmatch(line); m != nil {
+		switch strings.ToUpper(m[1]) {
+		case "W":
+			return LineWarn
+		case "E":
+			return LineError
+		}
+		return LineInfo // "I" and "D" are informational by default
+	}
 	for _, r := range lineKindRules {
 		if r.re.MatchString(line) {
 			return r.kind

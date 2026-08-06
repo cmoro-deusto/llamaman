@@ -32,6 +32,11 @@ func TestClassifyLine(t *testing.T) {
 		{"llama_perf_context_print: prompt eval time = 12.3 ms", LineTiming},
 		{"llama_perf_context_print: 34 tokens per second", LineTiming},
 		{"load time = 412.5 ms", LineTiming},
+		// llama.cpp default-logger severity letters (owner feedback).
+		{"0.00.177.074 W DEPRECATED: argument '--top-k' specified multiple times", LineWarn},
+		{"0.00.573.859 I cmn  common_param: common_params_print_info: verbosity = 3", LineInfo},
+		{"0.00.002.001 E error initializing model", LineError},
+		{"0.00.004.000 D debug detail line", LineInfo},
 		// INFO default.
 		{"llm_load_print_meta: format          = GGUF v3", LineInfo},
 		{"slot update_slots: id  0 | task 4 | n_tokens = 16", LineInfo},

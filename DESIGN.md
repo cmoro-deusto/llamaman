@@ -1235,16 +1235,19 @@ plus a `colorizeLine` render helper in `run.go`:
 
 | Kind | Match (conservative, case-insensitive) | Color |
 |---|---|---|
-| ERROR | `\berror\b` \| `\bfailed\b` \| `\bfatal\b` \| `\baborted\b` | `StatusErr` |
-| WARN | `\bwarn(ing)?\b` | `StatusStart` |
+| ERROR | severity letter `E` in llama.cpp's `0.00.… E …` prefix, or `\berror\b` \| `\bfailed\b` \| `\bfatal\b` \| `\baborted\b` | `StatusErr` |
+| WARN | severity letter `W`, or `\bwarn(ing)?\b` \| `\bdeprecated\b` | `StatusStart` |
 | TIMING | `tokens? per second` \| `ms per token` \| `eval time` \| `prompt eval time` \| `total time` \| `load time` | `Muted` |
 | READY | contains `listening on` (the ready marker) | `StatusReady` + bold |
-| INFO | default | none (plain) |
+| INFO | default (incl. llama.cpp severity letters `I` / `D`) | none (plain) |
 
-The rules are a single slice of (regex, kind) pairs — cheap to extend
-as llama.cpp output drifts (P6). **Conservative by design (§2.2 risk):**
-the worst case is an uncolored line; the ERROR/WARN patterns are broad
-enough that a real critical line is never rendered as plain INFO.
+The severity-letter prefix (`^[0-9.]+ [IWED] `) is checked first — it is
+the authoritative severity in llama.cpp's default logger (owner
+feedback). The remaining rules are a single slice of (regex, kind)
+pairs — cheap to extend as llama.cpp output drifts (P6). **Conservative
+by design (§2.2 risk):** the worst case is an uncolored line; the
+ERROR/WARN patterns are broad enough that a real critical line is never
+rendered as plain INFO.
 
 **Where it applies.** `renderViewportContent()` is the single hook:
 per line → `colorizeLine(kind, highlightOccurrences(line, q))`.
