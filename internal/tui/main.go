@@ -119,10 +119,10 @@ func (m *MainMode) SetCfgPath(cfgPath string) {
 	m.applyListSize()
 }
 
-// SetRunning updates the "▶ Detached" line. Called by Root after session
-// state changes. Empty alias hides the line and disables `a`. Router
-// sessions report the models-file path as their alias, so the marker
-// lights up in Router mode.
+// SetRunning records the live session identity for the reattach screen
+// (DESIGN §15.2). Called by Root after session state changes. Empty
+// alias clears the reattach state. Router sessions report the
+// models-file path as their alias.
 func (m *MainMode) SetRunning(alias, preset string, port int) {
 	m.runningAlias = alias
 	m.runningPreset = preset
@@ -141,8 +141,9 @@ func (m *MainMode) SetMode(mode mainMode) {
 	m.applyListSize()
 }
 
-// IsSessionRunning reports whether main mode currently shows the detached
-// line / accepts the `a` shortcut. Used by Root to gate `a`.
+// IsSessionRunning reports whether Main is in the reattach state (a
+// live session). Used by Root to gate `a` and by Main to switch to the
+// reattach screen.
 func (m MainMode) IsSessionRunning() bool { return m.runningAlias != "" }
 
 // SetFlash sets a short status message shown beneath the list (or
@@ -457,24 +458,16 @@ func (m *MainMode) applyListSize() {
 // ---- rendering ----
 
 // View renders the main screen, centered in the current terminal
-// window. When a session is running, a full-width session header strip
-// (DESIGN §15.2) sits at the top of the viewport; the centered column
-// shrinks to make room.
+// window. When a session is running, Main becomes a single reattach
+// entry (DESIGN §15.2); otherwise the centered column shows the model
+// list (or the empty state) as usual.
 func (m MainMode) View() string {
 	if m.width == 0 || m.height == 0 {
 		return ""
 	}
-	header := ""
 	height := m.height
-	if m.IsSessionRunning() {
-		header = m.renderSessionHeader() + "\n\n"
-		height -= 4 // strip (3 rows) + blank line
-	}
-	if height < 6 {
-		height = 6
-	}
 	if m.showHelp {
-		return header + lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, m.renderHelp())
+		return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, m.renderHelp())
 	}
 
 	wordmark := lipgloss.NewStyle().
@@ -487,28 +480,70 @@ func (m MainMode) View() string {
 
 	parts := []string{wordmark, "", tagline}
 
+	running := m.IsSessionRunning()
 	hasModels := m.HasModels()
-	if hasModels {
+	switch {
+	case running:
+		// A session is live: Main becomes a single reattach entry — the
+		// model list is hidden until the session ends (DESIGN §15.2).
+		parts = append(parts, "", m.renderReattachBox())
+	case hasModels:
 		parts = append(parts, "", m.renderListBox())
-	} else {
+	default:
 		parts = append(parts, "", m.renderEmptyState())
 	}
 
-	if hasModels && m.flash != "" {
+	if (running || hasModels) && m.flash != "" {
 		parts = append(parts, "", m.renderFlash())
 	}
 
 	parts = append(parts, "", m.renderShortcuts())
 
-	if !hasModels && m.flash != "" {
+	if !running && !hasModels && m.flash != "" {
 		parts = append(parts, "", m.renderFlash())
 	}
 
 	body := lipgloss.JoinVertical(lipgloss.Center, parts...)
-	return header + lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, body)
+	return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, body)
+}
+
+// renderReattachBox is the single-entry screen shown while a session is
+// running (DESIGN §15.2): one highlighted row carrying the session
+// identity, Enter/a attach. The model list returns when the session
+// ends.
+func (m MainMode) renderReattachBox() string {
+	preset := m.runningPreset
+	if preset == "" {
+		preset = "—"
+	}
+	row := fmt.Sprintf("running  %s/%s · listening on :%d",
+		m.runningAlias, preset, m.runningPort)
+	if pad := m.listWidth() - lipgloss.Width(row); pad > 0 {
+		row += strings.Repeat(" ", pad)
+	}
+	box := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.theme.Border).
+		Padding(0, 1)
+	// Highlighted like the model-list selection: plain text in a single
+	// reverse-video SGR pair (no inner colors, DESIGN §15.2).
+	return box.Render("\x1b[7m" + row + "\x1b[0m")
 }
 
 func (m MainMode) renderShortcuts() string {
+	if m.IsSessionRunning() {
+		// Reattach screen: a single entry, no list navigation. `q` quits
+		// llamaman leaving the server running (DESIGN §15.2).
+		parts := []string{
+			shortcut("Enter", "attach", m.theme),
+			shortcut("a", "attach", m.theme),
+			shortcut("c", "configure", m.theme),
+			shortcut("s", "settings", m.theme),
+			shortcut("?", "help", m.theme),
+			shortcut("q", "quit", m.theme),
+		}
+		return strings.Join(parts, "   ")
+	}
 	hasModels := m.HasModels()
 	var parts []string
 	if hasModels {
@@ -586,30 +621,22 @@ func (m MainMode) renderFlash() string {
 	return lipgloss.NewStyle().Foreground(col).Render(m.flash)
 }
 
-// renderSessionHeader is the full-width detached-session strip at the
-// top of the Main viewport (DESIGN §15.2), shown only while a session
-// is running. Alias in Accent, the rest in StatusReady.
-func (m MainMode) renderSessionHeader() string {
-	preset := m.runningPreset
-	if preset == "" {
-		preset = "—"
-	}
-	alias := lipgloss.NewStyle().
-		Foreground(m.theme.Accent).
-		Bold(true).
-		Render(m.runningAlias)
-	line := fmt.Sprintf("▶ Detached: %s/%s listening on :%d — press a to attach",
-		alias, preset, m.runningPort)
-	line = lipgloss.NewStyle().Foreground(m.theme.StatusReady).Render(line)
-	return lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(m.theme.Border).
-		Padding(0, 1).
-		Width(max(0, m.width-4)).
-		Render(line)
-}
-
 func (m MainMode) renderHelp() string {
+	if m.IsSessionRunning() {
+		keys := []string{
+			"Enter / a attach to the running session",
+			"c           open configuration mode",
+			"s           open settings (theme, animations)",
+			"t / Shift+t cycle theme (forward / backward)",
+			"?           toggle this help",
+			"q / Ctrl+C  quit (server keeps running)",
+		}
+		return lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(m.theme.Accent).
+			Padding(1, 3).
+			Render("Main mode keys (session running)\n\n" + strings.Join(keys, "\n"))
+	}
 	keys := []string{
 		"↑ / ↓       move selection",
 		"Enter       run selected model (pivot to preset list when 2+)",
@@ -652,29 +679,37 @@ func (m MainMode) Update(msg tea.Msg) (MainMode, tea.Cmd) {
 		case "?":
 			m.showHelp = true
 			return m, nil
-		case "tab":
-			m.showPresets = false
-			if m.mode == modeRouter {
-				m.mode = modeSingle
-			} else {
-				m.mode = modeRouter
+		case "enter":
+			if m.IsSessionRunning() {
+				// Reattach screen: Enter attaches to the running session.
+				return m, func() tea.Msg { return reattachRequestMsg{} }
 			}
-			m.applyListSize()
-			return m, nil
-		case "esc":
+			if !m.HasModels() {
+				return m, nil
+			}
+			return m.handleEnter()
+		case "tab", "esc":
+			if m.IsSessionRunning() {
+				return m, nil // no list to toggle/escape on the reattach screen
+			}
+			if k.String() == "tab" {
+				m.showPresets = false
+				if m.mode == modeRouter {
+					m.mode = modeSingle
+				} else {
+					m.mode = modeRouter
+				}
+				m.applyListSize()
+				return m, nil
+			}
 			if m.showPresets {
 				m.showPresets = false
 				return m, nil
 			}
 			return m, nil
-		case "enter":
-			if !m.HasModels() {
-				return m, nil
-			}
-			return m.handleEnter()
 		}
 	}
-	if !m.HasModels() {
+	if m.IsSessionRunning() || !m.HasModels() {
 		return m, nil
 	}
 	if m.mode == modeRouter {

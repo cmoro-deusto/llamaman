@@ -168,7 +168,7 @@ Order of evaluation:
 | Invocation | Session running? | Mode |
 |---|---|---|
 | `llamaman` (no positional args) | no | TUI main mode |
-| `llamaman` (no positional args) | yes | TUI main mode (session header strip; attach with `a`) |
+| `llamaman` (no positional args) | yes | TUI main mode (session reattach screen; attach with `a`/Enter) |
 | `llamaman <alias>` | no, alias exists | TUI run mode (start fresh, default preset or only preset) |
 | `llamaman <alias> <preset>` | no, both exist | TUI run mode (start fresh, named preset) |
 | `llamaman <alias>` or `llamaman <alias> <preset>` | yes | TUI run mode (reattach, **arguments ignored**) |
@@ -177,7 +177,7 @@ Order of evaluation:
 
 If two `llamaman` instances race to start a session, the loser sees `Another llamaman is already running` on stderr and exits 0.
 
-A no-args launch with a session already running lands on **Main mode**, not run mode (owner decision): the session header strip (§15.2) makes the detached session visible, and `a` attaches. `llamaman <alias>` with a running session still reattaches directly (arguments ignored).
+A no-args launch with a session already running lands on **Main mode**, not run mode (owner decision): the session reattach screen (§15.2) makes the detached session visible, and `a`/Enter attach. `llamaman <alias>` with a running session still reattaches directly (arguments ignored).
 
 ### 4.4 Exit codes
 
@@ -350,7 +350,7 @@ When **no** models are configured, the list is hidden and the screen reverts to 
 | `q` | Quit |
 | `a` | Attach to running session (only shown when a session is running) |
 
-If a session is running, a full-width header strip appears at the top of the viewport: `▶ Detached: <alias>/<preset> listening on :<port> — press a to attach` (alias in Accent, rest in StatusReady; §15.2). The `a` shortcut chip appears in the shortcut row while a session is running.
+If a session is running, Main shows a single reattach entry: `running <alias>/<preset> · listening on :<port>` (highlighted; §15.2). Enter/`a` attach; `q` quits llamaman leaving the server running.
 
 Order: rows follow the configuration order (`models[]` in the JSON). No alphabetical sort — users who reorder via Shift+↑/↓ in configuration mode see the change reflected here.
 
@@ -496,7 +496,7 @@ Status state machine: `starting → ready → exited|error`.
 | `i` | Show model & preset detail overlay (alias + Source/HF + preset name + every preset param in source order). Any key closes. |
 | `/` | Search forward in output. Live highlights (reverse video + bold) wrap matches as you type; `Enter` applies, `Esc` cancels. |
 | `n` / `N` | Next / previous search match |
-| `Esc` | Clear active search and remove highlights (no-op when nothing is applied) |
+| `Esc` | Layered: close the router action menu → close router stats → clear an applied search → **detach to Main** (server keeps running, llamaman stays open; the final layer fires only while the session is live — a dead server keeps the crash view in control) |
 | `g` / `G` | Jump to top / bottom |
 | `↑` / `↓` / wheel | Scroll one line. `j`/`k` are **not** bound here so `k` is free for the kill shortcut. |
 | `Space` / `b` | Page down / up |
@@ -1220,30 +1220,37 @@ layout rework consumes palette tokens (item 2).
 
 **Goal.** Make Main mode surface what the user wants at a glance and use
 the terminal it has. Commits the four §12.2 "likely to change" items:
-per-row source kind, a session header strip, preset preview on the
+per-row source kind, a session reattach screen, preset preview on the
 highlighted row, and wider lists on wide terminals. Pure presentation —
-no server-side state, no new mode, no new keys, `?` help overlay stays
-canonical (§12.2 constraints). Consumes the §15.1 palette tokens.
+no server-side state, no new mode, `?` help overlay stays canonical
+(§12.2 constraints). Consumes the §15.1 palette tokens.
 
 **Layout, top to bottom:**
 
-1. **Session header strip** — rendered only when a session is running
-   (otherwise omitted; the screen stays clean). A full-width bordered
-   box at the top of the Main viewport, replacing the current centered
-   detached line (`renderDetached`):
-   `▶ Detached: <alias>/<preset> listening on :<port> — press a to attach`
-   - alias in `Accent`, the rest in `StatusReady` (same family as
-     today's line); border uses `Border`.
-   - Router sessions keep reporting the models-file path as alias
-     (existing behavior).
-   - "Sticky" is a non-issue here: Main is a single non-scrolling
-     screen, so the strip is simply the top element of its View.
-   - **Reachability (owner decision).** The strip is reachable: the
-     quit-prompt `d` (detach) exits llamaman leaving the server
-     running, and a no-args relaunch now lands on **Main mode** (§4.3)
-     — not run view — so the strip shows the detached session and `a`
-     attaches. `llamaman <alias>` with a live session still reattaches
-     directly.
+1. **Session reattach screen** — when a session is running (live PID in
+   `session.json`), Main becomes a **single reattach entry**; the model
+   list is hidden until the session ends (owner decision: with a single
+   session nothing else can launch, so the list would invite dead Ends;
+   the list-with-markers variant returns when concurrent sessions
+   arrive):
+   ```
+   running  alpha/default · listening on :9080
+   ```
+   - one highlighted row (plain text, single reverse-video SGR pair),
+     `running` tag in `Muted`; router sessions report the models-file
+     path as the alias.
+   - **Enter** or **`a`** attaches. No kill affordance on this screen
+     (owner decision — attach → `k` → confirm covers it; concurrent-
+     session work will design per-session kill properly).
+   - Shortcut row: `Enter attach · a attach · c configure · s settings ·
+     ? help · q quit` (`q` quits llamaman leaving the server running;
+     `tab`/↑↓ are gone with the list).
+   - **Reachability (owner decision).** A no-args launch with a live
+     session lands on Main mode (§4.3), not run view. In-app: `esc` in
+     run mode (final layer after menu/stats/search) detaches to Main
+     with the server running and llamaman still open; the quit-prompt
+     `d` still detaches *and quits* llamaman. `llamaman <alias>` with a
+     live session still reattaches directly.
 
 2. **Wider list on wide terminals** — the inline list box width cap
    grows from 60 to **90** columns (`min(90, width − 8)`, floor stays
@@ -1270,7 +1277,7 @@ canonical (§12.2 constraints). Consumes the §15.1 palette tokens.
    (`router · N models — <path>`).
 
 **Palette tokens (from §15.1).** source tags → `Muted`; preset preview →
-`Subtle`; header strip → `StatusReady` + `Accent` alias; borders →
+`Subtle`; reattach entry → `Muted` tag, reverse-video highlight; borders →
 `Border`/`BorderFocus` as today; wordmark → `Accent` (unchanged).
 `SetTheme` (item 1) already rebuilds the inline delegates, so a theme
 change re-renders all of this consistently.
@@ -1284,18 +1291,19 @@ unchanged).
 **Determinism (P9).** All changes are pure render. Snapshot tests
 assert: source tags on local/hf/router rows; preset names on the
 highlighted multi-preset row (and count-only on non-highlighted rows);
-the header strip when a session is running and its absence otherwise;
-the list-box width on a wide window. Existing key-driven tests are
-unaffected (no key changes).
+the session reattach entry when a session is running and the model
+list otherwise; the list-box width on a wide window.
 
 **Non-goals.** No per-user layout preferences (the `preferences` object
 stays item 1's scope); no server-side changes; no new TUI mode; no
 change to the preset-pivot mechanics; no two-line row expansion in v1.
 
-**File map.** `internal/tui/main.go` — `renderDetached` → session header
-strip, `inlineDelegate.Render` (source tag + preset preview), `listWidth`
-cap 60 → 90. `internal/tui/main_test.go` + `snapshot_test.go` — updated
-and new assertions. No `root.go` changes (the strip is part of Main's
-View). DESIGN §7.2 gains the row-layout description in the same change
-(P5).
+**File map.** `internal/tui/main.go` — session reattach screen
+(`renderReattachBox` replaces the old strip/detached line),
+`inlineDelegate.Render` (source tag + preset preview + stable box),
+`listWidth` cap 60 → 90, reattach-state shortcuts/help/Update.
+`internal/tui/run.go` — `esc` final layer detaches to Main (live
+session only), footer + help gain `esc back`. `main.go` — no-args
+launch lands on Main when a session is live (§4.3).
+`snapshot_test.go` + `main_test.go` — updated and new assertions.
 

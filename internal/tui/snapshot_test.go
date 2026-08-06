@@ -194,30 +194,63 @@ func TestSnapshotMainModeNoModelsHidesList(t *testing.T) {
 	}
 }
 
-func TestSnapshotMainModeShowsDetachedLineWhenSessionRunning(t *testing.T) {
+// TestSnapshotMainReattachScreen pins §15.2: with a session running,
+// Main shows the single reattach entry (identity + port) and hides the
+// model list; Enter/a attach.
+func TestSnapshotMainReattachScreen(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	root := NewRoot(cfg, "/dev/null", stubSpawner{runningAlias: "alpha"}, nil, "v0.0.0-test", nil)
 	root.refreshSessionState()
 
 	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
 
-	for _, want := range []string{"Detached", "alpha", "9080", "press a to attach"} {
+	for _, want := range []string{"running", "alpha", "default", "9080", "listening on"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("main mode output missing %q\nout:\n%s", want, out)
+			t.Errorf("reattach screen missing %q\nout:\n%s", want, out)
+		}
+	}
+	// The model list is replaced, not shown underneath.
+	if strings.Contains(out, "beta") {
+		t.Errorf("model list must be hidden while a session runs\nout:\n%s", out)
+	}
+	// Shortcut row is the reattach set (attach/configure/settings/help/quit).
+	for _, want := range []string{"Enter attach", "a attach", "c configure", "s settings", "q quit"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("reattach shortcut row missing %q\nout:\n%s", want, out)
 		}
 	}
 }
 
-// TestSnapshotMainModeShowsRunningMarker verifies the inline list's
-// per-row `(running)` suffix when a session for that alias is live.
-func TestSnapshotMainModeShowsRunningMarker(t *testing.T) {
+// TestSnapshotMainNoSessionShowsList pins the flip side: without a
+// session the model list renders normally and no reattach entry appears.
+func TestSnapshotMainNoSessionShowsList(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	if !strings.Contains(out, "beta") {
+		t.Errorf("model list should be visible without a session\nout:\n%s", out)
+	}
+	if strings.Contains(out, "listening on") {
+		t.Errorf("reattach entry must be absent without a session\nout:\n%s", out)
+	}
+}
+
+// TestSnapshotMainEnterOnReattachEmitsAttach: Enter on the reattach
+// screen emits reattachRequestMsg instead of a spawn.
+func TestSnapshotMainEnterOnReattachEmitsAttach(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	root := NewRoot(cfg, "/dev/null", stubSpawner{runningAlias: "alpha"}, nil, "v0.0.0-test", nil)
 	root.refreshSessionState()
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
 
-	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
-	if !strings.Contains(out, "(running)") {
-		t.Errorf("expected (running) marker on alpha row; out:\n%s", out)
+	_, cmd := root.mainMode.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter on the reattach screen must emit a command")
+	}
+	if _, ok := cmd().(reattachRequestMsg); !ok {
+		t.Fatalf("Enter on reattach screen emitted %T, want reattachRequestMsg", cmd())
 	}
 }
 
@@ -324,39 +357,6 @@ func TestSnapshotMainPresetPreviewEllipsizesOnNarrowTerminal(t *testing.T) {
 	}
 	if strings.Contains(out, "smallctx") {
 		t.Errorf("narrow terminal preview must be truncated, found full names\nout:\n%s", out)
-	}
-}
-
-// TestSnapshotMainHeaderStripAbsentWithoutSession: no session → no
-// "Detached" text anywhere (the strip is session-only, §15.2).
-func TestSnapshotMainHeaderStripAbsentWithoutSession(t *testing.T) {
-	cfg := sampleSnapshotConfig()
-	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
-
-	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
-	if strings.Contains(out, "Detached") {
-		t.Errorf("header strip must be absent without a running session\nout:\n%s", out)
-	}
-}
-
-// TestSnapshotMainHeaderStripPresentWhenRunning pins §15.2 item 1: with
-// a session, the full-width strip renders the detached line text at the
-// top of the viewport.
-func TestSnapshotMainHeaderStripPresentWhenRunning(t *testing.T) {
-	cfg := sampleSnapshotConfig()
-	root := NewRoot(cfg, "/dev/null", stubSpawner{runningAlias: "alpha"}, nil, "v0.0.0-test", nil)
-	root.refreshSessionState()
-
-	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
-
-	for _, want := range []string{"▶ Detached:", "alpha", "9080", "press a to attach"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("header strip missing %q\nout:\n%s", want, out)
-		}
-	}
-	// The strip must be the first content line (before the wordmark).
-	if !strings.HasPrefix(strings.TrimSpace(out), "╭") {
-		t.Errorf("header strip should be the top element, got:\n%s", out)
 	}
 }
 
@@ -890,6 +890,70 @@ func TestRunModeQuitPromptKillQuitsLlamaman(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatal("q+k did not stop the child — quit prompt's kill is wired to the wrong cmd")
 		}
+	}
+}
+
+// TestRunModeEscDetachesToMain: with a live session, the final Esc layer
+// returns to Main (returnToMainMsg) while the server keeps running
+// (§15.2 — in-app detach).
+func TestRunModeEscDetachesToMain(t *testing.T) {
+	bin := filepath.Join(repoRoot(t), "bin", "llamaman-fakeserver")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("fakeserver not built: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "llama.log")
+	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+	cfg := sampleSnapshotConfig()
+	opts := RunModeOpts{
+		Cfg: cfg, Model: cfg.Models[0], Preset: cfg.Models[0].Presets[0],
+		Argv: proc.Argv, Process: proc,
+	}
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 140, Height: 40})
+
+	// Esc with no overlay/search → detach to Main.
+	driveRoot(t, root, tea.KeyMsg{Type: tea.KeyEsc})
+	if root.view != ViewMain {
+		t.Fatalf("after esc: view = %d, want ViewMain (detached)", root.view)
+	}
+	if !server.IsLive(proc.Pid) {
+		t.Fatal("esc-detach must leave the server running")
+	}
+}
+
+// TestRunModeEscKeepsCrashViewWhenServerDead: the final Esc layer is
+// gated on a live process — a dead server keeps run mode (crash view)
+// in control instead of detaching to a dead-session Main.
+func TestRunModeEscKeepsCrashViewWhenServerDead(t *testing.T) {
+	bin := filepath.Join(repoRoot(t), "bin", "llamaman-fakeserver")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("fakeserver not built: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "llama.log")
+	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+	cfg := sampleSnapshotConfig()
+	opts := RunModeOpts{
+		Cfg: cfg, Model: cfg.Models[0], Preset: cfg.Models[0].Presets[0],
+		Argv: proc.Argv, Process: proc,
+	}
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 140, Height: 40})
+
+	// Kill the child out-of-band, then Esc must not detach.
+	proc.Stop(2 * time.Second)
+	driveRoot(t, root, tea.KeyMsg{Type: tea.KeyEsc})
+	if root.view != ViewRun {
+		t.Fatalf("after esc with a dead server: view = %d, want ViewRun (crash view keeps control)", root.view)
 	}
 }
 

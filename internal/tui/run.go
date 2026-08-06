@@ -720,7 +720,10 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		case "esc":
 			// Layered Esc: close the action menu, then the router stats
 			// panel (back to the model list), then clear any applied
-			// search query. Panel focus is toggled with Tab, not Esc.
+			// search query, then detach to Main — the server keeps
+			// running and llamaman stays open (DESIGN §15.2). The final
+			// detach layer only fires while the session is live; a dead
+			// server keeps the crash view in control.
 			if r.routerFile != "" && r.routerMenu {
 				r.routerMenu = false
 				return r, nil
@@ -734,6 +737,10 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 				r.searchMatches = nil
 				r.searchIdx = 0
 				r.refreshContent()
+				return r, nil
+			}
+			if r.proc != nil && server.IsLive(r.proc.Pid) {
+				return r, func() tea.Msg { return returnToMainMsg{} }
 			}
 			return r, nil
 		case "q", "ctrl+c":
@@ -1515,6 +1522,7 @@ func (r *RunMode) renderHelp() string {
 	type entry struct{ key, desc string }
 	rows := []entry{
 		{"q / Ctrl+C", "open quit prompt — kill / detach / cancel"},
+		{"esc", "back to main — detach (server keeps running)"},
 		{"k", "kill server and return to main"},
 		{"r", "restart server (confirms)"},
 		{"c", "copy launch command to clipboard"},
@@ -1564,7 +1572,7 @@ func (r *RunMode) renderFooter() string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	sep := subtle.Render(" · ")
 	tokens := []string{
-		"q quit", "k kill", "r restart", "c copy", "i info",
+		"q quit", "k kill", "r restart", "c copy", "i info", "esc back",
 	}
 	if r.routerFile != "" {
 		// The tab hint names the panel you'd switch TO.
