@@ -168,17 +168,20 @@ func decideEntry(cfg *config.Config, registry flags.Registry, sessMgr *server.Se
 		return nil, exitGeneric
 	}
 	if existing != nil {
-		// A session is running. Both no-args and args+session paths
-		// reattach. Args are silently ignored per §4.3.
+		// A session is running. With positional args, reattach (args are
+		// silently ignored per §4.3). With no args, land on Main mode so
+		// the session header strip shows and the user can press `a` to
+		// attach — the manager comes first (owner decision, §4.3/§15.2).
 		if alias != "" {
 			slog.Info("session already running; ignoring positional args", "alias", alias, "preset", preset)
+			opts, err := buildReattachOpts(cfg, registry, *existing, sessMgr)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "reattach:", err)
+				return nil, exitGeneric
+			}
+			return opts, 0
 		}
-		opts, err := buildReattachOpts(cfg, registry, *existing, sessMgr)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "reattach:", err)
-			return nil, exitGeneric
-		}
-		return opts, 0
+		return nil, 0
 	}
 	if alias == "" {
 		// No positional args, no session → main mode.

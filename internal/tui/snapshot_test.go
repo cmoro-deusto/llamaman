@@ -248,6 +248,28 @@ func TestSnapshotMainListBoxStableWidth(t *testing.T) {
 	}
 }
 
+// TestSnapshotMainHighlightSpansWholeRow pins the highlight fix: the
+// highlighted row is wrapped in a single reverse-video SGR pair with
+// plain text inside (styled substrings would inject `\x1b[0m` resets
+// and break the reverse mid-row — owner feedback). The reverse must
+// start immediately before the tag+title with no inner color SGR.
+func TestSnapshotMainHighlightSpansWholeRow(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		tea.KeyMsg{Type: tea.KeyDown}, // highlight beta
+	)
+
+	raw := root.mainMode.View()
+	if !containsSequence(raw, "\x1b[7mlocal  beta") {
+		t.Errorf("reverse video must start immediately before the tag+title\nraw:\n%.400s", raw)
+	}
+	if containsSequence(raw, "\x1b[7m\x1b[38;5;") {
+		t.Errorf("highlighted row must not carry inner color styling (breaks reverse video)\nraw:\n%.400s", raw)
+	}
+}
+
 // TestSnapshotMainShowsSourceTags pins §15.2 item 3: every model row
 // carries its source kind (local / hf) and router rows carry "router".
 func TestSnapshotMainShowsSourceTags(t *testing.T) {

@@ -168,7 +168,7 @@ Order of evaluation:
 | Invocation | Session running? | Mode |
 |---|---|---|
 | `llamaman` (no positional args) | no | TUI main mode |
-| `llamaman` (no positional args) | yes | TUI run mode (reattach) |
+| `llamaman` (no positional args) | yes | TUI main mode (session header strip; attach with `a`) |
 | `llamaman <alias>` | no, alias exists | TUI run mode (start fresh, default preset or only preset) |
 | `llamaman <alias> <preset>` | no, both exist | TUI run mode (start fresh, named preset) |
 | `llamaman <alias>` or `llamaman <alias> <preset>` | yes | TUI run mode (reattach, **arguments ignored**) |
@@ -176,6 +176,8 @@ Order of evaluation:
 | `llamaman <alias> <preset>` | no, alias exists, preset missing | stderr error, exit 2 |
 
 If two `llamaman` instances race to start a session, the loser sees `Another llamaman is already running` on stderr and exits 0.
+
+A no-args launch with a session already running lands on **Main mode**, not run mode (owner decision): the session header strip (§15.2) makes the detached session visible, and `a` attaches. `llamaman <alias>` with a running session still reattaches directly (arguments ignored).
 
 ### 4.4 Exit codes
 
@@ -1236,6 +1238,12 @@ canonical (§12.2 constraints). Consumes the §15.1 palette tokens.
      (existing behavior).
    - "Sticky" is a non-issue here: Main is a single non-scrolling
      screen, so the strip is simply the top element of its View.
+   - **Reachability (owner decision).** The strip is reachable: the
+     quit-prompt `d` (detach) exits llamaman leaving the server
+     running, and a no-args relaunch now lands on **Main mode** (§4.3)
+     — not run view — so the strip shows the detached session and `a`
+     attaches. `llamaman <alias>` with a live session still reattaches
+     directly.
 
 2. **Wider list on wide terminals** — the inline list box width cap
    grows from 60 to **90** columns (`min(90, width − 8)`, floor stays

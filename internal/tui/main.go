@@ -256,23 +256,34 @@ func (d inlineDelegate) Render(w io.Writer, lm list.Model, index int, item list.
 		desc = truncateRunes(desc, avail)
 	}
 
-	row := title + sep + subtle.Render(desc)
+	row := title + sep + desc
 	if tag != "" {
-		tagCol := tag + strings.Repeat(" ", 6-len(tag))
-		row = muted.Render(tagCol) + " " + row
-	}
-
-	// Pad every row to the list width so the box keeps a stable size
-	// regardless of which row is highlighted.
-	if pad := lm.Width() - lipgloss.Width(row); pad > 0 {
-		row += strings.Repeat(" ", pad)
+		row = tag + strings.Repeat(" ", 6-len(tag)) + " " + row
 	}
 
 	if index == lm.Index() {
-		// Reverse video for the highlighted row, full row width. Literal
-		// SGR (not lipgloss.Reverse) so it's deterministic without a TTY.
+		// Highlighted row: plain text wrapped in a single reverse-video
+		// SGR pair. Styling the substrings would inject their own
+		// `\x1b[0m` resets and break the reverse video mid-row (owner
+		// feedback), so the highlighted row carries no inner colors.
+		if pad := lm.Width() - lipgloss.Width(row); pad > 0 {
+			row += strings.Repeat(" ", pad)
+		}
+		// Literal SGR (not lipgloss.Reverse) so it's deterministic
+		// without a TTY.
 		fmt.Fprint(w, "\x1b[7m"+row+"\x1b[0m")
 		return
+	}
+
+	// Non-highlighted row: styled tag + description, padded to the list
+	// width so the enclosing box keeps a stable size regardless of which
+	// row is highlighted.
+	row = title + sep + subtle.Render(desc)
+	if tag != "" {
+		row = muted.Render(tag+strings.Repeat(" ", 6-len(tag))) + " " + row
+	}
+	if pad := lm.Width() - lipgloss.Width(row); pad > 0 {
+		row += strings.Repeat(" ", pad)
 	}
 	fmt.Fprint(w, row)
 }
