@@ -1275,17 +1275,16 @@ const (
 )
 
 // currentOccurrenceOpen returns the SGR opening for the current search
-// occurrence: bold + reverse tinted with the theme's StatusStart color,
-// so the match reads as a colored background — clearly distinct from
-// the plain matches (§15.3, owner feedback: color instead of
-// underline). lipgloss.Render("") appends a reset; it is stripped to
-// get the opening sequence.
+// occurrence: bold + reverse tinted with the theme's StatusIdle color
+// (a colored background). StatusIdle is deliberately NOT one of the
+// line-kind colors (Err/Start/Ready/Muted), so the highlight stays
+// visible even on a WARN (StatusStart) line (owner feedback).
 func (r *RunMode) currentOccurrenceOpen() string {
-	if r.theme.StatusStart == "" {
+	if r.theme.StatusIdle == "" {
 		return highlightOpen // no theme (tests/edge) → plain bold+reverse
 	}
 	s := lipgloss.NewStyle().
-		Foreground(r.theme.StatusStart).
+		Foreground(r.theme.StatusIdle).
 		Reverse(true).
 		Bold(true).
 		Render("")

@@ -1266,11 +1266,13 @@ line's reset — accepted cosmetic during active search.
 
 **Current search occurrence (owner feedback).** `n`/`N` navigation
 marks the current matching line's matches with **bold+reverse tinted
-with the theme's `StatusStart` color** (a colored background) while
+with the theme's `StatusIdle` color** (a colored background) while
 other matches stay plain bold+reverse — the selected occurrence is
-unmistakable at a glance. The tint moves with the selection
-(`jumpSearch` re-renders before scrolling). Granularity is per
-matching line (the existing `searchMatches` model). A scanning
+unmistakable at a glance, and the tint deliberately avoids the
+line-kind colors (`StatusErr`/`StatusStart`/`StatusReady`/`Muted`) so
+it never disappears on a WARN or ERROR line. The tint moves with the
+selection (`jumpSearch` re-renders before scrolling). Granularity is
+per matching line (the existing `searchMatches` model). A scanning
 animation for next/previous occurrence is a candidate for item 5
 (gated by `preferences.animations`), not part of item 3.
 

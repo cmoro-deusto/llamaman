@@ -224,11 +224,21 @@ func TestRunModeSearchEnterRefreshesHighlights(t *testing.T) {
 	if r.searchQuery != "error" {
 		t.Errorf("searchQuery = %q, want %q", r.searchQuery, "error")
 	}
-	// Current occurrence (line 0) is tinted with the theme's StatusStart
-	// color (llamaman dark gold #FFD700 → xterm 220); the other match
-	// keeps the plain bold+reverse style.
+	// Current occurrence (line 0) is tinted with the theme's StatusIdle
+	// color; the other match keeps the plain bold+reverse style.
 	curOpen := r.currentOccurrenceOpen()
 	got := r.viewport.View()
+	// The tint must be distinct from the WARN (StatusStart) color so it
+	// stays visible on WARN lines (owner feedback).
+	warnTint := lipgloss.NewStyle().
+		Foreground(r.theme.StatusStart).
+		Reverse(true).
+		Bold(true).
+		Render("")
+	warnTint = strings.TrimSuffix(warnTint, "\x1b[0m")
+	if curOpen == warnTint {
+		t.Fatalf("current-occurrence tint must differ from the WARN color, both %q", curOpen)
+	}
 	wantCur := curOpen + "error" + highlightClose
 	if !strings.Contains(got, wantCur) {
 		t.Errorf("viewport missing current-occurrence wrap %q\nview: %q", wantCur, got)
