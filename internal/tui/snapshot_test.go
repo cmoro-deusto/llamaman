@@ -60,10 +60,12 @@ func sampleSnapshotConfig() *config.Config {
 	}
 }
 
-// driveRoot calls Init then Update with each message, draining the
-// resulting tea.Cmds (one level deep) so dispatched messages like
-// SpawnRequestMsg actually reach Root.Update on the next round-trip.
-// Returns the View after the final message has been processed.
+// driveRoot calls Init then Update with each message, recursively
+// draining the resulting tea.Cmds so dispatched messages (SpawnRequestMsg,
+// huh form field transitions, returnFromSettingsMsg) actually reach
+// Root.Update. Depth is bounded so long-lived cmds (tea.Tick, tailers)
+// don't recurse forever; safeCmd time-boxes blocking cmds. Returns the
+// View after the final message has been processed.
 //
 // Init is only invoked if root.initialRun was set at construction (or
 // will produce a non-nil Cmd) — without that, driving from a fresh
@@ -72,28 +74,36 @@ func driveRoot(t *testing.T, root *Root, msgs ...tea.Msg) string {
 	t.Helper()
 	var m tea.Model = root
 	if cmd := root.Init(); cmd != nil {
-		for _, sub := range collectCmds(cmd) {
-			out := safeCmd(sub)
-			if out == nil {
-				continue
-			}
-			next, _ := m.Update(out)
-			m = next
-		}
+		m = drainCmds(m, cmd, 0)
 	}
 	for _, msg := range msgs {
 		next, cmd := m.Update(msg)
 		m = next
-		for _, sub := range collectCmds(cmd) {
-			out := safeCmd(sub)
-			if out == nil {
-				continue
-			}
-			next, _ = m.Update(out)
-			m = next
-		}
+		m = drainCmds(m, cmd, 0)
 	}
 	return stripANSI(m.View())
+}
+
+// drainCmds executes a tea.Cmd and feeds its message back through the
+// model, recursing into the next Cmd up to a bounded depth. BatchMsg
+// children are drained individually.
+func drainCmds(m tea.Model, cmd tea.Cmd, depth int) tea.Model {
+	if cmd == nil || depth > 8 {
+		return m
+	}
+	out := safeCmd(cmd)
+	if out == nil {
+		return m
+	}
+	if b, ok := out.(tea.BatchMsg); ok {
+		for _, sub := range b {
+			m = drainCmds(m, sub, depth+1)
+		}
+		return m
+	}
+	next, c := m.Update(out)
+	m = next
+	return drainCmds(m, c, depth+1)
 }
 
 // collectCmds flattens a tea.Cmd batch into its constituent Cmds. tea
@@ -265,7 +275,7 @@ func TestSnapshotMainModeRouterDefaultSource(t *testing.T) {
 func TestMainModeRouterEmptyStateDirect(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	cfg.Globals.ModelsFiles = nil
-	m := NewMainMode(cfg, "v0.0.0-test") // no cfgPath → no default source
+	m := NewMainMode(cfg, "v0.0.0-test", DefaultTheme()) // no cfgPath → no default source
 	m.SetSize(120, 40)
 	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
 
@@ -342,7 +352,7 @@ func TestMainModeRouterToggleCycles(t *testing.T) {
 	}
 	cfg := sampleSnapshotConfig()
 	cfg.Globals.ModelsFiles = []string{good, filepath.Join(dir, "broken.ini")}
-	m := NewMainMode(cfg, "v0.0.0-test")
+	m := NewMainMode(cfg, "v0.0.0-test", DefaultTheme())
 	m.SetSize(120, 40)
 
 	// Default: single model mode shows model aliases.
@@ -376,7 +386,7 @@ func TestMainModeRouterEnterEmitsRouterSpawnRequest(t *testing.T) {
 	}
 	cfg := sampleSnapshotConfig()
 	cfg.Globals.ModelsFiles = []string{ini}
-	m := NewMainMode(cfg, "v0.0.0-test")
+	m := NewMainMode(cfg, "v0.0.0-test", DefaultTheme())
 	m.SetSize(120, 40)
 
 	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab}) // router mode
@@ -828,7 +838,7 @@ func TestParamPickerShowsNamesWithoutDashesAndDescriptions(t *testing.T) {
 	}
 	p := newParamPicker(reg)
 	p.SetSize(100, 30)
-	out := stripANSI(p.View(CurrentTheme()))
+	out := stripANSI(p.View(DefaultTheme()))
 
 	for _, want := range []string{
 		"threads",               // bare name (no --)
@@ -891,7 +901,7 @@ func TestParamPickerFilterRendersInlineNotFullWidth(t *testing.T) {
 	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
 	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
 	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
-	view := stripANSI(p.View(CurrentTheme()))
+	view := stripANSI(p.View(DefaultTheme()))
 
 	if !strings.Contains(view, "filter: thr") {
 		t.Fatalf("expected compact 'filter: thr' line; view:\n%s", view)
@@ -1049,7 +1059,7 @@ func TestFirstRunWindowSizeDoesNotPanic(t *testing.T) {
 			t.Fatalf("first-run WindowSizeMsg panicked: %v", r)
 		}
 	}()
-	fr := NewFirstRunMode("/tmp/nonexistent/config.json")
+	fr := NewFirstRunMode("/tmp/nonexistent/config.json", DefaultTheme())
 	root := NewRootForFirstRun("/tmp/nonexistent/config.json", "v0.0.0-test", fr)
 	// Send a sequence of messages that exercise every uninitialized
 	// sub-model path: window size, session tick, then more sizing.

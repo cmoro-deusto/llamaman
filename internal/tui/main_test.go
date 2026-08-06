@@ -12,7 +12,7 @@ import (
 // configure/help/quit shortcuts.
 func TestMainViewRendersWordmarkAndShortcuts(t *testing.T) {
 	cfg := &config.Config{Version: 1}
-	m := NewMainMode(cfg, "v0.0.1-test")
+	m := NewMainMode(cfg, "v0.0.1-test", DefaultTheme())
 	m.SetSize(120, 40)
 
 	out := m.View()

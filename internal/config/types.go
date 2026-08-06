@@ -7,9 +7,50 @@ const SchemaVersion = 1
 
 // Config mirrors the on-disk JSON schema documented in DESIGN.md §3.2.
 type Config struct {
-	Version int     `json:"version"`
-	Globals Globals `json:"globals"`
-	Models  []Model `json:"models"`
+	Version     int          `json:"version"`
+	Globals     Globals      `json:"globals"`
+	Preferences *Preferences `json:"preferences,omitempty"`
+	Models      []Model      `json:"models"`
+}
+
+// Preferences holds user preferences, separate from Globals per DESIGN
+// §15.1: globals are launch-time parameters every preset needs (host,
+// port, binary, models-files); preferences are user preferences of a
+// different nature (theme, animations). Additive v1 — older binaries
+// reject the object with `json: unknown field "preferences"` (accepted
+// P2 contract).
+//
+// The zero value equals the defaults (theme "auto", animations true),
+// so Config.Preferences is a pointer: the object stays absent from the
+// file until the user actually changes a preference, and untouched
+// configs remain byte-identical on save.
+type Preferences struct {
+	// Theme is a palette ID from the TUI palette table ("auto", the
+	// default, resolves to the llamaman palette). Unknown values are a
+	// Warning resolved to "auto" by the TUI resolver — config.Validate
+	// only checks shape (non-empty string), keeping the palette-name
+	// list single-sourced in internal/tui (DESIGN §15.1).
+	Theme string `json:"theme,omitempty"`
+	// Animations defaults to true. A pointer so an explicit `false` is
+	// distinct from absent and survives a save round-trip (a plain bool
+	// with omitempty would silently drop an explicit false).
+	Animations *bool `json:"animations,omitempty"`
+}
+
+// Prefs returns the effective preferences, or the zero value (==
+// defaults) when the object is absent. Callers must use this instead of
+// dereferencing Preferences directly.
+func (c *Config) Prefs() Preferences {
+	if c.Preferences == nil {
+		return Preferences{}
+	}
+	return *c.Preferences
+}
+
+// AnimationsEnabled reports the effective animations setting: absent
+// (nil) means the default, true.
+func (p Preferences) AnimationsEnabled() bool {
+	return p.Animations == nil || *p.Animations
 }
 
 // Globals holds the binary path and the listen host/port. The JSON tag for

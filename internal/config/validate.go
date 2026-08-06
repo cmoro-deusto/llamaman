@@ -74,6 +74,7 @@ func Validate(cfg *Config) Issues {
 	}
 
 	out = append(out, validateGlobals(cfg.Globals)...)
+	out = append(out, validatePreferences(cfg.Prefs())...)
 
 	aliasSeen := make(map[string]int)
 	for i, m := range cfg.Models {
@@ -122,6 +123,18 @@ func Validate(cfg *Config) Issues {
 		out = append(out, validatePresets(i, m.Presets)...)
 	}
 	return out
+}
+
+// validatePreferences holds the config-level rules for the preferences
+// object (DESIGN §15.1). Both fields are type-checked by JSON decode,
+// and the zero value equals the defaults, so there is nothing to flag
+// at config level today: an empty/absent theme means "auto", any bool
+// is valid, and the *semantic* check — is the theme a real palette —
+// deliberately lives in the TUI resolver (config cannot import tui,
+// and duplicating the palette-name list would break P8). Unknown
+// theme values degrade to "auto" with a Warning, never a Block.
+func validatePreferences(_ Preferences) Issues {
+	return nil
 }
 
 func validateGlobals(g Globals) Issues {

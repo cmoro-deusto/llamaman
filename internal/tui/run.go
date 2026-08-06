@@ -214,7 +214,10 @@ type RunModeOpts struct {
 // NewRunMode wires a RunMode around an already-spawned (or adopted)
 // process. It opens the tailer on the existing log file and returns the
 // initial Cmd batch (chunk reader, process exit watcher, uptime ticker).
-func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
+// theme is the resolved palette (DESIGN §15.1); it is fixed for the
+// lifetime of the run view — a theme change while a session runs shows
+// on the next attach/launch.
+func NewRunMode(opts RunModeOpts, theme Theme) (*RunMode, tea.Cmd, error) {
 	if opts.Process == nil {
 		return nil, nil, fmt.Errorf("RunMode: Process must be non-nil")
 	}
@@ -251,7 +254,7 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 		viewport:               vp,
 		status:                 StatusStarting,
 		keys:                   DefaultKeymap(),
-		theme:                  CurrentTheme(),
+		theme:                  theme,
 		searchInput:            ti,
 		serverVersion:          loadServerVersion(opts.Cfg.Globals.Bin),
 		fetcher:                opts.Fetcher,

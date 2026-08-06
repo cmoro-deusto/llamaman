@@ -125,7 +125,7 @@ func run() int {
 	cfg, cfgPath, code, missing := loadConfigOrFirstRun(cli.Config)
 	if missing {
 		// Default config absent and no -c override → first-run flow.
-		fr := tui.NewFirstRunMode(cfgPath)
+		fr := tui.NewFirstRunMode(cfgPath, tui.DefaultTheme())
 		root := tui.NewRootForFirstRun(cfgPath, versionString(), fr)
 		if _, err := tea.NewProgram(root, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run(); err != nil {
 			fmt.Fprintln(os.Stderr, "tui:", err)

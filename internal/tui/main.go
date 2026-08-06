@@ -58,17 +58,39 @@ type MainMode struct {
 	showPresets bool // multi-preset pivot state
 }
 
-// NewMainMode constructs the landing-screen model.
-func NewMainMode(cfg *config.Config, version string) MainMode {
+// NewMainMode constructs the landing-screen model. theme is the
+// resolved palette (DESIGN §15.1).
+func NewMainMode(cfg *config.Config, version string, theme Theme) MainMode {
 	m := MainMode{
 		cfg:     cfg,
 		keys:    DefaultKeymap(),
-		theme:   CurrentTheme(),
+		theme:   theme,
 		version: version,
 	}
 	m.rebuildModels()
 	m.rebuildRouterFiles()
 	return m
+}
+
+// SetTheme swaps the active palette and rebuilds the inline list
+// delegates (they capture the theme at list construction). Selection
+// positions are preserved. Used by Root after a Settings save or a
+// quick-key theme cycle.
+func (m *MainMode) SetTheme(t Theme) {
+	m.theme = t
+	// A theme change resets any preset pivot: the sub-list would render
+	// against a stale delegate otherwise.
+	m.showPresets = false
+	modelIdx := m.models.Index()
+	routerIdx := m.routerFiles.Index()
+	m.models = list.Model{}
+	m.routerFiles = list.Model{}
+	m.presets = list.Model{}
+	m.rebuildModels()
+	m.rebuildRouterFiles()
+	m.models.Select(modelIdx)
+	m.routerFiles.Select(routerIdx)
+	m.applyListSize()
 }
 
 // SetSize is called by the root model on every WindowSizeMsg.
@@ -410,6 +432,8 @@ func (m MainMode) renderShortcuts() string {
 	}
 	parts = append(parts, shortcut("tab", modeLabel, m.theme))
 	parts = append(parts, shortcut("c", "configure", m.theme))
+	parts = append(parts, shortcut("s", "settings", m.theme))
+	parts = append(parts, shortcut("t", "theme", m.theme))
 	parts = append(parts, shortcut("?", "help", m.theme))
 	parts = append(parts, shortcut("q", "quit", m.theme))
 	if m.IsSessionRunning() {
@@ -490,6 +514,8 @@ func (m MainMode) renderHelp() string {
 		"tab         toggle Single Model / Router mode",
 		"Esc         back out of preset pivot",
 		"c           open configuration mode",
+		"s           open settings (theme, animations)",
+		"t / Shift+t cycle theme (forward / backward)",
 		"a           attach to running session (only when one exists)",
 		"?           toggle this help",
 		"q / Ctrl+C  quit",
