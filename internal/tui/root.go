@@ -491,7 +491,7 @@ type returnFromSettingsMsg struct{}
 // openSettings switches to the Settings mode, which edits exactly the
 // preferences object (DESIGN §15.1).
 func (r *Root) openSettings() (tea.Model, tea.Cmd) {
-	r.settings = NewSettingsMode(r.cfgPath, r.cfg, r.theme, lipgloss.HasDarkBackground())
+	r.settings = NewSettingsMode(r.cfgPath, r.cfg, r.theme, lipgloss.HasDarkBackground(), r.version)
 	r.settings.SetSize(r.width, r.height)
 	r.view = ViewSettings
 	return r, r.settings.Init()

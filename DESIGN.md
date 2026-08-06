@@ -1141,6 +1141,12 @@ resolver are new.
 - The form edits the live `cfg.Preferences` and saves on submit — no
   working copy needed (two scalar fields; the atomic save makes it
   safe).
+- **Live preview (owner decision).** Arrowing through the theme select
+  re-themes the Settings chrome and the form instantly (huh's
+  `WithTheme` re-applies post-construction), and a preview pane renders
+  the *actual* Main screen (a throwaway `MainMode` with the candidate
+  palette — deterministic, side-effect-free) so the user sees the theme
+  before committing. Esc discards; the preview never persists anything.
 - **Quick keys (P8, shortcuts only).** Main **`t`** cycles the theme
   forward through all palettes + `auto`, and **`shift+t`** cycles
   backward — both live: resolve → write `preferences.theme` →

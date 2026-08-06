@@ -20,13 +20,19 @@ type SettingsMode struct {
 	cfg     *config.Config
 	theme   Theme
 	darkBg  bool
+	version string
 
 	form     *huh.Form
 	themeVal string
 	anim     bool
 
+	// lastThemeVal tracks the select's live value so Update can detect
+	// arrow-key changes and re-theme the chrome + preview immediately
+	// (DESIGN §15.1: live preview while browsing).
+	lastThemeVal string
+
 	applied *config.Preferences // non-nil after a successful submit
-	warn    string              // unknown/incompatible theme banner
+	warn    string              // unknown/mismatched theme banner
 
 	width, height int
 }
@@ -42,7 +48,7 @@ type SettingsMode struct {
 // the values the user picks land in the same struct the caller and
 // snapshot() read (a value-returning constructor would bind the form to
 // a dead copy).
-func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg bool) *SettingsMode {
+func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg bool, version string) *SettingsMode {
 	prefs := cfg.Prefs()
 	themeVal := prefs.Theme
 	if themeVal == "" {
@@ -58,13 +64,15 @@ func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg boo
 	}
 
 	sm := &SettingsMode{
-		cfgPath:  cfgPath,
-		cfg:      cfg,
-		theme:    theme,
-		darkBg:   darkBg,
-		themeVal: themeVal,
-		anim:     prefs.AnimationsEnabled(),
-		warn:     warn,
+		cfgPath:      cfgPath,
+		cfg:          cfg,
+		theme:        theme,
+		darkBg:       darkBg,
+		version:      version,
+		themeVal:     themeVal,
+		anim:         prefs.AnimationsEnabled(),
+		lastThemeVal: themeVal,
+		warn:         warn,
 	}
 
 	opts := make([]huh.Option[string], 0, len(palettes)+1)
@@ -125,7 +133,9 @@ func (s *SettingsMode) Applied() *config.Preferences { return s.applied }
 
 // Update forwards keys to the form and, on completion, snapshots the
 // edited preferences (only non-default values, keeping the object
-// minimal per the field-arrival contract) and returns to Main.
+// minimal per the field-arrival contract) and returns to Main. While
+// the user arrows through the theme select, the chrome and the preview
+// pane re-theme live with the candidate palette.
 func (s *SettingsMode) Update(msg tea.Msg) (*SettingsMode, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok && k.String() == "esc" && s.form.State != huh.StateCompleted {
 		return s, func() tea.Msg { return returnFromSettingsMsg{} }
@@ -134,11 +144,39 @@ func (s *SettingsMode) Update(msg tea.Msg) (*SettingsMode, tea.Cmd) {
 	if f, ok := next.(*huh.Form); ok {
 		s.form = f
 	}
+	s.refreshPreview()
 	if s.form.State == huh.StateCompleted && s.applied == nil {
 		s.applied = s.snapshot()
 		return s, func() tea.Msg { return returnFromSettingsMsg{} }
 	}
 	return s, cmd
+}
+
+// refreshPreview re-resolves the selected theme when the picker value
+// changed, re-theming the Settings chrome and the form itself so the
+// user sees the candidate palette live (DESIGN §15.1).
+func (s *SettingsMode) refreshPreview() {
+	if s.themeVal == s.lastThemeVal {
+		return
+	}
+	s.lastThemeVal = s.themeVal
+	t, _, _ := ResolveTheme(s.themeVal, s.darkBg)
+	s.theme = t
+	s.form.WithTheme(configHuhTheme(t))
+}
+
+// previewPane renders the actual Main landing screen with the candidate
+// palette — a true live preview of what the theme will look like. It is
+// a throwaway MainMode (no side effects, deterministic); skipped on
+// short terminals where the popup would overflow.
+func (s SettingsMode) previewPane() string {
+	if s.height < 24 || s.cfg == nil {
+		return ""
+	}
+	pm := NewMainMode(s.cfg, s.version, s.theme)
+	pw := min(60, max(20, s.width-14))
+	pm.SetSize(pw, min(14, s.height-16))
+	return pm.View()
 }
 
 // snapshot builds the preferences value to persist. Defaults are left
@@ -189,6 +227,15 @@ func (s SettingsMode) View() string {
 	if s.warn != "" {
 		parts = append(parts,
 			lipgloss.NewStyle().Foreground(s.theme.StatusStart).Render("⚠ "+s.warn),
+			"",
+		)
+	}
+	if preview := s.previewPane(); preview != "" {
+		parts = append(parts,
+			lipgloss.NewStyle().
+				Foreground(s.theme.Muted).
+				Render("preview (main screen with selected theme):"),
+			preview,
 			"",
 		)
 	}

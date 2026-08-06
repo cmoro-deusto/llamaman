@@ -344,6 +344,44 @@ func TestSettingsMismatchedThemeAppliesWithWarning(t *testing.T) {
 	}
 }
 
+// TestSettingsLivePreviewReThemes: arrowing through the theme select
+// re-themes the Settings chrome and the preview pane live — the raw
+// view must show the candidate palette's accent (ANSI-256 SGR) both in
+// the chrome and in the real Main-screen preview.
+func TestSettingsLivePreviewReThemes(t *testing.T) {
+	forceDarkBg(t)
+	defer forceDarkBgRestore()
+
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		keyMsg("s"),
+	)
+	if root.settings == nil {
+		t.Fatal("settings not open")
+	}
+
+	raw := root.settings.View()
+	if !strings.Contains(raw, "preview (main screen with selected theme)") {
+		t.Error("preview pane missing")
+	}
+	// Initial: auto → llamaman dark accent #E8A33D (xterm 179).
+	if !containsSequence(raw, "\x1b[38;5;179m") {
+		t.Errorf("initial preview should use llamaman dark accent (179):\n%.400s", raw)
+	}
+
+	// Arrow to Catppuccin Mocha (peach #FAB387, xterm 216).
+	driveRoot(t, root, tea.KeyMsg{Type: tea.KeyDown}, tea.KeyMsg{Type: tea.KeyDown})
+	if got := root.settings.theme.Accent; got != lipgloss.Color("#FAB387") {
+		t.Fatalf("chrome accent = %v, want catppuccin-mocha peach", got)
+	}
+	raw = root.settings.View()
+	if !containsSequence(raw, "\x1b[38;5;216m") {
+		t.Errorf("preview must show the candidate palette accent (216):\n%.400s", raw)
+	}
+}
+
 // TestSettingsWarnsOnUnknownStoredTheme: a hand-edited unknown theme
 // shows the warning banner and the form defaults to auto (P3: degrade
 // with a warning, never block).
