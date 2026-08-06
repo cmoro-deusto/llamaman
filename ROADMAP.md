@@ -95,15 +95,22 @@ no new llama-server interaction.
 ### 2.1 Multi-palette theme system
 
 - **What:** the hard-coded light/dark pair in `internal/tui/common.go`
-  (`Theme`, `CurrentTheme()`) becomes a palette table with 4–6 curated
-  palettes (e.g. Catppuccin Mocha, Tokyo Night, Dracula, Solarized Dark,
-  Solarized Light) plus `auto` (current behavior).
+  (`Theme`, `CurrentTheme()`) becomes a palette table (owner-approved
+  set, DESIGN §15.1): the original theme named `llamaman` (adaptive),
+  plus 11 dark palettes (Catppuccin Mocha, Tokyo Night, Dracula,
+  Gruvbox Dark, Solarized Dark, Nord, One Dark, Kanagawa, Monokai,
+  Rosé Pine, Night Owl) with their official light counterparts
+  (Catppuccin Latte, Tokyo Night Day, Dracula Light/Alucard, Gruvbox
+  Light, Solarized Light, Nord Light, One Dark Light, Kanagawa Lotus,
+  Monokai Light, Rosé Pine Dawn, Light Owl) plus the `auto` default
+  value (resolves to `llamaman`).
 - **Config:** new additive v1 field `preferences.theme` (string). Unknown
   value → warning + fall back to `auto` (non-blocking). See §2.6 for the
   `preferences` object and the Settings mode.
-- **TUI:** the Settings mode (§2.6) offers the palette picker; a quick key in
-  Main mode cycles palettes live. Both write `preferences.theme` — the quick
-  key is a shortcut, not a second source of truth.
+- **TUI:** the Settings mode (§2.6) offers the palette picker; `t` /
+  `shift+t` in Main mode cycles palettes live (backward/forward). Both
+  write `preferences.theme` — the quick key is a shortcut, not a
+  second source of truth.
 - **Constraints:** every palette keeps the existing named-color mapping so
   256-color SSH renders correctly; snapshot tests assert specific colors.
 - **Non-goal:** user-defined arbitrary colors (no color picker in v1).
@@ -175,8 +182,9 @@ no new llama-server interaction.
   meaning (owner decision, recorded in §1).
 - **Design:** a `huh` form like the globals form; changes write
   `preferences` and save via the standard atomic save path (DESIGN §3.4).
-  Quick keys (theme cycle in Main, animation toggle in run mode) write the
-  same object — shortcuts only.
+  Quick keys (`t`/`shift+t` theme cycle in Main, animation toggle in run
+  mode — the latter lands with item 5) write the same object — shortcuts
+  only.
 - **First-run:** no preferences step in first-run setup; defaults apply.
 
 ### 2.7 Suggested order within Release 1

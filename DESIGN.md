@@ -53,6 +53,10 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
     "ip_address": "127.0.0.1",
     "port": 9080
   },
+  "preferences": {          // optional; absent == defaults
+    "theme": "auto",        // palette ID from the TUI table; "auto" is default
+    "animations": true      // default true; explicit false is honored
+  },
   "models": [
     {
       "alias": "qwen3.6-27B",
@@ -338,6 +342,8 @@ When **no** models are configured, the list is hidden and the screen reverts to 
 | `Enter` | Run the selected model. If the model has 0 or 1 presets it spawns directly; with 2+ presets the box pivots to a preset sub-list with the same Enter/Esc semantics |
 | `Esc` | Back out of the preset sub-list to the model list |
 | `c` | Configuration mode |
+| `s` | Settings mode (theme, animations — edits `preferences`) |
+| `t` / `Shift+t` | Cycle theme forward / backward (writes `preferences.theme`; `Shift+t` is not shown in the shortcut row) |
 | `?` | Help overlay |
 | `q` | Quit |
 | `a` | Attach to running session (only shown when a session is running) |
@@ -657,10 +663,21 @@ llamaman/
 
 ### 10.4 Theme
 
-- `lipgloss.HasDarkBackground()` chooses palette (light / dark).
-- Two built-in palettes, no user customization currently.
-- Accent: soft orange (`#E8A33D`-ish).
-- Status indicators: green ready, yellow starting, red error, gray exited.
+- `preferences.theme` selects a palette (default `auto`); the palette
+  table and resolver live in `internal/tui/theme.go` (DESIGN §15.1).
+  23 curated palettes: llamaman (the original hard-coded theme,
+  background-adaptive), 11 dark + 11 light official counterparts.
+  `auto` and `llamaman` resolve to the same adaptive pair.
+- `lipgloss.HasDarkBackground()` picks the dark/light variant for
+  adaptive palettes and drives the P1 compatibility filter: a dark
+  terminal is offered llamaman + dark palettes, a light terminal
+  llamaman + light palettes. An unknown or incompatible stored theme
+  degrades to `auto` with a Warning (never a Block).
+- Every palette field carries its nearest xterm-256 index (computed
+  with the standard 6×6×6-cube + grayscale approximation; ties resolve
+  to the lower index) so 256-color SSH renders correctly.
+- Status indicators: green ready, yellow starting, red error, gray
+  exited (per-palette values).
 - `NO_COLOR` env var honored (Lip Gloss handles automatically).
 
 ### 10.5 Shell completions
@@ -949,4 +966,241 @@ multiple concurrent sessions.
   experimental-grade upstream).
 - Track llama.cpp default-port change 8080 → 9931 (PR #26508) on release;
   llamaman's 9080 default is unaffected unless overridden.
+
+---
+
+## 15. Release 1 — implementation design
+
+One subsection per work item, in §2.7 order. Each subsection is the
+implementation design note for its item: written *before* code (P5) and
+reviewed by the owner; the owner's validation declares the unit done.
+Cross-cutting rules from §14.5 and ROADMAP.md §1 apply to every item.
+The note is updated in the same change as the code it describes; if
+implementation forces a deviation, the note is amended in that same
+change.
+
+### 15.1 Theme system, `preferences` object, Settings mode
+
+**Scope.** Replace the hard-coded `Theme`/`CurrentTheme()` pair in
+`internal/tui/common.go` with a curated palette table; add the new
+top-level `preferences` config object; add a Settings TUI mode that
+edits exactly that object; wire the Main-mode quick keys as shortcuts
+that write the same object (P8). **Non-goals:** no user-defined
+arbitrary colors (ROADMAP §2.1), no animation behavior yet (item 5),
+no CLI flag for theme (config.json is the only source of truth).
+
+#### The `preferences` object (config schema)
+
+Additive `version: 1`, per P2:
+
+```jsonc
+{
+  "version": 1,
+  "globals": { ... },
+  "preferences": {            // optional object; absent == all defaults
+    "theme": "auto",          // string, default "auto"
+    "animations": true        // bool, default true
+  },
+  "models": [ ... ]
+}
+```
+
+- `Config.Preferences *Preferences` — a **pointer**, so the object is
+  omitted from the file until the user actually changes a preference.
+  Untouched configs stay byte-identical on save; the zero value of
+  `Preferences` *is* the defaults, so nil-safe access is trivial.
+- `Preferences { Theme string; Animations *bool }` with JSON tags
+  `theme,omitempty` and `animations,omitempty`. Field-arrival contract:
+  - `theme` absent or empty → `"auto"`.
+  - `animations` absent (`nil`) → `true`. An explicit
+    `"animations": false` is distinct from absent and must survive a
+    save round-trip — hence `*bool`, not `bool` (a plain `bool` with
+    omitempty would silently drop an explicit `false` on the next
+    save).
+- Nil-safe accessor `Config.Prefs() Preferences` (returns the zero
+  value when the pointer is nil) is the only way the TUI reads
+  preferences; callers never dereference the pointer directly.
+- Older binaries reject the whole config with `json: unknown field
+  "preferences"` — the accepted P2 contract; `version` stays 1.
+
+**Validation (P2/P3).** `validatePreferences()` in
+`internal/config/validate.go`: the fields are type-checked by JSON
+decode, so the only config-level rule is that `theme`, when present, is
+a non-empty string. The *semantic* check — is the name a real palette —
+lives in the TUI resolver, **not** in `config.Validate`: `config`
+cannot import `tui` (import direction), and duplicating the palette
+name list in config would break P8 (two sources of truth). An unknown
+name is a **Warning** (never a Block, P3): resolve to `auto`, log to
+the app log, surface in the Settings-mode banner. `llamaman -l` never
+resolves themes (no rendering), so no warning there — acceptable
+because theme is purely visual.
+
+#### Palette table (TUI)
+
+New file `internal/tui/theme.go`. The `Theme` struct stays in
+`common.go` (zones.go and the live bars consume it); the table and the
+resolver are new.
+
+- `type Background int` with `BackgroundAdaptive` / `BackgroundDark` /
+  `BackgroundLight`.
+- `type Palette struct { ID, Display string; Background Background; T Theme }`.
+- `auto` is a **value**, not a palette: it is the default of
+  `preferences.theme` and the fallback for unknown values (§14.1
+  wording kept), and it resolves to the `llamaman` palette. Keeping
+  `auto` as the stored default lets a future release move the default
+  look without a config change.
+- The current hard-coded theme becomes the first-class palette
+  **`llamaman`** (owner decision): display "llamaman (default)", kept
+  **exactly as-is** (the two existing dark/light variants, chosen by
+  terminal background). It is the only **background-adaptive** palette
+  (compatible with any terminal); nothing about its colors or the
+  `auto` behavior changes in this release — it is only named and tabled.
+- Table of 23 curated palettes plus the `auto` value — every dark
+  palette ships its official light counterpart (owner decision:
+  one light theme was not acceptable; either all-dark or dark+light
+  pairs, and light variants add no structural cost). Grouped by
+  family:
+
+| Family | Dark | Light |
+|---|---|---|
+| llamaman | `llamaman` (adaptive — both variants in one palette) | — |
+| Catppuccin | `catppuccin-mocha` | `catppuccin-latte` |
+| Tokyo Night | `tokyo-night` | `tokyo-night-day` |
+| Dracula | `dracula` | `dracula-light` (official name: Alucard) |
+| Gruvbox | `gruvbox-dark` | `gruvbox-light` |
+| Solarized | `solarized-dark` | `solarized-light` |
+| Nord | `nord` | `nord-light` |
+| One Dark | `one-dark` | `one-dark-light` |
+| Kanagawa | `kanagawa` | `kanagawa-lotus` |
+| Monokai | `monokai` | `monokai-light` |
+| Rosé Pine | `rose-pine` | `rose-pine-dawn` |
+| Night Owl | `night-owl` | `light-owl` (official light name) |
+
+  A light terminal sees 12 options (llamaman + 11 light); a dark
+  terminal sees 12 (llamaman + 11 dark) — the background-compatibility
+  filter keeps each picker list short. The `t` / `shift+t` quick keys
+  cycle the 24 entries forward / backward and wrap; the Settings picker
+  scrolls; nothing else changes.
+  Light palettes cost nothing structurally — the mechanism is identical
+  to Solarized Light, which already exercises the light path (resolution,
+  filtering, tests); the work is transcribing each theme's official
+  light hexes (incl. their 256-color intent) and adding table-driven
+  test cases. The official light values are already tuned for contrast
+  on light backgrounds (e.g. Alucard red `#CB3A2A`), so the Status*
+  fields keep the same discipline as the existing llamaman light theme.
+- `llamaman` (and therefore `auto`) keeps today's behavior exactly:
+  `lipgloss.HasDarkBackground()` picks between its dark and light
+  variants.
+- **Resolver** (a pure function of name + background — P9):
+  `ResolveTheme(name string, darkBg bool) (Theme, resolvedID string, ok bool)`.
+  `auto` and `llamaman` both resolve to the `llamaman` palette.
+  Unknown name → (llamaman/auto theme, `"auto"`, `false`); the caller
+  turns `!ok` into the Warning above.
+- **Background compatibility (P1).** A named palette is compatible when
+  its `Background` is `BackgroundAdaptive` or matches the detected
+  terminal background. The Settings picker offers only compatible
+  palettes (+ the `auto` default); the Main quick key cycles only
+  compatible palettes (skipping incompatible ones). A hand-edited
+  incompatible `theme` in config.json → Warning + resolve to `auto`
+  (this path is only reachable by hand-editing, since both TUI surfaces
+  already filter). The Settings screen shows the detected background
+  mode so absent palettes are explainable.
+- **Color discipline (§10.4, P1).** Every palette field keeps the
+  named-color mapping: hexes come from each palette's canonical values,
+  chosen so their nearest 256-color index is the palette's classic
+  xterm value, and each field carries a `// maps to 256-color NNN`
+  comment exactly as today. 8-color terminals degrade through
+  lipgloss's basic-color fallback; NO_COLOR keeps working via termenv
+  with no code change.
+- `CurrentTheme()` is removed. All four mode constructors (main, run,
+  config, firstrun) stop calling it and receive the resolved `Theme`
+  from Root; Root re-resolves on every preferences change and pushes
+  the new theme down via `SetTheme` (MainMode also rebuilds its inline
+  list delegates, which capture the theme).
+
+#### Settings mode (TUI)
+
+- New `internal/tui/settings.go`; `ViewSettings` added to the `View`
+  enum in `root.go`; Root owns the mode exactly like Main/Run/Config.
+- Reached from Main with **`s`** (free key: Main binds ↑/↓, Enter, Esc,
+  tab, `c`, `a`, `?`, `q`). The `?` help overlay lists it; the
+  shortcut row gains an `s` entry and a `t` entry (the `shift+t`
+  backward direction is not shown in the shortcut row — owner call,
+  it is well-known).
+- **Screen.** A `huh` form, styled with the same `configHuhTheme` used
+  by the config-mode forms:
+  - `theme` — `huh.NewSelect` over compatible palettes + `auto`, each
+    option showing the display name and background-mode hint.
+  - `animations` — `huh.NewConfirm` (on/off), default on.
+  - Submit → write `Preferences` into the config, save via the standard
+    atomic path (`config.Save`, §3.4), Root re-resolves the theme, back
+    to Main. Esc → discard, no mutation, back to Main.
+- The form edits the live `cfg.Preferences` and saves on submit — no
+  working copy needed (two scalar fields; the atomic save makes it
+  safe).
+- **Quick keys (P8, shortcuts only).** Main **`t`** cycles the theme
+  forward through compatible palettes + `auto`, and **`shift+t`**
+  cycles backward — both live: resolve → write `preferences.theme` →
+  atomic save → re-render (Bubble Tea reports the key as `T`). Same
+  object, same save path as the Settings form — never a second source
+  of truth. The `?` help overlay (canonical keybinding reference,
+  §7.2) lists `t / shift+t`; the shortcut row shows only `t`.
+- **First-run:** no preferences step (ROADMAP §2.6); defaults apply;
+  the object stays absent until the user visits Settings or presses
+  `t`.
+- **Detach/reattach (P4):** theme is presentation-only, resolved from
+  config at attach/launch; `session.json` is untouched; a theme change
+  while a server runs detached shows on the next attach.
+- `preferences.animations` ships its field + Settings toggle now (P2:
+  field, validation, editor support, and default in the same change)
+  but has no visible effect until item 5 — its default `true` matches
+  today's behavior, and the run-mode quick-key toggle lands with item 5.
+
+#### What changes in config load/save/validate
+
+- `load.go`: no path expansion applies (no paths in `preferences`);
+  `DisallowUnknownFields` already gives older binaries their rejection.
+- `save.go`: unchanged — `json.MarshalIndent` on `Config` handles the
+  `*Preferences` pointer and the `*bool` correctly (nil → omitted,
+  explicit `false` → written).
+- `validate.go`: new `validatePreferences()` with the shape-only rules
+  above; the unknown-theme Warning is emitted by the resolver at theme
+  resolution time, not here.
+
+#### Tests (P9)
+
+- Resolver unit tests: `auto` and `llamaman` resolve to the same
+  adaptive palette (dark/light by injected background); unknown name →
+  `"auto"` + `!ok`; every named palette resolves to its own colors.
+- Deterministic color assertions:
+  `lipgloss.SetColorProfile(termenv.ANSI256)` and
+  `lipgloss.SetHasDarkBackground(bool)` (both exist in lipgloss
+  v1.1.0) force the profile in tests, so snapshots are
+  terminal-independent and tests can assert the **specific 256-color
+  SGR codes** per palette field (P1: "snapshot tests assert specific
+  colors"). Existing snapshots strip ANSI and are unaffected.
+- Config tests: load/save round-trip of `preferences`; absent vs
+  explicit-`false` `animations` survives a save; the object is absent
+  from the file until first edited.
+- Settings-mode snapshots: `s` from Main renders the form; submit saves
+  preferences and returns to Main; `t` cycles the theme and persists.
+- Fakeserver integration tests: unchanged — theme is TUI-local.
+
+#### File map
+
+| File | Change |
+|---|---|
+| `internal/config/types.go` | `Preferences` struct + `Config.Preferences *Preferences` |
+| `internal/config/validate.go` | `validatePreferences` (shape-only rules) |
+| `internal/tui/theme.go` (new) | palette table, `ResolveTheme`, `CompatiblePalettes` |
+| `internal/tui/common.go` | remove `CurrentTheme()`; `Theme` struct stays |
+| `internal/tui/root.go` | `ViewSettings`, `s` routing, theme resolution + `SetTheme` push |
+| `internal/tui/settings.go` (new) | Settings mode + huh form |
+| `internal/tui/main.go` | `t` / `shift+t` quick keys, `s` shortcut + help text, `SetTheme` |
+| `internal/tui/run.go`, `config.go`, `firstrun.go` | constructors take the resolved theme |
+| `DESIGN.md` §3.2 / §7.2 / §10.4 | schema example, key tables, theme section — updated in the same commit as the code |
+
+**Deferred to later items:** animation rendering and the run-mode
+toggle key (item 5, consumes `preferences.animations`); the §12.2
+layout rework consumes palette tokens (item 2).
 
