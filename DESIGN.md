@@ -690,10 +690,10 @@ Explicitly deferred:
 
 - Multiple concurrent sessions (single global port).
 - `--detach` / `--no-tui` flags.
-- Auto-restart on crash.
-- Browser-open shortcut from run mode.
+- Auto-restart on crash. (→ §14.3: planned, opt-in, attached-only.)
+- Browser-open shortcut from run mode. (→ §14.3: planned.)
 - Telemetry of any kind.
-- Themes beyond auto light/dark.
+- Themes beyond auto light/dark. (→ §14.1: planned.)
 - Search / sort options beyond filter + alphabetical.
 - Recently-used sort.
 - Disk-backed log paging (sessions are buffered fully in memory).
@@ -828,3 +828,125 @@ grammar mirrors llama.cpp's own PEG parser in `common/preset.cpp`.
 - Subcommands are dispatched before kong's positional dispatch and have
   their own kong parser (kong v1 cannot mix positional args and `cmd:`
   branches on one struct).
+
+---
+
+## 14. Roadmap
+
+Agreed roadmap for the next releases (owner decision, August 2026). Scope,
+constraints, risks, and implementation order are tracked in detail in
+`ROADMAP.md` at the repo root; this section records the decisions so they are
+not relitigated. Three releases, in priority order 4 → 2 → (3 + 1).
+
+### 14.1 Release 1 — Polish
+
+- **Multi-palette theme system.** `Theme`/`CurrentTheme()` in
+  `internal/tui/common.go` become a palette table (4–6 curated palettes +
+  `auto`). New additive v1 field `preferences.theme` (string); unknown value
+  → warning + `auto`. Picker lives in the Settings mode (§14.1); a Main-mode
+  quick key cycles live — both write `preferences.theme`. Palettes declare a
+  background mode; incompatible choices warn and fall back (P1). Every
+  palette keeps the named 256-color mapping (§10.4).
+- **Settings mode & `preferences` object.** New top-level `preferences`
+  object, separate from `globals` (owner decision — `globals` stays
+  launch-param-only: host, port, binary, models-files). New Bubble Tea mode
+  under Root, reachable from Main, editing exactly `preferences`. Release 1
+  fields: `theme`, `animations`. Quick keys write the same object —
+  shortcuts, not a second source of truth (P8).
+- **Log & status readability.** Render-time colorizing of llama-server log
+  lines by kind (ERROR/WARN/TIMING/INFO), ready-marker highlight, unicode
+  status glyphs, terminal title via OSC escape. Search/jump/scrollback and
+  the on-disk log are unaffected.
+- **Load-progress indicator.** Live phase/progress line parsed from stderr
+  (model load → layer offload → HF download % → listening). **Hard
+  constraint:** separate from the `[STARTING]` badge — nothing replaces it.
+  Tolerant classifiers; unknown phase degrades to today's static UI.
+- **Subtle color animation.** `tea.Tick` ≤ 4 fps; true-color lerp with a
+  2–3 step discrete fallback on 256-color (P1). Scoped to: load-progress
+  fill, `[STARTING]` badge breathing, status-dot pulse while generating. No
+  wordmark animation; steady state stays static; snapshot tests freeze a
+  fake clock. No desktop notifications. **User control (P10):** gated by
+  `preferences.animations`, default **on**; toggled in Settings mode.
+- **Main-mode layout rework.** Implement §12.2 as designed.
+
+### 14.2 Release 2 — Acquisition
+
+- **Hybrid storage.** Managed downloads write into llama.cpp's HF cache
+  layout by default (`$LLAMA_CACHE` / `~/.cache/llama.cpp`, `<org>__<model>/`
+  folders; tolerate the legacy `~/.cache/huggingface/hub` layout for reads),
+  with optional `preferences.models-dir` override. One copy shared with
+  `llama-cli`/`--hf-repo`; router `(cache)` tags line up.
+- **Managed downloads.** llamaman downloads GGUFs itself (HF API `tree/main`
+  for list+sizes+sha256, `resolve/main` with `Range` for resume), live
+  progress in the TUI, sha256 verify. An `hf` config model is checked against
+  the cache first and only downloaded when missing, then run via `--model`.
+  Token support for gated repos (`HF_TOKEN` env or config). `mmproj`
+  downloaded alongside when present.
+- **Quantization picker.** Per-quant real file sizes from the HF API, with a
+  "fits VRAM" hint powered by the §14.3 estimator.
+- **Storage manager.** Sizes, free space, delete-with-confirmation; never
+  deletes config entries without asking.
+- **HF model browser.** Search/browse HF in the TUI (search API,
+  `filter=gguf`), metadata display, hand-off into config/download. Largest
+  item; may slip to Release 3 under effort pressure.
+- **Router note.** llama.cpp's router downloads internally; managed downloads
+  apply to single-model runs; router progress is surfaced only. Rewriting
+  router presets to local paths is a deferred implementation decision.
+
+### 14.3 Release 3 — Trust & Touch
+
+- **Crash diagnostics & auto-restart.** Crash view (exit code with
+  interpretation + log tail) and optional auto-restart with exponential
+  backoff while attached. **Default off** (opt-in). Detached-server
+  watchdog is out of scope (no daemon mode).
+- **VRAM preflight.** Rough (±20%) footprint estimate vs NVML VRAM before
+  launch; warn, never block. Silent when NVML is unavailable. Feeds the
+  quant picker's "fits VRAM" hints.
+- **Pre-spawn checks.** Port-in-use probe with next-free-port offer (never a
+  silent port change; CLI keeps exit code 4), free-disk check before
+  downloads, HF repo existence validation.
+- **Quick test prompt.** One key → small `/v1/chat/completions` request →
+  overlay with TTFT + first tokens.
+- **KV-cache pause/resume.** Save/restore via `/slots?action=save` with
+  `--slot-save-path` (a normal preset param); TUI save/restore actions and a
+  saved-slots list. Disabled for multimodal presets (llama.cpp #19466).
+- **Web-UI shortcut.** `xdg-open http://<host>:<port>/` to llama-server's
+  built-in UI; warning line if `xdg-open` is absent.
+
+### 14.4 Deferred (do not re-propose without new information)
+
+Desktop notifications; gradient wordmark (lipgloss v1.1.0 has no gradient
+API); wordmark breathing; LoRA hot-swap; cancel-in-flight generation;
+restart-with-edited-params (stays §11); config migration machinery (§12.1 —
+additive v1 covers the roadmap, so no migration is triggered); health
+watchdog (process alive but HTTP hung); daemon mode / detached watchdog;
+multiple concurrent sessions.
+
+### 14.5 Cross-cutting rules
+
+- All new config fields are additive `version: 1`. New top-level
+  `preferences` object holds user preferences (`theme`, `animations`, later
+  `models-dir`, auto-restart); `globals` stays launch-param-only. §12.1
+  stays dormant (P2).
+- P1 visual contract: capability ladder truecolor → 256 → 8/bold →
+  NO_COLOR; palette hexes map to 256; palettes declare background mode.
+- P3 severity taxonomy: Info / Warning / Block; block only when the
+  operation cannot proceed (exit codes 2/3/4); TUI offers recovery where
+  the CLI exits.
+- P6: documented minimum llama.cpp build; tolerant below floor for
+  single-model use, hard gates for version-dependent features; CI floor →
+  latest. Tolerant parsers; degrade to static UI, never crash.
+- P7 network & privacy: requests only for explicit user actions, only to
+  user-specified hosts; no telemetry, no implicit update checks.
+- P8 single source of truth: config.json is the only definition; file-vs-
+  config disagreement warns, never silently reconciles.
+- P9 determinism: in-process snapshot tests, injectable clock/fetcher/
+  spawner; unit tests need no real llama-server or terminal.
+- P10 user control: anything costing performance/battery or changing
+  behavior is toggleable in Settings mode; animations default on.
+- Full principle texts live in ROADMAP.md §1.
+- Version-gate router features; tolerate endpoint drift (router mode is
+  experimental-grade upstream).
+- Track llama.cpp default-port change 8080 → 9931 (PR #26508) on release;
+  llamaman's 9080 default is unaffected unless overridden.
+
