@@ -221,6 +221,96 @@ func TestSnapshotMainModeShowsRunningMarker(t *testing.T) {
 	}
 }
 
+// TestSnapshotMainShowsSourceTags pins §15.2 item 3: every model row
+// carries its source kind (local / hf) and router rows carry "router".
+func TestSnapshotMainShowsSourceTags(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	cfg.Models[1].HF = "org/repo:Q4_K_M" // beta becomes an hf model
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	for _, want := range []string{"local  alpha", "hf     beta"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("row missing source tag %q\nout:\n%s", want, out)
+		}
+	}
+}
+
+// TestSnapshotMainPresetPreviewOnHighlight pins §15.2 item 4: the
+// highlighted row with 2+ presets shows the actual preset names;
+// non-highlighted rows keep the bare count.
+func TestSnapshotMainPresetPreviewOnHighlight(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	// alpha (1 preset) highlighted first: no preview expansion.
+	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
+	if !strings.Contains(out, "1 preset: default") {
+		t.Errorf("single-preset row should show its name\nout:\n%s", out)
+	}
+
+	// Move highlight to beta (2 presets): preview shows the names.
+	out = driveRoot(t, root, tea.KeyMsg{Type: tea.KeyDown})
+	for _, want := range []string{"2 presets: default · smallctx"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("highlighted multi-preset row should preview names %q\nout:\n%s", want, out)
+		}
+	}
+}
+
+// TestSnapshotMainPresetPreviewEllipsizesOnNarrowTerminal pins the
+// single-line ellipsis: at a narrow width the preview truncates with
+// "…" instead of overflowing the row.
+func TestSnapshotMainPresetPreviewEllipsizesOnNarrowTerminal(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 40, Height: 30},
+		tea.KeyMsg{Type: tea.KeyDown}, // highlight beta
+	)
+	if !strings.Contains(out, "…") {
+		t.Errorf("narrow terminal should ellipsize the preset preview\nout:\n%s", out)
+	}
+	if strings.Contains(out, "smallctx") {
+		t.Errorf("narrow terminal preview must be truncated, found full names\nout:\n%s", out)
+	}
+}
+
+// TestSnapshotMainHeaderStripAbsentWithoutSession: no session → no
+// "Detached" text anywhere (the strip is session-only, §15.2).
+func TestSnapshotMainHeaderStripAbsentWithoutSession(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
+	if strings.Contains(out, "Detached") {
+		t.Errorf("header strip must be absent without a running session\nout:\n%s", out)
+	}
+}
+
+// TestSnapshotMainHeaderStripPresentWhenRunning pins §15.2 item 1: with
+// a session, the full-width strip renders the detached line text at the
+// top of the viewport.
+func TestSnapshotMainHeaderStripPresentWhenRunning(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{runningAlias: "alpha"}, nil, "v0.0.0-test", nil)
+	root.refreshSessionState()
+
+	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	for _, want := range []string{"▶ Detached:", "alpha", "9080", "press a to attach"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("header strip missing %q\nout:\n%s", want, out)
+		}
+	}
+	// The strip must be the first content line (before the wordmark).
+	if !strings.HasPrefix(strings.TrimSpace(out), "╭") {
+		t.Errorf("header strip should be the top element, got:\n%s", out)
+	}
+}
+
 // TestSnapshotMainModePivotsToPresetSubList exercises the multi-preset
 // pivot: navigating to `beta` (2 presets) and pressing Enter swaps the
 // inline list to show the preset names.

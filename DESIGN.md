@@ -332,7 +332,7 @@ Modal dialogs (quit prompt, kill confirm, restart confirm, help, config-mode for
 
 Centered window. Top: stylized "llamaman" wordmark (figlet-style, baked-in font, no runtime dependency). Below: version + tagline.
 
-When at least one model is configured, a bordered single-line-per-row selection list is embedded directly in the landing screen between the version line and the shortcuts. The first model is pre-selected; the row is reverse-video. Each row shows the alias, an optional `(running)` marker, and a subtle preset-count summary.
+When at least one model is configured, a bordered single-line-per-row selection list is embedded directly in the landing screen between the version line and the shortcuts. The first model is pre-selected; the row is reverse-video. Each row shows a leading source tag (`local` / `hf` / `router`, in Muted — §15.2), the alias, an optional `(running)` marker, and a subtle preset-count summary. The highlighted model row with 2+ presets previews the preset names in its description, ellipsized to the row width (§15.2); the list box grows with wide terminals (cap 90 cols).
 
 When **no** models are configured, the list is hidden and the screen reverts to its bare wordmark + shortcuts form so first-run users aren't confronted with an empty box.
 
@@ -348,7 +348,7 @@ When **no** models are configured, the list is hidden and the screen reverts to 
 | `q` | Quit |
 | `a` | Attach to running session (only shown when a session is running) |
 
-If a session is running, an additional line appears above the list: `▶ Detached: <alias>/<preset> listening on :<port> — press a to attach`.
+If a session is running, a full-width header strip appears at the top of the viewport: `▶ Detached: <alias>/<preset> listening on :<port> — press a to attach` (alias in Accent, rest in StatusReady; §15.2). The `a` shortcut chip appears in the shortcut row while a session is running.
 
 Order: rows follow the configuration order (`models[]` in the JSON). No alphabetical sort — users who reorder via Shift+↑/↓ in configuration mode see the change reflected here.
 
@@ -1213,4 +1213,81 @@ resolver are new.
 **Deferred to later items:** animation rendering and the run-mode
 toggle key (item 5, consumes `preferences.animations`); the §12.2
 layout rework consumes palette tokens (item 2).
+
+### 15.2 Main-mode layout rework (§12.2)
+
+**Goal.** Make Main mode surface what the user wants at a glance and use
+the terminal it has. Commits the four §12.2 "likely to change" items:
+per-row source kind, a session header strip, preset preview on the
+highlighted row, and wider lists on wide terminals. Pure presentation —
+no server-side state, no new mode, no new keys, `?` help overlay stays
+canonical (§12.2 constraints). Consumes the §15.1 palette tokens.
+
+**Layout, top to bottom:**
+
+1. **Session header strip** — rendered only when a session is running
+   (otherwise omitted; the screen stays clean). A full-width bordered
+   box at the top of the Main viewport, replacing the current centered
+   detached line (`renderDetached`):
+   `▶ Detached: <alias>/<preset> listening on :<port> — press a to attach`
+   - alias in `Accent`, the rest in `StatusReady` (same family as
+     today's line); border uses `Border`.
+   - Router sessions keep reporting the models-file path as alias
+     (existing behavior).
+   - "Sticky" is a non-issue here: Main is a single non-scrolling
+     screen, so the strip is simply the top element of its View.
+
+2. **Wider list on wide terminals** — the inline list box width cap
+   grows from 60 to **90** columns (`min(90, width − 8)`, floor stays
+   20). This is the only width-dependent change; no behavioral
+   threshold.
+
+3. **Per-row source tag** — every row gains a leading tag rendered in
+   `Muted` before the alias: `local` (config model with `location`),
+   `hf` (config model with Hugging Face ID), `router` (my-models.ini
+   source). So users see at a glance which models will hit the network
+   on first launch. The `(running)` suffix and the alias stay.
+
+4. **Preset preview on highlight** — when the highlighted row is a
+   config model with ≥ 2 presets, its description line shows the actual
+   preset names instead of the bare count, single line, ellipsized to
+   the row width (`2 presets: fast · smallctx · …`). 1 preset already
+   shows its name; 0 shows `0 presets`. **Committed decision:** the
+   preview is single-line (height-stable, no variable-height delegate
+   requirement in bubbles/list); the two-line expand is deferred. The
+   preview is passive — Enter still pivots to the preset sub-list to
+   launch (§7.2 mechanics unchanged).
+
+5. **Router rows** — tag `router`; description unchanged
+   (`router · N models — <path>`).
+
+**Palette tokens (from §15.1).** source tags → `Muted`; preset preview →
+`Subtle`; header strip → `StatusReady` + `Accent` alias; borders →
+`Border`/`BorderFocus` as today; wordmark → `Accent` (unchanged).
+`SetTheme` (item 1) already rebuilds the inline delegates, so a theme
+change re-renders all of this consistently.
+
+**Constraints preserved (§12.2).** The no-models empty state stays
+minimal (wordmark + shortcuts, no empty list box); configuration-file
+row order remains the visible order; every existing keybinding keeps
+its meaning (no new keys, so §7.2 and the help overlay text are
+unchanged).
+
+**Determinism (P9).** All changes are pure render. Snapshot tests
+assert: source tags on local/hf/router rows; preset names on the
+highlighted multi-preset row (and count-only on non-highlighted rows);
+the header strip when a session is running and its absence otherwise;
+the list-box width on a wide window. Existing key-driven tests are
+unaffected (no key changes).
+
+**Non-goals.** No per-user layout preferences (the `preferences` object
+stays item 1's scope); no server-side changes; no new TUI mode; no
+change to the preset-pivot mechanics; no two-line row expansion in v1.
+
+**File map.** `internal/tui/main.go` — `renderDetached` → session header
+strip, `inlineDelegate.Render` (source tag + preset preview), `listWidth`
+cap 60 → 90. `internal/tui/main_test.go` + `snapshot_test.go` — updated
+and new assertions. No `root.go` changes (the strip is part of Main's
+View). DESIGN §7.2 gains the row-layout description in the same change
+(P5).
 

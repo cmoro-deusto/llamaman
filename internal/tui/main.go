@@ -206,8 +206,11 @@ func (p presetItem) FilterValue() string { return p.preset.Name }
 
 // inlineDelegate renders one row per item with reverse video on the
 // selected row. Theme-aware via the Subtle color for the trailing meta
-// (preset count / preset description). Single row, no spacing — the
-// embedded list is a compact picker, not a screen-full menu.
+// (preset count / preset description). Each row carries a leading
+// source tag in Muted — local / hf / router (DESIGN §15.2) — and the
+// highlighted model row with 2+ presets previews the preset names in
+// its description, ellipsized to the row width. Single row, no spacing
+// — the embedded list is a compact picker, not a screen-full menu.
 type inlineDelegate struct {
 	theme Theme
 }
@@ -217,18 +220,34 @@ func (d inlineDelegate) Spacing() int                            { return 0 }
 func (d inlineDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
 
 func (d inlineDelegate) Render(w io.Writer, lm list.Model, index int, item list.Item) {
-	type titled interface {
-		Title() string
-		Description() string
-	}
-	t, ok := item.(titled)
-	if !ok {
+	subtle := lipgloss.NewStyle().Foreground(d.theme.Subtle)
+	muted := lipgloss.NewStyle().Foreground(d.theme.Muted)
+
+	var tag, title, desc string
+	switch it := item.(type) {
+	case modelItem:
+		tag = it.model.SourceLabel() // "local" | "hf"
+		title = it.Title()
+		desc = it.Description()
+		if index == lm.Index() && len(it.model.Presets) >= 2 {
+			desc = previewPresets(it.model, lm.Width())
+		}
+	case routerItem:
+		tag = "router"
+		title = it.Title()
+		desc = it.Description()
+	case presetItem: // preset sub-list rows carry no source tag
+		title = it.Title()
+		desc = it.Description()
+	default:
 		return
 	}
-	title := t.Title()
-	desc := t.Description()
-	subtle := lipgloss.NewStyle().Foreground(d.theme.Subtle)
+
 	row := title + "  " + subtle.Render("· "+desc)
+	if tag != "" {
+		tagCol := tag + strings.Repeat(" ", 6-len(tag))
+		row = muted.Render(tagCol) + " " + row
+	}
 	if index == lm.Index() {
 		// Reverse video for the highlighted row. Literal SGR (not
 		// lipgloss.Reverse) so it's deterministic without a TTY.
@@ -236,6 +255,36 @@ func (d inlineDelegate) Render(w io.Writer, lm list.Model, index int, item list.
 		return
 	}
 	fmt.Fprint(w, row)
+}
+
+// previewPresets builds the highlighted-row description for a model
+// with 2+ presets: the count plus the actual preset names, ellipsized
+// to fit the remaining row width (DESIGN §15.2 item 4).
+func previewPresets(m config.Model, rowWidth int) string {
+	names := make([]string, 0, len(m.Presets))
+	for _, p := range m.Presets {
+		names = append(names, p.Name)
+	}
+	s := fmt.Sprintf("%d presets: %s", len(m.Presets), strings.Join(names, " · "))
+	// The leading tag column (7), title, and "· " separator consume the
+	// rest of the row; a conservative overhead keeps the ellipsis sane.
+	const overhead = 14
+	if avail := rowWidth - overhead; avail > 0 && len([]rune(s)) > avail {
+		return truncateRunes(s, avail)
+	}
+	return s
+}
+
+// truncateRunes cuts s to at most max runes, appending an ellipsis.
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	if max <= 1 {
+		return "…"
+	}
+	return string(r[:max-1]) + "…"
 }
 
 func (m *MainMode) rebuildModels() {
@@ -326,10 +375,11 @@ func (m *MainMode) rebuildPresets(model config.Model) {
 
 // listInnerWidth is the inner content width for the bordered list (a
 // little narrower than the terminal so the box reads as "inside"
-// rather than "edge to edge"). Capped so very wide terminals don't
-// stretch single-line rows uncomfortably.
+// rather than "edge to edge"). Grows with wide terminals (cap 90,
+// DESIGN §15.2) so rows can show more; capped so single-line rows
+// don't stretch uncomfortably.
 func (m *MainMode) listWidth() int {
-	const max = 60
+	const max = 90
 	w := m.width - 8
 	if w > max {
 		w = max
@@ -375,13 +425,25 @@ func (m *MainMode) applyListSize() {
 
 // ---- rendering ----
 
-// View renders the main screen, centered in the current terminal window.
+// View renders the main screen, centered in the current terminal
+// window. When a session is running, a full-width session header strip
+// (DESIGN §15.2) sits at the top of the viewport; the centered column
+// shrinks to make room.
 func (m MainMode) View() string {
 	if m.width == 0 || m.height == 0 {
 		return ""
 	}
+	header := ""
+	height := m.height
+	if m.IsSessionRunning() {
+		header = m.renderSessionHeader() + "\n\n"
+		height -= 4 // strip (3 rows) + blank line
+	}
+	if height < 6 {
+		height = 6
+	}
 	if m.showHelp {
-		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.renderHelp())
+		return header + lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, m.renderHelp())
 	}
 
 	wordmark := lipgloss.NewStyle().
@@ -393,10 +455,6 @@ func (m MainMode) View() string {
 		Render(fmt.Sprintf("llamaman %s — llama-server manager", m.version))
 
 	parts := []string{wordmark, "", tagline}
-
-	if m.IsSessionRunning() {
-		parts = append(parts, "", m.renderDetached())
-	}
 
 	hasModels := m.HasModels()
 	if hasModels {
@@ -416,7 +474,7 @@ func (m MainMode) View() string {
 	}
 
 	body := lipgloss.JoinVertical(lipgloss.Center, parts...)
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, body)
+	return header + lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, body)
 }
 
 func (m MainMode) renderShortcuts() string {
@@ -497,14 +555,27 @@ func (m MainMode) renderFlash() string {
 	return lipgloss.NewStyle().Foreground(col).Render(m.flash)
 }
 
-func (m MainMode) renderDetached() string {
+// renderSessionHeader is the full-width detached-session strip at the
+// top of the Main viewport (DESIGN §15.2), shown only while a session
+// is running. Alias in Accent, the rest in StatusReady.
+func (m MainMode) renderSessionHeader() string {
 	preset := m.runningPreset
 	if preset == "" {
 		preset = "—"
 	}
+	alias := lipgloss.NewStyle().
+		Foreground(m.theme.Accent).
+		Bold(true).
+		Render(m.runningAlias)
 	line := fmt.Sprintf("▶ Detached: %s/%s listening on :%d — press a to attach",
-		m.runningAlias, preset, m.runningPort)
-	return lipgloss.NewStyle().Foreground(m.theme.StatusReady).Render(line)
+		alias, preset, m.runningPort)
+	line = lipgloss.NewStyle().Foreground(m.theme.StatusReady).Render(line)
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.theme.Border).
+		Padding(0, 1).
+		Width(max(0, m.width-4)).
+		Render(line)
 }
 
 func (m MainMode) renderHelp() string {
