@@ -68,10 +68,12 @@ type RunMode struct {
 
 	// Load-progress state (§15.4): newest parsed phase/progress while
 	// starting, plus the minimum-visible deadline (2s from the last
-	// phase line).
+	// phase line) and the partial-line accumulator for raw tailer
+	// chunks.
 	loadPhase      string
 	loadProgress   *float64
 	loadPhaseUntil time.Time
+	loadPartial    string
 	argv           []string
 	routerFile     string // my-models.ini path for router-mode runs; "" otherwise
 	warnings       []string
@@ -3330,6 +3332,9 @@ func parseLoadPhase(line string) (phase string, progress *float64) {
 	if loadOffloadingRE.MatchString(line) {
 		return "offloading layers to GPU", nil
 	}
+	if loadOffloadOutputRE.MatchString(line) {
+		return "offloading layers to GPU", nil
+	}
 	if m := loadDownloadRE.FindStringSubmatch(line); m != nil {
 		if pct, err := strconv.ParseFloat(m[1], 64); err == nil && pct >= 0 && pct <= 100 {
 			p := pct / 100
@@ -3340,14 +3345,19 @@ func parseLoadPhase(line string) (phase string, progress *float64) {
 	if loadLoadingRE.MatchString(line) {
 		return "loading model file", nil
 	}
+	if loadTensorsRE.MatchString(line) {
+		return "loading model tensors", nil
+	}
 	return "", nil
 }
 
 var (
-	loadOffloadedRE  = regexp.MustCompile(`(?i)offloaded\s+(\d+)\s*/\s*(\d+)\s+layers`)
-	loadOffloadingRE = regexp.MustCompile(`(?i)offloading\s+\d+\s+repeating\s+layers`)
-	loadDownloadRE   = regexp.MustCompile(`(?i)(?:downloading|download).*?(\d+(?:\.\d+)?)\s*%`)
-	loadLoadingRE    = regexp.MustCompile(`(?i)loading\s+model\s+(?:from|file)`)
+	loadOffloadedRE     = regexp.MustCompile(`(?i)offloaded\s+(\d+)\s*/\s*(\d+)\s+layers`)
+	loadOffloadingRE    = regexp.MustCompile(`(?i)offloading\s+\d+\s+repeating\s+layers`)
+	loadOffloadOutputRE = regexp.MustCompile(`(?i)offloading output layer`)
+	loadDownloadRE      = regexp.MustCompile(`(?i)(?:downloading|download).*?(\d+(?:\.\d+)?)\s*%`)
+	loadLoadingRE       = regexp.MustCompile(`(?i)loading\s+model\s+(?:from|file)`)
+	loadTensorsRE       = regexp.MustCompile(`(?i)loading model tensors`)
 )
 
 // showingLoadBlock reports whether the left panel should show the
@@ -3402,12 +3412,18 @@ func progressBar(frac float64, width int) string {
 
 // ingestLoadChunk feeds a log chunk to the load-progress classifier
 // (§15.4): while starting, the newest phase/progress is kept and the
-// 2s minimum-visible deadline extends on every update.
+// 2s minimum-visible deadline extends on every update. The tailer
+// delivers raw 4096-byte chunks that can split a line in two, so a
+// partial-line accumulator reassembles them before parsing (owner
+// feedback: only "loading…" ever showed).
 func (r *RunMode) ingestLoadChunk(chunk string) {
 	if r.status != StatusStarting {
 		return
 	}
-	for _, ln := range strings.Split(chunk, "\n") {
+	joined := r.loadPartial + chunk
+	lines := strings.Split(joined, "\n")
+	r.loadPartial = lines[len(lines)-1] // keep the unfinished tail
+	for _, ln := range lines[:len(lines)-1] {
 		if phase, prog := parseLoadPhase(ln); phase != "" {
 			r.loadPhase = phase
 			r.loadProgress = prog

@@ -129,6 +129,9 @@ func TestParseLoadPhase(t *testing.T) {
 		{"llm_load_tensors: offloaded 16/33 layers to GPU", "offloading layers to GPU", frac(16, 33)},
 		{"llm_load_tensors: offloaded 33/33 layers to GPU", "offloading layers to GPU", frac(1, 1)},
 		{"llm_load_tensors: offloading 16 repeating layers to GPU", "offloading layers to GPU", nil},
+		{"0.00.573.859 I llm_load_tensors: offloaded 16/33 layers to GPU", "offloading layers to GPU", frac(16, 33)},
+		{"llm_load_tensors: offloading output layer to GPU", "offloading layers to GPU", nil},
+		{"llama_model_loader: loading model tensors, this can take a while...", "loading model tensors", nil},
 		{"main: downloading model from hf.co/org/repo:quant ... 50%", "downloading model", half()},
 		{"downloading model.gguf 50%", "downloading model", half()},
 		{"loading model from /m/model.gguf", "loading model file", nil},
@@ -204,6 +207,28 @@ func TestRunModeIngestLoadChunk(t *testing.T) {
 	r.ingestLoadChunk("llm_load_tensors: offloaded 33/33 layers to GPU\n")
 	if r.loadPhase != "offloading layers to GPU" {
 		t.Error("chunks after ready must not overwrite the phase")
+	}
+}
+
+// TestRunModeIngestLoadChunkReassemblesSplitLines pins the partial-line
+// accumulator: the tailer delivers raw 4096-byte chunks, so a phase
+// line split across two chunks must still be detected (owner feedback:
+// only "loading…" ever showed with a real server).
+func TestRunModeIngestLoadChunkReassemblesSplitLines(t *testing.T) {
+	r := &RunMode{status: StatusStarting}
+	r.ingestLoadChunk("llm_load_tensors: offloaded 16/")
+	if r.loadPhase != "" {
+		t.Fatalf("partial line must not match yet, got %q", r.loadPhase)
+	}
+	r.ingestLoadChunk("33 layers to GPU\nmain: server is listening on\n")
+	if r.loadPhase != "offloading layers to GPU" {
+		t.Fatalf("reassembled line must be detected, got %q", r.loadPhase)
+	}
+	if r.loadProgress == nil || *r.loadProgress < 0.48 || *r.loadProgress > 0.49 {
+		t.Errorf("progress = %v, want ≈16/33", r.loadProgress)
+	}
+	if r.loadPartial != "" {
+		t.Errorf("partial accumulator must be empty after a complete line, got %q", r.loadPartial)
 	}
 }
 
