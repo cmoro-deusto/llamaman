@@ -243,14 +243,34 @@ func (d inlineDelegate) Render(w io.Writer, lm list.Model, index int, item list.
 		return
 	}
 
-	row := title + "  " + subtle.Render("· "+desc)
+	// Clamp the description so the row never exceeds the list width
+	// (long router paths, previews): bubbles/list does not pad custom
+	// delegate output, so an unclamped row would widen the enclosing
+	// box (DESIGN §15.2).
+	prefix := title
+	if tag != "" {
+		prefix = tag + strings.Repeat(" ", 6-len(tag)) + " " + title
+	}
+	const sep = "  · " // visible separator before the description
+	if avail := lm.Width() - lipgloss.Width(prefix) - len(sep); avail > 8 {
+		desc = truncateRunes(desc, avail)
+	}
+
+	row := title + sep + subtle.Render(desc)
 	if tag != "" {
 		tagCol := tag + strings.Repeat(" ", 6-len(tag))
 		row = muted.Render(tagCol) + " " + row
 	}
+
+	// Pad every row to the list width so the box keeps a stable size
+	// regardless of which row is highlighted.
+	if pad := lm.Width() - lipgloss.Width(row); pad > 0 {
+		row += strings.Repeat(" ", pad)
+	}
+
 	if index == lm.Index() {
-		// Reverse video for the highlighted row. Literal SGR (not
-		// lipgloss.Reverse) so it's deterministic without a TTY.
+		// Reverse video for the highlighted row, full row width. Literal
+		// SGR (not lipgloss.Reverse) so it's deterministic without a TTY.
 		fmt.Fprint(w, "\x1b[7m"+row+"\x1b[0m")
 		return
 	}

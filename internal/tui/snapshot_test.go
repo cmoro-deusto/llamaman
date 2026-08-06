@@ -221,6 +221,33 @@ func TestSnapshotMainModeShowsRunningMarker(t *testing.T) {
 	}
 }
 
+// TestSnapshotMainListBoxStableWidth pins the box-sizing fix: bubbles
+// list does not pad custom delegate output, so rows must be padded to
+// the list width or the enclosing box resizes when the highlighted
+// row's description length changes (§15.2 — owner feedback).
+func TestSnapshotMainListBoxStableWidth(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	boxWidth := func() int {
+		for _, l := range strings.Split(stripANSI(root.mainMode.View()), "\n") {
+			if strings.Contains(l, "╭") && strings.Contains(l, "──") {
+				return strings.Count(l, "─")
+			}
+		}
+		t.Fatal("list box top border not found")
+		return 0
+	}
+
+	before := boxWidth()
+	driveRoot(t, root, tea.KeyMsg{Type: tea.KeyDown}) // highlight beta (2 presets)
+	after := boxWidth()
+	if before != after {
+		t.Errorf("list box width changed with highlighted row: %d -> %d", before, after)
+	}
+}
+
 // TestSnapshotMainShowsSourceTags pins §15.2 item 3: every model row
 // carries its source kind (local / hf) and router rows carry "router".
 func TestSnapshotMainShowsSourceTags(t *testing.T) {
@@ -350,9 +377,10 @@ func TestSnapshotMainModeRouterDefaultSource(t *testing.T) {
 		tea.KeyMsg{Type: tea.KeyTab}, // Single → Router
 	)
 
-	want := filepath.Join(dir, modelsini.DefaultModelsIniName)
-	if !strings.Contains(out, want) {
-		t.Errorf("router view missing derived default source %q; out:\n%s", want, out)
+	// The derived default source appears (its full path may be
+	// ellipsized on narrower boxes — §15.2 keeps rows width-stable).
+	if !strings.Contains(out, modelsini.DefaultModelsIniName) {
+		t.Errorf("router view missing derived default source %q; out:\n%s", modelsini.DefaultModelsIniName, out)
 	}
 	if strings.Contains(out, "alpha") {
 		t.Errorf("router view should not list config models; out:\n%s", out)
