@@ -22,8 +22,9 @@ interview (August 2026) — each principle is a decision, not prose.
   bold/dim), and NO_COLOR (honored automatically via lipgloss/termenv).
   Palette hexes must map to good 256-color indices (existing DESIGN §10.4
   discipline). Palettes declare a background mode; the theme picker offers
-  only compatible palettes, and an incompatible choice warns and falls back
-  to `auto`.
+  both variants of every family (owner decision), and an incompatible
+  choice warns and **applies** — only an unknown value falls back to
+  `auto` (P3).
 - **P2 — Additive v1 schema with trigger + field-arrival contract.** Config
   stays additive `version: 1`; older binaries reject new fields with
   `json: unknown field` (existing behavior). Additive v1 ends only when a

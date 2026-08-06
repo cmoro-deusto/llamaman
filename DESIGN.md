@@ -669,10 +669,10 @@ llamaman/
   background-adaptive), 11 dark + 11 light official counterparts.
   `auto` and `llamaman` resolve to the same adaptive pair.
 - `lipgloss.HasDarkBackground()` picks the dark/light variant for
-  adaptive palettes and drives the P1 compatibility filter: a dark
-  terminal is offered llamaman + dark palettes, a light terminal
-  llamaman + light palettes. An unknown or incompatible stored theme
-  degrades to `auto` with a Warning (never a Block).
+  adaptive palettes and drives the mismatch warning: a palette whose
+  background differs from the terminal's is applied with a warning,
+  never silently (owner decision — the user may override explicitly).
+  An unknown theme degrades to `auto` with a Warning (never a Block).
 - Every palette field carries its nearest xterm-256 index (computed
   with the standard 6×6×6-cube + grayscale approximation; ties resolve
   to the lower index) so 256-color SSH renders correctly.
@@ -862,7 +862,8 @@ not relitigated. Three releases, in priority order 4 → 2 → (3 + 1).
   `auto`). New additive v1 field `preferences.theme` (string); unknown value
   → warning + `auto`. Picker lives in the Settings mode (§14.1); a Main-mode
   quick key cycles live — both write `preferences.theme`. Palettes declare a
-  background mode; incompatible choices warn and fall back (P1). Every
+  background mode; incompatible choices warn and apply (explicit
+  override, owner decision). Every
   palette keeps the named 256-color mapping (§10.4).
 - **Settings mode & `preferences` object.** New top-level `preferences`
   object, separate from `globals` (owner decision — `globals` stays
@@ -1076,11 +1077,12 @@ resolver are new.
 | Rosé Pine | `rose-pine` | `rose-pine-dawn` |
 | Night Owl | `night-owl` | `light-owl` (official light name) |
 
-  A light terminal sees 12 options (llamaman + 11 light); a dark
-  terminal sees 12 (llamaman + 11 dark) — the background-compatibility
-  filter keeps each picker list short. The `t` / `shift+t` quick keys
-  cycle the 24 entries forward / backward and wrap; the Settings picker
-  scrolls; nothing else changes.
+  A light terminal sees llamaman + all 23 palettes grouped by
+  background — both variants of every family are offered (owner
+  decision: the background is a hint, not a filter). The `t` /
+  `shift+t` quick keys cycle the 24 entries (auto + all palettes)
+  forward / backward and wrap; the Settings picker scrolls; nothing
+  else changes.
   Light palettes cost nothing structurally — the mechanism is identical
   to Solarized Light, which already exercises the light path (resolution,
   filtering, tests); the work is transcribing each theme's official
@@ -1096,15 +1098,15 @@ resolver are new.
   `auto` and `llamaman` both resolve to the `llamaman` palette.
   Unknown name → (llamaman/auto theme, `"auto"`, `false`); the caller
   turns `!ok` into the Warning above.
-- **Background compatibility (P1).** A named palette is compatible when
-  its `Background` is `BackgroundAdaptive` or matches the detected
-  terminal background. The Settings picker offers only compatible
-  palettes (+ the `auto` default); the Main quick key cycles only
-  compatible palettes (skipping incompatible ones). A hand-edited
-  incompatible `theme` in config.json → Warning + resolve to `auto`
-  (this path is only reachable by hand-editing, since both TUI surfaces
-  already filter). The Settings screen shows the detected background
-  mode so absent palettes are explainable.
+- **Background compatibility (P1).** Palettes declare a background
+  mode; compatibility is now a **warning-level hint, not a filter**
+  (owner decision): the Settings picker offers all 23 palettes, both
+  variants, explicitly labeled `(dark)` / `(light)`, and the Settings
+  screen shows the detected terminal background. Choosing a
+  mismatched palette applies it with a warning (banner in Settings,
+  flash in Main) — never a silent fallback. Only a hand-edited
+  *unknown* theme degrades to `auto` with a Warning (P3), since it
+  cannot render.
 - **Color discipline (§10.4, P1).** Every palette field keeps the
   named-color mapping: hexes come from each palette's canonical values,
   chosen so their nearest 256-color index is the palette's classic
@@ -1129,8 +1131,9 @@ resolver are new.
   it is well-known).
 - **Screen.** A `huh` form, styled with the same `configHuhTheme` used
   by the config-mode forms:
-  - `theme` — `huh.NewSelect` over compatible palettes + `auto`, each
-    option showing the display name and background-mode hint.
+  - `theme` — `huh.NewSelect` over all 23 palettes + `auto`, each
+    option showing the display name with an explicit `(dark)` /
+    `(light)` variant label.
   - `animations` — `huh.NewConfirm` (on/off), default on.
   - Submit → write `Preferences` into the config, save via the standard
     atomic path (`config.Save`, §3.4), Root re-resolves the theme, back
@@ -1139,11 +1142,12 @@ resolver are new.
   working copy needed (two scalar fields; the atomic save makes it
   safe).
 - **Quick keys (P8, shortcuts only).** Main **`t`** cycles the theme
-  forward through compatible palettes + `auto`, and **`shift+t`**
-  cycles backward — both live: resolve → write `preferences.theme` →
+  forward through all palettes + `auto`, and **`shift+t`** cycles
+  backward — both live: resolve → write `preferences.theme` →
   atomic save → re-render (Bubble Tea reports the key as `T`). Same
   object, same save path as the Settings form — never a second source
-  of truth. The `?` help overlay (canonical keybinding reference,
+  of truth. A mismatched landed palette flashes its warning instead of
+  being skipped. The `?` help overlay (canonical keybinding reference,
   §7.2) lists `t / shift+t`; the shortcut row shows only `t`.
 - **First-run:** no preferences step (ROADMAP §2.6); defaults apply;
   the object stays absent until the user visits Settings or presses
