@@ -250,7 +250,7 @@ func TestRunModeLoadBlock(t *testing.T) {
 		loadProgress:   &prog,
 		loadPhaseUntil: time.Now().Add(time.Hour), // pinned future
 	}
-	panel := stripANSI(r.renderServerPanel(30))
+	panel := stripANSI(r.renderServerPanel(40))
 	if !strings.Contains(panel, "offloading layers to GPU") || !strings.Contains(panel, "48%") {
 		t.Errorf("starting panel must show the phase + percent\n%s", panel)
 	}
