@@ -1147,23 +1147,28 @@ func (r *RunMode) effectiveQuery() string {
 // renderViewportContent returns the log buffer with per-line kind
 // coloring (DESIGN §15.3, disabled by the log-colors preference) and
 // reverse+bold ANSI for search matches — the current occurrence (the
-// line at searchIdx, §15.3) uses bold+reverse+underline so n/N
-// navigation stands out. Lines stay byte-identical on disk — coloring
-// is render-time only — and search/jump/scrollback operate on the
-// plain lines.
+// line at searchIdx, §15.3) uses bold+reverse tinted with the theme's
+// StatusStart color so n/N navigation stands out. Lines stay
+// byte-identical on disk — coloring is render-time only — and
+// search/jump/scrollback operate on the plain lines.
 func (r *RunMode) renderViewportContent() string {
 	lines := r.visibleLogLines()
 	current := -1
 	if r.searchQuery != "" && len(r.searchMatches) > 0 {
 		current = r.searchMatches[r.searchIdx]
 	}
+	curOpen := r.currentOccurrenceOpen()
 	colors := true
 	if r.cfg != nil {
 		colors = r.cfg.Prefs().LogColorsEnabled()
 	}
 	out := make([]string, len(lines))
 	for i, ln := range lines {
-		hl := highlightOccurrencesCurrent(ln, r.effectiveQuery(), i == current)
+		open := highlightOpen
+		if i == current {
+			open = curOpen
+		}
+		hl := highlightOccurrencesOpen(ln, r.effectiveQuery(), open)
 		if colors {
 			out[i] = r.colorizeLine(hl)
 		} else {
@@ -1266,22 +1271,38 @@ func (r *RunMode) refreshContent() {
 // would otherwise suppress codes when no TTY is detected.
 const (
 	highlightOpen  = "\x1b[1;7m"
-	highlightCur   = "\x1b[1;7;4m"
 	highlightClose = "\x1b[0m"
 )
+
+// currentOccurrenceOpen returns the SGR opening for the current search
+// occurrence: bold + reverse tinted with the theme's StatusStart color,
+// so the match reads as a colored background — clearly distinct from
+// the plain matches (§15.3, owner feedback: color instead of
+// underline). lipgloss.Render("") appends a reset; it is stripped to
+// get the opening sequence.
+func (r *RunMode) currentOccurrenceOpen() string {
+	if r.theme.StatusStart == "" {
+		return highlightOpen // no theme (tests/edge) → plain bold+reverse
+	}
+	s := lipgloss.NewStyle().
+		Foreground(r.theme.StatusStart).
+		Reverse(true).
+		Bold(true).
+		Render("")
+	return strings.TrimSuffix(s, "\x1b[0m")
+}
 
 // highlightOccurrences wraps every non-overlapping case-insensitive
 // match of q in raw with bold+reverse ANSI. Position-stable: matched
 // bytes are taken from raw so original case is preserved. Advances by
 // len(q) after each match to avoid overlap on inputs like "aaa"/"aa".
 func highlightOccurrences(raw, q string) string {
-	return highlightOccurrencesCurrent(raw, q, false)
+	return highlightOccurrencesOpen(raw, q, highlightOpen)
 }
 
-// highlightOccurrencesCurrent is highlightOccurrences with a `current`
-// flag: when true the match spans use bold+reverse+underline so the
-// selected occurrence stands out during n/N navigation (§15.3).
-func highlightOccurrencesCurrent(raw, q string, current bool) string {
+// highlightOccurrencesOpen is highlightOccurrences with an explicit
+// opening SGR, so the current occurrence can use a distinct style.
+func highlightOccurrencesOpen(raw, q, open string) string {
 	if q == "" || raw == "" {
 		return raw
 	}
@@ -1289,10 +1310,6 @@ func highlightOccurrencesCurrent(raw, q string, current bool) string {
 	qLower := strings.ToLower(q)
 	if len(qLower) == 0 || len(qLower) > len(lower) {
 		return raw
-	}
-	open := highlightOpen
-	if current {
-		open = highlightCur
 	}
 	var b strings.Builder
 	b.Grow(len(raw) + 16)
@@ -1344,6 +1361,10 @@ func (r *RunMode) jumpSearch(delta int) tea.Cmd {
 		r.searchIdx += len(r.searchMatches)
 	}
 	target := r.searchMatches[r.searchIdx]
+	// Re-render first so the current-occurrence highlight moves with the
+	// selection, then scroll to the match (owner feedback: the underline
+	// never moved because the viewport content was stale).
+	r.refreshContent()
 	r.viewport.SetYOffset(target)
 	return r.setFlash(fmt.Sprintf("match %d/%d", r.searchIdx+1, len(r.searchMatches)))
 }

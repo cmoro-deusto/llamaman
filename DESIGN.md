@@ -1265,12 +1265,14 @@ reverts the remainder of that line to default color until the next
 line's reset — accepted cosmetic during active search.
 
 **Current search occurrence (owner feedback).** `n`/`N` navigation
-marks the current matching line's matches with **bold+reverse+underline**
-(`1;7;4`) while other matches stay bold+reverse — the selected
-occurrence is distinguishable at a glance. Granularity is per matching
-line (the existing `searchMatches` model). A scanning animation for
-next/previous occurrence is a candidate for item 5 (gated by
-`preferences.animations`), not part of item 3.
+marks the current matching line's matches with **bold+reverse tinted
+with the theme's `StatusStart` color** (a colored background) while
+other matches stay plain bold+reverse — the selected occurrence is
+unmistakable at a glance. The tint moves with the selection
+(`jumpSearch` re-renders before scrolling). Granularity is per
+matching line (the existing `searchMatches` model). A scanning
+animation for next/previous occurrence is a candidate for item 5
+(gated by `preferences.animations`), not part of item 3.
 
 **Log-colors toggle (owner decision: preference + quick key).**
 Coloring is controlled by the new `preferences.log-colors` field

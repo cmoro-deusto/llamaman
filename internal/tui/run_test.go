@@ -205,7 +205,10 @@ func TestRunModeEscInPromptKeepsAppliedWhenTyping(t *testing.T) {
 // path: press /, type a query, press Enter, viewport content has
 // highlights wrapped around the matches.
 func TestRunModeSearchEnterRefreshesHighlights(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(termenv.ColorProfile())
 	r := newTestRunMode("error: failed\nokay\nERROR: again\n")
+	r.theme = DefaultTheme()
 	// Open the search prompt.
 	r.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
 	if !r.searchActive {
@@ -221,20 +224,32 @@ func TestRunModeSearchEnterRefreshesHighlights(t *testing.T) {
 	if r.searchQuery != "error" {
 		t.Errorf("searchQuery = %q, want %q", r.searchQuery, "error")
 	}
+	// Current occurrence (line 0) is tinted with the theme's StatusStart
+	// color (llamaman dark gold #FFD700 → xterm 220); the other match
+	// keeps the plain bold+reverse style.
+	curOpen := r.currentOccurrenceOpen()
 	got := r.viewport.View()
-	// The current occurrence (first match, searchIdx 0) uses the
-	// distinct bold+reverse+underline style; other matches stay
-	// bold+reverse (§15.3).
-	wantCur := highlightCur + "error" + highlightClose
+	wantCur := curOpen + "error" + highlightClose
 	if !strings.Contains(got, wantCur) {
-		t.Errorf("viewport missing current-occurrence wrap\nview: %q", got)
+		t.Errorf("viewport missing current-occurrence wrap %q\nview: %q", wantCur, got)
 	}
-	wantWrapUpper := highlightOpen + "ERROR" + highlightClose
-	if !strings.Contains(got, wantWrapUpper) {
-		t.Errorf("viewport missing wrapped uppercase match\nview: %q", got)
+	wantOther := highlightOpen + "ERROR" + highlightClose
+	if !strings.Contains(got, wantOther) {
+		t.Errorf("viewport missing plain wrap for other match\nview: %q", got)
 	}
 	if strings.Contains(got, highlightOpen+"error"+highlightClose) {
-		t.Errorf("lowercase match (current) must not use the plain style\nview: %q", got)
+		t.Errorf("current match must not use the plain style\nview: %q", got)
+	}
+
+	// n moves the selection: the highlight must move to line 2 (owner
+	// feedback — previously only the first occurrence stayed tinted).
+	r.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	got = r.viewport.View()
+	if !strings.Contains(got, curOpen+"ERROR"+highlightClose) {
+		t.Errorf("after n, the new current occurrence must be tinted\nview: %q", got)
+	}
+	if strings.Contains(got, curOpen+"error"+highlightClose) {
+		t.Errorf("after n, the old current occurrence must lose the tint\nview: %q", got)
 	}
 }
 
