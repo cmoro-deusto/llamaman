@@ -418,7 +418,7 @@ func newRouterTestRunMode(fake *fakeFetcher) *RunMode {
 		viewport:               viewport.New(120, 30),
 		searchInput:            textinput.New(),
 		theme:                  DefaultTheme(),
-		status:                 StatusStarting,
+		status:                 StatusReady, // router panel tests exercise the ready-state list (§15.4 load block needs Starting)
 		fetcher:                fake,
 		routerMetricsAvailable: true,
 		denoise:                true,
@@ -452,6 +452,7 @@ func TestRouterPropsNCtxZeroTransitionsReady(t *testing.T) {
 func TestSingleModelPropsNCtxZeroStaysStarting(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
 	r.routerFile = "" // single-model mode
+	r.status = StatusStarting
 	r.Update(propsFetchedMsg{nctx: 0})
 	if r.status != StatusStarting {
 		t.Errorf("status = %v, want Starting", r.status)

@@ -520,6 +520,18 @@ ANSI color codes from llama-server are passed through (Lip Gloss / `bubbles/view
 
 **Status badge glyphs (§15.3):** the `[READY]`-style badge gains a per-state glyph prefix — `● [READY]`, `◌ [STARTING]`, `✕ [ERROR]`, `◌ [EXITED]` — with the `[STARTING]` label text/format preserved.
 
+**Load-progress indicator (§15.4).** While the server is starting, the
+left panel (llama-server live-data box in single mode, the model list in
+router mode) shows the load-progress block instead of its usual content:
+the latest parsed phase (`loading model file` → `offloading layers to
+GPU: 21/33` → download %) with an `Accent` block bar when a numeric
+progress is known, or a static `loading…` before anything parses.
+Tolerant classifier (§15.4): unknown lines change nothing, and format
+drift degrades to the static text. The block stays visible for a
+minimum of 2 s after the last phase line even once READY (`o`-style
+toggle not applicable — it is load-window-only). Separate from the
+`[STARTING]` badge, which is untouched.
+
 **Terminal title (§15.3):** `tea.SetWindowTitle` sets `llamaman — <alias> [STARTING]` at run-mode entry, `[READY]` on the ready transition, `[ERROR]`/`[EXITED]` on process exit; router runs use the models-file basename. Not restored on exit (v1).
 
 Scrollback: unlimited, in-memory, sourced from the on-disk log file. The whole file is buffered.
@@ -1226,6 +1238,95 @@ resolver are new.
 **Deferred to later items:** animation rendering and the run-mode
 toggle key (item 5, consumes `preferences.animations`); the §12.2
 layout rework consumes palette tokens (item 2).
+
+### 15.4 Load-progress indicator (§2.3)
+
+**Goal.** While a model loads, show a live phase/progress line parsed
+from llama-server's stderr — `loading model file` → `offloading N
+layers to GPU` → HF download % (when applicable) → done. **Hard
+constraint (owner decision):** the indicator is **separate** from the
+`[STARTING]` badge; no spinner or progress element replaces the badge,
+which stays exactly as-is. If parsing yields nothing, the UI is
+identical to today (tolerant classifiers, §2.3 risk / P6).
+
+**Phase classifier** — `parseLoadPhase(line string) (phase string,
+progress *float64)` in `run.go`, a pure function over single stderr
+lines (P9), tolerant (patterns stop matching → no indicator):
+
+| Phase | Match (case-insensitive) | Progress |
+|---|---|---|
+| load-file | `loading model (from\|file)` | none (text only) |
+| offload | `offloaded (\d+)\/(\d+) layers` | fraction `n/m` |
+| offload-start | `offloading \d+ repeating layers` | none (text only) |
+| download | `(downloading\|download).*?(\d+(?:\.\d+)?)%` | percent/100 |
+| done | `listening on` | — (existing readyMarker handles transition) |
+
+Unknown lines → no phase; the newest matching line wins (a `lastPhase`/
+`lastProgress` pair, cleared when status leaves `StatusStarting`).
+
+**Indicator placement & rendering (owner decision).** The load-progress
+block lives **inside the left panel** — the "llama-server" live-data
+box in single-model mode, the model list in router mode — replacing
+that panel's content while the starting window is open (live stats /
+the model list can't render meaningfully before READY anyway):
+
+```
+╭── llama-server ─────────────────────╮
+│ loading model file …                │
+│ offloading layers to GPU: 21/33     │
+│ ▓▓▓▓▓░░░░░░░░ 41%                   │
+╰─────────────────────────────────────╯
+```
+
+- phase text in `Subtle`; progress bar in `Accent` (blocks `▓`/`░`,
+  capped ~12 cells); the bar appears only when a numeric progress is
+  known. Multiple phase lines accumulate (newest at the bottom) within
+  the block, capped to the panel height.
+- When starting but no phase has parsed yet, the block shows the
+  static text `loading…` (§2.3 "unknown phase → static text"). On
+  READY (or exit) the normal panel content returns.
+- **Minimum visible time (owner decision):** once a phase line is
+  shown, the load block stays visible for **≥ 2 s** even if READY
+  arrives sooner (`loadPhaseUntil = shownAt + 2s`; the panel switches
+  back only when READY *and* the deadline has passed) — the indicator
+  never flashes by.
+- **Separate from `[STARTING]`:** the badge (row 1) is untouched; the
+  indicator is panel content (§2.3 hard constraint).
+- **Both modes:** single-model (llama-server stats panel) and router
+  (model list panel) show the same block during the starting window —
+  the owner tests both.
+
+**Data flow.** The `logChunkMsg` handler already scans incoming chunks
+for the ready marker; it now also feeds each chunk line to
+`parseLoadPhase` while `StatusStarting`, storing the latest
+phase/progress and stamping `loadPhaseUntil = now + 2s` when a phase
+first appears. The left panel renders the load block while
+`status == StatusStarting || now < loadPhaseUntil`. On exit the pair
+is cleared. No new keys, no polling — purely reactive to log chunks
+plus the 2s minimum-visible clock.
+
+**Determinism (P9).** Classifier unit tests on synthetic lines (real
+llama.cpp shapes + near-misses); panel render tests for the load block
+(single + router) with a stored pair; a chunk-driven test asserting
+the phase appears and the block clears after ready + the 2s deadline
+(`loadPhaseUntil` is a settable field — tests pin the past/future
+cases). The fakeserver fixture gains load-progress lines (offload
+fraction + a download % line) so integration tests exercise the real
+path. The classifier is kept as a single small function — the
+§6-synergy "same tolerant classifier" needed by Release 2's download
+progress can reuse/extend it.
+
+**Non-goals.** No spinner animation (item 5, gated by
+`preferences.animations`); nothing replaces or modifies the
+`[STARTING]` badge; no model-load percent from llama.cpp internals
+(only what the log text exposes).
+
+**File map.** `internal/tui/run.go` — `parseLoadPhase`,
+`loadPhase`/`loadProgress`/`loadPhaseUntil` fields, the load block in
+`renderServerPanel` (single) and `renderRouterPanel` (router),
+`logChunkMsg` hook. `cmd/llamaman-fakeserver` — fixture lines.
+New tests in `run_test.go` / `loglines_test.go`. DESIGN §7.4 gains the
+indicator description in the same change (P5).
 
 ### 15.3 Log & status readability (§2.2)
 

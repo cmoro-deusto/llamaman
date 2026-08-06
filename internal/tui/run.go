@@ -52,17 +52,29 @@ type uptimeTickMsg time.Time
 // during long model loads (GGUF into memory, HF download).
 const readyMarker = "listening on"
 
+// loadPhaseMinVisible is the minimum time the load-progress block stays
+// visible once a phase line is seen (§15.4): the block never flashes by
+// even when the server reaches READY sooner.
+const loadPhaseMinVisible = 2 * time.Second
+
 // RunMode owns (or has adopted) a llama-server child plus the viewport
 // tailing its log file. Quit prompt is per DESIGN.md §7.4: q/Ctrl+C opens
 // (k)ill / (d)etach / (c)ancel.
 type RunMode struct {
-	cfg        *config.Config
-	cfgPath    string // on-disk config path (from opts) — enables preference quick keys (§15.3)
-	model      config.Model
-	preset     config.Preset
-	argv       []string
-	routerFile string // my-models.ini path for router-mode runs; "" otherwise
-	warnings   []string
+	cfg     *config.Config
+	cfgPath string // on-disk config path (from opts) — enables preference quick keys (§15.3)
+	model   config.Model
+	preset  config.Preset
+
+	// Load-progress state (§15.4): newest parsed phase/progress while
+	// starting, plus the minimum-visible deadline (2s from the last
+	// phase line).
+	loadPhase      string
+	loadProgress   *float64
+	loadPhaseUntil time.Time
+	argv           []string
+	routerFile     string // my-models.ini path for router-mode runs; "" otherwise
+	warnings       []string
 
 	// Router-mode live state (only populated when routerFile != ""):
 	// the model list from GET /models and the loaded-model ids from
@@ -405,6 +417,7 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		// at render time (visibleLogLines), so toggling it off shows
 		// previously hidden lines at their exact positions.
 		r.buf.WriteString(string(m))
+		r.ingestLoadChunk(string(m))
 		atBottom := r.viewport.AtBottom()
 		r.viewport.SetContent(r.renderViewportContent())
 		if atBottom {
@@ -431,6 +444,9 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if r.fetchCancel != nil {
 			r.fetchCancel()
 		}
+		// Load-progress block is load-window only: clear the minimum-
+		// visible deadline so a dead server never shows "loading…".
+		r.loadPhaseUntil = time.Time{}
 		state := "EXITED"
 		if m.err != nil {
 			r.status = StatusErrored
@@ -2460,6 +2476,11 @@ func (r *RunMode) renderServerPanel(width int) string {
 		}
 		return r.renderRouterPanel(width)
 	}
+	if r.showingLoadBlock() {
+		// §15.4: live stats can't render before READY — the panel shows
+		// the load-progress block during the starting window.
+		return r.renderTitledPanel("llama-server", width, padRows(r.loadRows(), liveBandContentRows), false)
+	}
 	return r.renderTitledPanel("llama-server", width, padRows(r.renderServerRows(r.singleModelStatsView()), liveBandContentRows), false)
 }
 
@@ -2548,8 +2569,12 @@ func (r *RunMode) routerModelState(id, status string) string {
 
 // renderRouterPanel replaces the llama-server live-data panel in router
 // runs: one row per model from GET /models, tagged loaded/loading/
-// unloaded.
+// unloaded. During the starting window it shows the load-progress block
+// instead (§15.4 — the model list can't render before READY).
 func (r *RunMode) renderRouterPanel(width int) string {
+	if r.showingLoadBlock() {
+		return r.renderTitledPanel("models", width, padRows(r.loadRows(), liveBandContentRows), r.routerPanelActive)
+	}
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	loadedStyle := lipgloss.NewStyle().Foreground(r.theme.StatusReady)
 	unloadedStyle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
@@ -3283,6 +3308,112 @@ func (r *RunMode) toggleLogColors() (*RunMode, tea.Cmd) {
 	}
 	r.refreshContent()
 	return r, r.setFlash("log colors " + state)
+}
+
+// parseLoadPhase classifies a llama-server stderr line into a
+// load-progress phase (DESIGN §15.4). Tolerant by design (§2.3/P6):
+// patterns that stop matching simply yield no phase and the indicator
+// degrades to the static "loading…" block.
+func parseLoadPhase(line string) (phase string, progress *float64) {
+	if m := loadOffloadedRE.FindStringSubmatch(line); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		d, _ := strconv.Atoi(m[2])
+		if d > 0 {
+			p := float64(n) / float64(d)
+			if p > 1 {
+				p = 1
+			}
+			return "offloading layers to GPU", &p
+		}
+		return "offloading layers to GPU", nil
+	}
+	if loadOffloadingRE.MatchString(line) {
+		return "offloading layers to GPU", nil
+	}
+	if m := loadDownloadRE.FindStringSubmatch(line); m != nil {
+		if pct, err := strconv.ParseFloat(m[1], 64); err == nil && pct >= 0 && pct <= 100 {
+			p := pct / 100
+			return "downloading model", &p
+		}
+		return "downloading model", nil
+	}
+	if loadLoadingRE.MatchString(line) {
+		return "loading model file", nil
+	}
+	return "", nil
+}
+
+var (
+	loadOffloadedRE  = regexp.MustCompile(`(?i)offloaded\s+(\d+)\s*/\s*(\d+)\s+layers`)
+	loadOffloadingRE = regexp.MustCompile(`(?i)offloading\s+\d+\s+repeating\s+layers`)
+	loadDownloadRE   = regexp.MustCompile(`(?i)(?:downloading|download).*?(\d+(?:\.\d+)?)\s*%`)
+	loadLoadingRE    = regexp.MustCompile(`(?i)loading\s+model\s+(?:from|file)`)
+)
+
+// showingLoadBlock reports whether the left panel should show the
+// load-progress block: while starting, or for the 2s minimum-visible
+// window after the last phase line even once READY (§15.4).
+func (r *RunMode) showingLoadBlock() bool {
+	return r.status == StatusStarting || time.Now().Before(r.loadPhaseUntil)
+}
+
+// loadRows builds the panel content for the starting window (§15.4):
+// the parsed phase line(s) with the progress bar, or the static
+// "loading…" fallback when nothing has been parsed yet.
+func (r *RunMode) loadRows() []string {
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	var rows []string
+	if r.loadPhase != "" {
+		rows = append(rows, subtle.Render(r.loadPhase))
+		if r.loadProgress != nil {
+			pct := int(*r.loadProgress * 100)
+			if pct > 100 {
+				pct = 100
+			}
+			if pct < 0 {
+				pct = 0
+			}
+			bar := progressBar(*r.loadProgress, 12)
+			rows = append(rows, lipgloss.NewStyle().
+				Foreground(r.theme.Accent).
+				Render(bar)+subtle.Render(fmt.Sprintf(" %d%%", pct)))
+		}
+	} else {
+		rows = append(rows, subtle.Render("loading…"))
+	}
+	return rows
+}
+
+// progressBar renders a fixed-width filled/empty block bar (▓/░) for a
+// progress fraction in [0,1], capped at width cells.
+func progressBar(frac float64, width int) string {
+	if width < 1 {
+		width = 1
+	}
+	if frac < 0 {
+		frac = 0
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	filled := int(frac*float64(width) + 0.5)
+	return strings.Repeat("▓", filled) + strings.Repeat("░", width-filled)
+}
+
+// ingestLoadChunk feeds a log chunk to the load-progress classifier
+// (§15.4): while starting, the newest phase/progress is kept and the
+// 2s minimum-visible deadline extends on every update.
+func (r *RunMode) ingestLoadChunk(chunk string) {
+	if r.status != StatusStarting {
+		return
+	}
+	for _, ln := range strings.Split(chunk, "\n") {
+		if phase, prog := parseLoadPhase(ln); phase != "" {
+			r.loadPhase = phase
+			r.loadProgress = prog
+			r.loadPhaseUntil = time.Now().Add(loadPhaseMinVisible)
+		}
+	}
 }
 
 // runTitle is the terminal-title (OSC) content for the run view
