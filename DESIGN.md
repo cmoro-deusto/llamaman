@@ -55,7 +55,8 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
   },
   "preferences": {          // optional; absent == defaults
     "theme": "auto",        // palette ID from the TUI table; "auto" is default
-    "animations": true      // default true; explicit false is honored
+    "animations": true,      // default true; explicit false is honored
+    "log-colors": true       // default true; explicit false is honored (§15.3)
   },
   "models": [
     {
@@ -489,6 +490,7 @@ Status state machine: `starting → ready → exited|error`.
 
 | Key | Action |
 |---|---|
+| `o` | Toggle log line-kind colors (persists to `preferences.log-colors`, §15.3) |
 | `q` / `Ctrl+C` | Quit prompt: `(k)ill / (d)etach / (c)ancel`. `(k)ill` returns to the main screen; `(d)etach` exits llamaman and leaves llama-server running. |
 | `k` | Direct kill shortcut (with `(y)es / (n)o` confirm). On confirm: stops llama-server, removes the log + session record, and returns to the main screen — llamaman itself stays open. |
 | `r` | Restart server (confirm if currently ready) |
@@ -1007,8 +1009,9 @@ Additive `version: 1`, per P2:
   "version": 1,
   "globals": { ... },
   "preferences": {            // optional object; absent == all defaults
-    "theme": "auto",          // string, default "auto"
-    "animations": true        // bool, default true
+    "theme": "auto",        // string, default "auto"
+    "animations": true,      // bool, default true
+    "log-colors": true       // bool, default true (§15.3)
   },
   "models": [ ... ]
 }
@@ -1026,6 +1029,8 @@ Additive `version: 1`, per P2:
     save round-trip — hence `*bool`, not `bool` (a plain `bool` with
     omitempty would silently drop an explicit `false` on the next
     save).
+  - `log-colors` follows the same `*bool` contract (default `true`,
+    §15.3) — the run-mode log-coloring toggle.
 - Nil-safe accessor `Config.Prefs() Preferences` (returns the zero
   value when the pointer is nil) is the only way the TUI reads
   preferences; callers never dereference the pointer directly.
@@ -1258,6 +1263,20 @@ render-time only). Search highlight (bold+reverse) takes visual
 precedence during an active search; a match inside a colored line
 reverts the remainder of that line to default color until the next
 line's reset — accepted cosmetic during active search.
+
+**Current search occurrence (owner feedback).** `n`/`N` navigation
+marks the current matching line's matches with **bold+reverse+underline**
+(`1;7;4`) while other matches stay bold+reverse — the selected
+occurrence is distinguishable at a glance. Granularity is per matching
+line (the existing `searchMatches` model). A scanning animation for
+next/previous occurrence is a candidate for item 5 (gated by
+`preferences.animations`), not part of item 3.
+
+**Log-colors toggle (owner decision: preference + quick key).**
+Coloring is controlled by the new `preferences.log-colors` field
+(default `true`, §15.1) — the Settings form edits it — and the
+run-mode `o` quick key flips it live, writing the same object and
+persisting via the config path (P8 shortcut pattern, like theme).
 
 **Terminal title (OSC).** `tea.SetWindowTitle` (bubbletea v1.3.10):
 `llamaman — <alias> [STARTING]` on run-mode init; `[READY]` on both

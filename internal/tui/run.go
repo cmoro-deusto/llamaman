@@ -57,6 +57,7 @@ const readyMarker = "listening on"
 // (k)ill / (d)etach / (c)ancel.
 type RunMode struct {
 	cfg        *config.Config
+	cfgPath    string // on-disk config path (from opts) — enables preference quick keys (§15.3)
 	model      config.Model
 	preset     config.Preset
 	argv       []string
@@ -201,6 +202,7 @@ type RunMode struct {
 // owner vs adopted mode before the TUI starts.
 type RunModeOpts struct {
 	Cfg        *config.Config
+	CfgPath    string // on-disk config path; set by Root so run-mode preference quick keys can persist (§15.3)
 	Model      config.Model
 	Preset     config.Preset
 	RouterFile string // non-empty for router-mode runs (my-models.ini path)
@@ -243,6 +245,7 @@ func NewRunMode(opts RunModeOpts, theme Theme) (*RunMode, tea.Cmd, error) {
 
 	r := &RunMode{
 		cfg:                    opts.Cfg,
+		cfgPath:                opts.CfgPath,
 		model:                  opts.Model,
 		preset:                 opts.Preset,
 		routerFile:             opts.RouterFile,
@@ -886,6 +889,8 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		case "c":
 			r.copyCommand()
 			return r, nil
+		case "o":
+			return r.toggleLogColors()
 		case "r":
 			// Always confirm — restart kills the running child even
 			// when startup is mid-progress or the server has already
@@ -1140,14 +1145,30 @@ func (r *RunMode) effectiveQuery() string {
 // outer span. llama-server stderr is overwhelmingly plain in practice
 // so we accept this rather than tokenizing the buffer.
 // renderViewportContent returns the log buffer with per-line kind
-// coloring (DESIGN §15.3) and reverse+bold ANSI for search matches.
-// Lines stay byte-identical on disk — coloring is render-time only —
-// and search/jump/scrollback operate on the plain lines.
+// coloring (DESIGN §15.3, disabled by the log-colors preference) and
+// reverse+bold ANSI for search matches — the current occurrence (the
+// line at searchIdx, §15.3) uses bold+reverse+underline so n/N
+// navigation stands out. Lines stay byte-identical on disk — coloring
+// is render-time only — and search/jump/scrollback operate on the
+// plain lines.
 func (r *RunMode) renderViewportContent() string {
 	lines := r.visibleLogLines()
+	current := -1
+	if r.searchQuery != "" && len(r.searchMatches) > 0 {
+		current = r.searchMatches[r.searchIdx]
+	}
+	colors := true
+	if r.cfg != nil {
+		colors = r.cfg.Prefs().LogColorsEnabled()
+	}
 	out := make([]string, len(lines))
 	for i, ln := range lines {
-		out[i] = r.colorizeLine(highlightOccurrences(ln, r.effectiveQuery()))
+		hl := highlightOccurrencesCurrent(ln, r.effectiveQuery(), i == current)
+		if colors {
+			out[i] = r.colorizeLine(hl)
+		} else {
+			out[i] = hl
+		}
 	}
 	return strings.Join(out, "\n")
 }
@@ -1245,6 +1266,7 @@ func (r *RunMode) refreshContent() {
 // would otherwise suppress codes when no TTY is detected.
 const (
 	highlightOpen  = "\x1b[1;7m"
+	highlightCur   = "\x1b[1;7;4m"
 	highlightClose = "\x1b[0m"
 )
 
@@ -1253,6 +1275,13 @@ const (
 // bytes are taken from raw so original case is preserved. Advances by
 // len(q) after each match to avoid overlap on inputs like "aaa"/"aa".
 func highlightOccurrences(raw, q string) string {
+	return highlightOccurrencesCurrent(raw, q, false)
+}
+
+// highlightOccurrencesCurrent is highlightOccurrences with a `current`
+// flag: when true the match spans use bold+reverse+underline so the
+// selected occurrence stands out during n/N navigation (§15.3).
+func highlightOccurrencesCurrent(raw, q string, current bool) string {
 	if q == "" || raw == "" {
 		return raw
 	}
@@ -1260,6 +1289,10 @@ func highlightOccurrences(raw, q string) string {
 	qLower := strings.ToLower(q)
 	if len(qLower) == 0 || len(qLower) > len(lower) {
 		return raw
+	}
+	open := highlightOpen
+	if current {
+		open = highlightCur
 	}
 	var b strings.Builder
 	b.Grow(len(raw) + 16)
@@ -1273,7 +1306,7 @@ func highlightOccurrences(raw, q string) string {
 		start := i + rel
 		end := start + len(qLower)
 		b.WriteString(raw[i:start])
-		b.WriteString(highlightOpen)
+		b.WriteString(open)
 		b.WriteString(raw[start:end])
 		b.WriteString(highlightClose)
 		i = end
@@ -1618,6 +1651,7 @@ func (r *RunMode) renderHelp() string {
 	rows := []entry{
 		{"q / Ctrl+C", "open quit prompt — kill / detach / cancel"},
 		{"esc", "back to main — detach (server keeps running)"},
+		{"o", "toggle log line-kind colors (persists to preferences)"},
 		{"k", "kill server and return to main"},
 		{"r", "restart server (confirms)"},
 		{"c", "copy launch command to clipboard"},
@@ -1667,7 +1701,7 @@ func (r *RunMode) renderFooter() string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	sep := subtle.Render(" · ")
 	tokens := []string{
-		"q quit", "k kill", "r restart", "c copy", "i info", "esc back",
+		"q quit", "k kill", "r restart", "c copy", "i info", "o colors", "esc back",
 	}
 	if r.routerFile != "" {
 		// The tab hint names the panel you'd switch TO.
@@ -3204,6 +3238,31 @@ func statusBadge(label string, color lipgloss.Color) string {
 		Foreground(color).
 		Bold(true).
 		Render(glyph + "[" + strings.ToUpper(label) + "]")
+}
+
+// toggleLogColors flips the log-colors preference live (DESIGN §15.3):
+// the run-mode `o` quick key writes the same object the Settings form
+// edits (P8) and persists it when a config path is available; without
+// one it flips in-memory only.
+func (r *RunMode) toggleLogColors() (*RunMode, tea.Cmd) {
+	if r.cfg == nil {
+		return r, r.setFlash("no config to toggle log colors in")
+	}
+	prefs := r.cfg.Prefs()
+	enabled := !prefs.LogColorsEnabled()
+	prefs.LogColors = &enabled
+	r.cfg.Preferences = &prefs
+	if r.cfgPath != "" {
+		if err := config.Save(r.cfgPath, r.cfg); err != nil {
+			return r, r.setFlash("could not save log-colors: " + err.Error())
+		}
+	}
+	state := "off"
+	if enabled {
+		state = "on"
+	}
+	r.refreshContent()
+	return r, r.setFlash("log colors " + state)
 }
 
 // runTitle is the terminal-title (OSC) content for the run view

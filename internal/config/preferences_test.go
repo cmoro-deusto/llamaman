@@ -43,6 +43,9 @@ func TestPreferencesAbsentMeansDefaults(t *testing.T) {
 	if !p.AnimationsEnabled() {
 		t.Error("default animations should be enabled")
 	}
+	if !p.LogColorsEnabled() {
+		t.Error("default log colors should be enabled")
+	}
 }
 
 // TestPreferencesRoundTrip pins the full field-arrival contract: an
@@ -53,12 +56,14 @@ func TestPreferencesRoundTrip(t *testing.T) {
 	path := filepath.Join(dir, "config.json")
 
 	animOff := false
+	logOff := false
 	cfg := &Config{
 		Version: 1,
 		Globals: Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Preferences: &Preferences{
 			Theme:      "nord",
 			Animations: &animOff,
+			LogColors:  &logOff,
 		},
 	}
 	if err := Save(path, cfg); err != nil {
@@ -75,6 +80,9 @@ func TestPreferencesRoundTrip(t *testing.T) {
 	}
 	if p.AnimationsEnabled() {
 		t.Error("explicit animations=false must survive a save round-trip")
+	}
+	if p.LogColorsEnabled() {
+		t.Error("explicit log-colors=false must survive a save round-trip")
 	}
 	if loaded.Preferences == nil || loaded.Preferences.Animations == nil || *loaded.Preferences.Animations {
 		t.Fatalf("Animations pointer must be non-nil and false, got %+v", loaded.Preferences)

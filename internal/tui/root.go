@@ -139,6 +139,7 @@ func (r *Root) Init() tea.Cmd {
 	}
 	if r.initialRun != nil {
 		opts := *r.initialRun
+		opts.CfgPath = r.cfgPath // enable run-mode preference quick keys (§15.3)
 		r.initialRun = nil
 		run, cmd, err := NewRunMode(opts, r.theme)
 		if err != nil {
@@ -373,6 +374,7 @@ func (r *Root) handleRouterSpawn(msg RouterSpawnRequestMsg) (tea.Model, tea.Cmd)
 // enterRunMode wraps an already-spawned process in a RunMode and flips
 // the view. Shared by the single-model and router spawn paths.
 func (r *Root) enterRunMode(opts RunModeOpts) (tea.Model, tea.Cmd) {
+	opts.CfgPath = r.cfgPath // enable run-mode preference quick keys (§15.3)
 	run, cmd, err := NewRunMode(opts, r.theme)
 	if err != nil {
 		r.flashSpawnError(err)
@@ -446,6 +448,7 @@ func (r *Root) handleReattach() (tea.Model, tea.Cmd) {
 		r.refreshSessionState()
 		return r, nil
 	}
+	opts.CfgPath = r.cfgPath // enable run-mode preference quick keys (§15.3)
 	run, cmd, err := NewRunMode(*opts, r.theme)
 	if err != nil {
 		r.startErr = err

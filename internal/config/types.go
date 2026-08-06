@@ -35,6 +35,9 @@ type Preferences struct {
 	// distinct from absent and survives a save round-trip (a plain bool
 	// with omitempty would silently drop an explicit false).
 	Animations *bool `json:"animations,omitempty"`
+	// LogColors defaults to true: render-time line-kind coloring of the
+	// run-mode log (§15.3). Same pointer semantics as Animations.
+	LogColors *bool `json:"log-colors,omitempty"`
 }
 
 // Prefs returns the effective preferences, or the zero value (==
@@ -51,6 +54,12 @@ func (c *Config) Prefs() Preferences {
 // (nil) means the default, true.
 func (p Preferences) AnimationsEnabled() bool {
 	return p.Animations == nil || *p.Animations
+}
+
+// LogColorsEnabled reports the effective log-coloring setting: absent
+// (nil) means the default, true.
+func (p Preferences) LogColorsEnabled() bool {
+	return p.LogColors == nil || *p.LogColors
 }
 
 // Globals holds the binary path and the listen host/port. The JSON tag for

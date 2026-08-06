@@ -22,9 +22,10 @@ type SettingsMode struct {
 	darkBg  bool
 	version string
 
-	form     *huh.Form
-	themeVal string
-	anim     bool
+	form      *huh.Form
+	themeVal  string
+	anim      bool
+	logColors bool
 
 	// lastThemeVal tracks the select's live value so Update can detect
 	// arrow-key changes and re-theme the chrome + preview immediately
@@ -71,6 +72,7 @@ func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg boo
 		version:      version,
 		themeVal:     themeVal,
 		anim:         prefs.AnimationsEnabled(),
+		logColors:    prefs.LogColorsEnabled(),
 		lastThemeVal: themeVal,
 		warn:         warn,
 	}
@@ -99,6 +101,10 @@ func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg boo
 			Title("animations").
 			Description("subtle transitional animations (dot pulse, badge breathing); off in Preferences too").
 			Value(&sm.anim),
+		huh.NewConfirm().
+			Title("log colors").
+			Description("render-time line-kind coloring of the run-mode log (also toggled with `o` in run mode)").
+			Value(&sm.logColors),
 	)).WithTheme(configHuhTheme(theme))
 	return sm
 }
@@ -197,6 +203,12 @@ func (s *SettingsMode) snapshot() *config.Preferences {
 	if s.anim != prefs.AnimationsEnabled() {
 		anim := s.anim
 		prefs.Animations = &anim
+		changed = true
+	}
+
+	if s.logColors != prefs.LogColorsEnabled() {
+		logColors := s.logColors
+		prefs.LogColors = &logColors
 		changed = true
 	}
 

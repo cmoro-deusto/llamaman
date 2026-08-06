@@ -15,6 +15,8 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
@@ -220,13 +222,19 @@ func TestRunModeSearchEnterRefreshesHighlights(t *testing.T) {
 		t.Errorf("searchQuery = %q, want %q", r.searchQuery, "error")
 	}
 	got := r.viewport.View()
-	wantWrap := highlightOpen + "error" + highlightClose
-	if !strings.Contains(got, wantWrap) {
-		t.Errorf("viewport missing wrapped lowercase match\nview: %q", got)
+	// The current occurrence (first match, searchIdx 0) uses the
+	// distinct bold+reverse+underline style; other matches stay
+	// bold+reverse (§15.3).
+	wantCur := highlightCur + "error" + highlightClose
+	if !strings.Contains(got, wantCur) {
+		t.Errorf("viewport missing current-occurrence wrap\nview: %q", got)
 	}
 	wantWrapUpper := highlightOpen + "ERROR" + highlightClose
 	if !strings.Contains(got, wantWrapUpper) {
 		t.Errorf("viewport missing wrapped uppercase match\nview: %q", got)
+	}
+	if strings.Contains(got, highlightOpen+"error"+highlightClose) {
+		t.Errorf("lowercase match (current) must not use the plain style\nview: %q", got)
 	}
 }
 
@@ -2605,4 +2613,44 @@ func TestRunHeaderNCtxZeroIgnored(t *testing.T) {
 	}
 	assertNotLogged(t, logs, slog.LevelWarn, "/props fetch failed")
 	assertNotLogged(t, logs, slog.LevelInfo, "ctx-size mismatch")
+}
+
+// TestRunModeToggleLogColors pins the §15.3 `o` quick key: it flips the
+// log-colors preference in memory, persists it to config.json, and the
+// rendered log becomes plain.
+func TestRunModeToggleLogColors(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(termenv.ColorProfile())
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg := sampleSnapshotConfig()
+	if err := config.Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	buf.WriteString("error: boom\ninfo line\n")
+	r := &RunMode{cfg: cfg, cfgPath: path, buf: buf, theme: DefaultTheme(), status: StatusReady}
+	if !cfg.Prefs().LogColorsEnabled() {
+		t.Fatal("log colors must default on")
+	}
+	if got := r.colorizeLine("error: boom"); !strings.Contains(got, "\x1b[38;5;") {
+		t.Errorf("error line should be colored by default, got %q", got)
+	}
+
+	next, _ := r.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	r = next
+	if cfg.Prefs().LogColorsEnabled() {
+		t.Error("o must flip log colors off")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"log-colors": false`) {
+		t.Errorf("log-colors=false not persisted:\n%s", data)
+	}
+	// The rendered log is plain now.
+	if got := r.renderViewportContent(); strings.Contains(got, "\x1b[38;5;") {
+		t.Errorf("rendered log must be plain with colors off, got %q", got)
+	}
 }

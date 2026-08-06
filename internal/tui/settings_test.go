@@ -174,6 +174,7 @@ func TestSettingsSubmitNoChangePersistsNothing(t *testing.T) {
 		keyMsg("s"),
 		keyMsg("enter"),
 		keyMsg("enter"),
+		keyMsg("enter"),
 	)
 	if root.view != ViewMain {
 		t.Fatalf("after submit: view = %d, want ViewMain", root.view)
@@ -201,6 +202,7 @@ func TestSettingsSubmitPersistsThemeChange(t *testing.T) {
 		tea.WindowSizeMsg{Width: 120, Height: 40},
 		keyMsg("s"),
 		tea.KeyMsg{Type: tea.KeyDown}, // select llamaman (first option after auto)
+		keyMsg("enter"),
 		keyMsg("enter"),
 		keyMsg("enter"),
 	)
@@ -231,6 +233,7 @@ func TestSettingsSubmitAnimationsOff(t *testing.T) {
 		keyMsg("s"),
 		keyMsg("enter"),               // select → confirm
 		tea.KeyMsg{Type: tea.KeyLeft}, // toggle confirm to "no"
+		keyMsg("enter"),               // confirm → log colors
 		keyMsg("enter"),               // complete form
 	)
 	if root.view != ViewMain {
@@ -329,7 +332,7 @@ func TestSettingsMismatchedThemeAppliesWithWarning(t *testing.T) {
 	}
 
 	// Submit with a change (animations off): the mismatch applies, not auto.
-	driveRoot(t, root, keyMsg("enter"), tea.KeyMsg{Type: tea.KeyLeft}, keyMsg("enter"))
+	driveRoot(t, root, keyMsg("enter"), tea.KeyMsg{Type: tea.KeyLeft}, keyMsg("enter"), keyMsg("enter"))
 	if got := root.cfg.Prefs().Theme; got != "solarized-light" {
 		t.Fatalf("after submit: theme = %q, want solarized-light", got)
 	}
