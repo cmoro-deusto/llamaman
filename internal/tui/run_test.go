@@ -358,7 +358,7 @@ func TestTopStripColumnsAlign(t *testing.T) {
 	}{
 		{"Alias:", "Preset:"},
 		{"Server:", "Uptime:"},
-		{"Context Size:", "[READY]"},
+		{"Context Size:", "● [READY]"}, // badge block incl. the glyph prefix (§15.3)
 	}
 	for _, p := range pairs {
 		c1 := findCol(p.row1)

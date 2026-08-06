@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -274,6 +275,9 @@ func NewRunMode(opts RunModeOpts, theme Theme) (*RunMode, tea.Cmd, error) {
 		// the server being ready (gopsutil + NVML are local reads).
 		hwSnapshotCmd(),
 		tickHwPoll(),
+		// Terminal title (DESIGN §15.3): set at entry, updated on
+		// ready/error/exited transitions.
+		tea.SetWindowTitle(r.runTitle("STARTING")),
 	}
 	// Readiness is detected by two signals, whichever arrives first:
 	//
@@ -424,13 +428,15 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if r.fetchCancel != nil {
 			r.fetchCancel()
 		}
-		if m.err == nil {
-			r.status = StatusExited
-		} else {
+		state := "EXITED"
+		if m.err != nil {
 			r.status = StatusErrored
 			r.startErr = m.err
+			state = "ERROR"
+		} else {
+			r.status = StatusExited
 		}
-		return r, nil
+		return r, tea.SetWindowTitle(r.runTitle(state))
 
 	case propsFetchedMsg:
 		if m.err != nil {
@@ -470,6 +476,10 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			r.status = StatusReady
 		}
 		cmds := r.startLivePoll()
+		if r.status == StatusReady {
+			// Terminal title: reflect the ready state (§15.3).
+			cmds = append(cmds, tea.SetWindowTitle(r.runTitle("READY")))
+		}
 		// Disagreement diagnostic: the preset declared a value, the
 		// live server reports a different one. Most common cause is
 		// llama-server clamping a too-large request to the model's max.
@@ -1129,8 +1139,78 @@ func (r *RunMode) effectiveQuery() string {
 // our reset at the end of the highlight prematurely terminates the
 // outer span. llama-server stderr is overwhelmingly plain in practice
 // so we accept this rather than tokenizing the buffer.
+// renderViewportContent returns the log buffer with per-line kind
+// coloring (DESIGN §15.3) and reverse+bold ANSI for search matches.
+// Lines stay byte-identical on disk — coloring is render-time only —
+// and search/jump/scrollback operate on the plain lines.
 func (r *RunMode) renderViewportContent() string {
-	return highlightOccurrences(strings.Join(r.visibleLogLines(), "\n"), r.effectiveQuery())
+	lines := r.visibleLogLines()
+	out := make([]string, len(lines))
+	for i, ln := range lines {
+		out[i] = r.colorizeLine(highlightOccurrences(ln, r.effectiveQuery()))
+	}
+	return strings.Join(out, "\n")
+}
+
+// LineKind classifies a llama-server log line for render-time coloring.
+type LineKind int
+
+const (
+	LineInfo LineKind = iota
+	LineError
+	LineWarn
+	LineTiming
+	LineReady
+)
+
+// lineKindRules is the ordered classifier table (DESIGN §15.3). First
+// match wins; READY is checked first so "listening on" lines always get
+// the ready highlight regardless of other content. Patterns are
+// conservative: the worst case is an uncolored line, and a real
+// critical line is never rendered as plain INFO.
+var lineKindRules = []struct {
+	kind LineKind
+	re   *regexp.Regexp
+}{
+	{LineReady, regexp.MustCompile(`listening on`)},
+	{LineError, regexp.MustCompile(`(?i)\berror\b|\bfailed\b|\bfatal\b|\baborted\b`)},
+	{LineWarn, regexp.MustCompile(`(?i)\bwarn(ing)?\b`)},
+	{LineTiming, regexp.MustCompile(`(?i)tokens? per second|ms per token|eval time|prompt eval time|total time|load time`)},
+}
+
+func classifyLine(line string) LineKind {
+	for _, r := range lineKindRules {
+		if r.re.MatchString(line) {
+			return r.kind
+		}
+	}
+	return LineInfo
+}
+
+// colorizeLine wraps line in its kind's SGR (DESIGN §15.3). INFO lines
+// stay plain; the search highlight applied by the caller is wrapped
+// inside the kind color.
+func (r *RunMode) colorizeLine(line string) string {
+	var color lipgloss.Color
+	bold := false
+	switch classifyLine(line) {
+	case LineError:
+		color = r.theme.StatusErr
+	case LineWarn:
+		color = r.theme.StatusStart
+	case LineTiming:
+		color = r.theme.Muted
+	case LineReady:
+		color = r.theme.StatusReady
+		bold = true
+	default:
+		return line
+	}
+	st := lipgloss.NewStyle().Foreground(color)
+	if bold {
+		st = st.Bold(true)
+	}
+	return st.Render(line)
 }
 
 // refreshContent re-renders the viewport, preserving auto-follow when
@@ -3089,13 +3169,37 @@ func ctxSizeDisplay(live int, params map[string]any) string {
 }
 
 // statusBadge renders the run-mode status indicator that sits at the
-// end of row 1. Bracketed, uppercase, bold, with the state's themed
-// foreground color and no background fill.
+// end of row 1. A per-state unicode glyph prefix (DESIGN §15.3) plus
+// the bracketed uppercase label, bold, in the state's themed
+// foreground color. The [STARTING] badge text/format stays (only the
+// hollow-dot prefix is additive — §2.3).
 func statusBadge(label string, color lipgloss.Color) string {
+	glyph := ""
+	switch strings.ToUpper(label) {
+	case "READY":
+		glyph = "● "
+	case "STARTING":
+		glyph = "◌ "
+	case "ERROR":
+		glyph = "✕ "
+	case "EXITED":
+		glyph = "◌ "
+	}
 	return lipgloss.NewStyle().
 		Foreground(color).
 		Bold(true).
-		Render("[" + strings.ToUpper(label) + "]")
+		Render(glyph + "[" + strings.ToUpper(label) + "]")
+}
+
+// runTitle is the terminal-title (OSC) content for the run view
+// (DESIGN §15.3): `llamaman — <alias> [STATE]`. Router sessions use
+// the models-file basename as the alias.
+func (r *RunMode) runTitle(state string) string {
+	alias := r.model.Alias
+	if alias == "" && r.routerFile != "" {
+		alias = filepath.Base(r.routerFile)
+	}
+	return fmt.Sprintf("llamaman — %s [%s]", alias, state)
 }
 
 func (r *RunMode) statusColor() lipgloss.Color {

@@ -514,6 +514,12 @@ Auto-scroll: locked to bottom unless the user has scrolled up. When scrolled up,
 
 ANSI color codes from llama-server are passed through (Lip Gloss / `bubbles/viewport` render them).
 
+**Render-time line coloring (§15.3):** the log viewport colorizes lines by kind — ERROR (red), WARN (yellow), TIMING (dim), the readiness marker `listening on` (green + bold) — and leaves INFO plain. Conservative classifier: worst case is an uncolored line, never a critical line shown as plain INFO. Coloring is render-time only: search matching, jump-to-match indices, scrollback positions, and the denoise toggle operate on the plain lines, and the on-disk log is byte-identical.
+
+**Status badge glyphs (§15.3):** the `[READY]`-style badge gains a per-state glyph prefix — `● [READY]`, `◌ [STARTING]`, `✕ [ERROR]`, `◌ [EXITED]` — with the `[STARTING]` label text/format preserved.
+
+**Terminal title (§15.3):** `tea.SetWindowTitle` sets `llamaman — <alias> [STARTING]` at run-mode entry, `[READY]` on the ready transition, `[ERROR]`/`[EXITED]` on process exit; router runs use the models-file basename. Not restored on exit (v1).
+
 Scrollback: unlimited, in-memory, sourced from the on-disk log file. The whole file is buffered.
 
 ### 7.5 Configuration mode
@@ -1215,6 +1221,72 @@ resolver are new.
 **Deferred to later items:** animation rendering and the run-mode
 toggle key (item 5, consumes `preferences.animations`); the §12.2
 layout rework consumes palette tokens (item 2).
+
+### 15.3 Log & status readability (§2.2)
+
+**Goal.** Make the run-mode log readable at a glance: colorize
+llama-server output by line kind, highlight the readiness marker,
+refresh the terminal title, and add unicode status glyphs — all
+render-time only, never touching the on-disk log, search, scrollback,
+or the denoise toggle (§2.2 constraints).
+
+**Line-kind classifier** — new `classifyLine(line string) LineKind`
+plus a `colorizeLine` render helper in `run.go`:
+
+| Kind | Match (conservative, case-insensitive) | Color |
+|---|---|---|
+| ERROR | `\berror\b` \| `\bfailed\b` \| `\bfatal\b` \| `\baborted\b` | `StatusErr` |
+| WARN | `\bwarn(ing)?\b` | `StatusStart` |
+| TIMING | `tokens? per second` \| `ms per token` \| `eval time` \| `prompt eval time` \| `total time` \| `load time` | `Muted` |
+| READY | contains `listening on` (the ready marker) | `StatusReady` + bold |
+| INFO | default | none (plain) |
+
+The rules are a single slice of (regex, kind) pairs — cheap to extend
+as llama.cpp output drifts (P6). **Conservative by design (§2.2 risk):**
+the worst case is an uncolored line; the ERROR/WARN patterns are broad
+enough that a real critical line is never rendered as plain INFO.
+
+**Where it applies.** `renderViewportContent()` is the single hook:
+per line → `colorizeLine(kind, highlightOccurrences(line, q))`.
+`visibleLogLines()` stays plain, so search matching, jump-to-match
+indices, scrollback positions, and the denoise toggle are all
+unaffected; the on-disk log is byte-identical (colorizing is
+render-time only). Search highlight (bold+reverse) takes visual
+precedence during an active search; a match inside a colored line
+reverts the remainder of that line to default color until the next
+line's reset — accepted cosmetic during active search.
+
+**Terminal title (OSC).** `tea.SetWindowTitle` (bubbletea v1.3.10):
+`llamaman — <alias> [STARTING]` on run-mode init; `[READY]` on both
+ready paths (the textual `listening on` marker and the /props
+transition); `[ERROR]` / `[EXITED]` on those state changes. Router runs
+use the models-file basename as the alias. No restore-on-exit in v1
+(the terminal keeps the last title).
+
+**Unicode status glyphs.** The `[LABEL]` badge (`statusBadge`) gains a
+per-state glyph prefix, colored with the state color:
+`● [READY]`, `◌ [STARTING]`, `✕ [ERROR]`, `◌ [EXITED]`.
+**§2.3 constraint honored:** the `[STARTING]` badge's text and format
+stay — the hollow-dot prefix is additive, and nothing replaces the
+badge (the load-progress indicator is item 4's job). The glyphs are
+owner-vetoable if the plain badge is preferred.
+
+**Determinism (P9).** Classifier unit tests on synthetic lines
+(error/warn/timing/ready/info + near-misses); a render test with a
+forced ANSI-256 profile asserting the viewport wraps an ERROR line in
+the expected SGR and leaves INFO lines plain; a title test asserting
+the OSC string helper. Existing snapshot tests strip ANSI and are
+unaffected (the one `renderViewportContent` test already strips).
+
+**Non-goals.** No on-disk log changes; no new keys; no spinner or
+progress element (item 4); no change to the `[STARTING]` badge
+semantics.
+
+**File map.** `internal/tui/run.go` — `classifyLine`, `colorizeLine`,
+`renderViewportContent` hook, `statusBadge` glyph prefix,
+`tea.SetWindowTitle` on init/ready/error/exited transitions. New tests
+in `run_test.go`. DESIGN §7.4 gains the status/lines description in the
+same change (P5).
 
 ### 15.2 Main-mode layout rework (§12.2)
 
