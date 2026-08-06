@@ -31,9 +31,12 @@ type SettingsMode struct {
 	width, height int
 }
 
-// NewSettingsMode builds the form over the live preferences. A
-// hand-edited unknown or background-incompatible theme is warned about
-// and reset to "auto" (P3: degrade with a warning, never block).
+// NewSettingsMode builds the form over the live preferences. Both
+// variants of every family are offered (owner decision, DESIGN §15.1):
+// the terminal background is a hint, not a filter. A hand-edited
+// *unknown* theme is reset to "auto" with a warning (P3); a known but
+// background-mismatched theme is kept and warned about, so the user can
+// override explicitly.
 //
 // Returns a pointer: the form binds directly to the mode's fields, so
 // the values the user picks land in the same struct the caller and
@@ -46,16 +49,12 @@ func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg boo
 		themeVal = "auto"
 	}
 	var warn string
-	if themeVal != "auto" {
-		switch {
-		case !paletteCompatible(themeVal, darkBg):
-			if _, known := lookupPalette(themeVal); known {
-				warn = fmt.Sprintf("%q does not match this terminal's background — showing auto", prefs.Theme)
-			} else {
-				warn = fmt.Sprintf("unknown theme %q — showing auto", prefs.Theme)
-			}
-			themeVal = "auto"
-		}
+	switch {
+	case themeVal != "auto" && !lookupKnown(themeVal):
+		warn = fmt.Sprintf("unknown theme %q — showing auto", prefs.Theme)
+		themeVal = "auto"
+	case themeVal != "auto" && !paletteCompatible(themeVal, darkBg):
+		warn = fmt.Sprintf("%s — applied anyway", mismatchWarning(themeVal, darkBg))
 	}
 
 	sm := &SettingsMode{
@@ -70,13 +69,22 @@ func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg boo
 
 	opts := make([]huh.Option[string], 0, len(palettes)+1)
 	opts = append(opts, huh.NewOption("auto (llamaman default)", "auto"))
-	for _, p := range CompatiblePalettes(darkBg) {
-		opts = append(opts, huh.NewOption(p.Display, p.ID))
+	for _, p := range cyclePalettes() {
+		label := p.Display
+		switch p.Background {
+		case BackgroundAdaptive:
+			label += " — dark or light by terminal"
+		case BackgroundDark:
+			label += " (dark)"
+		case BackgroundLight:
+			label += " (light)"
+		}
+		opts = append(opts, huh.NewOption(label, p.ID))
 	}
 	sm.form = huh.NewForm(huh.NewGroup(
 		huh.NewSelect[string]().
 			Title("theme").
-			Description("options match your terminal background").
+			Description("both variants shown; pick whichever suits your terminal").
 			Options(opts...).
 			Value(&sm.themeVal),
 		huh.NewConfirm().
@@ -160,14 +168,22 @@ func (s *SettingsMode) snapshot() *config.Preferences {
 	return &prefs
 }
 
-// View renders the settings form in a bordered popup, with an optional
-// warning banner when the stored theme was unknown/incompatible.
+// View renders the settings form in a bordered popup, with the detected
+// terminal background and an optional warning banner when the stored
+// theme was unknown or background-mismatched.
 func (s SettingsMode) View() string {
 	if s.form == nil {
 		return ""
 	}
+	term := "light"
+	if s.darkBg {
+		term = "dark"
+	}
 	parts := []string{
 		lipgloss.NewStyle().Foreground(s.theme.Accent).Bold(true).Render("Settings"),
+		"",
+		lipgloss.NewStyle().Foreground(s.theme.Subtle).Render(
+			fmt.Sprintf("terminal background: %s — pick any palette; mismatched ones warn", term)),
 		"",
 	}
 	if s.warn != "" {

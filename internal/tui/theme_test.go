@@ -117,49 +117,78 @@ func TestResolveThemeUnknownFallsBack(t *testing.T) {
 	}
 }
 
-// TestCompatiblePalettesFiltersByBackground pins the P1 compatibility
-// rule: a dark terminal sees llamaman + all dark palettes; a light
-// terminal sees llamaman + all light palettes. 12 each, no overlap.
-func TestCompatiblePalettesFiltersByBackground(t *testing.T) {
-	dark := CompatiblePalettes(true)
-	light := CompatiblePalettes(false)
-	if len(dark) != 12 {
-		t.Errorf("dark-terminal palette count = %d, want 12 (llamaman + 11 dark)", len(dark))
+// TestCyclePalettesGroupsByBackground pins the picker/cycle ordering:
+// llamaman (adaptive) first, then dark palettes, then light ones — both
+// variants of every family are offered (owner decision: background is a
+// hint, not a filter).
+func TestCyclePalettesGroupsByBackground(t *testing.T) {
+	all := cyclePalettes()
+	if len(all) != 23 {
+		t.Fatalf("cycle palettes = %d, want 23", len(all))
 	}
-	if len(light) != 12 {
-		t.Errorf("light-terminal palette count = %d, want 12 (llamaman + 11 light)", len(light))
+	if all[0].ID != "llamaman" || all[0].Background != BackgroundAdaptive {
+		t.Errorf("first palette must be the adaptive llamaman, got %+v", all[0])
 	}
-	if dark[0].ID != "llamaman" || light[0].ID != "llamaman" {
-		t.Error("llamaman (adaptive) must be offered first on both backgrounds")
-	}
-	for _, p := range dark {
-		if p.Background == BackgroundLight {
-			t.Errorf("dark terminal offered light palette %s", p.ID)
+	darks, lights := 0, 0
+	for i, p := range all {
+		switch p.Background {
+		case BackgroundDark:
+			darks++
+			if i < 1 || i > 11 {
+				t.Errorf("dark palette %s out of the dark block", p.ID)
+			}
+		case BackgroundLight:
+			lights++
+			if i < 12 || i > 22 {
+				t.Errorf("light palette %s outside the light block", p.ID)
+			}
 		}
 	}
-	for _, p := range light {
-		if p.Background == BackgroundDark {
-			t.Errorf("light terminal offered dark palette %s", p.ID)
-		}
+	if darks != 11 || lights != 11 {
+		t.Errorf("dark/light counts = %d/%d, want 11/11", darks, lights)
+	}
+}
+
+// TestMismatchWarning covers the explicit-override behavior: a known
+// palette whose background mismatches the terminal yields a warning;
+// adaptive, matching, and unknown values warn nothing.
+func TestMismatchWarning(t *testing.T) {
+	if w := mismatchWarning("solarized-light", true); w == "" || !containsSequence(w, "hard to read") {
+		t.Errorf("light palette on dark terminal must warn, got %q", w)
+	}
+	if w := mismatchWarning("solarized-light", false); w != "" {
+		t.Errorf("matching light palette on light terminal must not warn, got %q", w)
+	}
+	if w := mismatchWarning("solarized-dark", true); w != "" {
+		t.Errorf("matching dark palette on dark terminal must not warn, got %q", w)
+	}
+	if w := mismatchWarning("llamaman", true); w != "" {
+		t.Errorf("adaptive palette must not warn, got %q", w)
+	}
+	if w := mismatchWarning("auto", true); w != "" {
+		t.Errorf("auto must not warn, got %q", w)
+	}
+	if w := mismatchWarning("garbage", true); w != "" {
+		t.Errorf("unknown value must not warn (resolver handles it), got %q", w)
 	}
 }
 
 // TestThemeCycleCoversAllValuesAndWraps verifies the quick-key cycle:
-// it starts at "auto", steps through every compatible palette, and
-// wraps in both directions.
+// it starts at "auto", steps through all 23 palettes, and wraps in both
+// directions.
 func TestThemeCycleCoversAllValuesAndWraps(t *testing.T) {
-	seq := themeCycle(true)
+	seq := themeCycle()
 	if seq[0] != "auto" {
 		t.Fatalf("cycle must start at auto, got %q", seq[0])
 	}
-	if len(seq) != 13 { // auto + 12 compatible
-		t.Fatalf("cycle length = %d, want 13", len(seq))
+	if len(seq) != 24 { // auto + 23 palettes
+		t.Fatalf("cycle length = %d, want 24", len(seq))
 	}
 
 	// Forward from auto walks the whole cycle and wraps.
 	cur := "auto"
 	for i := 0; i < len(seq); i++ {
-		cur = nextTheme(cur, +1, true)
+		cur = nextTheme(cur, +1)
 		if cur != seq[(i+1)%len(seq)] {
 			t.Fatalf("forward step %d = %q, want %q", i, cur, seq[(i+1)%len(seq)])
 		}
@@ -170,18 +199,18 @@ func TestThemeCycleCoversAllValuesAndWraps(t *testing.T) {
 
 	// Backward wraps too.
 	cur = "auto"
-	cur = nextTheme(cur, -1, true)
+	cur = nextTheme(cur, -1)
 	if cur != seq[len(seq)-1] {
 		t.Errorf("backward from auto = %q, want %q", cur, seq[len(seq)-1])
 	}
 }
 
-// TestThemeCycleAnchorsUnknownValues: an unknown/incompatible stored
-// value behaves as if sitting just before "auto", so the first press
-// lands on auto and re-anchors.
+// TestThemeCycleAnchorsUnknownValues: an unknown stored value behaves
+// as if sitting just before "auto", so the first press lands on auto
+// and re-anchors.
 func TestThemeCycleAnchorsUnknownValues(t *testing.T) {
-	seq := themeCycle(true)
-	got := nextTheme("garbage", +1, true)
+	seq := themeCycle()
+	got := nextTheme("garbage", +1)
 	if got != seq[0] {
 		t.Errorf("first press from an unknown value = %q, want %q", got, seq[0])
 	}
@@ -225,4 +254,13 @@ func containsSequence(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// mustPalette returns the palette Theme for a known ID (test helper).
+func mustPalette(id string) Theme {
+	p, ok := lookupPalette(id)
+	if !ok {
+		panic("unknown palette in test: " + id)
+	}
+	return p.T
 }

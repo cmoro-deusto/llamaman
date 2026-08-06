@@ -94,8 +94,8 @@ func TestQuickKeyTAndShiftTWrapTheCycle(t *testing.T) {
 	root := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
 
-	seq := themeCycle(true)
-	// Step forward through the whole cycle from auto.
+	seq := themeCycle()
+	// Step forward through the whole cycle from auto (24 entries).
 	for i := 1; i < len(seq); i++ {
 		driveRoot(t, root, keyMsg("t"))
 		if got := root.cfg.Prefs().Theme; got != seq[i] {
@@ -268,6 +268,79 @@ func TestThemeCycleResetsPresetPivot(t *testing.T) {
 	}
 	if out := stripANSI(root.mainMode.View()); !strings.Contains(out, "alpha") {
 		t.Errorf("model list should be visible again after pivot reset:\n%s", out)
+	}
+}
+
+// TestSettingsShowsBothVariants: on a dark terminal the picker still
+// offers the light palettes, explicitly labeled (owner decision: the
+// background is a hint, not a filter).
+func TestSettingsShowsBothVariants(t *testing.T) {
+	forceDarkBg(t)
+	defer forceDarkBgRestore()
+
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	out := driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		keyMsg("s"),
+	)
+	for _, want := range []string{
+		"terminal background: dark",
+		"Catppuccin Latte (light)",
+		"Solarized Light (light)",
+		"Catppuccin Mocha (dark)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("settings picker missing %q (both variants must be visible)\nout:\n%s", want, out)
+		}
+	}
+}
+
+// TestSettingsMismatchedThemeAppliesWithWarning: a stored light palette
+// on a dark terminal is kept (not reset to auto), warned about, and
+// applied on submit — the explicit-override path. The user also toggles
+// animations off so the submit carries a change through the full
+// apply-and-save path (incl. the Main-mode warning flash).
+func TestSettingsMismatchedThemeAppliesWithWarning(t *testing.T) {
+	forceDarkBg(t)
+	defer forceDarkBgRestore()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg := sampleSnapshotConfig()
+	cfg.Preferences = &config.Preferences{Theme: "solarized-light"}
+	if err := config.Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	root := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		keyMsg("s"),
+	)
+	if root.settings == nil || root.settings.warn == "" {
+		t.Fatalf("expected a mismatch warning, got warn=%q", root.settings.warn)
+	}
+	if !strings.Contains(out, "hard to read") {
+		t.Errorf("settings view missing mismatch warning\nout:\n%s", out)
+	}
+	if root.settings.themeVal != "solarized-light" {
+		t.Errorf("mismatched stored theme must be kept for explicit override, got %q", root.settings.themeVal)
+	}
+
+	// Submit with a change (animations off): the mismatch applies, not auto.
+	driveRoot(t, root, keyMsg("enter"), tea.KeyMsg{Type: tea.KeyLeft}, keyMsg("enter"))
+	if got := root.cfg.Prefs().Theme; got != "solarized-light" {
+		t.Fatalf("after submit: theme = %q, want solarized-light", got)
+	}
+	if got := root.mainMode.theme; got != mustPalette("solarized-light") {
+		t.Errorf("main mode did not apply the light palette on the dark terminal")
+	}
+	if !strings.Contains(root.mainMode.flash, "hard to read") {
+		t.Errorf("Main flash should carry the mismatch warning, got %q", root.mainMode.flash)
+	}
+	if root.cfg.Prefs().AnimationsEnabled() {
+		t.Error("animations should be off after the form toggle")
 	}
 }
 

@@ -360,10 +360,11 @@ func lookupPalette(id string) (Palette, bool) {
 	return Palette{}, false
 }
 
-// paletteCompatible reports whether a stored theme value is usable on a
-// terminal of the given background: "auto"/"" always, named palettes
-// when adaptive or background-matching (P1). The Settings form uses it
-// to warn-and-reset on hand-edited incompatible values.
+// paletteCompatible reports whether a stored theme value matches the
+// terminal background: "auto"/"" always, named palettes when adaptive
+// or background-matching. Compatibility is now a warning-level hint,
+// not a filter (owner decision, DESIGN §15.1): the user may pick any
+// variant explicitly.
 func paletteCompatible(id string, darkBg bool) bool {
 	if id == "" || id == "auto" {
 		return true
@@ -376,14 +377,56 @@ func paletteCompatible(id string, darkBg bool) bool {
 		(p.Background == BackgroundDark) == darkBg
 }
 
-// CompatiblePalettes returns the palettes offered for a terminal of the
-// given background: the adaptive llamaman palette first, then every
-// named palette whose Background matches (P1). Order matches the table.
-func CompatiblePalettes(darkBg bool) []Palette {
+// lookupKnown reports whether the value is a usable theme reference
+// ("", "auto", "llamaman", or a palette-table ID).
+func lookupKnown(id string) bool {
+	if id == "" || id == "auto" || id == "llamaman" {
+		return true
+	}
+	_, ok := lookupPalette(id)
+	return ok
+}
+
+// mismatchWarning returns a user-facing warning when the stored theme
+// is a known palette that does not match the terminal background
+// (empty string when it does, or when the value is unknown/auto — the
+// unknown case is handled by the resolver's fallback instead).
+func mismatchWarning(id string, darkBg bool) string {
+	if id == "" || id == "auto" {
+		return ""
+	}
+	p, ok := lookupPalette(id)
+	if !ok {
+		return ""
+	}
+	if paletteCompatible(id, darkBg) {
+		return ""
+	}
+	term := "light"
+	if darkBg {
+		term = "dark"
+	}
+	return p.Display + " may be hard to read on a " + term + " terminal"
+}
+
+// cyclePalettes returns every selectable palette grouped for browsing:
+// the adaptive llamaman default first, then dark palettes, then light
+// ones. Both variants of every family are offered — the background is
+// a hint, not a filter (owner decision).
+func cyclePalettes() []Palette {
 	out := make([]Palette, 0, len(palettes))
 	for _, p := range palettes {
-		if p.Background == BackgroundAdaptive ||
-			(p.Background == BackgroundDark) == darkBg {
+		if p.Background == BackgroundAdaptive {
+			out = append(out, p)
+		}
+	}
+	for _, p := range palettes {
+		if p.Background == BackgroundDark {
+			out = append(out, p)
+		}
+	}
+	for _, p := range palettes {
+		if p.Background == BackgroundLight {
 			out = append(out, p)
 		}
 	}
@@ -391,15 +434,14 @@ func CompatiblePalettes(darkBg bool) []Palette {
 }
 
 // themeCycle returns the ordered sequence of preferences.theme values
-// the quick keys step through: "auto" first (the default), then the
-// compatible palettes. An unknown or incompatible stored value is
-// treated as sitting just before "auto", so the first keypress lands on
-// "auto" and re-anchors the cycle.
-func themeCycle(darkBg bool) []string {
-	compat := CompatiblePalettes(darkBg)
-	seq := make([]string, 0, len(compat)+1)
+// the quick keys step through: "auto" first (the default), then all 23
+// palettes. An unknown stored value is treated as sitting just before
+// "auto", so the first keypress lands on "auto" and re-anchors.
+func themeCycle() []string {
+	all := cyclePalettes()
+	seq := make([]string, 0, len(all)+1)
 	seq = append(seq, "auto")
-	for _, p := range compat {
+	for _, p := range all {
 		seq = append(seq, p.ID)
 	}
 	return seq
@@ -410,8 +452,8 @@ func themeCycle(darkBg bool) []string {
 // cycle. `t` / `shift+t` call this with ±1. An unknown current value
 // sits just before "auto", so the first press lands on "auto" and
 // re-anchors the cycle.
-func nextTheme(current string, dir int, darkBg bool) string {
-	seq := themeCycle(darkBg)
+func nextTheme(current string, dir int) string {
+	seq := themeCycle()
 	idx := -1 // unknown values sit before "auto"
 	if current == "" || current == "auto" {
 		idx = 0 // "" (absent) means auto: first press steps to llamaman

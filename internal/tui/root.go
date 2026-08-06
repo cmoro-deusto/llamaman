@@ -523,7 +523,7 @@ func (r *Root) cycleTheme(dir int) {
 	if r.cfg == nil || r.cfgPath == "" {
 		return
 	}
-	next := nextTheme(r.cfg.Prefs().Theme, dir, lipgloss.HasDarkBackground())
+	next := nextTheme(r.cfg.Prefs().Theme, dir)
 	prefs := r.cfg.Prefs()
 	prefs.Theme = next
 	prev := r.cfg.Preferences
@@ -540,11 +540,17 @@ func (r *Root) cycleTheme(dir int) {
 	if p, ok := lookupPalette(next); ok {
 		display = p.Display
 	}
-	r.mainMode.SetFlash("theme: " + display)
+	flash := "theme: " + display
+	if w := mismatchWarning(next, lipgloss.HasDarkBackground()); w != "" {
+		flash = "⚠ " + w + " — " + flash
+	}
+	r.mainMode.SetFlash(flash)
 }
 
 // applyTheme re-resolves the theme from preferences and pushes it into
-// main mode (the only mode alive while Settings/the cycle run).
+// main mode (the only mode alive while Settings/the cycle run). A
+// background-mismatched palette surfaces as a Main-mode flash warning
+// (the user picked it explicitly, so it applies — DESIGN §15.1).
 func (r *Root) applyTheme() {
 	theme, resolved, ok := ResolveTheme(r.cfg.Prefs().Theme, lipgloss.HasDarkBackground())
 	if !ok {
@@ -552,6 +558,9 @@ func (r *Root) applyTheme() {
 	}
 	r.theme = theme
 	r.mainMode.SetTheme(theme)
+	if w := mismatchWarning(r.cfg.Prefs().Theme, lipgloss.HasDarkBackground()); w != "" {
+		r.mainMode.SetFlash("⚠ " + w)
+	}
 }
 
 func (r *Root) View() string {
