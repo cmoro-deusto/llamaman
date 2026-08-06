@@ -3343,10 +3343,13 @@ func parseLoadPhase(line string) (phase string, progress *float64) {
 		return "downloading model", nil
 	}
 	if loadLoadingRE.MatchString(line) {
-		return "loading model file", nil
+		return "loading model", nil
 	}
-	if loadTensorsRE.MatchString(line) {
-		return "loading model tensors", nil
+	if loadInitRE.MatchString(line) {
+		return "initializing", nil
+	}
+	if loadLoadedRE.MatchString(line) {
+		return "model loaded", nil
 	}
 	return "", nil
 }
@@ -3356,8 +3359,9 @@ var (
 	loadOffloadingRE    = regexp.MustCompile(`(?i)offloading\s+\d+\s+repeating\s+layers`)
 	loadOffloadOutputRE = regexp.MustCompile(`(?i)offloading output layer`)
 	loadDownloadRE      = regexp.MustCompile(`(?i)(?:downloading|download).*?(\d+(?:\.\d+)?)\s*%`)
-	loadLoadingRE       = regexp.MustCompile(`(?i)loading\s+model\s+(?:from|file)`)
-	loadTensorsRE       = regexp.MustCompile(`(?i)loading model tensors`)
+	loadLoadingRE       = regexp.MustCompile(`(?i)loading\s+model\b`)
+	loadInitRE          = regexp.MustCompile(`(?i)\binitializing\b`)
+	loadLoadedRE        = regexp.MustCompile(`(?i)\bmodel loaded\b`)
 )
 
 // showingLoadBlock reports whether the left panel should show the
