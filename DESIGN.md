@@ -1889,3 +1889,67 @@ resolution), `layout.go` (folder-name mapping + detection), `scan.go`
 `settings_test.go`. `DESIGN.md` — this §16.1, §3.2, §3.3 (and, on
 owner confirmation, §14.2). No `main.go` change.
 
+
+### 16.2 HF API client
+
+**Scope.** Second item of Release 2 (ROADMAP §3.7). A small,
+dependency-free HTTP client for the Hugging Face API surface named in
+ROADMAP §3.2 — the piece shared by every network-consuming item that
+follows (quant picker §3.3, the manager's download action §3.4, the
+config editor's repo check §3.8b, the browser §3.5). New package
+`internal/hf/`. **Non-goals:** no download loop (the manager's download
+action owns resume/sha256, §3.4), no quant filtering (item 3), no search
+(item 7), no config token (`HF_TOKEN` env only; `preferences.hf-token`
+stays deferred).
+
+**Endpoints** (P7: requests only on explicit caller actions, only to
+huggingface.co unless overridden):
+
+| Call | Request | Returns |
+|---|---|---|
+| File tree | `GET {endpoint}/api/models/{repo}/tree/{revision}?recursive=true` | `[]RepoFile{Path, Size, OID}` — existence check + quant list + sizes + LFS sha256 in one round trip |
+| Repo metadata | `GET {endpoint}/api/models/{repo}` | `RepoMeta{ID, SHA, Downloads, Likes, Tags}` (browser extends later) |
+
+- **Endpoint:** `$HF_ENDPOINT`, default `https://huggingface.co`
+  (mirrors llama.cpp's `common_get_model_endpoint` and
+  `huggingface_hub`; keeps a mirror usable and is the single update
+  point if the API moves). Revision defaults to `main`; callers may
+  pass a branch or commit.
+- **Tree entries:** `type: "file"` only; size = `lfs.size` when present
+  else `size`; OID = `lfs.oid` else `oid` (the LFS oid is the sha256
+  the downloader verifies against). Directories are skipped.
+- **Token:** read `HF_TOKEN` once per client; when non-empty, send
+  `Authorization: Bearer <token>` on every request (gated repos).
+- **Errors (P3, for §3.8b's distinct messages):** typed `hf.Error` with
+  a kind: `ErrNotFound` (404), `ErrGated` (401/403), `ErrNetwork`
+  (DNS/timeout/transport), `ErrHTTP` (other status, carries the code).
+  Convenience predicates `IsNotFound`/`IsGated`.
+
+**API surface.**
+
+```go
+func New() (*Client, error)                     // endpoint/token from env
+func NewWithEndpoint(endpoint, token string) *Client // tests + injection
+func (c *Client) Tree(ctx, repo, revision string) ([]RepoFile, error)
+func (c *Client) Repo(ctx, repo string) (RepoMeta, error)
+func (c *Client) RepoExists(ctx, repo string) (bool, error) // Tree, kind-filtered
+```
+
+- Repo ids are path-escaped per segment (`Qwen/Qwen3-32B-GGUF`).
+- A bounded `http.Client` timeout; `ctx` passes cancellation through
+  (P10 — user control later).
+- `RepoExists` is `Tree` with `IsNotFound` → false, other errors
+  surfaced (a gated repo *exists*).
+
+**Determinism (P9).** All tests run against `httptest.Server` — no
+network, no llama-server. Cover: URL path + `recursive=true` query;
+Bearer header with `HF_TOKEN` set (`t.Setenv`) and absent; lfs-oid and
+lfs-size extraction; directory entries skipped; 404 → `ErrNotFound`,
+401/403 → `ErrGated`, transport error → `ErrNetwork`; malformed JSON →
+error; `HF_ENDPOINT` honored; empty repo response.
+
+**File map.** New `internal/hf/` — `client.go` (endpoint/token/HTTP,
+error types), `types.go` (`RepoFile`, `RepoMeta`), `client_test.go`,
+`types_test.go`. No `main.go` change, no TUI change, no config change.
+DESIGN §14.2 / ROADMAP §3.2 already describe the item; this note adds
+the implementation contract.
