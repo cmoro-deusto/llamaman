@@ -22,8 +22,10 @@ import (
 // frozen time so rendered frames stay stable (P9).
 var clock = time.Now
 
-// animTickInterval is the animation frame period (≤ 4 fps, §2.4).
-const animTickInterval = 250 * time.Millisecond
+// animTickInterval is the animation frame period (owner-amended: 10
+// fps for smoother motion, §15.5 — still cheap since the frame redraw
+// is small).
+const animTickInterval = 100 * time.Millisecond
 
 // animTickMsg triggers a re-render so animated elements move.
 type animTickMsg struct{}
@@ -48,18 +50,19 @@ func animPhase(period time.Duration) float64 {
 	return (math.Sin(2*math.Pi*t) + 1) / 2
 }
 
-// quantizePhase snaps t to 3 discrete levels on 256-color (or fewer)
-// terminals so the visible color steps rather than smearing (P1);
+// quantizePhase snaps t to 6 discrete levels on 256-color (or fewer)
+// terminals so the visible color steps smoothly rather than smearing
+// (P1 — owner-amended from 3 to 6 steps for less jerky breathing);
 // truecolor terminals keep the continuous value.
 func quantizePhase(t float64) float64 {
 	if lipgloss.ColorProfile() == termenv.TrueColor {
 		return t
 	}
-	return math.Round(t*3) / 3
+	return math.Round(t*6) / 6
 }
 
 // animColor is lerpColor with the phase quantized per the terminal
-// profile (P1): smooth on truecolor, 3 discrete steps otherwise.
+// profile (P1): smooth on truecolor, 6 discrete steps otherwise.
 func animColor(a, b lipgloss.Color, period time.Duration) lipgloss.Color {
 	return lerpColor(a, b, quantizePhase(animPhase(period)))
 }

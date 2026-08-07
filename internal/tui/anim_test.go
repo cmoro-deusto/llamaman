@@ -56,13 +56,22 @@ func TestLerpColor(t *testing.T) {
 	}
 }
 
-// TestQuantizePhase: 256-color profile snaps to 3 steps; truecolor is
-// continuous.
+// TestQuantizePhase: 256-color profile snaps to 6 discrete steps;
+// truecolor is continuous.
 func TestQuantizePhase(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.ANSI256)
 	defer lipgloss.SetColorProfile(termenv.ColorProfile())
 	if got := quantizePhase(0.4); got != 0.3333333333333333 {
 		t.Errorf("ANSI256 quantize(0.4) = %v, want 1/3", got)
+	}
+	// At most 7 distinct levels across a full period (6 steps + both
+	// endpoints 0 and 1).
+	seen := map[float64]bool{}
+	for i := 0; i < 100; i++ {
+		seen[quantizePhase(float64(i)/100)] = true
+	}
+	if len(seen) > 7 {
+		t.Errorf("ANSI256 quantization produced %d distinct levels, want ≤ 7 (6 steps + endpoints)", len(seen))
 	}
 	lipgloss.SetColorProfile(termenv.TrueColor)
 	if got := quantizePhase(0.4); got != 0.4 {

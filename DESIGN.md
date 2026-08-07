@@ -541,7 +541,8 @@ bars fill smoothly; the Tokens/Prompt sparklines glow softly while
 busy. One-shot: a ready glow on STARTING→READY, a red flash on ERROR,
 a pulse on the current search occurrence after `n`/`N`, a glow when
 TTFT arrives, and a flash on router models that just loaded/unloaded.
-No wordmark animation; steady-state READY idle is static; ≤ 4 fps;
+No wordmark animation; steady-state READY idle is static; 10 fps
+(owner-amended from 4 for smoother motion);
 truecolor lerp with a 3-step discrete fallback on 256-color (P1); a
 frozen clock in tests (P9).
 
@@ -914,8 +915,10 @@ not relitigated. Three releases, in priority order 4 → 2 → (3 + 1).
   (model load → layer offload → HF download % → listening). **Hard
   constraint:** separate from the `[STARTING]` badge — nothing replaces it.
   Tolerant classifiers; unknown phase degrades to today's static UI.
-- **Subtle color animation.** `tea.Tick` ≤ 4 fps; true-color lerp with a
-  2–3 step discrete fallback on 256-color (P1). Scoped to: load-progress
+- **Subtle color animation.** `tea.Tick` 10 fps (owner-amended from 4);
+  true-color lerp with a
+  6-step discrete fallback on 256-color (P1, owner-amended from 2–3
+  steps for less jerky breathing). Scoped to: load-progress
   fill, `[STARTING]` badge breathing, status-dot pulse while generating. No
   wordmark animation; steady state stays static; snapshot tests freeze a
   fake clock. No desktop notifications. **User control (P10):** gated by
@@ -1255,7 +1258,7 @@ layout rework consumes palette tokens (item 2).
 ### 15.5 Subtle color animation (§2.4)
 
 **Goal.** Minimal, tasteful motion that signals transitions without
-noise: ≤ 4 fps, only while transitional/generating, **never** in steady
+noise: 10 fps (owner-amended from ≤ 4 for smoother motion), only while transitional/generating, **never** in steady
 state, no wordmark animation (ROADMAP §2.4 scope). Gated by
 `preferences.animations` (default **on** — item 1's field; Settings
 toggles it) and a new run-mode quick key. Determinism first: all
