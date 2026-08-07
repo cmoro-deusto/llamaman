@@ -38,14 +38,14 @@ func writeSnapshotConfig(t *testing.T) (string, *config.Config) {
 }
 
 // TestSnapshotMainShowsSettingsAndThemeShortcuts pins the new shortcut
-// row entries (s = settings, t = theme) in Main mode.
+// row entries (s = storage, p = preferences, t = theme) in Main mode.
 func TestSnapshotMainShowsSettingsAndThemeShortcuts(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
 
 	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
 
-	for _, want := range []string{"settings", "theme"} {
+	for _, want := range []string{"storage", "preferences", "theme"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("main mode shortcut row missing %q\nout:\n%s", want, out)
 		}
@@ -128,7 +128,7 @@ func TestSettingsOpensFromMain(t *testing.T) {
 
 	out := driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 	)
 
 	if root.view != ViewSettings {
@@ -148,7 +148,7 @@ func TestSettingsEscDiscards(t *testing.T) {
 	root := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 		keyMsg("esc"),
 	)
 	if root.view != ViewMain {
@@ -171,7 +171,7 @@ func TestSettingsSubmitNoChangePersistsNothing(t *testing.T) {
 	root := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 		keyMsg("enter"),
 		keyMsg("enter"),
 		keyMsg("enter"),
@@ -201,7 +201,7 @@ func TestSettingsSubmitPersistsThemeChange(t *testing.T) {
 	root := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 		tea.KeyMsg{Type: tea.KeyDown}, // select llamaman (first option after auto)
 		keyMsg("enter"),
 		keyMsg("enter"),
@@ -232,7 +232,7 @@ func TestSettingsSubmitAnimationsOff(t *testing.T) {
 	root := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 		keyMsg("enter"),               // select → confirm
 		tea.KeyMsg{Type: tea.KeyLeft}, // toggle confirm to "no"
 		keyMsg("enter"),               // confirm → log colors
@@ -288,7 +288,7 @@ func TestSettingsShowsBothVariants(t *testing.T) {
 	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
 	out := driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 	)
 	for _, want := range []string{
 		"terminal background: dark",
@@ -322,7 +322,7 @@ func TestSettingsMismatchedThemeAppliesWithWarning(t *testing.T) {
 
 	out := driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 	)
 	if root.settings == nil || root.settings.warn == "" {
 		t.Fatalf("expected a mismatch warning, got warn=%q", root.settings.warn)
@@ -362,7 +362,7 @@ func TestSettingsLivePreviewReThemes(t *testing.T) {
 	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 	)
 	if root.settings == nil {
 		t.Fatal("settings not open")
@@ -398,7 +398,7 @@ func TestSettingsWarnsOnUnknownStoredTheme(t *testing.T) {
 
 	out := driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 	)
 
 	if root.settings == nil || root.settings.warn == "" {
@@ -421,7 +421,7 @@ func TestSettingsSubmitModelsDir(t *testing.T) {
 	root := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 		keyMsg("enter"), // theme → animations
 		keyMsg("enter"), // animations → log colors
 		keyMsg("enter"), // log colors → models dir
@@ -443,7 +443,7 @@ func TestSettingsSubmitModelsDir(t *testing.T) {
 	root = NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 		keyMsg("enter"),
 		keyMsg("enter"),
 		keyMsg("enter"),
@@ -470,7 +470,7 @@ func TestSettingsOpensWithModelsDirFromConfig(t *testing.T) {
 	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 	)
 	if root.view != ViewSettings {
 		t.Fatalf("view = %d, want ViewSettings", root.view)

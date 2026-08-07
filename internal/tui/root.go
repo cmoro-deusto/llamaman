@@ -9,6 +9,8 @@ import (
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
+	"github.com/cmoro-deusto/llamaman/internal/hf"
+	"github.com/cmoro-deusto/llamaman/internal/storage"
 )
 
 // View enumerates the top-level TUI screens.
@@ -20,6 +22,7 @@ const (
 	ViewConfig
 	ViewFirstRun
 	ViewSettings
+	ViewStorage
 )
 
 // SpawnRequestMsg asks the root to spawn llama-server for (Model, Preset)
@@ -80,6 +83,8 @@ type Root struct {
 	configMod *ConfigMode
 	firstRun  *FirstRunMode
 	settings  *SettingsMode
+	storage   *StorageMode
+	dlEngine  downloadEngine
 
 	// initialRun, if non-nil, makes the program jump straight to run mode
 	// on Init() (used both for `llamaman <alias>` and for reattach).
@@ -171,6 +176,9 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if r.settings != nil {
 			r.settings.SetSize(msg.Width, msg.Height)
 		}
+		if r.storage != nil {
+			r.storage.SetSize(msg.Width, msg.Height)
+		}
 		return r, nil
 
 	case FirstRunCompletedMsg:
@@ -222,6 +230,11 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		r.view = ViewMain
 		return r, nil
 
+	case returnFromStorageMsg:
+		r.storage = nil
+		r.view = ViewMain
+		return r, nil
+
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" && r.view != ViewRun && r.view != ViewConfig {
 			r.quitting = true
@@ -258,6 +271,8 @@ func (r *Root) routeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "c":
 			return r.openConfig(configEntry{focus: FocusModels})
 		case "s":
+			return r.openStorage()
+		case "p":
 			return r.openSettings()
 		case "t":
 			r.cycleTheme(+1)
@@ -298,6 +313,13 @@ func (r *Root) routeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		next, cmd := r.settings.Update(msg)
 		r.settings = next
 		return r, cmd
+	case ViewStorage:
+		if r.storage == nil {
+			return r, nil
+		}
+		next, cmd := r.storage.Update(msg)
+		r.storage = next
+		return r, cmd
 	case ViewFirstRun:
 		if r.firstRun == nil {
 			return r, nil
@@ -331,6 +353,13 @@ func (r *Root) forward(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		next, cmd := r.settings.Update(msg)
 		r.settings = next
+		return r, cmd
+	case ViewStorage:
+		if r.storage == nil {
+			return r, nil
+		}
+		next, cmd := r.storage.Update(msg)
+		r.storage = next
 		return r, cmd
 	case ViewFirstRun:
 		if r.firstRun == nil {
@@ -493,6 +522,34 @@ type returnFromSettingsMsg struct{}
 
 // openSettings switches to the Settings mode, which edits exactly the
 // preferences object (DESIGN §15.1).
+// SetDownloadEngine attaches the download engine used by the Storage
+// manager (DESIGN §16.4). Tests inject a stub; the default is a real
+// *hf.Client built lazily in openStorage.
+func (r *Root) SetDownloadEngine(e downloadEngine) { r.dlEngine = e }
+
+// openStorage switches to the Storage & Downloads manager.
+func (r *Root) openStorage() (tea.Model, tea.Cmd) {
+	if r.cfg == nil {
+		return r, nil
+	}
+	root, err := storage.CacheRoot(r.cfg.Prefs().ModelsDir)
+	if err != nil {
+		r.mainMode.SetFlash("could not resolve cache root: " + err.Error())
+		return r, nil
+	}
+	sm := NewStorageMode(r.cfg, r.theme, root)
+	if r.dlEngine != nil {
+		sm.SetEngine(r.dlEngine)
+	} else if c, err := hf.New(); err == nil {
+		sm.SetEngine(c)
+	}
+	sm.SetSize(r.width, r.height)
+	sm.rebuild()
+	r.storage = sm
+	r.view = ViewStorage
+	return r, nil
+}
+
 func (r *Root) openSettings() (tea.Model, tea.Cmd) {
 	r.settings = NewSettingsMode(r.cfgPath, r.cfg, r.theme, lipgloss.HasDarkBackground(), r.version)
 	r.settings.SetSize(r.width, r.height)
@@ -588,6 +645,11 @@ func (r *Root) View() string {
 			return ""
 		}
 		return r.settings.View()
+	case ViewStorage:
+		if r.storage == nil {
+			return ""
+		}
+		return r.storage.View()
 	case ViewFirstRun:
 		if r.firstRun == nil {
 			return ""

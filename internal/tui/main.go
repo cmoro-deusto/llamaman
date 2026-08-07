@@ -538,7 +538,8 @@ func (m MainMode) renderShortcuts() string {
 			shortcut("Enter", "attach", m.theme),
 			shortcut("a", "attach", m.theme),
 			shortcut("c", "configure", m.theme),
-			shortcut("s", "settings", m.theme),
+			shortcut("s", "storage", m.theme),
+			shortcut("p", "preferences", m.theme),
 			shortcut("?", "help", m.theme),
 			shortcut("q", "quit", m.theme),
 		}
@@ -556,7 +557,8 @@ func (m MainMode) renderShortcuts() string {
 	}
 	parts = append(parts, shortcut("tab", modeLabel, m.theme))
 	parts = append(parts, shortcut("c", "configure", m.theme))
-	parts = append(parts, shortcut("s", "settings", m.theme))
+	parts = append(parts, shortcut("s", "storage", m.theme))
+	parts = append(parts, shortcut("p", "preferences", m.theme))
 	parts = append(parts, shortcut("t", "theme", m.theme))
 	parts = append(parts, shortcut("?", "help", m.theme))
 	parts = append(parts, shortcut("q", "quit", m.theme))
@@ -626,7 +628,8 @@ func (m MainMode) renderHelp() string {
 		keys := []string{
 			"Enter / a attach to the running session",
 			"c           open configuration mode",
-			"s           open settings (theme, animations)",
+			"s           open storage manager (cache, downloads)",
+			"p           open preferences (theme, animations, models-dir)",
 			"t / Shift+t cycle theme (forward / backward)",
 			"?           toggle this help",
 			"q / Ctrl+C  quit (server keeps running)",
@@ -643,7 +646,8 @@ func (m MainMode) renderHelp() string {
 		"tab         toggle Single Model / Router mode",
 		"Esc         back out of preset pivot",
 		"c           open configuration mode",
-		"s           open settings (theme, animations)",
+		"s           open storage manager (cache, downloads)",
+		"p           open preferences (theme, animations, models-dir)",
 		"t / Shift+t cycle theme (forward / backward)",
 		"a           attach to running session (only when one exists)",
 		"?           toggle this help",

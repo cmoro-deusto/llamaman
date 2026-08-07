@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -164,40 +163,16 @@ func kindOf(err error) ErrorKind {
 	return ErrNetwork
 }
 
-// getJSON GETs u with the optional Bearer token and decodes the JSON
-// body into v, mapping failures to typed Errors.
+// getJSON GETs u and decodes the JSON body into v.
 func (c *Client) getJSON(ctx context.Context, u string, v any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	body, err := c.get(ctx, u)
 	if err != nil {
-		return &Error{Kind: ErrNetwork, Message: err.Error()}
+		return err
 	}
-	req.Header.Set("Accept", "application/json")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if err := json.Unmarshal(body, v); err != nil {
+		return &Error{Kind: ErrNetwork, Message: "invalid JSON: " + err.Error()}
 	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return &Error{Kind: ErrNetwork, Message: err.Error()}
-	}
-	defer resp.Body.Close()
-
-	switch resp.StatusCode {
-	case http.StatusOK:
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-		if err != nil {
-			return &Error{Kind: ErrNetwork, Message: err.Error()}
-		}
-		if err := json.Unmarshal(body, v); err != nil {
-			return &Error{Kind: ErrNetwork, Message: "invalid JSON: " + err.Error()}
-		}
-		return nil
-	case http.StatusNotFound:
-		return &Error{Kind: ErrNotFound, Status: resp.StatusCode, Message: "not found"}
-	case http.StatusUnauthorized, http.StatusForbidden:
-		return &Error{Kind: ErrGated, Status: resp.StatusCode, Message: "gated or requires a token"}
-	default:
-		return &Error{Kind: ErrHTTP, Status: resp.StatusCode, Message: "unexpected status"}
-	}
+	return nil
 }
 
 // escapeRepo path-escapes each repo segment (repos may contain dots and

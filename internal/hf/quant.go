@@ -123,3 +123,9 @@ func quantTag(p string) string {
 	}
 	return name
 }
+
+// Choose fetches a repo's quants (method form — satisfies the TUI's
+// downloadEngine; the package-level Choose remains for callers).
+func (c *Client) Choose(ctx context.Context, repo string) ([]QuantOption, error) {
+	return Choose(ctx, c, repo)
+}

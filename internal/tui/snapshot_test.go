@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -101,9 +102,35 @@ func drainCmds(m tea.Model, cmd tea.Cmd, depth int) tea.Model {
 		}
 		return m
 	}
+	// tea.Sequence returns an unexported sequenceMsg ([]Cmd): the
+	// contained cmds must run in order, each result fed back to the
+	// model (form Init messages arrive this way — swallowing them
+	// leaves forms unfocusable). Match by type name via reflection.
+	if seq, ok := asSequenceMsg(out); ok {
+		for _, sub := range seq {
+			m = drainCmds(m, sub, depth+1)
+		}
+		return m
+	}
 	next, c := m.Update(out)
 	m = next
 	return drainCmds(m, c, depth+1)
+}
+
+// asSequenceMsg extracts the cmds of bubbletea's unexported
+// tea.sequenceMsg, if out is one.
+func asSequenceMsg(out tea.Msg) ([]tea.Cmd, bool) {
+	if out == nil || reflect.TypeOf(out).Name() != "sequenceMsg" {
+		return nil, false
+	}
+	v := reflect.ValueOf(out)
+	cmds := make([]tea.Cmd, 0, v.Len())
+	for i := 0; i < v.Len(); i++ {
+		if c, ok := v.Index(i).Interface().(tea.Cmd); ok {
+			cmds = append(cmds, c)
+		}
+	}
+	return cmds, true
 }
 
 // collectCmds flattens a tea.Cmd batch into its constituent Cmds. tea
@@ -143,7 +170,7 @@ func safeCmd(cmd tea.Cmd) tea.Msg {
 	select {
 	case msg := <-done:
 		return msg
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(300 * time.Millisecond):
 		return nil
 	}
 }
@@ -213,8 +240,8 @@ func TestSnapshotMainReattachScreen(t *testing.T) {
 	if strings.Contains(out, "beta") {
 		t.Errorf("model list must be hidden while a session runs\nout:\n%s", out)
 	}
-	// Shortcut row is the reattach set (attach/configure/settings/help/quit).
-	for _, want := range []string{"Enter attach", "a attach", "c configure", "s settings", "q quit"} {
+	// Shortcut row is the reattach set (attach/configure/storage/preferences/help/quit).
+	for _, want := range []string{"Enter attach", "a attach", "c configure", "s storage", "p preferences", "q quit"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("reattach shortcut row missing %q\nout:\n%s", want, out)
 		}
