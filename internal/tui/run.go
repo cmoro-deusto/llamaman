@@ -3539,7 +3539,7 @@ func (r *RunMode) loadRows() []string {
 			rows = append(rows, accent.Render(" > "+bar)+subtle.Render(fmt.Sprintf(" %d%%", pct))+" ")
 		} else if animationsEnabled(r.cfg) {
 			// No numeric progress: the indeterminate comet (§15.5).
-			p, forward := cometPhase(15 * time.Second) // TEMP owner experiment — slow enough to inspect; revert later
+			p, forward := cometPhase(1600 * time.Millisecond)
 			rows = append(rows, accent.Render(" > "+indeterminateBar(12, p, forward))+" ")
 		}
 	} else {
