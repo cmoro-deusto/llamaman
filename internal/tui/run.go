@@ -74,9 +74,19 @@ type RunMode struct {
 	loadProgress   *float64
 	loadPhaseUntil time.Time
 	loadPartial    string
-	argv           []string
-	routerFile     string // my-models.ini path for router-mode runs; "" otherwise
-	warnings       []string
+
+	// Animation event timestamps (§15.5): one-shot effects fade from
+	// these; smooth bars ease between polls.
+	readyAt     time.Time
+	errAt       time.Time
+	lastJumpAt  time.Time
+	ttftAt      time.Time
+	genFrac     smoothVal
+	procFrac    smoothVal
+	routerFlash map[string]time.Time
+	argv        []string
+	routerFile  string // my-models.ini path for router-mode runs; "" otherwise
+	warnings    []string
 
 	// Router-mode live state (only populated when routerFile != ""):
 	// the model list from GET /models and the loaded-model ids from
@@ -295,6 +305,8 @@ func NewRunMode(opts RunModeOpts, theme Theme) (*RunMode, tea.Cmd, error) {
 		// Terminal title (DESIGN §15.3): set at entry, updated on
 		// ready/error/exited transitions.
 		tea.SetWindowTitle(r.runTitle("STARTING")),
+		// Animation frame while an animated element is visible (§15.5).
+		r.animCmd(),
 	}
 	// Readiness is detected by two signals, whichever arrives first:
 	//
@@ -453,11 +465,12 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if m.err != nil {
 			r.status = StatusErrored
 			r.startErr = m.err
+			r.errAt = clock()
 			state = "ERROR"
 		} else {
 			r.status = StatusExited
 		}
-		return r, tea.SetWindowTitle(r.runTitle(state))
+		return r, tea.Batch(tea.SetWindowTitle(r.runTitle(state)), r.animCmd())
 
 	case propsFetchedMsg:
 		if m.err != nil {
@@ -495,12 +508,14 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		// llama-server versions.
 		if r.status == StatusStarting {
 			r.status = StatusReady
+			r.readyAt = clock()
 		}
 		cmds := r.startLivePoll()
 		if r.status == StatusReady {
-			// Terminal title: reflect the ready state (§15.3).
+			// Terminal title + animation tick for the ready glow (§15.3/§15.5).
 			cmds = append(cmds, tea.SetWindowTitle(r.runTitle("READY")))
 		}
+		cmds = append(cmds, r.animCmd())
 		// Disagreement diagnostic: the preset declared a value, the
 		// live server reports a different one. Most common cause is
 		// llama-server clamping a too-large request to the model's max.
@@ -518,7 +533,12 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if len(cmds) > 0 {
 			return r, tea.Batch(cmds...)
 		}
-		return r, nil
+		return r, r.animCmd()
+
+	case animTickMsg:
+		// Re-render for the animation frame; keep ticking while an
+		// animated element is visible, stop in steady state (§15.5).
+		return r, r.animCmd()
 
 	case uptimeTickMsg:
 		return r, tickUptime()
@@ -546,6 +566,20 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 
 	case modelsFetchedMsg:
 		if m.err == nil && m.m != nil {
+			// Record one-shot flash timestamps for models whose status
+			// changed (loaded/unloaded, §15.5).
+			if r.routerFlash == nil {
+				r.routerFlash = map[string]time.Time{}
+			}
+			prev := map[string]string{}
+			for _, old := range r.routerModels {
+				prev[old.ID] = old.Status.Value
+			}
+			for _, mm := range m.m.Data {
+				if prev[mm.ID] != "" && prev[mm.ID] != mm.Status.Value {
+					r.routerFlash[mm.ID] = clock()
+				}
+			}
 			r.routerModels = m.m.Data
 			// Keep the selection and scroll window valid as the list
 			// changes (a selected model may disappear).
@@ -554,7 +588,7 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 				r.routerFocus = ""
 			}
 		}
-		return r, nil
+		return r, r.animCmd()
 
 	case healthFetchedMsg:
 		if m.err == nil && m.h != nil {
@@ -694,6 +728,7 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if m.s.GenDecoded > 0 && !r.ttftStart.IsZero() && r.ttft == 0 {
 			// First token appeared.
 			r.ttft = time.Since(r.ttftStart)
+			r.ttftAt = clock() // TTFT arrival glow (§15.5)
 		}
 		// Reset when request completes (back to idle).
 		if m.s.PromptTokensTotal == 0 && m.s.GenDecoded == 0 {
@@ -909,6 +944,8 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		case "o":
 			return r.toggleLogColors()
+		case "a":
+			return r.toggleAnimations()
 		case "r":
 			// Always confirm — restart kills the running child even
 			// when startup is mid-progress or the server has already
@@ -1292,17 +1329,35 @@ const (
 	highlightClose = "\x1b[0m"
 )
 
+// pulseTheme lightens the sparkline colors slightly by phase — the
+// live-edge glow (§15.5).
+func pulseTheme(t Theme, phase float64) Theme {
+	f := 0.12 * phase
+	t.StatusIdle = lighten(t.StatusIdle, f)
+	t.Accent = lighten(t.Accent, f)
+	t.StatusReady = lighten(t.StatusReady, f)
+	return t
+}
+
 // currentOccurrenceOpen returns the SGR opening for the current search
 // occurrence: bold + reverse tinted with the theme's StatusIdle color
 // (a colored background). StatusIdle is deliberately NOT one of the
 // line-kind colors (Err/Start/Ready/Muted), so the highlight stays
-// visible even on a WARN (StatusStart) line (owner feedback).
+// visible even on a WARN (StatusStart) line (owner feedback). With
+// animations on, a one-shot pulse brightens it right after n/N
+// (search-jump pulse, §15.5).
 func (r *RunMode) currentOccurrenceOpen() string {
 	if r.theme.StatusIdle == "" {
 		return highlightOpen // no theme (tests/edge) → plain bold+reverse
 	}
+	color := r.theme.StatusIdle
+	if animationsEnabled(r.cfg) {
+		if s := oneShotStrength(r.lastJumpAt, jumpPulseDur); s > 0 {
+			color = oneShotColor(color, s)
+		}
+	}
 	s := lipgloss.NewStyle().
-		Foreground(r.theme.StatusIdle).
+		Foreground(color).
 		Reverse(true).
 		Bold(true).
 		Render("")
@@ -1378,12 +1433,13 @@ func (r *RunMode) jumpSearch(delta int) tea.Cmd {
 		r.searchIdx += len(r.searchMatches)
 	}
 	target := r.searchMatches[r.searchIdx]
+	r.lastJumpAt = clock()
 	// Re-render first so the current-occurrence highlight moves with the
 	// selection, then scroll to the match (owner feedback: the underline
 	// never moved because the viewport content was stale).
 	r.refreshContent()
 	r.viewport.SetYOffset(target)
-	return r.setFlash(fmt.Sprintf("match %d/%d", r.searchIdx+1, len(r.searchMatches)))
+	return tea.Batch(r.setFlash(fmt.Sprintf("match %d/%d", r.searchIdx+1, len(r.searchMatches))), r.animCmd())
 }
 
 // handleQuitPrompt runs the (k)ill / (d)etach / (c)ancel decision tree
@@ -1690,6 +1746,7 @@ func (r *RunMode) renderHelp() string {
 		{"q / Ctrl+C", "open quit prompt — kill / detach / cancel"},
 		{"esc", "back to main — detach (server keeps running)"},
 		{"o", "toggle log line-kind colors (persists to preferences)"},
+		{"a", "toggle animations (persists to preferences)"},
 		{"k", "kill server and return to main"},
 		{"r", "restart server (confirms)"},
 		{"c", "copy launch command to clipboard"},
@@ -1739,7 +1796,7 @@ func (r *RunMode) renderFooter() string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	sep := subtle.Render(" · ")
 	tokens := []string{
-		"q quit", "k kill", "r restart", "c copy", "i info", "o colors", "esc back",
+		"q quit", "k kill", "r restart", "c copy", "i info", "o colors", "a anim", "esc back",
 	}
 	if r.routerFile != "" {
 		// The tab hint names the panel you'd switch TO.
@@ -1883,7 +1940,7 @@ func (r *RunMode) renderTopStrip() string {
 			subtle.Render("Models:") + " " + r.renderRouterModelCount(),
 			subtle.Render("Mode:") + " " + accent.Render("router"),
 			subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
-			statusBadge(r.statusLabel(), r.statusColor()),
+			statusBadge(r.statusLabel(), r.badgeColor()),
 		}
 	} else {
 		cells = []string{
@@ -1892,7 +1949,7 @@ func (r *RunMode) renderTopStrip() string {
 			subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params) + "  " + subtle.Render(fmt.Sprintf("(%d reqs)", int(r.decodeTotal))),
 			subtle.Render("Preset:") + " " + accent.Render(presetNameOrDash(r.preset)),
 			subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
-			statusBadge(r.statusLabel(), r.statusColor()),
+			statusBadge(r.statusLabel(), r.badgeColor()),
 		}
 	}
 
@@ -2604,11 +2661,22 @@ func (r *RunMode) renderRouterPanel(width int) string {
 		for _, m := range models[start:end] {
 			state := r.routerModelState(m.ID, m.Status.Value)
 			mark, style := "○", unloadedStyle
+			var baseColor lipgloss.Color = r.theme.Subtle
 			switch state {
 			case "loaded":
-				mark, style = "●", loadedStyle
+				mark, style, baseColor = "●", loadedStyle, r.theme.StatusReady
 			case "loading":
-				mark, style = "◐", loadingStyle
+				mark, style, baseColor = "◐", loadingStyle, r.theme.Accent
+			}
+			// One-shot flash on a just-loaded/unloaded model (§15.5).
+			if animationsEnabled(r.cfg) {
+				if base, ok := r.routerFlash[m.ID]; ok {
+					if s := oneShotStrength(base, routerFlashDur); s > 0 {
+						style = lipgloss.NewStyle().Foreground(oneShotColor(baseColor, s))
+					} else {
+						delete(r.routerFlash, m.ID) // expired
+					}
+				}
 			}
 			// Selection indicator: a leading ▸ on the selected row.
 			sel := "  "
@@ -2710,7 +2778,14 @@ func (r *RunMode) renderServerRow(sv *statsView, label string, hist *ringBuffer,
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight(label, metricLabelWidth))
 
-	spark := renderSparkline(r.theme, hist.Snapshot(), MetricUtil)
+	// Sparkline live-edge glow (§15.5): while busy, the whole
+	// sparkline breathes softly (the newest cell is where the motion
+	// reads).
+	sparkTheme := r.theme
+	if animationsEnabled(r.cfg) && r.busyCount > 0 {
+		sparkTheme = pulseTheme(sparkTheme, animPhase(1000*time.Millisecond))
+	}
+	spark := renderSparkline(sparkTheme, hist.Snapshot(), MetricUtil)
 
 	// Rate cell: "<current> tps / <avg> avg". Fixed-width slots so
 	// the column stays put as values transition (e.g. 99.9 → 100.0
@@ -2834,6 +2909,10 @@ func (r *RunMode) renderGenProgressRow(sv *statsView) string {
 	if genPct > 100 {
 		genPct = 100
 	}
+	if animationsEnabled(r.cfg) {
+		r.genFrac.set(genPct)
+		genPct = r.genFrac.display() // smooth fill between polls (§15.5)
+	}
 	genBar := renderBar(r.theme, genPct, zoneFor(MetricUtil, genPct))
 
 	genDecodedStr := formatTokenCount(sv.genDecoded)
@@ -2842,11 +2921,18 @@ func (r *RunMode) renderGenProgressRow(sv *statsView) string {
 
 	// TTFT display
 	var ttftCell string
+	ttftColor := r.theme.Subtle
+	if animationsEnabled(r.cfg) {
+		if s := oneShotStrength(r.ttftAt, ttftGlowDur); s > 0 {
+			ttftColor = oneShotColor(r.theme.StatusReady, s) // TTFT arrival glow (§15.5)
+		}
+	}
+	ttftStyle := lipgloss.NewStyle().Foreground(ttftColor)
 	if sv.ttft < 0 {
 		// Missed the prompt phase — generation already started.
 		ttftCell = subtle.Render("TTFT ") + "<1s"
 	} else if sv.ttft > 0 {
-		ttftCell = subtle.Render("TTFT ") + formatDuration(sv.ttft)
+		ttftCell = subtle.Render("TTFT ") + ttftStyle.Render(formatDuration(sv.ttft))
 	} else {
 		ttftCell = subtle.Render("TTFT ") + "—"
 	}
@@ -2879,6 +2965,10 @@ func (r *RunMode) renderPromptProgressRow(sv *statsView) string {
 	pct := float64(sv.promptToksProcessed) / float64(sv.promptToksTotal) * 100
 	if pct > 100 {
 		pct = 100
+	}
+	if animationsEnabled(r.cfg) {
+		r.procFrac.set(pct)
+		pct = r.procFrac.display() // smooth fill between polls (§15.5)
 	}
 	bar := renderBar(r.theme, pct, zoneFor(MetricUtil, pct))
 
@@ -3375,9 +3465,16 @@ func (r *RunMode) showingLoadBlock() bool {
 // the parsed phase line(s) with the progress bar, or the static
 // "loading…" fallback when nothing has been parsed yet. Owner polish:
 // a blank row above the block, a " > " prefix + one trailing space per
-// row, and the phase text in the brighter Accent color.
+// row, and the phase text in the brighter Accent color. With
+// animations on (§15.5) the color breathes and, when no numeric
+// progress is known, an indeterminate moving fill replaces the static
+// bar.
 func (r *RunMode) loadRows() []string {
-	accent := lipgloss.NewStyle().Foreground(r.theme.Accent)
+	accentColor := r.theme.Accent
+	if animationsEnabled(r.cfg) {
+		accentColor = animColor(r.theme.Accent, lighten(r.theme.Accent, 0.3), 1600*time.Millisecond)
+	}
+	accent := lipgloss.NewStyle().Foreground(accentColor)
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	rows := []string{""}
 	if r.loadPhase != "" {
@@ -3392,11 +3489,33 @@ func (r *RunMode) loadRows() []string {
 			}
 			bar := progressBar(*r.loadProgress, 12)
 			rows = append(rows, accent.Render(" > "+bar)+subtle.Render(fmt.Sprintf(" %d%%", pct))+" ")
+		} else if animationsEnabled(r.cfg) {
+			// No numeric progress: an indeterminate moving fill (§15.5).
+			rows = append(rows, accent.Render(" > "+indeterminateBar(12, animPhase(1200*time.Millisecond)))+" ")
 		}
 	} else {
 		rows = append(rows, accent.Render(" > loading…")+" ")
 	}
 	return rows
+}
+
+// indeterminateBar renders a 3-cell segment moving across a fixed-width
+// track (position motion only — no fabricated percentages, §15.5).
+func indeterminateBar(width, phase float64) string {
+	const seg = 3
+	w := int(width)
+	if w <= seg {
+		return strings.Repeat("▓", w)
+	}
+	off := int(phase*float64(w)) % w
+	out := make([]rune, w)
+	for i := range out {
+		out[i] = '░'
+	}
+	for i := 0; i < seg; i++ {
+		out[(off+i)%w] = '▓'
+	}
+	return string(out)
 }
 
 // progressBar renders a fixed-width filled/empty block bar (▓/░) for a
@@ -3437,6 +3556,29 @@ func (r *RunMode) ingestLoadChunk(chunk string) {
 	}
 }
 
+// toggleAnimations flips the animations preference live (§15.5): the
+// run-mode `a` quick key writes the same object the Settings form
+// edits (P8) and persists it when a config path is available.
+func (r *RunMode) toggleAnimations() (*RunMode, tea.Cmd) {
+	if r.cfg == nil {
+		return r, r.setFlash("no config to toggle animations in")
+	}
+	prefs := r.cfg.Prefs()
+	enabled := !prefs.AnimationsEnabled()
+	prefs.Animations = &enabled
+	r.cfg.Preferences = &prefs
+	if r.cfgPath != "" {
+		if err := config.Save(r.cfgPath, r.cfg); err != nil {
+			return r, r.setFlash("could not save animations: " + err.Error())
+		}
+	}
+	state := "off"
+	if enabled {
+		state = "on"
+	}
+	return r, tea.Batch(r.setFlash("animations "+state), r.animCmd())
+}
+
 // runTitle is the terminal-title (OSC) content for the run view
 // (DESIGN §15.3): `llamaman — <alias> [STATE]`. Router sessions use
 // the models-file basename as the alias.
@@ -3446,6 +3588,33 @@ func (r *RunMode) runTitle(state string) string {
 		alias = filepath.Base(r.routerFile)
 	}
 	return fmt.Sprintf("llamaman — %s [%s]", alias, state)
+}
+
+// badgeColor is statusColor with the §15.5 animations applied: the
+// STARTING badge breathes yellow↔gold, the READY dot pulses while
+// generating, and READY/ERROR get a one-shot glow/flash on entry. All
+// gated by preferences.animations.
+func (r *RunMode) badgeColor() lipgloss.Color {
+	base := r.statusColor()
+	if !animationsEnabled(r.cfg) {
+		return base
+	}
+	switch r.status {
+	case StatusStarting:
+		return animColor(base, lighten(base, 0.25), 2000*time.Millisecond)
+	case StatusReady:
+		if s := oneShotStrength(r.readyAt, readyGlowDur); s > 0 {
+			return oneShotColor(base, s)
+		}
+		if r.busyCount > 0 {
+			return animColor(base, lighten(base, 0.3), 800*time.Millisecond)
+		}
+	case StatusErrored:
+		if s := oneShotStrength(r.errAt, errFlashDur); s > 0 {
+			return oneShotColor(base, s)
+		}
+	}
+	return base
 }
 
 func (r *RunMode) statusColor() lipgloss.Color {

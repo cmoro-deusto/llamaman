@@ -532,6 +532,19 @@ minimum of 2 s after the last phase line even once READY (`o`-style
 toggle not applicable — it is load-window-only). Separate from the
 `[STARTING]` badge, which is untouched.
 
+**Subtle color animation (§15.5).** Gated by `preferences.animations`
+(default on; the run-mode `a` quick key flips it live). Repeating:
+the load-progress block breathes and, without numeric progress, shows
+an indeterminate moving fill; the `[STARTING]` badge breathes
+yellow↔gold; the READY dot pulses while generating; the Gen/Process
+bars fill smoothly; the Tokens/Prompt sparklines glow softly while
+busy. One-shot: a ready glow on STARTING→READY, a red flash on ERROR,
+a pulse on the current search occurrence after `n`/`N`, a glow when
+TTFT arrives, and a flash on router models that just loaded/unloaded.
+No wordmark animation; steady-state READY idle is static; ≤ 4 fps;
+truecolor lerp with a 3-step discrete fallback on 256-color (P1); a
+frozen clock in tests (P9).
+
 **Terminal title (§15.3):** `tea.SetWindowTitle` sets `llamaman — <alias> [STARTING]` at run-mode entry, `[READY]` on the ready transition, `[ERROR]`/`[EXITED]` on process exit; router runs use the models-file basename. Not restored on exit (v1).
 
 Scrollback: unlimited, in-memory, sourced from the on-disk log file. The whole file is buffered.
@@ -1187,9 +1200,9 @@ resolver are new.
   config at attach/launch; `session.json` is untouched; a theme change
   while a server runs detached shows on the next attach.
 - `preferences.animations` ships its field + Settings toggle now (P2:
-  field, validation, editor support, and default in the same change)
-  but has no visible effect until item 5 — its default `true` matches
-  today's behavior, and the run-mode quick-key toggle lands with item 5.
+  field, validation, editor support, and default in the same change);
+  its default `true` matches today's behavior, and item 5 (§15.5)
+  delivers the visible effects + the run-mode `a` quick-key toggle.
 
 #### What changes in config load/save/validate
 
@@ -1238,6 +1251,88 @@ resolver are new.
 **Deferred to later items:** animation rendering and the run-mode
 toggle key (item 5, consumes `preferences.animations`); the §12.2
 layout rework consumes palette tokens (item 2).
+
+### 15.5 Subtle color animation (§2.4)
+
+**Goal.** Minimal, tasteful motion that signals transitions without
+noise: ≤ 4 fps, only while transitional/generating, **never** in steady
+state, no wordmark animation (ROADMAP §2.4 scope). Gated by
+`preferences.animations` (default **on** — item 1's field; Settings
+toggles it) and a new run-mode quick key. Determinism first: all
+animation state is derived from an injectable clock at render time
+(P9).
+
+**Animated elements (all render-time; owner-approved set):**
+
+*Repeating — only while the state is active:*
+
+1. **Load-progress block** (only while the load window is open, §15.4):
+   the phase/bar rows **breathe** (slow color lerp, sine wave) and,
+   when no numeric progress is known, the bar row shows an
+   **indeterminate moving fill** — a moving segment on the 12-cell
+   `▓`/`░` track, 4 steps/s — the "something moving while loading"
+   ask from item 4. Numeric-progress bars keep their real fill (no
+   fake motion).
+2. **`[STARTING]` badge:** the badge color breathes **yellow ↔ gold**
+   (sine) while starting. The `[STARTING]` text is unchanged (§2.3).
+3. **Status dot:** the READY badge's `●` glyph pulses while a request
+   is generating (`busyCount > 0`), lerping between `StatusReady` and a
+   brighter green.
+4. **Gen/Process bar smooth fill** — the llama-server panel's Gen and
+   Process progress rows fill smoothly toward their real target
+   fraction between polls while generating/processing (honest motion
+   on real data, not a fabricated percentage).
+5. **Sparkline live-edge glow** — the newest Tokens/Prompt sparkline
+   cell pulses softly while tokens flow (subtle).
+
+*One-shot — fire on a transition, then static:*
+
+6. **Ready glow** — when the status flips STARTING → READY, the badge
+   does one brighten→settle (~0.6 s).
+7. **Search-jump pulse** — on `n`/`N`, the newly-current occurrence
+   fades briefly so the eye tracks the jump (complements the item-3
+   tint).
+8. **Error flash** — entering `✕ [ERROR]` does a brief red emphasis,
+   then static (errors never breathe).
+9. **TTFT arrival glow** — a brief glow on the Gen row when the first
+   token of a response arrives.
+10. **Router model-state flash** — a router-panel row that just
+    loaded/unloaded flashes green/red once.
+
+*(The "new-lines pulse" candidate was dropped: the `↓ N new lines`
+indicator described in §7.4 does not exist in the codebase, so there
+was nothing to animate.)*
+
+**Mechanics.** `clock func() time.Time` (package-level; tests override)
+feeds `animPhase(period)` → a 0..1 sine phase. A `tea.Tick` at 250 ms
+(`animTickMsg`) is scheduled **only** while an animated element is
+visible (load window open, starting, or busy) and animations are
+enabled — steady state schedules nothing (§2.4 cost note). Colors:
+`lerpColor(a, b, t)` (hex → RGB lerp → hex). Truecolor terminals get
+the continuous interpolation; **256-color terminals quantize `t` to 3
+discrete steps** (P1); NO_COLOR or `animations` off → no color change
+and no tick.
+
+**Run-mode quick key (P10/P8).** `a` in run mode toggles
+`preferences.animations` live — same object, same persist path as `o`
+(log colors, §15.3); footer + help gain `a anim`. `a` is free in run
+mode (verified). Toggling off stops all motion immediately.
+
+**Determinism (P9).** Tests freeze the clock: `animPhase` at fixed
+instants; the STARTING badge color differs between phase 0 and 0.5
+(forced ANSI-256 profile); the 256-color quantization yields ≤ 3
+distinct colors across a full period; no tick cmd is scheduled when
+animations are off or nothing animated is visible.
+
+**Non-goals.** No wordmark animation; no steady-state READY idle
+animation; no desktop notifications; no fabricated progress percentages
+(item 4 stays honest — the indeterminate bar is position motion only).
+
+**File map.** `internal/tui/anim.go` (new) — `clock`, `animPhase`,
+`lerpColor`, `animTickMsg` + scheduling helper. `internal/tui/run.go`
+— badge/dot/bar animation hooks (renderTopStrip + loadRows), `a` quick
+key. Tests in `anim_test.go` / `run_test.go`. DESIGN §7.4 and §15.1
+(animations field description) updated in the same change (P5).
 
 ### 15.4 Load-progress indicator (§2.3)
 

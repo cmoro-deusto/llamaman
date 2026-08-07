@@ -1,0 +1,182 @@
+package tui
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
+
+	"github.com/cmoro-deusto/llamaman/internal/config"
+)
+
+// freezeClock replaces the injectable animation clock for the duration
+// of a test (P9).
+func freezeClock(t *testing.T, at time.Time) {
+	t.Helper()
+	orig := clock
+	clock = func() time.Time { return at }
+	t.Cleanup(func() { clock = orig })
+}
+
+// TestAnimPhase: the sine phase is 0..1 and period-boundary aware.
+func TestAnimPhase(t *testing.T) {
+	base := time.UnixMilli(1_000_000_000_000)
+	freezeClock(t, base)
+	if p := animPhase(2000 * time.Millisecond); p != 0.5 {
+		t.Errorf("animPhase at t=0 of a 2s period = %v, want 0.5", p)
+	}
+	freezeClock(t, base.Add(500*time.Millisecond))
+	if p := animPhase(2000 * time.Millisecond); p != 1.0 {
+		t.Errorf("animPhase at quarter period = %v, want 1.0", p)
+	}
+	freezeClock(t, base.Add(1000*time.Millisecond))
+	if p := animPhase(2000 * time.Millisecond); p < 0.499 || p > 0.501 {
+		t.Errorf("animPhase at half period = %v, want ≈0.5", p)
+	}
+}
+
+// TestLerpColor: midpoint of black↔white is #808080; clamps at edges.
+func TestLerpColor(t *testing.T) {
+	if got := lerpColor(lipgloss.Color("#000000"), lipgloss.Color("#FFFFFF"), 0.5); got != lipgloss.Color("#7f7f7f") {
+		t.Errorf("midpoint = %v, want #7f7f7f (int truncation)", got)
+	}
+	if got := lerpColor(lipgloss.Color("#000000"), lipgloss.Color("#FFFFFF"), 0); got != lipgloss.Color("#000000") {
+		t.Errorf("t=0 = %v, want #000000", got)
+	}
+	if got := lerpColor(lipgloss.Color("#FF0000"), lipgloss.Color("#0000FF"), 1); got != lipgloss.Color("#0000ff") {
+		t.Errorf("t=1 = %v, want #0000ff", got)
+	}
+	if got := lighten(lipgloss.Color("#000000"), 1); got != lipgloss.Color("#ffffff") {
+		t.Errorf("lighten black by 1 = %v, want #ffffff", got)
+	}
+}
+
+// TestQuantizePhase: 256-color profile snaps to 3 steps; truecolor is
+// continuous.
+func TestQuantizePhase(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(termenv.ColorProfile())
+	if got := quantizePhase(0.4); got != 0.3333333333333333 {
+		t.Errorf("ANSI256 quantize(0.4) = %v, want 1/3", got)
+	}
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	if got := quantizePhase(0.4); got != 0.4 {
+		t.Errorf("truecolor quantize(0.4) = %v, want 0.4 (continuous)", got)
+	}
+}
+
+// TestIndeterminateBar: the segment moves with the phase and stays on
+// the track.
+func TestIndeterminateBar(t *testing.T) {
+	b0 := indeterminateBar(12, 0)
+	b1 := indeterminateBar(12, 0.3)
+	b2 := indeterminateBar(12, 0.6)
+	if b0 == b1 || b1 == b2 {
+		t.Errorf("different phases must move the segment: %q %q %q", b0, b1, b2)
+	}
+	if len([]rune(b0)) != 12 || len([]rune(b1)) != 12 {
+		t.Errorf("bar must keep the track width: %q %q", b0, b1)
+	}
+	if got := indeterminateBar(12, 0); strings.Count(got, "▓") != 3 {
+		t.Errorf("bar must have exactly 3 filled cells, got %q", got)
+	}
+}
+
+// TestBadgeColorAnimations: with a frozen clock + animations on, the
+// STARTING badge color breathes (differs across phases) and the ready
+// glow brightens the READY badge right after the transition; with
+// animations off everything is static.
+func TestBadgeColorAnimations(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(termenv.ColorProfile())
+	base := time.UnixMilli(2_000_000_000_000)
+
+	cfg := &config.Config{Version: 1, Globals: config.Globals{Bin: "b", Host: "h", Port: 1}}
+	r := &RunMode{cfg: cfg, status: StatusStarting, theme: DefaultTheme()}
+	freezeClock(t, base)
+	c1 := r.badgeColor()
+	freezeClock(t, base.Add(500*time.Millisecond))
+	c2 := r.badgeColor()
+	if c1 == c2 {
+		t.Errorf("STARTING badge must breathe across phases, got %v == %v", c1, c2)
+	}
+
+	// Ready glow: right after the transition the badge is brighter than
+	// the settled color.
+	r.status = StatusReady
+	r.readyAt = base
+	freezeClock(t, base.Add(100*time.Millisecond))
+	glow := r.badgeColor()
+	r.readyAt = base.Add(-time.Hour) // long past the glow window
+	settled := r.badgeColor()
+	if glow == settled {
+		t.Errorf("ready glow must differ from the settled color")
+	}
+
+	// Animations off → static base color.
+	off := false
+	cfg.Preferences = &config.Preferences{Animations: &off}
+	r.status = StatusStarting
+	freezeClock(t, base)
+	s1 := r.badgeColor()
+	freezeClock(t, base.Add(500*time.Millisecond))
+	s2 := r.badgeColor()
+	if s1 != s2 {
+		t.Errorf("animations off must keep the badge static, got %v != %v", s1, s2)
+	}
+}
+
+// TestAnimCmdScheduling: the frame tick is scheduled only when
+// animations are on AND something animated is visible.
+func TestAnimCmdScheduling(t *testing.T) {
+	cfg := &config.Config{Version: 1, Globals: config.Globals{Bin: "b", Host: "h", Port: 1}}
+	r := &RunMode{cfg: cfg, status: StatusReady} // idle
+	if cmd := r.animCmd(); cmd != nil {
+		t.Error("steady-state READY must not schedule the animation tick")
+	}
+	r.status = StatusStarting
+	if cmd := r.animCmd(); cmd == nil {
+		t.Error("starting must schedule the animation tick")
+	}
+	off := false
+	cfg.Preferences = &config.Preferences{Animations: &off}
+	r.status = StatusStarting
+	if cmd := r.animCmd(); cmd != nil {
+		t.Error("animations off must not schedule the tick")
+	}
+}
+
+// TestRunModeToggleAnimations pins the `a` quick key: it flips the
+// preference in memory, persists it, and stops the tick.
+func TestRunModeToggleAnimations(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg := sampleSnapshotConfig()
+	if err := config.Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	r := &RunMode{cfg: cfg, cfgPath: path, status: StatusStarting}
+	if !cfg.Prefs().AnimationsEnabled() {
+		t.Fatal("animations must default on")
+	}
+	next, _ := r.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	r = next
+	if cfg.Prefs().AnimationsEnabled() {
+		t.Error("a must flip animations off")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"animations": false`) {
+		t.Errorf("animations=false not persisted:\n%s", data)
+	}
+	if cmd := r.animCmd(); cmd != nil {
+		t.Error("after toggling off, the animation tick must not be scheduled")
+	}
+}
