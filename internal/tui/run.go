@@ -3538,8 +3538,9 @@ func (r *RunMode) loadRows() []string {
 			bar := progressBar(*r.loadProgress, 12)
 			rows = append(rows, accent.Render(" > "+bar)+subtle.Render(fmt.Sprintf(" %d%%", pct))+" ")
 		} else if animationsEnabled(r.cfg) {
-			// No numeric progress: an indeterminate moving fill (§15.5).
-			rows = append(rows, accent.Render(" > "+indeterminateBar(12, animPhase(1200*time.Millisecond)))+" ")
+			// No numeric progress: the indeterminate comet (§15.5).
+			p, forward := cometPhase(1200 * time.Millisecond)
+			rows = append(rows, accent.Render(" > "+indeterminateBar(12, p, forward))+" ")
 		}
 	} else {
 		rows = append(rows, accent.Render(" > loading…")+" ")
@@ -3547,45 +3548,88 @@ func (r *RunMode) loadRows() []string {
 	return rows
 }
 
-// blockFrags are the 8 horizontal sub-cell block fragments
-// (U+258F..U+2589, high to low) that give the indeterminate bar
-// sub-cell smoothness — the ASCII trick the owner asked for: segment
-// edges move in ⅛-cell steps instead of whole-cell jumps.
+// blockFrags are the 7 sub-cell block fragments (U+258F..U+2589, high
+// to low) used by the comet's tail: ▉ (7/8) nearest the head down to
+// ▏ (1/8) farthest away.
 var blockFrags = []rune{'▏', '▎', '▍', '▌', '▋', '▊', '▉'}
 
-// indeterminateBar renders a 3-cell segment with a smooth (sub-cell)
-// right edge bouncing across a fixed-width track (position motion only
-// — no fabricated percentages, §15.5). The left edge stays anchored to
-// a cell boundary, so the only partial cell is the rightmost one —
-// filled from the left, which is the correct side for the ▏▎▍▌▋▊▉
-// ladder (owner feedback: the previous version mirrored the fragment on
-// the left edge, showing a phantom tail when moving right→left). The
-// right tip flows smoothly in both directions and never wraps.
-func indeterminateBar(width, phase float64) string {
-	const segCells = 3.0
-	const sub = 8 // sub-cell steps per cell
+// cometPhase returns a constant-speed triangle phase 0..1 plus the
+// motion direction (forward = rising → the comet moves right).
+func cometPhase(period time.Duration) (float64, bool) {
+	f := float64(clock().UnixMilli()%period.Milliseconds()) / float64(period.Milliseconds())
+	if f < 0.5 {
+		return f * 2, true
+	}
+	return (1 - f) * 2, false
+}
+
+// indeterminateBar renders a comet: a solid █ head leading, with a
+// 7-cell fragment tail behind it (▉ nearest the head … ▏ farthest —
+// the "tail follows the head" look, owner's design). At the far edge
+// the head pins and the tail keeps sliding, merging into the solid
+// block; moving back, the mirror image. No fabricated percentages
+// (§15.5), no fragment ever on the wrong side of the head.
+func indeterminateBar(width, phase float64, forward bool) string {
 	w := int(width)
-	if w*sub <= int(segCells*sub) {
-		return strings.Repeat("█", w)
+	const tail = 7
+	travel := float64(w - 1 + tail)
+
+	var head float64
+	if forward {
+		head = float64(tail) + phase*travel
+	} else {
+		head = float64(w-1) - phase*travel
 	}
-	// Right edge travels so the segment stays fully on screen:
-	// [segCells*sub, w*sub] in eighths.
-	right := int(segCells*sub) + int(phase*float64(w-int(segCells))*sub)
-	if right > w*sub {
-		right = w * sub
+
+	// Drain: the head pins at the far edge; tail cells that slide past
+	// it merge into a solid block.
+	merged := 0
+	if forward {
+		if head > float64(w-1+tail) {
+			head = float64(w - 1 + tail)
+		}
+		if int(head) > w-1 {
+			merged = int(head) - (w - 1)
+			if merged > tail {
+				merged = tail
+			}
+			head = float64(w - 1)
+		}
+	} else {
+		if head < float64(-tail) {
+			head = float64(-tail)
+		}
+		if int(head) < 0 {
+			merged = -int(head)
+			if merged > tail {
+				merged = tail
+			}
+			head = 0
+		}
 	}
-	start := (right - int(segCells*sub)) / sub * sub // left edge snapped to a cell boundary
+
+	headInt := int(head)
 	out := make([]rune, w)
 	for i := 0; i < w; i++ {
-		lo, hi := i*sub, (i+1)*sub
-		overlap := min(hi, right) - max(lo, start)
-		switch {
-		case overlap <= 0:
-			out[i] = '░'
-		case overlap >= sub:
+		if i == headInt {
 			out[i] = '█'
+			continue
+		}
+		var d int
+		if forward {
+			d = headInt - i // tail is behind the head: to the left
+		} else {
+			d = i - headInt // tail to the right
+		}
+		switch {
+		case d <= 0:
+			out[i] = '░' // ahead of the head
+		case d <= merged:
+			out[i] = '█' // merged into the pinned head
+		case d <= tail:
+			out[i] = blockFrags[tail-d] // ▉ nearest … ▏ farthest
 		default:
-			out[i] = blockFrags[overlap-1] // fill from the left — correct for the right edge
+			out[i] = '░'
 		}
 	}
 	return string(out)

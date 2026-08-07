@@ -79,47 +79,64 @@ func TestQuantizePhase(t *testing.T) {
 	}
 }
 
-// TestIndeterminateBar: the segment bounces across the track with the
-// phase; only the right edge is partial (left-anchored, so the
-// fragment is never mirrored — owner feedback), reaches both ends, no
-// wrap, fill between 3 and 4 cells.
+// TestIndeterminateBar pins the comet (owner's design): a solid █ head
+// leading with the fragment tail following behind it — the tail is on
+// the LEFT moving right and on the RIGHT moving left — and at the far
+// edge the head pins while the tail merges into a solid block.
 func TestIndeterminateBar(t *testing.T) {
-	if got := indeterminateBar(12, 0); got != "███░░░░░░░░░" {
-		t.Errorf("phase 0 must put the segment at the left, got %q", got)
+	// Forward, start of the pass: the full comet at the left edge.
+	if got := indeterminateBar(12, 0, true); got != "▏▎▍▌▋▊▉█░░░░" {
+		t.Errorf("forward p=0 = %q, want the comet at the left", got)
 	}
-	if got := indeterminateBar(12, 1); got != "░░░░░░░░░███" {
-		t.Errorf("phase 1 must put the segment at the right (no wrap), got %q", got)
+	// Forward, head at the right edge.
+	if got := indeterminateBar(12, 4.0/18, true); got != "░░░░▏▎▍▌▋▊▉█" {
+		t.Errorf("forward at right edge = %q", got)
 	}
-	// Halfway: the right edge is mid-cell (▌ = 4/8), left edge full.
-	if got := indeterminateBar(12, 0.5); got != "░░░░███▌░░░░" {
-		t.Errorf("phase 0.5 must have the fragment on the right edge only, got %q", got)
+	// Forward, drain: the head pins and the tail merges into the block.
+	if got := indeterminateBar(12, 5.0/18, true); got != "░░░░▏▎▍▌▋▊██" {
+		t.Errorf("forward drain = %q, want merged tail next to the head", got)
 	}
-	// Adjacent phases differ by a single fragment step on the right tip.
-	a := indeterminateBar(12, 0.484375) // right = 58 → ▎ (2/8)
-	b := indeterminateBar(12, 0.5)      // right = 60 → ▌ (4/8)
-	if a == b || strings.Count(a, "▎") != 1 || strings.Count(b, "▌") != 1 {
-		t.Errorf("adjacent sub-cell phases must differ by one fragment: %q vs %q", a, b)
+	// Backward, head at the right edge with the tail following on the
+	// right (mirrored).
+	if got := indeterminateBar(12, 0, false); got != "░░░░░░░░░░░█" {
+		t.Errorf("backward p=0 = %q, want the head at the right edge", got)
 	}
-	// Fill is always between 3 and 4 cells (24..31 eighths), never 0.
-	fragLevel := map[rune]int{'▏': 1, '▎': 2, '▍': 3, '▌': 4, '▋': 5, '▊': 6, '▉': 7}
-	for _, ph := range []float64{0, 0.1, 0.5, 0.9, 1} {
-		bar := indeterminateBar(12, ph)
-		if len([]rune(bar)) != 12 {
-			t.Fatalf("bar width changed at phase %v: %q", ph, bar)
-		}
-		fill := 0
-		for _, c := range bar {
-			switch c {
-			case '░':
-			case '█':
-				fill += 8
-			default:
-				fill += fragLevel[c]
-			}
-		}
-		if fill < 24 || fill > 31 {
-			t.Errorf("phase %v: segment fill = %d eighths, want 24..31", ph, fill)
-		}
+	back := indeterminateBar(12, 0.1, false) // head ≈ 9, tail to its right
+	if !strings.HasPrefix(back, "░░░░░░░░░█") || !strings.Contains(back, "▉▊") {
+		t.Errorf("backward tail must follow on the right: %q", back)
+	}
+	// Backward, left drain: the head pins at the left, tail merges.
+	if got := indeterminateBar(12, 0.8, false); !strings.HasPrefix(got, "████") {
+		t.Errorf("backward drain must merge into a left block, got %q", got)
+	}
+	if got := indeterminateBar(12, 1, false); got != "████████░░░░" {
+		t.Errorf("backward fully drained = %q, want the solid block at the left", got)
+	}
+}
+
+// TestCometPhase: constant-speed triangle, direction flips at the
+// halfway point.
+func TestCometPhase(t *testing.T) {
+	base := time.UnixMilli(3_000_000_000_000)
+	freezeClock(t, base)
+	p, fwd := cometPhase(1200 * time.Millisecond)
+	if p != 0 || !fwd {
+		t.Errorf("cometPhase at t=0 = (%v, %v), want (0, forward)", p, fwd)
+	}
+	freezeClock(t, base.Add(300*time.Millisecond))
+	p, fwd = cometPhase(1200 * time.Millisecond)
+	if p != 0.5 || !fwd {
+		t.Errorf("cometPhase at 1/4 period = (%v, %v), want (0.5, forward)", p, fwd)
+	}
+	freezeClock(t, base.Add(600*time.Millisecond))
+	p, fwd = cometPhase(1200 * time.Millisecond)
+	if p != 1 || fwd {
+		t.Errorf("cometPhase at half period = (%v, %v), want (1, backward)", p, fwd)
+	}
+	freezeClock(t, base.Add(900*time.Millisecond))
+	p, fwd = cometPhase(1200 * time.Millisecond)
+	if p != 0.5 || fwd {
+		t.Errorf("cometPhase at 3/4 period = (%v, %v), want (0.5, backward)", p, fwd)
 	}
 }
 

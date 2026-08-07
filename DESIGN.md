@@ -1285,11 +1285,13 @@ animation state is derived from an injectable clock at render time
 1. **Load-progress block** (only while the load window is open, §15.4):
    the phase/bar rows **breathe** (slow color lerp, sine wave) and,
    when no numeric progress is known, the bar row shows an
-   **indeterminate moving fill** — a 3-cell segment bouncing across
-   the 12-cell `▓`/`░` track (never wrapping across the ends, owner
-   feedback), 10 steps/s — the "something moving while loading"
-   ask from item 4. Numeric-progress bars keep their real fill (no
-   fake motion).
+   **indeterminate comet** — a solid `█` head leading with a
+   7-fragment tail behind it (`▏▎▍▌▋▊▉█` going right, `█▉▊▋▌▍▎▏`
+   going left — the tail always follows the head, owner's design);
+   at the far edge the head pins while the tail keeps sliding and
+   merges into the solid block. Constant-speed triangle motion,
+   10 steps/s, no fabricated percentages, no fragment on the wrong
+   side of the head.
 2. **`[STARTING]` badge:** the badge color breathes **yellow ↔ gold**
    (sine) while starting. The `[STARTING]` text is unchanged (§2.3).
 3. **Status dot:** the READY badge's `●` glyph pulses while a request
