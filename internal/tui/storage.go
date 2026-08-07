@@ -694,8 +694,12 @@ func (s StorageMode) renderDownload() string {
 		if pct > 100 {
 			pct = 100
 		}
-		fill := strings.Repeat("▓", pct*12/100)
-		rest := strings.Repeat("░", 12-len(fill))
+		if pct < 0 {
+			pct = 0
+		}
+		fillCells := pct * 12 / 100
+		fill := strings.Repeat("▓", fillCells)
+		rest := strings.Repeat("░", 12-fillCells)
 		bar = fmt.Sprintf(" %s%s %d%%", fill, rest, pct)
 	}
 	status := "running"

@@ -175,7 +175,7 @@ func (c *Client) downloadOne(ctx context.Context, f RepoFile, blobPath, commit, 
 				return 0, &Error{Kind: ErrNetwork, Message: werr.Error()}
 			}
 			written += int64(n)
-			progress(written)
+			progress(int64(n)) // incremental — the caller accumulates
 		}
 		if rerr == io.EOF {
 			break
