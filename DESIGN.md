@@ -549,12 +549,12 @@ bars fill smoothly; the Tokens/Prompt sparklines glow softly while
 busy. One-shot: a ready glow on STARTING→READY, a red flash on ERROR,
 a pulse on the current search occurrence after `n`/`N`, a glow when
 TTFT arrives, and a flash on router models that just loaded/unloaded.
-**Frame rate (owner tuning, §15.5).** The frame period is decided in
-**one place**: `animTickInterval` in `internal/tui/anim.go`, and is
-overridable at runtime via **`LLAMAMAN_ANIM_FPS`** (e.g. `60`, `30`,
-`15`) without rebuilding. Currently set to 60 fps while the owner
-experiments; the final value is TBD (see §2.4 for the cost reasoning —
-the sweet spot is ~10–15 fps for these slow effects).
+**Frame rate (owner decision, §15.5).** The frame period is decided in
+**one place**: `animTickInterval` in `internal/tui/anim.go`, set to
+**60 fps** (owner decision, tried 10/15/30/60 and settled on 60).
+Overridable at runtime via **`LLAMAMAN_ANIM_FPS`** (e.g. `60`, `30`,
+`15`) without rebuilding. The tick still fires only while an animated
+element is visible, so the cost stays bounded (§2.4).
 (owner-amended from 4 for smoother motion);
 truecolor lerp with a 3-step discrete fallback on 256-color (P1); a
 frozen clock in tests (P9).
@@ -928,7 +928,8 @@ not relitigated. Three releases, in priority order 4 → 2 → (3 + 1).
   (model load → layer offload → HF download % → listening). **Hard
   constraint:** separate from the `[STARTING]` badge — nothing replaces it.
   Tolerant classifiers; unknown phase degrades to today's static UI.
-- **Subtle color animation.** `tea.Tick` 10 fps (owner-amended from 4);
+- **Subtle color animation.** `tea.Tick` 60 fps (owner decision;
+  overridable via `LLAMAMAN_ANIM_FPS`);
   true-color lerp with a
   6-step discrete fallback on 256-color (P1, owner-amended from 2–3
   steps for less jerky breathing). Scoped to: load-progress
@@ -1271,7 +1272,7 @@ layout rework consumes palette tokens (item 2).
 ### 15.5 Subtle color animation (§2.4)
 
 **Goal.** Minimal, tasteful motion that signals transitions without
-noise: 10 fps (owner-amended from ≤ 4 for smoother motion), only while transitional/generating, **never** in steady
+noise: 60 fps (owner decision; overridable via `LLAMAMAN_ANIM_FPS`), only while transitional/generating, **never** in steady
 state, no wordmark animation (ROADMAP §2.4 scope). Gated by
 `preferences.animations` (default **on** — item 1's field; Settings
 toggles it) and a new run-mode quick key. Determinism first: all

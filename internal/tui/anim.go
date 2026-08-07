@@ -24,8 +24,8 @@ import (
 // frozen time so rendered frames stay stable (P9).
 var clock = time.Now
 
-// animTickInterval is the animation frame period. Owner's temporary
-// experiment: 60 fps (final value TBD). Overridable at runtime via
+// animTickInterval is the animation frame period — 60 fps (owner
+// decision after trying 10/15/30/60). Overridable at runtime via
 // LLAMAMAN_ANIM_FPS (see animFrameInterval).
 const animTickInterval = time.Second / 60
 

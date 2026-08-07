@@ -71,7 +71,7 @@ interview (August 2026) — each principle is a decision, not prose.
   (animations, polling-heavy views) or changes runtime behavior
   (auto-restart) is user-toggleable via the Settings mode, backed by the
   `preferences` object. Animations default **on** (subtle, transitional-only,
-  ≤ 10 fps) and can be turned off.
+  ≤ 60 fps, gated by `preferences.animations`, and can be turned off.
 
 **Consequential decisions recorded with the interview** (owned by the
 owner, so they are not relitigated):
@@ -154,7 +154,8 @@ no new llama-server interaction.
   3. Status dot in run mode: pulses while a request is generating.
   4. **No** wordmark animation in Main mode; **no** animation in steady-state
      READY idle; **no** desktop notifications.
-- **Mechanics:** `tea.Tick` at 10 fps (owner-amended from ≤ 4); sine-wave color interpolation between
+- **Mechanics:** `tea.Tick` at 60 fps (owner decision; runtime
+  override via `LLAMAMAN_ANIM_FPS`); sine-wave color interpolation between
   two colors. True-color terminals get smooth interpolation; 256-color
   terminals get a 6-step discrete fallback (P1, owner-amended from
   2–3).
