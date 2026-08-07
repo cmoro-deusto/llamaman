@@ -80,37 +80,30 @@ func TestQuantizePhase(t *testing.T) {
 }
 
 // TestIndeterminateBar pins the comet (owner's design): a solid █ head
-// leading with the fragment tail following behind it — the tail is on
-// the LEFT moving right and on the RIGHT moving left — and at the far
-// edge the head pins while the tail merges into a solid block.
+// leading with the fragment tail behind it — left when moving right,
+// right when moving left — merging into a solid block at the far edge,
+// dissolving back to the head, then reversing. No gaps, no phantom
+// fragments, no teleports.
 func TestIndeterminateBar(t *testing.T) {
-	// Forward, start of the pass: the full comet at the left edge.
-	if got := indeterminateBar(12, 0, true); got != "▏▎▍▌▋▊▉█░░░░" {
-		t.Errorf("forward p=0 = %q, want the comet at the left", got)
+	cases := []struct {
+		phase   float64
+		forward bool
+		want    string
+	}{
+		{0, true, "▏▎▍▌▋▊▉█░░░░"},    // comet at the left, tail trailing
+		{0.2, true, "░░░░░▏▎▍▌▋██"},  // merge: tail + growing solid block
+		{0.4, true, "░░░░░███████"},  // fully merged at the right
+		{0.6, true, "░░░░░░░░████"},  // dissolve: block shrinks
+		{0.8, true, "░░░░░░░░░░░█"},  // hold: just the head at the edge
+		{0.8, false, "░░░░░░█▉▊▋▌▍"}, // backward: tail on the right
+		{0.5, false, "██▋▌▍▎▏░░░░░"}, // backward merge at the left
+		{0.3, false, "███████░░░░░"}, // backward fully merged
+		{0.0, false, "█░░░░░░░░░░░"}, // backward hold: head at the left
 	}
-	// Forward, head at the right edge.
-	if got := indeterminateBar(12, 4.0/18, true); got != "░░░░▏▎▍▌▋▊▉█" {
-		t.Errorf("forward at right edge = %q", got)
-	}
-	// Forward, drain: the head pins and the tail merges into the block.
-	if got := indeterminateBar(12, 5.0/18, true); got != "░░░░▏▎▍▌▋▊██" {
-		t.Errorf("forward drain = %q, want merged tail next to the head", got)
-	}
-	// Backward, head at the right edge with the tail following on the
-	// right (mirrored).
-	if got := indeterminateBar(12, 0, false); got != "░░░░░░░░░░░█" {
-		t.Errorf("backward p=0 = %q, want the head at the right edge", got)
-	}
-	back := indeterminateBar(12, 0.1, false) // head ≈ 9, tail to its right
-	if !strings.HasPrefix(back, "░░░░░░░░░█") || !strings.Contains(back, "▉▊") {
-		t.Errorf("backward tail must follow on the right: %q", back)
-	}
-	// Backward, left drain: the head pins at the left, tail merges.
-	if got := indeterminateBar(12, 0.8, false); !strings.HasPrefix(got, "████") {
-		t.Errorf("backward drain must merge into a left block, got %q", got)
-	}
-	if got := indeterminateBar(12, 1, false); got != "████████░░░░" {
-		t.Errorf("backward fully drained = %q, want the solid block at the left", got)
+	for _, c := range cases {
+		if got := indeterminateBar(12, c.phase, c.forward); got != c.want {
+			t.Errorf("indeterminateBar(12, %v, forward=%v) = %q, want %q", c.phase, c.forward, got, c.want)
+		}
 	}
 }
 

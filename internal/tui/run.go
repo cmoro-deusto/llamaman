@@ -3553,8 +3553,6 @@ func (r *RunMode) loadRows() []string {
 // ▏ (1/8) farthest away.
 var blockFrags = []rune{'▏', '▎', '▍', '▌', '▋', '▊', '▉'}
 
-// cometPhase returns a constant-speed triangle phase 0..1 plus the
-// motion direction (forward = rising → the comet moves right).
 func cometPhase(period time.Duration) (float64, bool) {
 	f := float64(clock().UnixMilli()%period.Milliseconds()) / float64(period.Milliseconds())
 	if f < 0.5 {
@@ -3564,70 +3562,80 @@ func cometPhase(period time.Duration) (float64, bool) {
 }
 
 // indeterminateBar renders a comet: a solid █ head leading, with a
-// 7-cell fragment tail behind it (▉ nearest the head … ▏ farthest —
-// the "tail follows the head" look, owner's design). At the far edge
-// the head pins and the tail keeps sliding, merging into the solid
-// block; moving back, the mirror image. No fabricated percentages
-// (§15.5), no fragment ever on the wrong side of the head.
+// 7-fragment tail behind it (▉ nearest the head … ▏ farthest — the
+// "tail follows the head" look, owner's design). Cycle per direction:
+// slide across the track, then at the far edge the head pins and the
+// tail merges into a solid block, then the block dissolves back to the
+// head, which is where the opposite pass takes over — no teleports, no
+// static holds, no fabricated percentages (§15.5), and no fragment
+// ever on the wrong side of the head.
 func indeterminateBar(width, phase float64, forward bool) string {
 	w := int(width)
 	const tail = 7
-	travel := float64(w - 1 + tail)
-
+	travel := float64(w-1) + 2*float64(tail)
 	var head float64
 	if forward {
 		head = float64(tail) + phase*travel
+		head = float64(int(head))
 	} else {
-		head = float64(w-1) - phase*travel
+		head = float64(w-1) - (1-phase)*travel
+		head = float64(int(head))
 	}
-
-	// Drain: the head pins at the far edge; tail cells that slide past
-	// it merge into a solid block.
 	merged := 0
+	headInt := int(head)
 	if forward {
-		if head > float64(w-1+tail) {
-			head = float64(w - 1 + tail)
-		}
-		if int(head) > w-1 {
-			merged = int(head) - (w - 1)
-			if merged > tail {
-				merged = tail
+		if headInt > w-1 {
+			headInt = w - 1
+			if head < float64(w-1+tail) {
+				merged = int(head) - (w - 1)
+			} else {
+				merged = int(w-1+2*tail) - int(head)
 			}
-			head = float64(w - 1)
+		}
+		if head > float64(w-1+2*tail) {
+			head = float64(w - 1 + 2*tail)
 		}
 	} else {
-		if head < float64(-tail) {
-			head = float64(-tail)
-		}
-		if int(head) < 0 {
-			merged = -int(head)
-			if merged > tail {
-				merged = tail
+		if headInt < 0 {
+			headInt = 0
+			if head > float64(-tail) {
+				merged = -int(head)
+			} else {
+				merged = int(head) + 2*tail
 			}
-			head = 0
+		}
+		if head < float64(-2*tail) {
+			head = float64(-2 * tail)
 		}
 	}
-
-	headInt := int(head)
+	if merged > tail {
+		merged = tail
+	}
+	if merged < 0 {
+		merged = 0
+	}
 	out := make([]rune, w)
 	for i := 0; i < w; i++ {
 		if i == headInt {
 			out[i] = '█'
 			continue
 		}
-		var d int
+		var pd, vd float64
 		if forward {
-			d = headInt - i // tail is behind the head: to the left
+			pd = float64(headInt - i)
+			vd = head - float64(i)
 		} else {
-			d = i - headInt // tail to the right
+			pd = float64(i - headInt)
+			vd = float64(i) - head
 		}
+		k := int(vd + 0.5)
 		switch {
-		case d <= 0:
-			out[i] = '░' // ahead of the head
-		case d <= merged:
-			out[i] = '█' // merged into the pinned head
-		case d <= tail:
-			out[i] = blockFrags[tail-d] // ▉ nearest … ▏ farthest
+		case pd <= 0:
+			out[i] = '░'
+		case int(pd) <= merged:
+			out[i] = '█'
+		case k >= 1 && k <= tail:
+			out[i] = blockFrags[tail-k]
 		default:
 			out[i] = '░'
 		}
