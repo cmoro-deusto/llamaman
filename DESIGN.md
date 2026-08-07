@@ -1953,3 +1953,62 @@ error types), `types.go` (`RepoFile`, `RepoMeta`), `client_test.go`,
 `types_test.go`. No `main.go` change, no TUI change, no config change.
 DESIGN §14.2 / ROADMAP §3.2 already describe the item; this note adds
 the implementation contract.
+
+### 16.3 Quantization picker — the shared quant chooser
+
+**Scope.** Third item of Release 2 (ROADMAP §3.7). Under owner decision C
+and §3.8, the "quantization picker" is a **shared data component**, not
+a UI host: it turns a repo's `hf.Tree` listing into a pickable, sized
+quant list. The UI pickers that render it land with their hosts — the
+Storage & Downloads manager's download action (§3.4) and the config
+editor's typed-repo flow (§3.8 step B). Ships in `internal/hf/`
+(`quant.go`) on top of the §16.2 client. **Non-goals:** no download loop
+(item 4), no VRAM math (the §14.3 estimator is a hook, sizes-only until
+it ships), no search (item 7), no mmproj *selection* (informational
+only — llama.cpp auto-downloads it), no TUI code in this item.
+
+**Quant parsing.** The quant lives in the file name, matching llama.cpp's
+`get_gguf_split_info` (verified): strip `.gguf`, then a trailing
+`[-.]([A-Z0-9_]+)` tag (case-insensitive match, uppercased) — e.g.
+`qwen3-UD-Q4_K_XL.gguf` → `UD-Q4_K_XL`, `model-Q8_0.gguf` → `Q8_0`,
+`model-F16.gguf` → `F16`. Split models (`-NNNNN-of-NNNNN`) share one
+quant: their parts group into a single option whose size is the **sum**
+of the parts. Files with no parseable tag fall back to their basename as
+the option name.
+
+**API surface.**
+
+```go
+type QuantOption struct {
+    Tag   string // quant tag (uppercased) or basename fallback
+    Files []hf.RepoFile
+    Size  int64 // total (split parts summed)
+}
+
+func Quants(files []hf.RepoFile) []QuantOption // filters .gguf, groups, sorts
+func HasMMProj(files []hf.RepoFile) bool       // informational note for §3.8b
+func HumanSize(n int64) string                 // 1.2 GiB style, for pickers
+func Choose(ctx context.Context, c *hf.Client, repo string) ([]QuantOption, error)
+    // Tree(repo, "main") → Quants; the single fetch behind the pickers
+```
+
+- `Quants` is a pure function of `[]hf.RepoFile` — fully testable
+  without network (P9); `Choose` is the only network wrapper.
+- Sort: size ascending, ties by tag — the natural "smallest first"
+  order for a "fits in VRAM" picker.
+- The chosen `Tag` becomes the `:quant` suffix of the config `hf` entry
+  (`org/repo:UD-Q4_K_XL`), which llama.cpp's `find_best_model` matches.
+- **VRAM hint hook (R3 §4.2):** hosts attach the estimate; `QuantOption`
+  carries `Size` only, so the hint is a render-time addition — no
+  coupling to the estimator in this item.
+
+**Determinism (P9).** Table tests on synthetic file lists: real quant
+shapes (Q4_K_M, Q8_0, F16, IQ3_XXS, UD-Q4_K_XL), split files summing,
+case-insensitive tags, no-tag fallback, `.mmproj` excluded from `Quants`
+but detected by `HasMMProj`, non-model files ignored, deterministic
+ordering. `Choose` tested against `httptest.Server` reusing the §16.2
+client.
+
+**File map.** New `internal/hf/quant.go`, `quant_test.go`. No `main.go`,
+TUI, config, or storage changes. DESIGN §14.2 / ROADMAP §3.3 already
+describe the item; this note adds the component contract.
