@@ -3553,11 +3553,14 @@ func (r *RunMode) loadRows() []string {
 // edges move in ⅛-cell steps instead of whole-cell jumps.
 var blockFrags = []rune{'▏', '▎', '▍', '▌', '▋', '▊', '▉'}
 
-// indeterminateBar renders a 3-cell segment with smooth (sub-cell)
-// edges bouncing across a fixed-width track (position motion only — no
-// fabricated percentages, §15.5). Each edge climbs/drops through the 8
-// block fragments, so the motion is visibly smoother than whole-cell
-// steps; the segment never wraps across the ends.
+// indeterminateBar renders a 3-cell segment with a smooth (sub-cell)
+// right edge bouncing across a fixed-width track (position motion only
+// — no fabricated percentages, §15.5). The left edge stays anchored to
+// a cell boundary, so the only partial cell is the rightmost one —
+// filled from the left, which is the correct side for the ▏▎▍▌▋▊▉
+// ladder (owner feedback: the previous version mirrored the fragment on
+// the left edge, showing a phantom tail when moving right→left). The
+// right tip flows smoothly in both directions and never wraps.
 func indeterminateBar(width, phase float64) string {
 	const segCells = 3.0
 	const sub = 8 // sub-cell steps per cell
@@ -3565,23 +3568,24 @@ func indeterminateBar(width, phase float64) string {
 	if w*sub <= int(segCells*sub) {
 		return strings.Repeat("█", w)
 	}
-	travel := int((float64(w) - segCells) * sub)
-	pos := int(phase*float64(travel) + 0.5) // leading edge, in eighths
-	if pos > travel {
-		pos = travel
+	// Right edge travels so the segment stays fully on screen:
+	// [segCells*sub, w*sub] in eighths.
+	right := int(segCells*sub) + int(phase*float64(w-int(segCells))*sub)
+	if right > w*sub {
+		right = w * sub
 	}
-	end := pos + int(segCells*sub)
+	start := (right - int(segCells*sub)) / sub * sub // left edge snapped to a cell boundary
 	out := make([]rune, w)
 	for i := 0; i < w; i++ {
 		lo, hi := i*sub, (i+1)*sub
-		overlap := min(hi, end) - max(lo, pos)
+		overlap := min(hi, right) - max(lo, start)
 		switch {
 		case overlap <= 0:
 			out[i] = '░'
 		case overlap >= sub:
 			out[i] = '█'
 		default:
-			out[i] = blockFrags[overlap-1]
+			out[i] = blockFrags[overlap-1] // fill from the left — correct for the right edge
 		}
 	}
 	return string(out)

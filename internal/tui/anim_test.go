@@ -80,8 +80,9 @@ func TestQuantizePhase(t *testing.T) {
 }
 
 // TestIndeterminateBar: the segment bounces across the track with the
-// phase, edges smooth via sub-cell block fragments (no wrap, reaches
-// both ends, 3 cells of fill at all times).
+// phase; only the right edge is partial (left-anchored, so the
+// fragment is never mirrored — owner feedback), reaches both ends, no
+// wrap, fill between 3 and 4 cells.
 func TestIndeterminateBar(t *testing.T) {
 	if got := indeterminateBar(12, 0); got != "███░░░░░░░░░" {
 		t.Errorf("phase 0 must put the segment at the left, got %q", got)
@@ -89,18 +90,17 @@ func TestIndeterminateBar(t *testing.T) {
 	if got := indeterminateBar(12, 1); got != "░░░░░░░░░███" {
 		t.Errorf("phase 1 must put the segment at the right (no wrap), got %q", got)
 	}
-	// Halfway: the leading edge is mid-cell (▌ = 4/8) and the trailing
-	// edge too — sub-cell smoothness.
-	if got := indeterminateBar(12, 0.5); got != "░░░░▌██▌░░░░" {
-		t.Errorf("phase 0.5 must have fragment edges, got %q", got)
+	// Halfway: the right edge is mid-cell (▌ = 4/8), left edge full.
+	if got := indeterminateBar(12, 0.5); got != "░░░░███▌░░░░" {
+		t.Errorf("phase 0.5 must have the fragment on the right edge only, got %q", got)
 	}
-	// Adjacent phases differ by a single fragment step (smooth motion).
-	a := indeterminateBar(12, 0.484375) // pos 35
-	b := indeterminateBar(12, 0.5)      // pos 36
-	if a == b || strings.Count(a, "▋") != 1 || strings.Count(b, "▌") != 2 {
+	// Adjacent phases differ by a single fragment step on the right tip.
+	a := indeterminateBar(12, 0.484375) // right = 58 → ▎ (2/8)
+	b := indeterminateBar(12, 0.5)      // right = 60 → ▌ (4/8)
+	if a == b || strings.Count(a, "▎") != 1 || strings.Count(b, "▌") != 1 {
 		t.Errorf("adjacent sub-cell phases must differ by one fragment: %q vs %q", a, b)
 	}
-	// The segment is always exactly 3 cells of fill (24 eighths).
+	// Fill is always between 3 and 4 cells (24..31 eighths), never 0.
 	fragLevel := map[rune]int{'▏': 1, '▎': 2, '▍': 3, '▌': 4, '▋': 5, '▊': 6, '▉': 7}
 	for _, ph := range []float64{0, 0.1, 0.5, 0.9, 1} {
 		bar := indeterminateBar(12, ph)
@@ -117,8 +117,8 @@ func TestIndeterminateBar(t *testing.T) {
 				fill += fragLevel[c]
 			}
 		}
-		if fill != 24 {
-			t.Errorf("phase %v: segment fill = %d eighths, want 24", ph, fill)
+		if fill < 24 || fill > 31 {
+			t.Errorf("phase %v: segment fill = %d eighths, want 24..31", ph, fill)
 		}
 	}
 }
