@@ -91,14 +91,13 @@ func TestIndeterminateBar(t *testing.T) {
 		want    string
 	}{
 		{0, true, "▏▎▍▌▋▊▉█░░░░"},    // comet at the left, tail trailing
-		{0.2, true, "░░░░░▏▎▍▌▋██"},  // merge: tail + growing solid block
-		{0.4, true, "░░░░░███████"},  // fully merged at the right
-		{0.6, true, "░░░░░░░░████"},  // dissolve: block shrinks
+		{0.2, true, "░░░░░░░█████"},  // merge: solid block grows at the right
+		{0.4, true, "░░░░░░░░░███"},  // dissolve: block shrinks
 		{0.8, true, "░░░░░░░░░░░█"},  // hold: just the head at the edge
-		{0.8, false, "░░░░░░█▉▊▋▌▍"}, // backward: tail on the right
-		{0.5, false, "██▋▌▍▎▏░░░░░"}, // backward merge at the left
-		{0.3, false, "███████░░░░░"}, // backward fully merged
-		{0.0, false, "█░░░░░░░░░░░"}, // backward hold: head at the left
+		{0.8, false, "░░░█▉▊▋▌▍▎▏░"}, // backward: tail on the right
+		{0.5, false, "██████░░░░░░"}, // backward merge at the left
+		{0.3, false, "█░░░░░░░░░░░"}, // backward hold: head at the left
+		{0.0, false, "█░░░░░░░░░░░"},
 	}
 	for _, c := range cases {
 		if got := indeterminateBar(12, c.phase, c.forward); got != c.want {

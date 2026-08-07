@@ -3539,7 +3539,7 @@ func (r *RunMode) loadRows() []string {
 			rows = append(rows, accent.Render(" > "+bar)+subtle.Render(fmt.Sprintf(" %d%%", pct))+" ")
 		} else if animationsEnabled(r.cfg) {
 			// No numeric progress: the indeterminate comet (§15.5).
-			p, forward := cometPhase(1200 * time.Millisecond)
+			p, forward := cometPhase(1600 * time.Millisecond)
 			rows = append(rows, accent.Render(" > "+indeterminateBar(12, p, forward))+" ")
 		}
 	} else {
@@ -3572,7 +3572,7 @@ func cometPhase(period time.Duration) (float64, bool) {
 func indeterminateBar(width, phase float64, forward bool) string {
 	w := int(width)
 	const tail = 7
-	travel := float64(w-1) + 2*float64(tail)
+	travel := float64(w-1) + 2*float64(tail) + 15 // +15 = longer hold pinned at each edge (owner feedback: pause too brief)
 	var head float64
 	if forward {
 		head = float64(tail) + phase*travel
