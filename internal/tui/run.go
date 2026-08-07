@@ -3539,7 +3539,7 @@ func (r *RunMode) loadRows() []string {
 			rows = append(rows, accent.Render(" > "+bar)+subtle.Render(fmt.Sprintf(" %d%%", pct))+" ")
 		} else if animationsEnabled(r.cfg) {
 			// No numeric progress: the indeterminate comet (§15.5).
-			p, forward := cometPhase(1600 * time.Millisecond)
+			p, forward := cometPhase(15 * time.Second) // TEMP owner experiment — slow enough to inspect; revert later
 			rows = append(rows, accent.Render(" > "+indeterminateBar(12, p, forward))+" ")
 		}
 	} else {
@@ -3572,72 +3572,67 @@ func cometPhase(period time.Duration) (float64, bool) {
 func indeterminateBar(width, phase float64, forward bool) string {
 	w := int(width)
 	const tail = 7
-	travel := float64(w-1) + 2*float64(tail) + 15 // +15 = longer hold pinned at each edge (owner feedback: pause too brief)
+	// Slide + drain (7) + edge hold (15): the comet slides, the head
+	// pins at the far edge and the tail shrinks from its far end one
+	// fragment per step — no growing solid block (owner feedback: a
+	// full block appeared to move with the tail).
+	travel := float64(w-1) + 2*float64(tail) + 15
+
 	var head float64
 	if forward {
-		head = float64(tail) + phase*travel
-		head = float64(int(head))
+		head = float64(tail) + phase*travel // p: 0→1
 	} else {
-		head = float64(w-1) - (1-phase)*travel
-		head = float64(int(head))
+		head = float64(w-1) - (1-phase)*travel // p: 1→0
 	}
-	merged := 0
+	head = float64(int(head)) // whole-cell motion, no gaps
+
+	// Drain: the head pins at the far edge; the tail shrinks from its
+	// far end (drained = how many far fragments have vanished).
+	drained := 0
 	headInt := int(head)
 	if forward {
-		if headInt > w-1 {
-			headInt = w - 1
-			if head < float64(w-1+tail) {
-				merged = int(head) - (w - 1)
-			} else {
-				merged = int(w-1+2*tail) - int(head)
-			}
+		if head > float64(w-1+tail) {
+			head = float64(w - 1 + tail)
 		}
-		if head > float64(w-1+2*tail) {
-			head = float64(w - 1 + 2*tail)
+		if headInt > w-1 {
+			drained = int(head) - (w - 1)
+			if drained > tail {
+				drained = tail
+			}
+			headInt = w - 1
 		}
 	} else {
+		if head < float64(-tail) {
+			head = float64(-tail)
+		}
 		if headInt < 0 {
-			headInt = 0
-			if head > float64(-tail) {
-				merged = -int(head)
-			} else {
-				merged = int(head) + 2*tail
+			drained = -int(head)
+			if drained > tail {
+				drained = tail
 			}
-		}
-		if head < float64(-2*tail) {
-			head = float64(-2 * tail)
+			headInt = 0
 		}
 	}
-	if merged > tail {
-		merged = tail
-	}
-	if merged < 0 {
-		merged = 0
-	}
+
 	out := make([]rune, w)
 	for i := 0; i < w; i++ {
 		if i == headInt {
 			out[i] = '█'
 			continue
 		}
-		var pd, vd float64
+		var pd int
 		if forward {
-			pd = float64(headInt - i)
-			vd = head - float64(i)
+			pd = headInt - i // tail behind the head: to the left
 		} else {
-			pd = float64(i - headInt)
-			vd = float64(i) - head
+			pd = i - headInt // tail to the right
 		}
-		k := int(vd + 0.5)
 		switch {
-		case pd <= 0:
+		case pd <= 0 || pd > tail:
 			out[i] = '░'
-		case int(pd) <= merged:
-			out[i] = '█'
-		case k >= 1 && k <= tail:
-			out[i] = blockFrags[tail-k]
+		case pd > tail-drained:
+			out[i] = '░' // far end has drained
 		default:
-			out[i] = '░'
+			out[i] = blockFrags[tail-pd] // ▉ nearest … ▏ farthest
 		}
 	}
 	return string(out)
