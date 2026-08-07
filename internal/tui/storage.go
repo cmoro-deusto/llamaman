@@ -700,9 +700,11 @@ func (s StorageMode) renderDownload() string {
 		fillCells := pct * 12 / 100
 		fill := strings.Repeat("▓", fillCells)
 		rest := strings.Repeat("░", 12-fillCells)
-		bar = fmt.Sprintf(" %s%s %d%%", fill, rest, pct)
+		// %3d and %9s keep the line width constant across ticks so the
+		// centered view does not re-flow (and flicker) as done grows.
+		bar = fmt.Sprintf(" %s%s %3d%%", fill, rest, pct)
 	}
-	status := "running"
+	status := "downloading"
 	switch s.dl.status {
 	case dlPaused:
 		status = "paused"
@@ -713,7 +715,7 @@ func (s StorageMode) renderDownload() string {
 	}
 	line := fmt.Sprintf("%s:%s — %s%s", s.dl.repo, s.dl.quant, status, bar)
 	if s.dl.status == dlRunning {
-		line += fmt.Sprintf("  (%s / %s)", hf.HumanSize(s.dl.done), hf.HumanSize(s.dl.total))
+		line += fmt.Sprintf("  (%9s / %9s)", hf.HumanSize(s.dl.done), hf.HumanSize(s.dl.total))
 	}
 	return lipgloss.NewStyle().Foreground(s.theme.Accent).Render(line)
 }

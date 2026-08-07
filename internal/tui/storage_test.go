@@ -267,3 +267,23 @@ func TestStorageDeleteDeclined(t *testing.T) {
 		t.Errorf("declined delete must keep the repo, stat err = %v", err)
 	}
 }
+
+// TestDownloadLineWidthStable pins the flicker report: the download
+// progress line must keep a constant rendered width as done grows (the
+// centered view re-centers on every width change, which flickers).
+func TestDownloadLineWidthStable(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	sm := NewStorageMode(cfg, DefaultTheme(), t.TempDir())
+	sm.dl = &downloadState{repo: "org/repo", quant: "Q4_K_M", status: dlRunning, total: 15 << 30}
+	widths := map[int64]int{}
+	for _, done := range []int64{0, 1 << 10, 512 << 20, 999 << 20, 1 << 30, 15 << 30} {
+		sm.dl.done = done
+		widths[done] = len(stripANSI(sm.renderDownload()))
+	}
+	first := widths[0]
+	for done, w := range widths {
+		if w != first {
+			t.Errorf("width at done=%d is %d, want %d (stable)", done, w, first)
+		}
+	}
+}

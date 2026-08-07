@@ -135,7 +135,7 @@ func (c *Client) downloadOne(ctx context.Context, f RepoFile, blobPath, commit, 
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
-	resp, err := c.http.Do(req)
+	resp, err := c.dlHTTP.Do(req)
 	if err != nil {
 		return 0, &Error{Kind: ErrNetwork, Message: err.Error()}
 	}

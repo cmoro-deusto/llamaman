@@ -30,7 +30,10 @@ const requestTimeout = 30 * time.Second
 type Client struct {
 	endpoint string
 	token    string
-	http     *http.Client
+	http     *http.Client // API calls: bounded by requestTimeout
+	dlHTTP   *http.Client // downloads: no timeout — ctx governs (a big
+	// model takes longer than any API-style deadline; the 30s API
+	// timeout must never kill a 16 GiB body read)
 }
 
 // New builds a Client from the environment: $HF_ENDPOINT (or the
@@ -51,6 +54,7 @@ func NewWithEndpoint(endpoint, token string) *Client {
 		endpoint: strings.TrimRight(endpoint, "/"),
 		token:    token,
 		http:     &http.Client{Timeout: requestTimeout},
+		dlHTTP:   &http.Client{},
 	}
 }
 

@@ -317,3 +317,17 @@ func TestDownloadRequiresQuant(t *testing.T) {
 		t.Error("empty quant must error")
 	}
 }
+
+// TestDownloadClientHasNoTimeout pins the owner-reported regression:
+// the 30s API timeout must never apply to downloads — a 16 GiB body
+// read would die mid-stream with "context deadline exceeded". Only ctx
+// (user cancel / pause) may end a download.
+func TestDownloadClientHasNoTimeout(t *testing.T) {
+	c := NewWithEndpoint("https://example.test", "")
+	if c.dlHTTP == nil || c.dlHTTP.Timeout != 0 {
+		t.Errorf("download client timeout = %v, want 0 (no timeout)", c.dlHTTP.Timeout)
+	}
+	if c.http.Timeout != requestTimeout {
+		t.Errorf("API client timeout = %v, want %v", c.http.Timeout, requestTimeout)
+	}
+}
