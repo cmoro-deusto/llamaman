@@ -2680,3 +2680,67 @@ func TestRunModeToggleLogColors(t *testing.T) {
 		t.Errorf("rendered log must be plain with colors off, got %q", got)
 	}
 }
+
+// TestRunModeFlashInHeaderTopRight pins the flash relocation (owner
+// feedback): flashes live in the header's top-right blank space, so
+// the header keeps its height and the footer stays a single static
+// line — nothing on screen shifts when a flash shows or hides.
+func TestRunModeFlashInHeaderTopRight(t *testing.T) {
+	r := newHeaderTestRunMode(config.Model{Alias: "alpha"}, config.Preset{Name: "default"}, nil, runHeaderWideWidth)
+	r.flash = "match 3/5"
+
+	headerWith := stripANSI(r.renderTopStrip())
+	headerLinesWith := len(strings.Split(headerWith, "\n"))
+	r.flash = ""
+	headerWithout := stripANSI(r.renderTopStrip())
+	headerLinesWithout := len(strings.Split(headerWithout, "\n"))
+
+	if headerLinesWith != headerLinesWithout {
+		t.Errorf("flash must not change the header height: %d vs %d", headerLinesWith, headerLinesWithout)
+	}
+	if !strings.Contains(headerWith, "match 3/5") {
+		t.Errorf("header must contain the flash text\n%s", headerWith)
+	}
+	// The flash is right-aligned on its row (nothing but spaces and the
+	// box border after it).
+	rightMost := false
+	for _, ln := range strings.Split(headerWith, "\n") {
+		trimmed := strings.TrimRight(ln, " │")
+		if strings.HasSuffix(trimmed, "match 3/5") {
+			rightMost = true
+		}
+	}
+	if !rightMost {
+		t.Errorf("flash must sit at the right end of its row\n%s", headerWith)
+	}
+
+	// The footer is unchanged by the flash.
+	r.flash = "match 3/5"
+	footWith := stripANSI(r.renderFooter())
+	r.flash = ""
+	footWithout := stripANSI(r.renderFooter())
+	if footWith != footWithout {
+		t.Errorf("footer must be static regardless of the flash\nwith: %q\nwithout: %q", footWith, footWithout)
+	}
+}
+
+// TestRightFlash pins the alignment helper: right-aligned within the
+// width, truncated with an ellipsis when too long, dropped when there's
+// no room.
+func TestRightFlash(t *testing.T) {
+	if got := rightFlash("left", "note", 12); got != "left    note" {
+		t.Errorf("rightFlash = %q, want %q", got, "left    note")
+	}
+	// Width 5 with a 4-char left part leaves no room — flash dropped.
+	if got := rightFlash("left", "note", 5); got != "left" {
+		t.Errorf("no-room flash must be dropped, got %q", got)
+	}
+	// Roomier width: flash truncated with an ellipsis to fit.
+	got := rightFlash("left", "a long flash", 10)
+	if !strings.HasSuffix(got, "…") || lipgloss.Width(got) > 10 {
+		t.Errorf("oversized flash must truncate with an ellipsis within width, got %q", got)
+	}
+	if got := rightFlash("left", "", 12); got != "left" {
+		t.Errorf("empty flash must not change the row, got %q", got)
+	}
+}

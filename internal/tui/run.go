@@ -1829,9 +1829,8 @@ func (r *RunMode) renderFooter() string {
 		hint = subtle.Render("[adopted] ") + hint
 	}
 	stack := []string{}
-	if r.flash != "" {
-		stack = append(stack, lipgloss.NewStyle().Foreground(r.theme.StatusStart).Render(r.flash))
-	}
+	// Transient flashes moved into the header's top-right blank space
+	// (§15.5 owner feedback) — the footer stays a single static line.
 	stack = append(stack, hint)
 	return lipgloss.JoinVertical(lipgloss.Left, stack...)
 }
@@ -1981,6 +1980,11 @@ func (r *RunMode) renderTopStrip() string {
 		if innerWidth < 1 {
 			innerWidth = 1
 		}
+		// Flashes live top-right, inside the fixed header box.
+		if r.flash != "" {
+			flash := lipgloss.NewStyle().Foreground(r.theme.StatusStart).Render(r.flash)
+			row1 = rightFlash(row1, flash, innerWidth)
+		}
 		body := strings.Join([]string{
 			"",
 			ansi.Truncate(row1, innerWidth, ""),
@@ -2004,12 +2008,44 @@ func (r *RunMode) renderTopStrip() string {
 	}
 	row1 := ansi.Truncate(strings.Join(cells[:3], "   "), rightWidth, "")
 	row2 := ansi.Truncate(strings.Join(cells[3:], "   "), rightWidth, "")
+	// Transient flashes (match x/y, colors off, …) live top-right in
+	// the header's blank space — never shifting the layout when they
+	// show or hide (owner feedback).
+	if r.flash != "" {
+		flash := lipgloss.NewStyle().Foreground(r.theme.StatusStart).Render(r.flash)
+		row1 = rightFlash(row1, flash, rightWidth)
+	}
 	// 4 rows total: 1 blank top + row1 + row2 + 1 blank bottom.
 	rightCol := strings.Join([]string{"", row1, row2, ""}, "\n")
 
 	twoColumn := lipgloss.JoinHorizontal(lipgloss.Top, wordmark, "  ", rightCol)
 	body := strings.Join([]string{"", twoColumn, ""}, "\n")
 	return box.Render(body)
+}
+
+// rightFlash aligns a transient flash to the right of an identity row
+// within width, using the header's blank space — the header box keeps
+// its fixed height, so nothing on screen moves when the flash shows or
+// hides (owner feedback). Oversized flashes truncate with an ellipsis.
+func rightFlash(row, flash string, width int) string {
+	if flash == "" || width <= 0 {
+		return row
+	}
+	rowW := lipgloss.Width(row)
+	avail := width - rowW - 1 // reserve at least one gap space
+	if avail < 1 {
+		return row // no room at all — drop the flash
+	}
+	fw := lipgloss.Width(flash)
+	if fw > avail {
+		flash = ansi.Truncate(flash, avail, "…")
+		fw = lipgloss.Width(flash)
+	}
+	gap := width - rowW - fw
+	if gap < 1 {
+		gap = 1
+	}
+	return row + strings.Repeat(" ", gap) + flash
 }
 
 // renderLiveBand renders the side-by-side llama-server + Hardware

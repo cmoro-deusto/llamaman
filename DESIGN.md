@@ -532,6 +532,14 @@ minimum of 2 s after the last phase line even once READY (`o`-style
 toggle not applicable — it is load-window-only). Separate from the
 `[STARTING]` badge, which is untouched.
 
+**Transient flashes (§15.5, owner feedback).** Informational messages
+(`match x/y`, `log colors off`, save errors, …) render **top-right
+inside the run-mode header's blank space** (the first identity row),
+right-aligned via `rightFlash`; the header box keeps its fixed height
+and the footer stays a single static line, so **nothing on screen
+moves** when a flash shows or hides. Oversized flashes truncate with an
+ellipsis; flashes are dropped when no room exists.
+
 **Subtle color animation (§15.5).** Gated by `preferences.animations`
 (default on; the run-mode `a` quick key flips it live). Repeating:
 the load-progress block breathes and, without numeric progress, shows
