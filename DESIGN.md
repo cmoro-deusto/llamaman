@@ -939,28 +939,43 @@ not relitigated. Three releases, in priority order 4 → 2 → (3 + 1).
   `preferences.animations`, default **on**; toggled in Settings mode.
 - **Main-mode layout rework.** Implement §12.2 as designed.
 
-### 14.2 Release 2 — Acquisition
+### 14.2 Release 2 — Storage Manager
 
 - **Hybrid storage.** Managed downloads write into llama.cpp's HF cache
-  layout by default (`$LLAMA_CACHE` / `~/.cache/llama.cpp`, `<org>__<model>/`
-  folders; tolerate the legacy `~/.cache/huggingface/hub` layout for reads),
-  with optional `preferences.models-dir` override. One copy shared with
-  `llama-cli`/`--hf-repo`; router `(cache)` tags line up.
-- **Managed downloads.** llamaman downloads GGUFs itself (HF API `tree/main`
-  for list+sizes+sha256, `resolve/main` with `Range` for resume), live
-  progress in the TUI, sha256 verify. An `hf` config model is checked against
-  the cache first and only downloaded when missing, then run via `--model`.
-  Token support for gated repos (`HF_TOKEN` env or config). `mmproj`
-  downloaded alongside when present.
+  layout by default — the HF hub chain (`$LLAMA_CACHE` → `$HF_HUB_CACHE` →
+  `$HUGGINGFACE_HUB_CACHE` → `$HF_HOME/hub` → `$XDG_CACHE_HOME/huggingface/hub`
+  → `~/.cache/huggingface/hub`, first set wins), repo folders
+  `models--<org>--<model>/` — with optional `preferences.models-dir`
+  override (§16.1). The legacy llama.cpp layout (`~/.cache/llama.cpp`,
+  `<org>__<model>` / flat `org__repo__file.gguf`) is tolerated for reads.
+  One copy shared with `llama-cli`/`--hf-repo`; router `(cache)` tags line
+  up.
+- **Delegated launch + Downloads manager (owner decision C).** `hf` models
+  stay fire-and-forget `--hf-repo`: llama.cpp downloads at startup
+  (cache-first, `Range` resume, sha256-oid blob dedup, `mmproj`, `HF_TOKEN`),
+  and the run-mode panel shows progress via the §15.4 classifier. No managed
+  download on the launch path. A **Storage & Downloads manager** (new mode
+  from Main) is the single place downloads are managed: cache listing (both
+  layouts, §16.1), sizes, free space, delete-with-confirmation, and a
+  "download now" pre-fetch (HF API `tree/main` for list+sizes+sha256,
+  `resolve/main` with `Range`, pause/resume, sha256 verify, clear failures).
+  Never deletes config entries without asking.
 - **Quantization picker.** Per-quant real file sizes from the HF API, with a
-  "fits VRAM" hint powered by the §14.3 estimator.
-- **Storage manager.** Sizes, free space, delete-with-confirmation; never
-  deletes config entries without asking.
+  "fits VRAM" hint powered by the §14.3 estimator; hand-off into config or the
+  manager's download action.
+- **Model editor integration (owner decision, ROADMAP §3.8).** The config
+  editor's free-type `location`/`hf` fields become picker-assisted: a GGUF
+  `filepicker` overlay for local files, a cached-repo list from the §16.1
+  reader for HF, and — for a newly typed repo — one async `tree/main` check
+  offering the quant chooser with real sizes (mmproj informational only).
+  No new config fields; failures non-blocking (P3).
 - **HF model browser.** Search/browse HF in the TUI (search API,
   `filter=gguf`), metadata display, hand-off into config/download. Largest
   item; may slip to Release 3 under effort pressure.
-- **Router note.** llama.cpp's router downloads internally; managed downloads
-  apply to single-model runs; router progress is surfaced only. Rewriting
+- **Router note.** llama.cpp's router downloads internally; manager-only
+  downloads (prefetch into the shared cache) apply to router and
+  single-model runs alike; llama.cpp's own download progress is surfaced
+  only. Rewriting
   router presets to local paths is a deferred implementation decision.
 
 ### 14.3 Release 3 — Trust & Touch
@@ -1637,4 +1652,238 @@ change to the preset-pivot mechanics; no two-line row expansion in v1.
 session only), footer + help gain `esc back`. `main.go` — no-args
 launch lands on Main when a session is live (§4.3).
 `snapshot_test.go` + `main_test.go` — updated and new assertions.
+
+---
+
+## 16. Release 2 (Storage Manager) — implementation design
+
+One subsection per work item, in §3.7 order. Each subsection is the
+implementation design note for its item: written *before* code (P5) and
+reviewed by the owner; the owner's validation declares the unit done.
+Cross-cutting rules from §14.5 and ROADMAP.md §1 apply to every item.
+The note is updated in the same change as the code it describes; if
+implementation forces a deviation, the note is amended in that same
+change.
+
+### 16.1 Hybrid storage foundation — the cache-layout reader
+
+**Scope.** First item of Release 2 (ROADMAP §3.7). Two deliverables in
+one unit:
+
+1. `preferences.models-dir` — the additive Release-2 field (ROADMAP §5,
+   DESIGN §14.5) with its full P2 field-arrival contract: JSON tag,
+   validation rule, Settings-mode editor, and a documented default, all
+   in the same change.
+2. The cache-layout reader — a new `internal/storage/` package that
+   resolves llama.cpp's HF cache root, classifies the entries it finds,
+   reads both known layouts, and warns on unrecognized entries
+   (ROADMAP §3.1; §8 risk row).
+
+**Non-goals.** No downloader (the manager's download action is the
+storage-manager item, ROADMAP §3.4), no HF API client (item 2), no
+storage-manager TUI (ROADMAP §3.4), no write path (the manager's
+download action creates cache entries), no quant-level filtering (quant
+picker item). The reader ships tested and ready; its first production
+consumer is the config editor's cached-repo list (ROADMAP §3.8 step A),
+then the Storage & Downloads manager (§3.4). The only new
+user-visible surface in this item is the Settings-mode field.
+
+#### Cache-path resolution rules
+
+The effective cache root resolves first-match-wins, in this order:
+
+| Priority | Source | Resolved root |
+|---|---|---|
+| 1 | `preferences.models-dir` (set) | the value, `~`/`$VAR`-expanded at load time (§3.3); wins over every environment variable |
+| 2 | `$LLAMA_CACHE` | the value, used as-is |
+| 3 | `$HF_HUB_CACHE` | the value, used as-is |
+| 4 | `$HUGGINGFACE_HUB_CACHE` | the value, used as-is |
+| 5 | `$HF_HOME` | `<HF_HOME>/hub` |
+| 6 | `$XDG_CACHE_HOME` | `<XDG_CACHE_HOME>/huggingface/hub` |
+| 7 | `$HOME` | `~/.cache/huggingface/hub` |
+
+This mirrors llama.cpp's `get_cache_directory()` in
+`common/hf-cache.cpp` exactly (verified against master at the time of
+writing: `LLAMA_CACHE` → `HF_HUB_CACHE` → `HUGGINGFACE_HUB_CACHE` →
+`HF_HOME/hub` → `XDG_CACHE_HOME/huggingface/hub` →
+`HOME/.cache/huggingface/hub`; llama.cpp's `getpwuid` fallback is
+covered by Go's `os.UserHomeDir`). First non-empty wins.
+
+Rules:
+
+- `models-dir` outranks the environment: an explicit config preference
+  beats a shell variable (P8 — config.json is the only definition of
+  preferences; the env chain is llama.cpp's fallback, not the user's
+  choice).
+- The root is **llama.cpp's** cache root, never llamaman's own
+  `$XDG_CACHE_HOME/llamaman` (`paths.CacheDir`). The two never merge.
+- The root does not need to exist (the manager's download action
+  creates it on first download).
+- `CacheRoot(modelsDir string) (string, error)` takes the preference
+  value; it does not expand paths (load-time job) and does not
+  absolutize relative values (pass-through, documented).
+
+#### Layout detection and tolerance
+
+**Two known layouts** (verified against llama.cpp history; see the
+acceptance-risk note):
+
+| Layout | Shape at root | Verified origin |
+|---|---|---|
+| **HF hub** (primary; written and read by llama.cpp since PR #20775, ~Mar 2025, and by master today) | `<root>/models--<org>--<model>/` — `refs/main` (commit hash), `snapshots/<commit>/<file>`, `blobs/<sha256>`; `snapshots/` files are usually symlinks to `../../blobs/<oid>` (`finalize_file`) | `repo_to_folder_name`: `"models--" + repo_id` with `/` → `--` |
+| **Legacy llama.cpp** (pre-#20775; llama.cpp stopped migrating it in PR #23266) | flat `<root>/<org>__<repo>__<file>.gguf` (+ `.etag` sidecars, `manifest=<org>=<repo>=latest.json`); tolerated folder variant `<root>/<org>__<model>/<file>` | #20775's migration code (the commit message shows the flat names); ROADMAP §3.1 documents the folder form |
+
+**Detection** — every child of the cache root is classified once, by
+name and type:
+
+1. Directory named `models--…` → HF hub repo (repo id: strip
+   `models--`, then `--` → `/`). Recognized even without `snapshots/`
+   (empty cache state — normal during or after a download; returns zero
+   files, no warning). A `models--` name whose converted repo id is
+   invalid (no `/`) → unrecognized → warning.
+2. Directory matching `^[\w.-]+__[\w.-]+$` → legacy folder repo.
+3. File matching `<org>__<repo>__<file>.gguf` / `.mmproj` → legacy flat
+   file (repo = the first two `__` segments).
+4. Legacy metadata — `*.etag` sidecars and `manifest=…` files →
+   recognized, skipped silently.
+5. Anything else → **unrecognized** → warning (tolerance strategy
+   below).
+
+**Lookup** — `Lookup(root, hfID)` with `hfID` = `org/repo[:quant]`:
+
+- Strip `:quant` (the quant lives in the file *name*; llama.cpp's repo
+  folder never encodes it).
+- Hub: read `refs/main` for the commit; enumerate files under
+  `snapshots/<commit>/`; if no ref resolves, fall back to any
+  `snapshots/*/` directory. Sizes via `os.Stat` (follows symlinks); the
+  reported path is the snapshots path (llama.cpp's `final_path`), the
+  canonical file for the cached model.
+- Legacy: files matching `org__repo__*` in the root (skip `.etag`),
+  plus files under the `<org>__<model>` folder variant.
+- Return `[]CachedFile{RepoID, Path, Size, Layout}` for `.gguf` and
+  `.mmproj` files only (tokenizers, `config.json` etc. are metadata,
+  not models). No quant filtering in this item.
+
+**Tolerance strategy (P6, P3):**
+
+- Both known layouts read without error. Unrecognized entries are a
+  **Warning**, never a Block, never a crash.
+- A missing or empty root is not an error: "not cached" is a normal
+  answer (the manager's download action and the cache listing depend on
+  this).
+- The reader never mutates anything (P8 — no silent reconciliation;
+  item 5 owns deletion).
+- Warnings leave the package through a `warn func(string)` callback;
+  item 1 routes it to the app log (`internal/logging`). Warn once per
+  entry.
+
+#### models-dir field-arrival contract (P2)
+
+- `Preferences.ModelsDir string` with JSON tag `models-dir,omitempty`.
+  A plain string, not a pointer: the default is `""` = "follow
+  llama.cpp's chain", and there is no meaningful explicit-empty
+  distinct from absent (unlike `animations`, where explicit `false`
+  must survive a round trip).
+- Absent or `""` → env chain (table above). Set → single root.
+- The zero value is the default, so the existing nil-safe
+  `Config.Prefs()` already covers access; no new accessor.
+- Older binaries reject the whole config with
+  `json: unknown field "models-dir"` — the accepted P2 contract;
+  `version` stays 1.
+
+**Config / load / validate changes (same change):**
+
+- `internal/config/types.go` — the field plus doc.
+- `internal/config/load.go` — extend the §3.3 expansion pass to
+  `preferences.models-dir` (`paths.ExpandPath`).
+- `internal/config/validate.go` — `validatePreferences` gains one
+  rule: when set and the path exists and is not a directory → Warning
+  (`models-dir is not a directory`). No existence requirement
+  otherwise (the directory is created later).
+- `internal/tui/settings.go` — a `huh.NewInput` field after log-colors;
+  the description states the default chain and the llama-cli sharing
+  benefit. Empty input removes the field from the persisted object
+  (`snapshot()` contract: only non-default values persist; untouched
+  configs stay byte-identical on save).
+- `DESIGN.md` §3.2 (schema example) and §3.3 (path-expansion list)
+  updated in the same change (P5).
+
+#### Interplay with downloads (owner decision C: delegated launch,
+#### manager-owned downloads)
+
+Recorded here so the storage-manager item implements against the right
+foundation:
+
+- The **launch path stays delegated** (`--hf-repo`): llama.cpp downloads
+  at startup, cache-first, into the same root the reader resolves.
+  `Lookup` is NOT used on the launch path — there is no `--model <cached
+  path>` takeover (ROADMAP §3.2).
+- The reader's first production consumer is the config editor's
+  cached-repo list (§3.8 step A); the **Storage & Downloads manager**
+  (§3.4) lists cached files via `Scan`/`Lookup`, and its "download
+  now" action writes into the same root (the writer reuses `CacheRoot` +
+  `RepoFolderNames`), verifies sha256, and leaves the cache populated
+  for the next launch.
+- Router `(cache)` rows in run mode (llama.cpp's own downloads) line up
+  with the manager's listing because both read and write the same hub
+  layout.
+- Users with `LLAMA_CACHE` set get downloads in their custom root,
+  matching `llama-cli`.
+
+#### Acceptance risk (owner confirmation)
+
+1. **ROADMAP §3.1 and DESIGN §14.2 describe a layout llama.cpp no
+   longer writes.** Both say: default chain `$LLAMA_CACHE → ~/.cache/
+   llama.cpp → HF hub layout` and repo folder form `<org>__<model>/
+   <file>` via `repo_to_folder_name`. Verified against llama.cpp
+   history and master at the time of writing: PR #20775 (~Mar 2025)
+   switched llama.cpp to the **standard HF hub layout** — chain
+   `LLAMA_CACHE → HF_HUB_CACHE → HUGGINGFACE_HUB_CACHE → HF_HOME/hub →
+   XDG_CACHE_HOME/huggingface/hub → ~/.cache/huggingface/hub`, repo
+   folder `models--<org>--<model>`, files under `snapshots/<commit>/`
+   (+ `blobs/`, `refs/`). `~/.cache/llama.cpp` and the
+   `<org>__<model>` / `<org>__<repo>__<file>` forms are the **legacy**
+   layout; llama.cpp stopped migrating it in PR #23266. **This note
+   adopts the verified current layout as default and treats the legacy
+   forms as the second known layout (read-only).** Confirming this also
+   amends §14.2 and ROADMAP §3.1 (same-change P5). If the owner prefers
+   the §3.1 wording as the default, that desyncs from llama.cpp ≥ b5xxx
+   and breaks the "one copy shared with `llama-cli`/`--hf-repo`" goal
+   (§3.1 Why) — the note asks the owner to confirm the verified-current
+   default.
+2. **Layout-change risk (ROADMAP §8).** llama.cpp may change the layout
+   again; the reader concentrates every pattern in two tables (env
+   chain + layout rules), degrades to warnings (P6), and never crashes;
+   the tables are the single update point, each table-driven tested.
+3. **Env-chain mirroring.** llamaman mirrors llama.cpp's env-var order
+   so behavior matches `llama-cli` under `LLAMA_CACHE` / `HF_HOME`; if
+   llama.cpp renames or reorders variables, only the one table changes.
+
+#### Determinism and tests (P9)
+
+No network, no llama-server, no real terminal.
+
+- `CacheRoot` — table-driven env matrix with `t.Setenv` (each var
+  alone; priority order; `models-dir` beats all env; HOME fallback; the
+  `getpwuid` path is not unit-tested — `os.UserHomeDir` covers it).
+- `RepoFolderNames`, `DetectLayout` — table tests (hub folder, legacy
+  folder, legacy flat, `.etag`, `manifest=`, junk file, junk dir,
+  dotfiles, invalid `models--` name).
+- `Scan`, `Lookup` — fake cache trees in `t.TempDir`: hub repo with
+  `refs/main` + `snapshots/<commit>/file`, the symlink-to-blob
+  variant, no-ref fallback to any snapshot; legacy flat + `.etag`;
+  legacy folder; unrecognized entries captured via the warn callback;
+  unknown repo → empty, no error; missing root → empty, no error.
+- Config — round trip: `"models-dir": "~/models"` loads expanded; empty
+  stays absent on save; validation Warning when the path is a file.
+- Settings — form gains the field; `snapshot()` writes it only when
+  non-empty and removes it on empty; existing settings form tests
+  updated for the extra field.
+
+**File map.** New `internal/storage/` — `root.go` (cache-root
+resolution), `layout.go` (folder-name mapping + detection), `scan.go`
+(scan/lookup + types), each with tests. `internal/config/types.go`,
+`load.go`, `validate.go` + tests. `internal/tui/settings.go` +
+`settings_test.go`. `DESIGN.md` — this §16.1, §3.2, §3.3 (and, on
+owner confirmation, §14.2). No `main.go` change.
 
