@@ -74,7 +74,7 @@ func TestZoneForTemp(t *testing.T) {
 }
 
 func TestZoneColorPicksTheRightThemeField(t *testing.T) {
-	theme := CurrentTheme()
+	theme := DefaultTheme()
 	cases := []struct {
 		z    Zone
 		want any

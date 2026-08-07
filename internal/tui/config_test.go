@@ -44,7 +44,7 @@ func strPtr(s string) *string { return &s }
 // does not bleed into the source.
 func TestConfigDuplicateModel(t *testing.T) {
 	cfg := duplicateTestConfig()
-	c := NewConfigMode("/dev/null", cfg)
+	c := NewConfigMode("/dev/null", cfg, DefaultTheme())
 	c.modelIdx = 0 // "alpha"
 
 	c.formStaging = formStaging{alias: strPtr("alpha-clone")}
@@ -103,7 +103,7 @@ func TestConfigDuplicateModel(t *testing.T) {
 // correctly — `HF` carries over and `Location` stays empty.
 func TestConfigDuplicateModelHF(t *testing.T) {
 	cfg := duplicateTestConfig()
-	c := NewConfigMode("/dev/null", cfg)
+	c := NewConfigMode("/dev/null", cfg, DefaultTheme())
 	c.modelIdx = 1 // "beta", HF source
 
 	c.formStaging = formStaging{alias: strPtr("beta-clone")}
@@ -145,7 +145,7 @@ func TestUniqueAliasValidator(t *testing.T) {
 // deep-copied, cursor moves to the new entry.
 func TestConfigDuplicatePreset(t *testing.T) {
 	cfg := duplicateTestConfig()
-	c := NewConfigMode("/dev/null", cfg)
+	c := NewConfigMode("/dev/null", cfg, DefaultTheme())
 	c.modelIdx, c.presetIdx = 0, 0 // alpha / default
 
 	c.formStaging = formStaging{name: strPtr("default-clone")}
@@ -198,7 +198,7 @@ func runExitChoice(c *ConfigMode, choice string) tea.Cmd {
 func TestConfigExitPromptSaveEmitsReturn(t *testing.T) {
 	cfg := duplicateTestConfig()
 	cfgPath := filepath.Join(t.TempDir(), "llamaman.json")
-	c := NewConfigMode(cfgPath, cfg)
+	c := NewConfigMode(cfgPath, cfg, DefaultTheme())
 
 	// Dirty the work copy so save() actually writes something.
 	c.work.Models[0].Alias = "alpha-renamed"
@@ -216,7 +216,7 @@ func TestConfigExitPromptSaveEmitsReturn(t *testing.T) {
 // same deferred-exit bug, same fix.
 func TestConfigExitPromptDiscardEmitsReturn(t *testing.T) {
 	cfg := duplicateTestConfig()
-	c := NewConfigMode("/dev/null", cfg)
+	c := NewConfigMode("/dev/null", cfg, DefaultTheme())
 	c.work.Models[0].Alias = "alpha-renamed"
 
 	cmd := runExitChoice(&c, "discard")
@@ -234,7 +234,7 @@ func TestConfigExitPromptDiscardEmitsReturn(t *testing.T) {
 // answer removes the row. Mirrors model/preset delete behavior.
 func TestConfigParamDeleteRequiresConfirm(t *testing.T) {
 	cfg := duplicateTestConfig()
-	c := NewConfigMode("/dev/null", cfg)
+	c := NewConfigMode("/dev/null", cfg, DefaultTheme())
 	c.modelIdx, c.presetIdx, c.paramIdx = 0, 0, 0
 	c.focus = FocusParams
 
@@ -278,7 +278,7 @@ func intPtr(i int) *int { return &i }
 // source model is unchanged, and cursor state stays on the source.
 func TestConfigClonePresetToModel(t *testing.T) {
 	cfg := duplicateTestConfig()
-	c := NewConfigMode("/dev/null", cfg)
+	c := NewConfigMode("/dev/null", cfg, DefaultTheme())
 	c.modelIdx, c.presetIdx = 0, 0 // alpha / default
 	c.focus = FocusPresets
 
@@ -365,7 +365,7 @@ func TestClonePresetToSingleModelIsNoOp(t *testing.T) {
 			}},
 		},
 	}
-	c := NewConfigMode("/dev/null", cfg)
+	c := NewConfigMode("/dev/null", cfg, DefaultTheme())
 	c.modelIdx, c.presetIdx = 0, 0
 	c.focus = FocusPresets
 
@@ -389,7 +389,7 @@ func TestClonePresetToSingleModelIsNoOp(t *testing.T) {
 // clone is the existing `c clone` action.
 func TestCloneToFormExcludesSourceModel(t *testing.T) {
 	cfg := duplicateTestConfig()
-	c := NewConfigMode("/dev/null", cfg)
+	c := NewConfigMode("/dev/null", cfg, DefaultTheme())
 	c.modelIdx, c.presetIdx = 0, 0 // alpha / default
 	c.focus = FocusPresets
 	c.SetSize(140, 40) // installForm uses width/height; non-zero avoids the no-op path
@@ -417,7 +417,7 @@ func TestCloneToFormExcludesSourceModel(t *testing.T) {
 // keys still work (covered indirectly by TestConfigModeArrowCyclesPanes).
 func TestConfigPaneNavIgnoresVimKeys(t *testing.T) {
 	cfg := duplicateTestConfig()
-	c := NewConfigMode("/dev/null", cfg)
+	c := NewConfigMode("/dev/null", cfg, DefaultTheme())
 	c.SetSize(140, 40)
 
 	cases := []struct {
@@ -448,7 +448,7 @@ func TestConfigPaneNavIgnoresVimKeys(t *testing.T) {
 func TestConfigExitPromptSaveBlockedByValidationDoesNotExit(t *testing.T) {
 	cfg := duplicateTestConfig()
 	cfgPath := filepath.Join(t.TempDir(), "llamaman.json")
-	c := NewConfigMode(cfgPath, cfg)
+	c := NewConfigMode(cfgPath, cfg, DefaultTheme())
 
 	// Force a validation error: two models sharing the same alias.
 	c.work.Models[1].Alias = c.work.Models[0].Alias
@@ -498,7 +498,7 @@ func TestConfigExportIni(t *testing.T) {
 	cfg := duplicateTestConfig() // alpha (2 presets) + beta (1 preset) = 3 sections
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")
-	c := NewConfigMode(cfgPath, cfg)
+	c := NewConfigMode(cfgPath, cfg, DefaultTheme())
 
 	// `x` on the models pane opens the export form.
 	c.handleModelsKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})

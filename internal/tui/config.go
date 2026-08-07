@@ -115,12 +115,13 @@ type ConfigMode struct {
 }
 
 // NewConfigMode builds an editor over a config + its on-disk path.
-func NewConfigMode(cfgPath string, original *config.Config) ConfigMode {
+// theme is the resolved palette (DESIGN §15.1).
+func NewConfigMode(cfgPath string, original *config.Config, theme Theme) ConfigMode {
 	return ConfigMode{
 		cfgPath: cfgPath,
 		saved:   cloneConfig(original),
 		work:    cloneConfig(original),
-		theme:   CurrentTheme(),
+		theme:   theme,
 	}
 }
 

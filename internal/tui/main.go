@@ -58,17 +58,39 @@ type MainMode struct {
 	showPresets bool // multi-preset pivot state
 }
 
-// NewMainMode constructs the landing-screen model.
-func NewMainMode(cfg *config.Config, version string) MainMode {
+// NewMainMode constructs the landing-screen model. theme is the
+// resolved palette (DESIGN §15.1).
+func NewMainMode(cfg *config.Config, version string, theme Theme) MainMode {
 	m := MainMode{
 		cfg:     cfg,
 		keys:    DefaultKeymap(),
-		theme:   CurrentTheme(),
+		theme:   theme,
 		version: version,
 	}
 	m.rebuildModels()
 	m.rebuildRouterFiles()
 	return m
+}
+
+// SetTheme swaps the active palette and rebuilds the inline list
+// delegates (they capture the theme at list construction). Selection
+// positions are preserved. Used by Root after a Settings save or a
+// quick-key theme cycle.
+func (m *MainMode) SetTheme(t Theme) {
+	m.theme = t
+	// A theme change resets any preset pivot: the sub-list would render
+	// against a stale delegate otherwise.
+	m.showPresets = false
+	modelIdx := m.models.Index()
+	routerIdx := m.routerFiles.Index()
+	m.models = list.Model{}
+	m.routerFiles = list.Model{}
+	m.presets = list.Model{}
+	m.rebuildModels()
+	m.rebuildRouterFiles()
+	m.models.Select(modelIdx)
+	m.routerFiles.Select(routerIdx)
+	m.applyListSize()
 }
 
 // SetSize is called by the root model on every WindowSizeMsg.
@@ -97,10 +119,10 @@ func (m *MainMode) SetCfgPath(cfgPath string) {
 	m.applyListSize()
 }
 
-// SetRunning updates the "▶ Detached" line. Called by Root after session
-// state changes. Empty alias hides the line and disables `a`. Router
-// sessions report the models-file path as their alias, so the marker
-// lights up in Router mode.
+// SetRunning records the live session identity for the reattach screen
+// (DESIGN §15.2). Called by Root after session state changes. Empty
+// alias clears the reattach state. Router sessions report the
+// models-file path as their alias.
 func (m *MainMode) SetRunning(alias, preset string, port int) {
 	m.runningAlias = alias
 	m.runningPreset = preset
@@ -119,8 +141,9 @@ func (m *MainMode) SetMode(mode mainMode) {
 	m.applyListSize()
 }
 
-// IsSessionRunning reports whether main mode currently shows the detached
-// line / accepts the `a` shortcut. Used by Root to gate `a`.
+// IsSessionRunning reports whether Main is in the reattach state (a
+// live session). Used by Root to gate `a` and by Main to switch to the
+// reattach screen.
 func (m MainMode) IsSessionRunning() bool { return m.runningAlias != "" }
 
 // SetFlash sets a short status message shown beneath the list (or
@@ -184,8 +207,11 @@ func (p presetItem) FilterValue() string { return p.preset.Name }
 
 // inlineDelegate renders one row per item with reverse video on the
 // selected row. Theme-aware via the Subtle color for the trailing meta
-// (preset count / preset description). Single row, no spacing — the
-// embedded list is a compact picker, not a screen-full menu.
+// (preset count / preset description). Each row carries a leading
+// source tag in Muted — local / hf / router (DESIGN §15.2) — and the
+// highlighted model row with 2+ presets previews the preset names in
+// its description, ellipsized to the row width. Single row, no spacing
+// — the embedded list is a compact picker, not a screen-full menu.
 type inlineDelegate struct {
 	theme Theme
 }
@@ -195,25 +221,102 @@ func (d inlineDelegate) Spacing() int                            { return 0 }
 func (d inlineDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
 
 func (d inlineDelegate) Render(w io.Writer, lm list.Model, index int, item list.Item) {
-	type titled interface {
-		Title() string
-		Description() string
-	}
-	t, ok := item.(titled)
-	if !ok {
+	subtle := lipgloss.NewStyle().Foreground(d.theme.Subtle)
+	muted := lipgloss.NewStyle().Foreground(d.theme.Muted)
+
+	var tag, title, desc string
+	switch it := item.(type) {
+	case modelItem:
+		tag = it.model.SourceLabel() // "local" | "hf"
+		title = it.Title()
+		desc = it.Description()
+		if index == lm.Index() && len(it.model.Presets) >= 2 {
+			desc = previewPresets(it.model, lm.Width())
+		}
+	case routerItem:
+		tag = "router"
+		title = it.Title()
+		desc = it.Description()
+	case presetItem: // preset sub-list rows carry no source tag
+		title = it.Title()
+		desc = it.Description()
+	default:
 		return
 	}
-	title := t.Title()
-	desc := t.Description()
-	subtle := lipgloss.NewStyle().Foreground(d.theme.Subtle)
-	row := title + "  " + subtle.Render("· "+desc)
+
+	// Clamp the description so the row never exceeds the list width
+	// (long router paths, previews): bubbles/list does not pad custom
+	// delegate output, so an unclamped row would widen the enclosing
+	// box (DESIGN §15.2).
+	prefix := title
+	if tag != "" {
+		prefix = tag + strings.Repeat(" ", 6-len(tag)) + " " + title
+	}
+	const sep = "  · " // visible separator before the description
+	if avail := lm.Width() - lipgloss.Width(prefix) - len(sep); avail > 8 {
+		desc = truncateRunes(desc, avail)
+	}
+
+	row := title + sep + desc
+	if tag != "" {
+		row = tag + strings.Repeat(" ", 6-len(tag)) + " " + row
+	}
+
 	if index == lm.Index() {
-		// Reverse video for the highlighted row. Literal SGR (not
-		// lipgloss.Reverse) so it's deterministic without a TTY.
+		// Highlighted row: plain text wrapped in a single reverse-video
+		// SGR pair. Styling the substrings would inject their own
+		// `\x1b[0m` resets and break the reverse video mid-row (owner
+		// feedback), so the highlighted row carries no inner colors.
+		if pad := lm.Width() - lipgloss.Width(row); pad > 0 {
+			row += strings.Repeat(" ", pad)
+		}
+		// Literal SGR (not lipgloss.Reverse) so it's deterministic
+		// without a TTY.
 		fmt.Fprint(w, "\x1b[7m"+row+"\x1b[0m")
 		return
 	}
+
+	// Non-highlighted row: styled tag + description, padded to the list
+	// width so the enclosing box keeps a stable size regardless of which
+	// row is highlighted.
+	row = title + sep + subtle.Render(desc)
+	if tag != "" {
+		row = muted.Render(tag+strings.Repeat(" ", 6-len(tag))) + " " + row
+	}
+	if pad := lm.Width() - lipgloss.Width(row); pad > 0 {
+		row += strings.Repeat(" ", pad)
+	}
 	fmt.Fprint(w, row)
+}
+
+// previewPresets builds the highlighted-row description for a model
+// with 2+ presets: the count plus the actual preset names, ellipsized
+// to fit the remaining row width (DESIGN §15.2 item 4).
+func previewPresets(m config.Model, rowWidth int) string {
+	names := make([]string, 0, len(m.Presets))
+	for _, p := range m.Presets {
+		names = append(names, p.Name)
+	}
+	s := fmt.Sprintf("%d presets: %s", len(m.Presets), strings.Join(names, " · "))
+	// The leading tag column (7), title, and "· " separator consume the
+	// rest of the row; a conservative overhead keeps the ellipsis sane.
+	const overhead = 14
+	if avail := rowWidth - overhead; avail > 0 && len([]rune(s)) > avail {
+		return truncateRunes(s, avail)
+	}
+	return s
+}
+
+// truncateRunes cuts s to at most max runes, appending an ellipsis.
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	if max <= 1 {
+		return "…"
+	}
+	return string(r[:max-1]) + "…"
 }
 
 func (m *MainMode) rebuildModels() {
@@ -304,10 +407,11 @@ func (m *MainMode) rebuildPresets(model config.Model) {
 
 // listInnerWidth is the inner content width for the bordered list (a
 // little narrower than the terminal so the box reads as "inside"
-// rather than "edge to edge"). Capped so very wide terminals don't
-// stretch single-line rows uncomfortably.
+// rather than "edge to edge"). Grows with wide terminals (cap 90,
+// DESIGN §15.2) so rows can show more; capped so single-line rows
+// don't stretch uncomfortably.
 func (m *MainMode) listWidth() int {
-	const max = 60
+	const max = 90
 	w := m.width - 8
 	if w > max {
 		w = max
@@ -353,13 +457,17 @@ func (m *MainMode) applyListSize() {
 
 // ---- rendering ----
 
-// View renders the main screen, centered in the current terminal window.
+// View renders the main screen, centered in the current terminal
+// window. When a session is running, Main becomes a single reattach
+// entry (DESIGN §15.2); otherwise the centered column shows the model
+// list (or the empty state) as usual.
 func (m MainMode) View() string {
 	if m.width == 0 || m.height == 0 {
 		return ""
 	}
+	height := m.height
 	if m.showHelp {
-		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.renderHelp())
+		return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, m.renderHelp())
 	}
 
 	wordmark := lipgloss.NewStyle().
@@ -372,32 +480,70 @@ func (m MainMode) View() string {
 
 	parts := []string{wordmark, "", tagline}
 
-	if m.IsSessionRunning() {
-		parts = append(parts, "", m.renderDetached())
-	}
-
+	running := m.IsSessionRunning()
 	hasModels := m.HasModels()
-	if hasModels {
+	switch {
+	case running:
+		// A session is live: Main becomes a single reattach entry — the
+		// model list is hidden until the session ends (DESIGN §15.2).
+		parts = append(parts, "", m.renderReattachBox())
+	case hasModels:
 		parts = append(parts, "", m.renderListBox())
-	} else {
+	default:
 		parts = append(parts, "", m.renderEmptyState())
 	}
 
-	if hasModels && m.flash != "" {
+	if (running || hasModels) && m.flash != "" {
 		parts = append(parts, "", m.renderFlash())
 	}
 
 	parts = append(parts, "", m.renderShortcuts())
 
-	if !hasModels && m.flash != "" {
+	if !running && !hasModels && m.flash != "" {
 		parts = append(parts, "", m.renderFlash())
 	}
 
 	body := lipgloss.JoinVertical(lipgloss.Center, parts...)
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, body)
+	return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, body)
+}
+
+// renderReattachBox is the single-entry screen shown while a session is
+// running (DESIGN §15.2): one highlighted row carrying the session
+// identity, Enter/a attach. The model list returns when the session
+// ends.
+func (m MainMode) renderReattachBox() string {
+	preset := m.runningPreset
+	if preset == "" {
+		preset = "—"
+	}
+	row := fmt.Sprintf("running  %s/%s · listening on :%d",
+		m.runningAlias, preset, m.runningPort)
+	if pad := m.listWidth() - lipgloss.Width(row); pad > 0 {
+		row += strings.Repeat(" ", pad)
+	}
+	box := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.theme.Border).
+		Padding(0, 1)
+	// Highlighted like the model-list selection: plain text in a single
+	// reverse-video SGR pair (no inner colors, DESIGN §15.2).
+	return box.Render("\x1b[7m" + row + "\x1b[0m")
 }
 
 func (m MainMode) renderShortcuts() string {
+	if m.IsSessionRunning() {
+		// Reattach screen: a single entry, no list navigation. `q` quits
+		// llamaman leaving the server running (DESIGN §15.2).
+		parts := []string{
+			shortcut("Enter", "attach", m.theme),
+			shortcut("a", "attach", m.theme),
+			shortcut("c", "configure", m.theme),
+			shortcut("s", "settings", m.theme),
+			shortcut("?", "help", m.theme),
+			shortcut("q", "quit", m.theme),
+		}
+		return strings.Join(parts, "   ")
+	}
 	hasModels := m.HasModels()
 	var parts []string
 	if hasModels {
@@ -410,6 +556,8 @@ func (m MainMode) renderShortcuts() string {
 	}
 	parts = append(parts, shortcut("tab", modeLabel, m.theme))
 	parts = append(parts, shortcut("c", "configure", m.theme))
+	parts = append(parts, shortcut("s", "settings", m.theme))
+	parts = append(parts, shortcut("t", "theme", m.theme))
 	parts = append(parts, shortcut("?", "help", m.theme))
 	parts = append(parts, shortcut("q", "quit", m.theme))
 	if m.IsSessionRunning() {
@@ -473,23 +621,30 @@ func (m MainMode) renderFlash() string {
 	return lipgloss.NewStyle().Foreground(col).Render(m.flash)
 }
 
-func (m MainMode) renderDetached() string {
-	preset := m.runningPreset
-	if preset == "" {
-		preset = "—"
-	}
-	line := fmt.Sprintf("▶ Detached: %s/%s listening on :%d — press a to attach",
-		m.runningAlias, preset, m.runningPort)
-	return lipgloss.NewStyle().Foreground(m.theme.StatusReady).Render(line)
-}
-
 func (m MainMode) renderHelp() string {
+	if m.IsSessionRunning() {
+		keys := []string{
+			"Enter / a attach to the running session",
+			"c           open configuration mode",
+			"s           open settings (theme, animations)",
+			"t / Shift+t cycle theme (forward / backward)",
+			"?           toggle this help",
+			"q / Ctrl+C  quit (server keeps running)",
+		}
+		return lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(m.theme.Accent).
+			Padding(1, 3).
+			Render("Main mode keys (session running)\n\n" + strings.Join(keys, "\n"))
+	}
 	keys := []string{
 		"↑ / ↓       move selection",
 		"Enter       run selected model (pivot to preset list when 2+)",
 		"tab         toggle Single Model / Router mode",
 		"Esc         back out of preset pivot",
 		"c           open configuration mode",
+		"s           open settings (theme, animations)",
+		"t / Shift+t cycle theme (forward / backward)",
 		"a           attach to running session (only when one exists)",
 		"?           toggle this help",
 		"q / Ctrl+C  quit",
@@ -524,29 +679,37 @@ func (m MainMode) Update(msg tea.Msg) (MainMode, tea.Cmd) {
 		case "?":
 			m.showHelp = true
 			return m, nil
-		case "tab":
-			m.showPresets = false
-			if m.mode == modeRouter {
-				m.mode = modeSingle
-			} else {
-				m.mode = modeRouter
+		case "enter":
+			if m.IsSessionRunning() {
+				// Reattach screen: Enter attaches to the running session.
+				return m, func() tea.Msg { return reattachRequestMsg{} }
 			}
-			m.applyListSize()
-			return m, nil
-		case "esc":
+			if !m.HasModels() {
+				return m, nil
+			}
+			return m.handleEnter()
+		case "tab", "esc":
+			if m.IsSessionRunning() {
+				return m, nil // no list to toggle/escape on the reattach screen
+			}
+			if k.String() == "tab" {
+				m.showPresets = false
+				if m.mode == modeRouter {
+					m.mode = modeSingle
+				} else {
+					m.mode = modeRouter
+				}
+				m.applyListSize()
+				return m, nil
+			}
 			if m.showPresets {
 				m.showPresets = false
 				return m, nil
 			}
 			return m, nil
-		case "enter":
-			if !m.HasModels() {
-				return m, nil
-			}
-			return m.handleEnter()
 		}
 	}
-	if !m.HasModels() {
+	if m.IsSessionRunning() || !m.HasModels() {
 		return m, nil
 	}
 	if m.mode == modeRouter {

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -51,16 +52,41 @@ type uptimeTickMsg time.Time
 // during long model loads (GGUF into memory, HF download).
 const readyMarker = "listening on"
 
+// loadPhaseMinVisible is the minimum time the load-progress block stays
+// visible once a phase line is seen (§15.4): the block never flashes by
+// even when the server reaches READY sooner.
+const loadPhaseMinVisible = 2 * time.Second
+
 // RunMode owns (or has adopted) a llama-server child plus the viewport
 // tailing its log file. Quit prompt is per DESIGN.md §7.4: q/Ctrl+C opens
 // (k)ill / (d)etach / (c)ancel.
 type RunMode struct {
-	cfg        *config.Config
-	model      config.Model
-	preset     config.Preset
-	argv       []string
-	routerFile string // my-models.ini path for router-mode runs; "" otherwise
-	warnings   []string
+	cfg     *config.Config
+	cfgPath string // on-disk config path (from opts) — enables preference quick keys (§15.3)
+	model   config.Model
+	preset  config.Preset
+
+	// Load-progress state (§15.4): newest parsed phase/progress while
+	// starting, plus the minimum-visible deadline (2s from the last
+	// phase line) and the partial-line accumulator for raw tailer
+	// chunks.
+	loadPhase      string
+	loadProgress   *float64
+	loadPhaseUntil time.Time
+	loadPartial    string
+
+	// Animation event timestamps (§15.5): one-shot effects fade from
+	// these; smooth bars ease between polls.
+	readyAt     time.Time
+	errAt       time.Time
+	lastJumpAt  time.Time
+	ttftAt      time.Time
+	genFrac     smoothVal
+	procFrac    smoothVal
+	routerFlash map[string]time.Time
+	argv        []string
+	routerFile  string // my-models.ini path for router-mode runs; "" otherwise
+	warnings    []string
 
 	// Router-mode live state (only populated when routerFile != ""):
 	// the model list from GET /models and the loaded-model ids from
@@ -199,9 +225,14 @@ type RunMode struct {
 // of the caller (main.go) so it can race for the session lock and choose
 // owner vs adopted mode before the TUI starts.
 type RunModeOpts struct {
-	Cfg        *config.Config
-	Model      config.Model
-	Preset     config.Preset
+	Cfg     *config.Config
+	CfgPath string // on-disk config path; set by Root so run-mode preference quick keys can persist (§15.3)
+	Model   config.Model
+	Preset  config.Preset
+	// Reattach marks an adopted, already-running server: the run view
+	// starts at READY and skips the load-progress window entirely
+	// (owner feedback — reattach replayed the loading animation).
+	Reattach   bool
 	RouterFile string // non-empty for router-mode runs (my-models.ini path)
 	Argv       []string
 	Warnings   []string
@@ -214,7 +245,10 @@ type RunModeOpts struct {
 // NewRunMode wires a RunMode around an already-spawned (or adopted)
 // process. It opens the tailer on the existing log file and returns the
 // initial Cmd batch (chunk reader, process exit watcher, uptime ticker).
-func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
+// theme is the resolved palette (DESIGN §15.1); it is fixed for the
+// lifetime of the run view — a theme change while a session runs shows
+// on the next attach/launch.
+func NewRunMode(opts RunModeOpts, theme Theme) (*RunMode, tea.Cmd, error) {
 	if opts.Process == nil {
 		return nil, nil, fmt.Errorf("RunMode: Process must be non-nil")
 	}
@@ -238,12 +272,12 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 	}
 
 	r := &RunMode{
-		cfg:                    opts.Cfg,
-		model:                  opts.Model,
-		preset:                 opts.Preset,
-		routerFile:             opts.RouterFile,
-		argv:                   opts.Argv,
-		warnings:               opts.Warnings,
+		cfg:        opts.Cfg,
+		cfgPath:    opts.CfgPath,
+		model:      opts.Model,
+		preset:     opts.Preset,
+		routerFile: opts.RouterFile,
+		argv:       opts.Argv, warnings: opts.Warnings,
 		proc:                   opts.Process,
 		tail:                   tail,
 		sessionMgr:             opts.SessionMgr,
@@ -251,7 +285,7 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 		viewport:               vp,
 		status:                 StatusStarting,
 		keys:                   DefaultKeymap(),
-		theme:                  CurrentTheme(),
+		theme:                  theme,
 		searchInput:            ti,
 		serverVersion:          loadServerVersion(opts.Cfg.Globals.Bin),
 		fetcher:                opts.Fetcher,
@@ -263,6 +297,15 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 		utilHistory:            map[string]*ringBuffer{},
 	}
 	r.fetchCtx, r.fetchCancel = context.WithCancel(context.Background())
+	titleState := "STARTING"
+	if opts.Reattach {
+		// Adopted an already-running server: start at READY and skip the
+		// load-progress window (owner feedback — reattach replayed the
+		// loading animation). The /props poll still arms the live stats.
+		r.status = StatusReady
+		r.readyAt = clock()
+		titleState = "READY"
+	}
 	cmds := []tea.Cmd{
 		waitForChunk(tail.Chunks()),
 		waitForProc(opts.Process),
@@ -271,6 +314,11 @@ func NewRunMode(opts RunModeOpts) (*RunMode, tea.Cmd, error) {
 		// the server being ready (gopsutil + NVML are local reads).
 		hwSnapshotCmd(),
 		tickHwPoll(),
+		// Terminal title (DESIGN §15.3): set at entry, updated on
+		// ready/error/exited transitions.
+		tea.SetWindowTitle(r.runTitle(titleState)),
+		// Animation frame while an animated element is visible (§15.5).
+		r.animCmd(),
 	}
 	// Readiness is detected by two signals, whichever arrives first:
 	//
@@ -395,6 +443,7 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		// at render time (visibleLogLines), so toggling it off shows
 		// previously hidden lines at their exact positions.
 		r.buf.WriteString(string(m))
+		r.ingestLoadChunk(string(m))
 		atBottom := r.viewport.AtBottom()
 		r.viewport.SetContent(r.renderViewportContent())
 		if atBottom {
@@ -421,13 +470,19 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if r.fetchCancel != nil {
 			r.fetchCancel()
 		}
-		if m.err == nil {
-			r.status = StatusExited
-		} else {
+		// Load-progress block is load-window only: clear the minimum-
+		// visible deadline so a dead server never shows "loading…".
+		r.loadPhaseUntil = time.Time{}
+		state := "EXITED"
+		if m.err != nil {
 			r.status = StatusErrored
 			r.startErr = m.err
+			r.errAt = clock()
+			state = "ERROR"
+		} else {
+			r.status = StatusExited
 		}
-		return r, nil
+		return r, tea.Batch(tea.SetWindowTitle(r.runTitle(state)), r.animCmd())
 
 	case propsFetchedMsg:
 		if m.err != nil {
@@ -465,8 +520,14 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		// llama-server versions.
 		if r.status == StatusStarting {
 			r.status = StatusReady
+			r.readyAt = clock()
 		}
 		cmds := r.startLivePoll()
+		if r.status == StatusReady {
+			// Terminal title + animation tick for the ready glow (§15.3/§15.5).
+			cmds = append(cmds, tea.SetWindowTitle(r.runTitle("READY")))
+		}
+		cmds = append(cmds, r.animCmd())
 		// Disagreement diagnostic: the preset declared a value, the
 		// live server reports a different one. Most common cause is
 		// llama-server clamping a too-large request to the model's max.
@@ -484,7 +545,12 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if len(cmds) > 0 {
 			return r, tea.Batch(cmds...)
 		}
-		return r, nil
+		return r, r.animCmd()
+
+	case animTickMsg:
+		// Re-render for the animation frame; keep ticking while an
+		// animated element is visible, stop in steady state (§15.5).
+		return r, r.animCmd()
 
 	case uptimeTickMsg:
 		return r, tickUptime()
@@ -512,6 +578,20 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 
 	case modelsFetchedMsg:
 		if m.err == nil && m.m != nil {
+			// Record one-shot flash timestamps for models whose status
+			// changed (loaded/unloaded, §15.5).
+			if r.routerFlash == nil {
+				r.routerFlash = map[string]time.Time{}
+			}
+			prev := map[string]string{}
+			for _, old := range r.routerModels {
+				prev[old.ID] = old.Status.Value
+			}
+			for _, mm := range m.m.Data {
+				if prev[mm.ID] != "" && prev[mm.ID] != mm.Status.Value {
+					r.routerFlash[mm.ID] = clock()
+				}
+			}
 			r.routerModels = m.m.Data
 			// Keep the selection and scroll window valid as the list
 			// changes (a selected model may disappear).
@@ -520,7 +600,7 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 				r.routerFocus = ""
 			}
 		}
-		return r, nil
+		return r, r.animCmd()
 
 	case healthFetchedMsg:
 		if m.err == nil && m.h != nil {
@@ -660,6 +740,7 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		if m.s.GenDecoded > 0 && !r.ttftStart.IsZero() && r.ttft == 0 {
 			// First token appeared.
 			r.ttft = time.Since(r.ttftStart)
+			r.ttftAt = clock() // TTFT arrival glow (§15.5)
 		}
 		// Reset when request completes (back to idle).
 		if m.s.PromptTokensTotal == 0 && m.s.GenDecoded == 0 {
@@ -717,7 +798,10 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		case "esc":
 			// Layered Esc: close the action menu, then the router stats
 			// panel (back to the model list), then clear any applied
-			// search query. Panel focus is toggled with Tab, not Esc.
+			// search query, then detach to Main — the server keeps
+			// running and llamaman stays open (DESIGN §15.2). The final
+			// detach layer only fires while the session is live; a dead
+			// server keeps the crash view in control.
 			if r.routerFile != "" && r.routerMenu {
 				r.routerMenu = false
 				return r, nil
@@ -731,6 +815,10 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 				r.searchMatches = nil
 				r.searchIdx = 0
 				r.refreshContent()
+				return r, nil
+			}
+			if r.proc != nil && server.IsLive(r.proc.Pid) {
+				return r, func() tea.Msg { return returnToMainMsg{} }
 			}
 			return r, nil
 		case "q", "ctrl+c":
@@ -866,6 +954,10 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		case "c":
 			r.copyCommand()
 			return r, nil
+		case "o":
+			return r.toggleLogColors()
+		case "a":
+			return r.toggleAnimations()
 		case "r":
 			// Always confirm — restart kills the running child even
 			// when startup is mid-progress or the server has already
@@ -1119,8 +1211,114 @@ func (r *RunMode) effectiveQuery() string {
 // our reset at the end of the highlight prematurely terminates the
 // outer span. llama-server stderr is overwhelmingly plain in practice
 // so we accept this rather than tokenizing the buffer.
+// renderViewportContent returns the log buffer with per-line kind
+// coloring (DESIGN §15.3, disabled by the log-colors preference) and
+// reverse+bold ANSI for search matches — the current occurrence (the
+// line at searchIdx, §15.3) uses bold+reverse tinted with the theme's
+// StatusStart color so n/N navigation stands out. Lines stay
+// byte-identical on disk — coloring is render-time only — and
+// search/jump/scrollback operate on the plain lines.
 func (r *RunMode) renderViewportContent() string {
-	return highlightOccurrences(strings.Join(r.visibleLogLines(), "\n"), r.effectiveQuery())
+	lines := r.visibleLogLines()
+	current := -1
+	if r.searchQuery != "" && len(r.searchMatches) > 0 {
+		current = r.searchMatches[r.searchIdx]
+	}
+	curOpen := r.currentOccurrenceOpen()
+	colors := true
+	if r.cfg != nil {
+		colors = r.cfg.Prefs().LogColorsEnabled()
+	}
+	out := make([]string, len(lines))
+	for i, ln := range lines {
+		open := highlightOpen
+		if i == current {
+			open = curOpen
+		}
+		hl := highlightOccurrencesOpen(ln, r.effectiveQuery(), open)
+		if colors {
+			out[i] = r.colorizeLine(hl)
+		} else {
+			out[i] = hl
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// LineKind classifies a llama-server log line for render-time coloring.
+type LineKind int
+
+const (
+	LineInfo LineKind = iota
+	LineError
+	LineWarn
+	LineTiming
+	LineReady
+)
+
+// lineKindRules is the ordered keyword classifier table (DESIGN
+// §15.3). First match wins; READY is checked first so "listening on"
+// lines always get the ready highlight regardless of other content.
+// Patterns are conservative: the worst case is an uncolored line, and
+// a real critical line is never rendered as plain INFO.
+var lineKindRules = []struct {
+	kind LineKind
+	re   *regexp.Regexp
+}{
+	{LineReady, regexp.MustCompile(`listening on`)},
+	{LineError, regexp.MustCompile(`(?i)\berror\b|\bfailed\b|\bfatal\b|\baborted\b`)},
+	{LineWarn, regexp.MustCompile(`(?i)\bwarn(ing)?\b|\bdeprecated\b`)},
+	{LineTiming, regexp.MustCompile(`(?i)tokens? per second|ms per token|eval time|prompt eval time|total time|load time`)},
+}
+
+// severityPrefixRE matches llama.cpp's default logger line shape:
+// "<sec>.<ms>... <LETTER> <message>" (e.g. "0.00.177.074 W DEPRECATED:
+// ..."). The letter is the authoritative severity — checked before the
+// keyword table (owner feedback: keyword matching alone missed these).
+var severityPrefixRE = regexp.MustCompile(`^[0-9.]+ ([IWEDiwed]) `)
+
+func classifyLine(line string) LineKind {
+	if m := severityPrefixRE.FindStringSubmatch(line); m != nil {
+		switch strings.ToUpper(m[1]) {
+		case "W":
+			return LineWarn
+		case "E":
+			return LineError
+		}
+		return LineInfo // "I" and "D" are informational by default
+	}
+	for _, r := range lineKindRules {
+		if r.re.MatchString(line) {
+			return r.kind
+		}
+	}
+	return LineInfo
+}
+
+// colorizeLine wraps line in its kind's SGR (DESIGN §15.3). INFO lines
+// stay plain; the search highlight applied by the caller is wrapped
+// inside the kind color.
+func (r *RunMode) colorizeLine(line string) string {
+	var color lipgloss.Color
+	bold := false
+	switch classifyLine(line) {
+	case LineError:
+		color = r.theme.StatusErr
+	case LineWarn:
+		color = r.theme.StatusStart
+	case LineTiming:
+		color = r.theme.Muted
+	case LineReady:
+		color = r.theme.StatusReady
+		bold = true
+	default:
+		return line
+	}
+	st := lipgloss.NewStyle().Foreground(color)
+	if bold {
+		st = st.Bold(true)
+	}
+	return st.Render(line)
 }
 
 // refreshContent re-renders the viewport, preserving auto-follow when
@@ -1143,11 +1341,52 @@ const (
 	highlightClose = "\x1b[0m"
 )
 
+// pulseTheme lightens the sparkline colors slightly by phase — the
+// live-edge glow (§15.5).
+func pulseTheme(t Theme, phase float64) Theme {
+	f := 0.12 * phase
+	t.StatusIdle = lighten(t.StatusIdle, f)
+	t.Accent = lighten(t.Accent, f)
+	t.StatusReady = lighten(t.StatusReady, f)
+	return t
+}
+
+// currentOccurrenceOpen returns the SGR opening for the current search
+// occurrence: bold + reverse tinted with the theme's StatusIdle color
+// (a colored background). StatusIdle is deliberately NOT one of the
+// line-kind colors (Err/Start/Ready/Muted), so the highlight stays
+// visible even on a WARN (StatusStart) line (owner feedback). With
+// animations on, a one-shot pulse brightens it right after n/N
+// (search-jump pulse, §15.5).
+func (r *RunMode) currentOccurrenceOpen() string {
+	if r.theme.StatusIdle == "" {
+		return highlightOpen // no theme (tests/edge) → plain bold+reverse
+	}
+	color := r.theme.StatusIdle
+	if animationsEnabled(r.cfg) {
+		if s := oneShotStrength(r.lastJumpAt, jumpPulseDur); s > 0 {
+			color = oneShotColor(color, s)
+		}
+	}
+	s := lipgloss.NewStyle().
+		Foreground(color).
+		Reverse(true).
+		Bold(true).
+		Render("")
+	return strings.TrimSuffix(s, "\x1b[0m")
+}
+
 // highlightOccurrences wraps every non-overlapping case-insensitive
 // match of q in raw with bold+reverse ANSI. Position-stable: matched
 // bytes are taken from raw so original case is preserved. Advances by
 // len(q) after each match to avoid overlap on inputs like "aaa"/"aa".
 func highlightOccurrences(raw, q string) string {
+	return highlightOccurrencesOpen(raw, q, highlightOpen)
+}
+
+// highlightOccurrencesOpen is highlightOccurrences with an explicit
+// opening SGR, so the current occurrence can use a distinct style.
+func highlightOccurrencesOpen(raw, q, open string) string {
 	if q == "" || raw == "" {
 		return raw
 	}
@@ -1168,7 +1407,7 @@ func highlightOccurrences(raw, q string) string {
 		start := i + rel
 		end := start + len(qLower)
 		b.WriteString(raw[i:start])
-		b.WriteString(highlightOpen)
+		b.WriteString(open)
 		b.WriteString(raw[start:end])
 		b.WriteString(highlightClose)
 		i = end
@@ -1206,8 +1445,13 @@ func (r *RunMode) jumpSearch(delta int) tea.Cmd {
 		r.searchIdx += len(r.searchMatches)
 	}
 	target := r.searchMatches[r.searchIdx]
+	r.lastJumpAt = clock()
+	// Re-render first so the current-occurrence highlight moves with the
+	// selection, then scroll to the match (owner feedback: the underline
+	// never moved because the viewport content was stale).
+	r.refreshContent()
 	r.viewport.SetYOffset(target)
-	return r.setFlash(fmt.Sprintf("match %d/%d", r.searchIdx+1, len(r.searchMatches)))
+	return tea.Batch(r.setFlash(fmt.Sprintf("match %d/%d", r.searchIdx+1, len(r.searchMatches))), r.animCmd())
 }
 
 // handleQuitPrompt runs the (k)ill / (d)etach / (c)ancel decision tree
@@ -1512,6 +1756,9 @@ func (r *RunMode) renderHelp() string {
 	type entry struct{ key, desc string }
 	rows := []entry{
 		{"q / Ctrl+C", "open quit prompt — kill / detach / cancel"},
+		{"esc", "back to main — detach (server keeps running)"},
+		{"o", "toggle log line-kind colors (persists to preferences)"},
+		{"a", "toggle animations (persists to preferences)"},
 		{"k", "kill server and return to main"},
 		{"r", "restart server (confirms)"},
 		{"c", "copy launch command to clipboard"},
@@ -1561,7 +1808,7 @@ func (r *RunMode) renderFooter() string {
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	sep := subtle.Render(" · ")
 	tokens := []string{
-		"q quit", "k kill", "r restart", "c copy", "i info",
+		"q quit", "k kill", "r restart", "c copy", "i info", "o colors", "a anim", "esc back",
 	}
 	if r.routerFile != "" {
 		// The tab hint names the panel you'd switch TO.
@@ -1594,9 +1841,8 @@ func (r *RunMode) renderFooter() string {
 		hint = subtle.Render("[adopted] ") + hint
 	}
 	stack := []string{}
-	if r.flash != "" {
-		stack = append(stack, lipgloss.NewStyle().Foreground(r.theme.StatusStart).Render(r.flash))
-	}
+	// Transient flashes moved into the header's top-right blank space
+	// (§15.5 owner feedback) — the footer stays a single static line.
 	stack = append(stack, hint)
 	return lipgloss.JoinVertical(lipgloss.Left, stack...)
 }
@@ -1705,7 +1951,7 @@ func (r *RunMode) renderTopStrip() string {
 			subtle.Render("Models:") + " " + r.renderRouterModelCount(),
 			subtle.Render("Mode:") + " " + accent.Render("router"),
 			subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
-			statusBadge(r.statusLabel(), r.statusColor()),
+			statusBadge(r.statusLabel(), r.badgeColor()),
 		}
 	} else {
 		cells = []string{
@@ -1714,7 +1960,7 @@ func (r *RunMode) renderTopStrip() string {
 			subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params) + "  " + subtle.Render(fmt.Sprintf("(%d reqs)", int(r.decodeTotal))),
 			subtle.Render("Preset:") + " " + accent.Render(presetNameOrDash(r.preset)),
 			subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
-			statusBadge(r.statusLabel(), r.statusColor()),
+			statusBadge(r.statusLabel(), r.badgeColor()),
 		}
 	}
 
@@ -1746,6 +1992,11 @@ func (r *RunMode) renderTopStrip() string {
 		if innerWidth < 1 {
 			innerWidth = 1
 		}
+		// Flashes live top-right, inside the fixed header box.
+		if r.flash != "" {
+			flash := lipgloss.NewStyle().Foreground(r.theme.StatusStart).Render(r.flash)
+			row1 = rightFlash(row1, flash, innerWidth)
+		}
 		body := strings.Join([]string{
 			"",
 			ansi.Truncate(row1, innerWidth, ""),
@@ -1769,12 +2020,44 @@ func (r *RunMode) renderTopStrip() string {
 	}
 	row1 := ansi.Truncate(strings.Join(cells[:3], "   "), rightWidth, "")
 	row2 := ansi.Truncate(strings.Join(cells[3:], "   "), rightWidth, "")
+	// Transient flashes (match x/y, colors off, …) live top-right in
+	// the header's blank space — never shifting the layout when they
+	// show or hide (owner feedback).
+	if r.flash != "" {
+		flash := lipgloss.NewStyle().Foreground(r.theme.StatusStart).Render(r.flash)
+		row1 = rightFlash(row1, flash, rightWidth)
+	}
 	// 4 rows total: 1 blank top + row1 + row2 + 1 blank bottom.
 	rightCol := strings.Join([]string{"", row1, row2, ""}, "\n")
 
 	twoColumn := lipgloss.JoinHorizontal(lipgloss.Top, wordmark, "  ", rightCol)
 	body := strings.Join([]string{"", twoColumn, ""}, "\n")
 	return box.Render(body)
+}
+
+// rightFlash aligns a transient flash to the right of an identity row
+// within width, using the header's blank space — the header box keeps
+// its fixed height, so nothing on screen moves when the flash shows or
+// hides (owner feedback). Oversized flashes truncate with an ellipsis.
+func rightFlash(row, flash string, width int) string {
+	if flash == "" || width <= 0 {
+		return row
+	}
+	rowW := lipgloss.Width(row)
+	avail := width - rowW - 1 // reserve at least one gap space
+	if avail < 1 {
+		return row // no room at all — drop the flash
+	}
+	fw := lipgloss.Width(flash)
+	if fw > avail {
+		flash = ansi.Truncate(flash, avail, "…")
+		fw = lipgloss.Width(flash)
+	}
+	gap := width - rowW - fw
+	if gap < 1 {
+		gap = 1
+	}
+	return row + strings.Repeat(" ", gap) + flash
 }
 
 // renderLiveBand renders the side-by-side llama-server + Hardware
@@ -2300,6 +2583,11 @@ func (r *RunMode) renderServerPanel(width int) string {
 		}
 		return r.renderRouterPanel(width)
 	}
+	if r.showingLoadBlock() {
+		// §15.4: live stats can't render before READY — the panel shows
+		// the load-progress block during the starting window.
+		return r.renderTitledPanel("llama-server", width, padRows(r.loadRows(), liveBandContentRows), false)
+	}
 	return r.renderTitledPanel("llama-server", width, padRows(r.renderServerRows(r.singleModelStatsView()), liveBandContentRows), false)
 }
 
@@ -2388,8 +2676,12 @@ func (r *RunMode) routerModelState(id, status string) string {
 
 // renderRouterPanel replaces the llama-server live-data panel in router
 // runs: one row per model from GET /models, tagged loaded/loading/
-// unloaded.
+// unloaded. During the starting window it shows the load-progress block
+// instead (§15.4 — the model list can't render before READY).
 func (r *RunMode) renderRouterPanel(width int) string {
+	if r.showingLoadBlock() {
+		return r.renderTitledPanel("models", width, padRows(r.loadRows(), liveBandContentRows), r.routerPanelActive)
+	}
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	loadedStyle := lipgloss.NewStyle().Foreground(r.theme.StatusReady)
 	unloadedStyle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
@@ -2417,11 +2709,22 @@ func (r *RunMode) renderRouterPanel(width int) string {
 		for _, m := range models[start:end] {
 			state := r.routerModelState(m.ID, m.Status.Value)
 			mark, style := "○", unloadedStyle
+			var baseColor lipgloss.Color = r.theme.Subtle
 			switch state {
 			case "loaded":
-				mark, style = "●", loadedStyle
+				mark, style, baseColor = "●", loadedStyle, r.theme.StatusReady
 			case "loading":
-				mark, style = "◐", loadingStyle
+				mark, style, baseColor = "◐", loadingStyle, r.theme.Accent
+			}
+			// One-shot flash on a just-loaded/unloaded model (§15.5).
+			if animationsEnabled(r.cfg) {
+				if base, ok := r.routerFlash[m.ID]; ok {
+					if s := oneShotStrength(base, routerFlashDur); s > 0 {
+						style = lipgloss.NewStyle().Foreground(oneShotColor(baseColor, s))
+					} else {
+						delete(r.routerFlash, m.ID) // expired
+					}
+				}
 			}
 			// Selection indicator: a leading ▸ on the selected row.
 			sel := "  "
@@ -2523,7 +2826,14 @@ func (r *RunMode) renderServerRow(sv *statsView, label string, hist *ringBuffer,
 	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
 	labelCell := subtle.Render(padRight(label, metricLabelWidth))
 
-	spark := renderSparkline(r.theme, hist.Snapshot(), MetricUtil)
+	// Sparkline live-edge glow (§15.5): while busy, the whole
+	// sparkline breathes softly (the newest cell is where the motion
+	// reads).
+	sparkTheme := r.theme
+	if animationsEnabled(r.cfg) && r.busyCount > 0 {
+		sparkTheme = pulseTheme(sparkTheme, animPhase(1000*time.Millisecond))
+	}
+	spark := renderSparkline(sparkTheme, hist.Snapshot(), MetricUtil)
 
 	// Rate cell: "<current> tps / <avg> avg". Fixed-width slots so
 	// the column stays put as values transition (e.g. 99.9 → 100.0
@@ -2647,6 +2957,10 @@ func (r *RunMode) renderGenProgressRow(sv *statsView) string {
 	if genPct > 100 {
 		genPct = 100
 	}
+	if animationsEnabled(r.cfg) {
+		r.genFrac.set(genPct)
+		genPct = r.genFrac.display() // smooth fill between polls (§15.5)
+	}
 	genBar := renderBar(r.theme, genPct, zoneFor(MetricUtil, genPct))
 
 	genDecodedStr := formatTokenCount(sv.genDecoded)
@@ -2655,11 +2969,18 @@ func (r *RunMode) renderGenProgressRow(sv *statsView) string {
 
 	// TTFT display
 	var ttftCell string
+	ttftColor := r.theme.Subtle
+	if animationsEnabled(r.cfg) {
+		if s := oneShotStrength(r.ttftAt, ttftGlowDur); s > 0 {
+			ttftColor = oneShotColor(r.theme.StatusReady, s) // TTFT arrival glow (§15.5)
+		}
+	}
+	ttftStyle := lipgloss.NewStyle().Foreground(ttftColor)
 	if sv.ttft < 0 {
 		// Missed the prompt phase — generation already started.
 		ttftCell = subtle.Render("TTFT ") + "<1s"
 	} else if sv.ttft > 0 {
-		ttftCell = subtle.Render("TTFT ") + formatDuration(sv.ttft)
+		ttftCell = subtle.Render("TTFT ") + ttftStyle.Render(formatDuration(sv.ttft))
 	} else {
 		ttftCell = subtle.Render("TTFT ") + "—"
 	}
@@ -2692,6 +3013,10 @@ func (r *RunMode) renderPromptProgressRow(sv *statsView) string {
 	pct := float64(sv.promptToksProcessed) / float64(sv.promptToksTotal) * 100
 	if pct > 100 {
 		pct = 100
+	}
+	if animationsEnabled(r.cfg) {
+		r.procFrac.set(pct)
+		pct = r.procFrac.display() // smooth fill between polls (§15.5)
 	}
 	bar := renderBar(r.theme, pct, zoneFor(MetricUtil, pct))
 
@@ -3078,13 +3403,338 @@ func ctxSizeDisplay(live int, params map[string]any) string {
 }
 
 // statusBadge renders the run-mode status indicator that sits at the
-// end of row 1. Bracketed, uppercase, bold, with the state's themed
-// foreground color and no background fill.
+// end of row 1. A per-state unicode glyph prefix (DESIGN §15.3) plus
+// the bracketed uppercase label, bold, in the state's themed
+// foreground color. The [STARTING] badge text/format stays (only the
+// hollow-dot prefix is additive — §2.3).
 func statusBadge(label string, color lipgloss.Color) string {
+	glyph := ""
+	switch strings.ToUpper(label) {
+	case "READY":
+		glyph = "● "
+	case "STARTING":
+		glyph = "◌ "
+	case "ERROR":
+		glyph = "✕ "
+	case "EXITED":
+		glyph = "◌ "
+	}
 	return lipgloss.NewStyle().
 		Foreground(color).
 		Bold(true).
-		Render("[" + strings.ToUpper(label) + "]")
+		Render(glyph + "[" + strings.ToUpper(label) + "]")
+}
+
+// toggleLogColors flips the log-colors preference live (DESIGN §15.3):
+// the run-mode `o` quick key writes the same object the Settings form
+// edits (P8) and persists it when a config path is available; without
+// one it flips in-memory only.
+func (r *RunMode) toggleLogColors() (*RunMode, tea.Cmd) {
+	if r.cfg == nil {
+		return r, r.setFlash("no config to toggle log colors in")
+	}
+	prefs := r.cfg.Prefs()
+	enabled := !prefs.LogColorsEnabled()
+	prefs.LogColors = &enabled
+	r.cfg.Preferences = &prefs
+	if r.cfgPath != "" {
+		if err := config.Save(r.cfgPath, r.cfg); err != nil {
+			return r, r.setFlash("could not save log-colors: " + err.Error())
+		}
+	}
+	state := "off"
+	if enabled {
+		state = "on"
+	}
+	r.refreshContent()
+	return r, r.setFlash("log colors " + state)
+}
+
+// parseLoadPhase classifies a llama-server stderr line into a
+// load-progress phase (DESIGN §15.4). Tolerant by design (§2.3/P6):
+// patterns that stop matching simply yield no phase and the indicator
+// degrades to the static "loading…" block.
+func parseLoadPhase(line string) (phase string, progress *float64) {
+	if m := loadOffloadedRE.FindStringSubmatch(line); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		d, _ := strconv.Atoi(m[2])
+		if d > 0 {
+			p := float64(n) / float64(d)
+			if p > 1 {
+				p = 1
+			}
+			return "offloading layers to GPU", &p
+		}
+		return "offloading layers to GPU", nil
+	}
+	if loadOffloadingRE.MatchString(line) {
+		return "offloading layers to GPU", nil
+	}
+	if loadOffloadOutputRE.MatchString(line) {
+		return "offloading layers to GPU", nil
+	}
+	if m := loadDownloadRE.FindStringSubmatch(line); m != nil {
+		if pct, err := strconv.ParseFloat(m[1], 64); err == nil && pct >= 0 && pct <= 100 {
+			p := pct / 100
+			return "downloading model", &p
+		}
+		return "downloading model", nil
+	}
+	if loadLoadingRE.MatchString(line) {
+		return "loading model", nil
+	}
+	if loadInitRE.MatchString(line) {
+		return "initializing", nil
+	}
+	if loadLoadedRE.MatchString(line) {
+		return "model loaded", nil
+	}
+	return "", nil
+}
+
+var (
+	loadOffloadedRE     = regexp.MustCompile(`(?i)offloaded\s+(\d+)\s*/\s*(\d+)\s+layers`)
+	loadOffloadingRE    = regexp.MustCompile(`(?i)offloading\s+\d+\s+repeating\s+layers`)
+	loadOffloadOutputRE = regexp.MustCompile(`(?i)offloading output layer`)
+	loadDownloadRE      = regexp.MustCompile(`(?i)(?:downloading|download).*?(\d+(?:\.\d+)?)\s*%`)
+	loadLoadingRE       = regexp.MustCompile(`(?i)loading\s+model\b`)
+	loadInitRE          = regexp.MustCompile(`(?i)\binitializing\b`)
+	loadLoadedRE        = regexp.MustCompile(`(?i)\bmodel loaded\b`)
+)
+
+// showingLoadBlock reports whether the left panel should show the
+// load-progress block: while starting, or for the 2s minimum-visible
+// window after the last phase line even once READY (§15.4).
+func (r *RunMode) showingLoadBlock() bool {
+	return r.status == StatusStarting || time.Now().Before(r.loadPhaseUntil)
+}
+
+// loadRows builds the panel content for the starting window (§15.4):
+// the parsed phase line(s) with the progress bar, or the static
+// "loading…" fallback when nothing has been parsed yet. Owner polish:
+// a blank row above the block, a " > " prefix + one trailing space per
+// row, and the phase text in the brighter Accent color. With
+// animations on (§15.5) the color breathes and, when no numeric
+// progress is known, an indeterminate moving fill replaces the static
+// bar.
+func (r *RunMode) loadRows() []string {
+	accentColor := r.theme.Accent
+	if animationsEnabled(r.cfg) {
+		accentColor = animColor(r.theme.Accent, lighten(r.theme.Accent, 0.3), 1600*time.Millisecond)
+	}
+	accent := lipgloss.NewStyle().Foreground(accentColor)
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	rows := []string{""}
+	if r.loadPhase != "" {
+		rows = append(rows, accent.Render(" > "+r.loadPhase)+" ")
+		if r.loadProgress != nil {
+			pct := int(*r.loadProgress * 100)
+			if pct > 100 {
+				pct = 100
+			}
+			if pct < 0 {
+				pct = 0
+			}
+			bar := progressBar(*r.loadProgress, 12)
+			rows = append(rows, accent.Render(" > "+bar)+subtle.Render(fmt.Sprintf(" %d%%", pct))+" ")
+		} else if animationsEnabled(r.cfg) {
+			// No numeric progress: the indeterminate comet (§15.5).
+			p, forward := cometPhase(1600 * time.Millisecond)
+			rows = append(rows, accent.Render(" > "+indeterminateBar(12, p, forward))+" ")
+		}
+	} else {
+		rows = append(rows, accent.Render(" > loading…")+" ")
+	}
+	return rows
+}
+
+// blockFrags are the 7 sub-cell block fragments (U+258F..U+2589, high
+// to low) used by the comet's tail: ▉ (7/8) nearest the head down to
+// ▏ (1/8) farthest away.
+var blockFrags = []rune{'▏', '▎', '▍', '▌', '▋', '▊', '▉'}
+
+func cometPhase(period time.Duration) (float64, bool) {
+	f := float64(clock().UnixMilli()%period.Milliseconds()) / float64(period.Milliseconds())
+	if f < 0.5 {
+		return f * 2, true
+	}
+	return (1 - f) * 2, false
+}
+
+// indeterminateBar renders a comet: a solid █ head leading, with a
+// 7-fragment tail behind it (▉ nearest the head … ▏ farthest — the
+// "tail follows the head" look, owner's design). Cycle per direction:
+// slide across the track, then at the far edge the head pins and the
+// tail merges into a solid block, then the block dissolves back to the
+// head, which is where the opposite pass takes over — no teleports, no
+// static holds, no fabricated percentages (§15.5), and no fragment
+// ever on the wrong side of the head.
+func indeterminateBar(width, phase float64, forward bool) string {
+	w := int(width)
+	const tail = 7
+	// Slide (w-1-tail) + drain (tail) = 11 units of work; travel = 20
+	// Both passes do 18 units of work (slide 11 + drain 7) so the edge
+	// holds are identical: travel = 33 → 45% hold ≈ 363ms at
+	// 1600ms/cycle, matching the owner-approved right-edge wait.
+	travel := float64(w-1) + 2*float64(tail) + 8
+
+	var head float64
+	if forward {
+		head = phase * travel // p: 0→1 — starts as just the head at the left; the tail enters from the left
+	} else {
+		head = float64(w-1) - (1-phase)*travel // p: 1→0
+	}
+	head = float64(int(head)) // whole-cell motion, no gaps
+
+	// Drain: the head pins at the far edge; the tail shrinks from its
+	// far end (drained = how many far fragments have vanished).
+	drained := 0
+	headInt := int(head)
+	if forward {
+		if head > float64(w-1+tail) {
+			head = float64(w - 1 + tail)
+		}
+		if headInt > w-1 {
+			drained = int(head) - (w - 1)
+			if drained > tail {
+				drained = tail
+			}
+			headInt = w - 1
+		}
+	} else {
+		if head < float64(-tail) {
+			head = float64(-tail)
+		}
+		if headInt < 0 {
+			drained = -int(head)
+			if drained > tail {
+				drained = tail
+			}
+			headInt = 0
+		}
+	}
+
+	out := make([]rune, w)
+	for i := 0; i < w; i++ {
+		if i == headInt {
+			out[i] = '█'
+			continue
+		}
+		var pd int
+		if forward {
+			pd = headInt - i // tail behind the head: to the left
+		} else {
+			pd = i - headInt // tail to the right
+		}
+		switch {
+		case pd <= 0 || pd > tail:
+			out[i] = '░'
+		case pd > tail-drained:
+			out[i] = '░' // far end has drained
+		default:
+			out[i] = blockFrags[tail-pd] // ▉ nearest … ▏ farthest
+		}
+	}
+	return string(out)
+}
+
+// progressBar renders a fixed-width filled/empty block bar (▓/░) for a
+// progress fraction in [0,1], capped at width cells.
+func progressBar(frac float64, width int) string {
+	if width < 1 {
+		width = 1
+	}
+	if frac < 0 {
+		frac = 0
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	filled := int(frac*float64(width) + 0.5)
+	return strings.Repeat("▓", filled) + strings.Repeat("░", width-filled)
+}
+
+// ingestLoadChunk feeds a log chunk to the load-progress classifier
+// (§15.4): while starting, the newest phase/progress is kept and the
+// 2s minimum-visible deadline extends on every update. The tailer
+// delivers raw 4096-byte chunks that can split a line in two, so a
+// partial-line accumulator reassembles them before parsing (owner
+// feedback: only "loading…" ever showed).
+func (r *RunMode) ingestLoadChunk(chunk string) {
+	if r.status != StatusStarting {
+		return
+	}
+	joined := r.loadPartial + chunk
+	lines := strings.Split(joined, "\n")
+	r.loadPartial = lines[len(lines)-1] // keep the unfinished tail
+	for _, ln := range lines[:len(lines)-1] {
+		if phase, prog := parseLoadPhase(ln); phase != "" {
+			r.loadPhase = phase
+			r.loadProgress = prog
+			r.loadPhaseUntil = time.Now().Add(loadPhaseMinVisible)
+		}
+	}
+}
+
+// toggleAnimations flips the animations preference live (§15.5): the
+// run-mode `a` quick key writes the same object the Settings form
+// edits (P8) and persists it when a config path is available.
+func (r *RunMode) toggleAnimations() (*RunMode, tea.Cmd) {
+	if r.cfg == nil {
+		return r, r.setFlash("no config to toggle animations in")
+	}
+	prefs := r.cfg.Prefs()
+	enabled := !prefs.AnimationsEnabled()
+	prefs.Animations = &enabled
+	r.cfg.Preferences = &prefs
+	if r.cfgPath != "" {
+		if err := config.Save(r.cfgPath, r.cfg); err != nil {
+			return r, r.setFlash("could not save animations: " + err.Error())
+		}
+	}
+	state := "off"
+	if enabled {
+		state = "on"
+	}
+	return r, tea.Batch(r.setFlash("animations "+state), r.animCmd())
+}
+
+// runTitle is the terminal-title (OSC) content for the run view
+// (DESIGN §15.3): `llamaman — <alias> [STATE]`. Router sessions use
+// the models-file basename as the alias.
+func (r *RunMode) runTitle(state string) string {
+	alias := r.model.Alias
+	if alias == "" && r.routerFile != "" {
+		alias = filepath.Base(r.routerFile)
+	}
+	return fmt.Sprintf("llamaman — %s [%s]", alias, state)
+}
+
+// badgeColor is statusColor with the §15.5 animations applied: the
+// STARTING badge breathes yellow↔gold, the READY dot pulses while
+// generating, and READY/ERROR get a one-shot glow/flash on entry. All
+// gated by preferences.animations.
+func (r *RunMode) badgeColor() lipgloss.Color {
+	base := r.statusColor()
+	if !animationsEnabled(r.cfg) {
+		return base
+	}
+	switch r.status {
+	case StatusStarting:
+		return animColor(base, lighten(base, 0.25), 2000*time.Millisecond)
+	case StatusReady:
+		if s := oneShotStrength(r.readyAt, readyGlowDur); s > 0 {
+			return oneShotColor(base, s)
+		}
+		if r.busyCount > 0 {
+			return animColor(base, lighten(base, 0.3), 800*time.Millisecond)
+		}
+	case StatusErrored:
+		if s := oneShotStrength(r.errAt, errFlashDur); s > 0 {
+			return oneShotColor(base, s)
+		}
+	}
+	return base
 }
 
 func (r *RunMode) statusColor() lipgloss.Color {

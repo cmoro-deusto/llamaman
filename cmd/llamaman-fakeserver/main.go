@@ -52,6 +52,12 @@ func main() {
 	fmt.Println("llm_load_print_meta: arch            = qwen3moe")
 	fmt.Println("ggml_cuda_init: GGML_CUDA_FORCE_MMQ:   no")
 	fmt.Println("llama_kv_cache_init: kv_size = 262144")
+	// Load-progress fixture lines (§15.4): the offload fraction makes
+	// the phase + bar appear while the server is still starting.
+	fmt.Println("llm_load_tensors: offloading 16 repeating layers to GPU")
+	fmt.Println("llm_load_tensors: offloaded 16/33 layers to GPU")
+	time.Sleep(80 * time.Millisecond)
+	fmt.Println("llm_load_tensors: offloaded 33/33 layers to GPU")
 
 	time.Sleep(*delay)
 

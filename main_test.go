@@ -6,9 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/modelsini"
+	"github.com/cmoro-deusto/llamaman/internal/server"
 )
 
 // withArgs patches os.Args for the duration of the test and restores it.
@@ -166,5 +168,67 @@ func TestImportDispatchBeforeKong(t *testing.T) {
 	}
 	if len(cfg.Models) != 1 || cfg.Models[0].Alias != "m" {
 		t.Fatalf("unexpected imported models: %+v", cfg.Models)
+	}
+}
+
+// liveSession writes a session.json with a live PID (the test process)
+// into an isolated XDG_RUNTIME_DIR and returns the manager.
+func liveSession(t *testing.T) *server.SessionManager {
+	t.Helper()
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	mgr, err := server.NewSessionManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := server.Session{
+		PID:       os.Getpid(), // live for the duration of the test
+		Alias:     "alpha",
+		Preset:    "default",
+		Host:      "127.0.0.1",
+		Port:      9080,
+		StartedAt: time.Now(),
+		Command:   []string{"/usr/bin/llama-server", "-m", "/m/alpha.gguf"},
+		LogPath:   filepath.Join(t.TempDir(), "llama.log"),
+	}
+	data, err := json.Marshal(sess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mgr.Path(), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return mgr
+}
+
+// TestDecideEntryNoArgsLandsOnMainWhenSessionRunning pins §4.3/§15.2:
+// a no-args launch with a live session returns nil (Main mode) so the
+// session header strip shows and `a` attaches — no auto-bypass.
+func TestDecideEntryNoArgsLandsOnMainWhenSessionRunning(t *testing.T) {
+	cfg := &config.Config{
+		Version: 1,
+		Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+	}
+	opts, code := decideEntry(cfg, nil, liveSession(t), "", "")
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if opts != nil {
+		t.Fatalf("no-args launch with a live session must land on Main (opts=nil), got %+v", opts)
+	}
+}
+
+// TestDecideEntryAliasStillReattaches: `llamaman <alias>` with a live
+// session keeps the direct reattach path (arguments ignored, §4.3).
+func TestDecideEntryAliasStillReattaches(t *testing.T) {
+	cfg := &config.Config{
+		Version: 1,
+		Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+	}
+	opts, code := decideEntry(cfg, nil, liveSession(t), "alpha", "default")
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if opts == nil {
+		t.Fatal("alias launch with a live session must still reattach (opts != nil)")
 	}
 }

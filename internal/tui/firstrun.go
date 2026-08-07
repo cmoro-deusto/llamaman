@@ -55,14 +55,16 @@ type FirstRunMode struct {
 
 // NewFirstRunMode constructs the flow rooted at the given config path.
 // The path is resolved by main.go (XDG default) before this is reached.
-func NewFirstRunMode(cfgPath string) *FirstRunMode {
+// theme is the resolved palette (auto/default at this stage, DESIGN
+// §15.1 — first-run has no preferences step).
+func NewFirstRunMode(cfgPath string, theme Theme) *FirstRunMode {
 	return &FirstRunMode{
 		cfgPath: cfgPath,
 		stage:   frWelcome,
 		bin:     autodetectBinary(),
 		host:    "127.0.0.1",
 		port:    "9080",
-		theme:   CurrentTheme(),
+		theme:   theme,
 	}
 }
 

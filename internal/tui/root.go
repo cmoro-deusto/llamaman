@@ -1,9 +1,11 @@
 package tui
 
 import (
+	"log/slog"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
@@ -17,6 +19,7 @@ const (
 	ViewRun
 	ViewConfig
 	ViewFirstRun
+	ViewSettings
 )
 
 // SpawnRequestMsg asks the root to spawn llama-server for (Model, Preset)
@@ -71,10 +74,12 @@ type Root struct {
 	view      View
 	width     int
 	height    int
+	theme     Theme
 	mainMode  MainMode
 	run       *RunMode
 	configMod *ConfigMode
 	firstRun  *FirstRunMode
+	settings  *SettingsMode
 
 	// initialRun, if non-nil, makes the program jump straight to run mode
 	// on Init() (used both for `llamaman <alias>` and for reattach).
@@ -101,6 +106,10 @@ func NewRootForFirstRun(cfgPath string, version string, fr *FirstRunMode) *Root 
 // registry may be nil to disable the type-aware param editor and fuzzy
 // flag picker.
 func NewRoot(cfg *config.Config, cfgPath string, spawner Spawner, registry flags.Registry, version string, initialRun *RunModeOpts) *Root {
+	theme, resolved, ok := ResolveTheme(cfg.Prefs().Theme, lipgloss.HasDarkBackground())
+	if !ok {
+		slog.Warn("unknown theme, falling back to auto", "theme", cfg.Prefs().Theme, "resolved", resolved)
+	}
 	r := &Root{
 		cfg:        cfg,
 		cfgPath:    cfgPath,
@@ -108,7 +117,8 @@ func NewRoot(cfg *config.Config, cfgPath string, spawner Spawner, registry flags
 		registry:   registry,
 		version:    version,
 		keys:       DefaultKeymap(),
-		mainMode:   NewMainMode(cfg, version),
+		theme:      theme,
+		mainMode:   NewMainMode(cfg, version, theme),
 		initialRun: initialRun,
 	}
 	r.mainMode.SetCfgPath(cfgPath)
@@ -129,8 +139,9 @@ func (r *Root) Init() tea.Cmd {
 	}
 	if r.initialRun != nil {
 		opts := *r.initialRun
+		opts.CfgPath = r.cfgPath // enable run-mode preference quick keys (§15.3)
 		r.initialRun = nil
-		run, cmd, err := NewRunMode(opts)
+		run, cmd, err := NewRunMode(opts, r.theme)
 		if err != nil {
 			r.startErr = err
 			r.view = ViewMain
@@ -156,6 +167,9 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if r.firstRun != nil {
 			r.firstRun.SetSize(msg.Width, msg.Height)
+		}
+		if r.settings != nil {
+			r.settings.SetSize(msg.Width, msg.Height)
 		}
 		return r, nil
 
@@ -200,6 +214,14 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		r.view = ViewMain
 		return r, nil
 
+	case returnFromSettingsMsg:
+		if r.settings != nil && r.settings.Applied() != nil {
+			r.applyPreferences(r.settings.Applied())
+		}
+		r.settings = nil
+		r.view = ViewMain
+		return r, nil
+
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" && r.view != ViewRun && r.view != ViewConfig {
 			r.quitting = true
@@ -214,10 +236,10 @@ func (r *Root) handleFirstRunCompleted(msg FirstRunCompletedMsg) (tea.Model, tea
 	r.cfg = msg.Cfg
 	r.cfgPath = msg.CfgPath
 	r.firstRun = nil
-	r.mainMode = NewMainMode(msg.Cfg, r.version)
+	r.mainMode = NewMainMode(msg.Cfg, r.version, r.theme)
 	r.mainMode.SetCfgPath(r.cfgPath)
 	r.mainMode.SetSize(r.width, r.height)
-	cm := NewConfigMode(msg.CfgPath, msg.Cfg)
+	cm := NewConfigMode(msg.CfgPath, msg.Cfg, r.theme)
 	cm.SetRegistry(r.registry)
 	cm.ShowFirstRunBanner()
 	cm.SetSize(r.width, r.height)
@@ -235,6 +257,14 @@ func (r *Root) routeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return r, tea.Quit
 		case "c":
 			return r.openConfig(configEntry{focus: FocusModels})
+		case "s":
+			return r.openSettings()
+		case "t":
+			r.cycleTheme(+1)
+			return r, nil
+		case "T": // shift+t — cycle backward
+			r.cycleTheme(-1)
+			return r, nil
 		case "a":
 			if r.mainMode.IsSessionRunning() {
 				return r.handleReattach()
@@ -260,6 +290,13 @@ func (r *Root) routeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		next, cmd := r.configMod.Update(msg)
 		r.configMod = next
+		return r, cmd
+	case ViewSettings:
+		if r.settings == nil {
+			return r, nil
+		}
+		next, cmd := r.settings.Update(msg)
+		r.settings = next
 		return r, cmd
 	case ViewFirstRun:
 		if r.firstRun == nil {
@@ -287,6 +324,13 @@ func (r *Root) forward(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		next, cmd := r.configMod.Update(msg)
 		r.configMod = next
+		return r, cmd
+	case ViewSettings:
+		if r.settings == nil {
+			return r, nil
+		}
+		next, cmd := r.settings.Update(msg)
+		r.settings = next
 		return r, cmd
 	case ViewFirstRun:
 		if r.firstRun == nil {
@@ -330,7 +374,8 @@ func (r *Root) handleRouterSpawn(msg RouterSpawnRequestMsg) (tea.Model, tea.Cmd)
 // enterRunMode wraps an already-spawned process in a RunMode and flips
 // the view. Shared by the single-model and router spawn paths.
 func (r *Root) enterRunMode(opts RunModeOpts) (tea.Model, tea.Cmd) {
-	run, cmd, err := NewRunMode(opts)
+	opts.CfgPath = r.cfgPath // enable run-mode preference quick keys (§15.3)
+	run, cmd, err := NewRunMode(opts, r.theme)
 	if err != nil {
 		r.flashSpawnError(err)
 		return r, nil
@@ -363,7 +408,7 @@ type configEntry struct {
 }
 
 func (r *Root) openConfig(entry configEntry) (tea.Model, tea.Cmd) {
-	cm := NewConfigMode(r.cfgPath, r.cfg)
+	cm := NewConfigMode(r.cfgPath, r.cfg, r.theme)
 	cm.SetRegistry(r.registry)
 	cm.SetSize(r.width, r.height)
 	if entry.focusAlias != "" {
@@ -403,7 +448,8 @@ func (r *Root) handleReattach() (tea.Model, tea.Cmd) {
 		r.refreshSessionState()
 		return r, nil
 	}
-	run, cmd, err := NewRunMode(*opts)
+	opts.CfgPath = r.cfgPath // enable run-mode preference quick keys (§15.3)
+	run, cmd, err := NewRunMode(*opts, r.theme)
 	if err != nil {
 		r.startErr = err
 		return r, nil
@@ -441,6 +487,85 @@ func (r *Root) applyConfigChanges() {
 	}
 }
 
+// returnFromSettingsMsg is dispatched when the user backs out of the
+// Settings mode (submit or cancel).
+type returnFromSettingsMsg struct{}
+
+// openSettings switches to the Settings mode, which edits exactly the
+// preferences object (DESIGN §15.1).
+func (r *Root) openSettings() (tea.Model, tea.Cmd) {
+	r.settings = NewSettingsMode(r.cfgPath, r.cfg, r.theme, lipgloss.HasDarkBackground(), r.version)
+	r.settings.SetSize(r.width, r.height)
+	r.view = ViewSettings
+	return r, r.settings.Init()
+}
+
+// applyPreferences persists the preferences snapshot from Settings and
+// re-resolves the theme so the TUI re-renders with the new palette. On
+// save failure the in-memory config is left untouched (no memory/disk
+// divergence).
+func (r *Root) applyPreferences(p *config.Preferences) {
+	if p == nil || r.cfgPath == "" {
+		return
+	}
+	prev := r.cfg.Preferences
+	r.cfg.Preferences = p
+	if err := config.Save(r.cfgPath, r.cfg); err != nil {
+		r.cfg.Preferences = prev
+		slog.Error("save preferences", "err", err)
+		r.mainMode.SetFlash("could not save preferences: " + err.Error())
+		return
+	}
+	r.applyTheme()
+}
+
+// cycleTheme steps the theme cycle forward (+1) or backward (-1),
+// persists preferences.theme, and re-renders live. The quick key is a
+// shortcut writing the same object Settings edits (P8).
+func (r *Root) cycleTheme(dir int) {
+	if r.cfg == nil || r.cfgPath == "" {
+		return
+	}
+	next := nextTheme(r.cfg.Prefs().Theme, dir)
+	prefs := r.cfg.Prefs()
+	prefs.Theme = next
+	prev := r.cfg.Preferences
+	r.cfg.Preferences = &prefs
+	if err := config.Save(r.cfgPath, r.cfg); err != nil {
+		// Roll back: never leave memory/disk/UI diverged.
+		r.cfg.Preferences = prev
+		slog.Error("save theme", "err", err)
+		r.mainMode.SetFlash("could not save theme: " + err.Error())
+		return
+	}
+	r.applyTheme()
+	display := next
+	if p, ok := lookupPalette(next); ok {
+		display = p.Display
+	}
+	flash := "theme: " + display
+	if w := mismatchWarning(next, lipgloss.HasDarkBackground()); w != "" {
+		flash = "⚠ " + w + " — " + flash
+	}
+	r.mainMode.SetFlash(flash)
+}
+
+// applyTheme re-resolves the theme from preferences and pushes it into
+// main mode (the only mode alive while Settings/the cycle run). A
+// background-mismatched palette surfaces as a Main-mode flash warning
+// (the user picked it explicitly, so it applies — DESIGN §15.1).
+func (r *Root) applyTheme() {
+	theme, resolved, ok := ResolveTheme(r.cfg.Prefs().Theme, lipgloss.HasDarkBackground())
+	if !ok {
+		slog.Warn("unknown theme, falling back to auto", "theme", r.cfg.Prefs().Theme, "resolved", resolved)
+	}
+	r.theme = theme
+	r.mainMode.SetTheme(theme)
+	if w := mismatchWarning(r.cfg.Prefs().Theme, lipgloss.HasDarkBackground()); w != "" {
+		r.mainMode.SetFlash("⚠ " + w)
+	}
+}
+
 func (r *Root) View() string {
 	if r.quitting {
 		return ""
@@ -458,6 +583,11 @@ func (r *Root) View() string {
 			return ""
 		}
 		return r.configMod.View()
+	case ViewSettings:
+		if r.settings == nil {
+			return ""
+		}
+		return r.settings.View()
 	case ViewFirstRun:
 		if r.firstRun == nil {
 			return ""

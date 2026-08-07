@@ -60,10 +60,12 @@ func sampleSnapshotConfig() *config.Config {
 	}
 }
 
-// driveRoot calls Init then Update with each message, draining the
-// resulting tea.Cmds (one level deep) so dispatched messages like
-// SpawnRequestMsg actually reach Root.Update on the next round-trip.
-// Returns the View after the final message has been processed.
+// driveRoot calls Init then Update with each message, recursively
+// draining the resulting tea.Cmds so dispatched messages (SpawnRequestMsg,
+// huh form field transitions, returnFromSettingsMsg) actually reach
+// Root.Update. Depth is bounded so long-lived cmds (tea.Tick, tailers)
+// don't recurse forever; safeCmd time-boxes blocking cmds. Returns the
+// View after the final message has been processed.
 //
 // Init is only invoked if root.initialRun was set at construction (or
 // will produce a non-nil Cmd) — without that, driving from a fresh
@@ -72,28 +74,36 @@ func driveRoot(t *testing.T, root *Root, msgs ...tea.Msg) string {
 	t.Helper()
 	var m tea.Model = root
 	if cmd := root.Init(); cmd != nil {
-		for _, sub := range collectCmds(cmd) {
-			out := safeCmd(sub)
-			if out == nil {
-				continue
-			}
-			next, _ := m.Update(out)
-			m = next
-		}
+		m = drainCmds(m, cmd, 0)
 	}
 	for _, msg := range msgs {
 		next, cmd := m.Update(msg)
 		m = next
-		for _, sub := range collectCmds(cmd) {
-			out := safeCmd(sub)
-			if out == nil {
-				continue
-			}
-			next, _ = m.Update(out)
-			m = next
-		}
+		m = drainCmds(m, cmd, 0)
 	}
 	return stripANSI(m.View())
+}
+
+// drainCmds executes a tea.Cmd and feeds its message back through the
+// model, recursing into the next Cmd up to a bounded depth. BatchMsg
+// children are drained individually.
+func drainCmds(m tea.Model, cmd tea.Cmd, depth int) tea.Model {
+	if cmd == nil || depth > 8 {
+		return m
+	}
+	out := safeCmd(cmd)
+	if out == nil {
+		return m
+	}
+	if b, ok := out.(tea.BatchMsg); ok {
+		for _, sub := range b {
+			m = drainCmds(m, sub, depth+1)
+		}
+		return m
+	}
+	next, c := m.Update(out)
+	m = next
+	return drainCmds(m, c, depth+1)
 }
 
 // collectCmds flattens a tea.Cmd batch into its constituent Cmds. tea
@@ -184,30 +194,169 @@ func TestSnapshotMainModeNoModelsHidesList(t *testing.T) {
 	}
 }
 
-func TestSnapshotMainModeShowsDetachedLineWhenSessionRunning(t *testing.T) {
+// TestSnapshotMainReattachScreen pins §15.2: with a session running,
+// Main shows the single reattach entry (identity + port) and hides the
+// model list; Enter/a attach.
+func TestSnapshotMainReattachScreen(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	root := NewRoot(cfg, "/dev/null", stubSpawner{runningAlias: "alpha"}, nil, "v0.0.0-test", nil)
 	root.refreshSessionState()
 
 	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
 
-	for _, want := range []string{"Detached", "alpha", "9080", "press a to attach"} {
+	for _, want := range []string{"running", "alpha", "default", "9080", "listening on"} {
 		if !strings.Contains(out, want) {
-			t.Errorf("main mode output missing %q\nout:\n%s", want, out)
+			t.Errorf("reattach screen missing %q\nout:\n%s", want, out)
+		}
+	}
+	// The model list is replaced, not shown underneath.
+	if strings.Contains(out, "beta") {
+		t.Errorf("model list must be hidden while a session runs\nout:\n%s", out)
+	}
+	// Shortcut row is the reattach set (attach/configure/settings/help/quit).
+	for _, want := range []string{"Enter attach", "a attach", "c configure", "s settings", "q quit"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("reattach shortcut row missing %q\nout:\n%s", want, out)
 		}
 	}
 }
 
-// TestSnapshotMainModeShowsRunningMarker verifies the inline list's
-// per-row `(running)` suffix when a session for that alias is live.
-func TestSnapshotMainModeShowsRunningMarker(t *testing.T) {
+// TestSnapshotMainNoSessionShowsList pins the flip side: without a
+// session the model list renders normally and no reattach entry appears.
+func TestSnapshotMainNoSessionShowsList(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	if !strings.Contains(out, "beta") {
+		t.Errorf("model list should be visible without a session\nout:\n%s", out)
+	}
+	if strings.Contains(out, "listening on") {
+		t.Errorf("reattach entry must be absent without a session\nout:\n%s", out)
+	}
+}
+
+// TestSnapshotMainEnterOnReattachEmitsAttach: Enter on the reattach
+// screen emits reattachRequestMsg instead of a spawn.
+func TestSnapshotMainEnterOnReattachEmitsAttach(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	root := NewRoot(cfg, "/dev/null", stubSpawner{runningAlias: "alpha"}, nil, "v0.0.0-test", nil)
 	root.refreshSessionState()
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	_, cmd := root.mainMode.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("Enter on the reattach screen must emit a command")
+	}
+	if _, ok := cmd().(reattachRequestMsg); !ok {
+		t.Fatalf("Enter on reattach screen emitted %T, want reattachRequestMsg", cmd())
+	}
+}
+
+// TestSnapshotMainListBoxStableWidth pins the box-sizing fix: bubbles
+// list does not pad custom delegate output, so rows must be padded to
+// the list width or the enclosing box resizes when the highlighted
+// row's description length changes (§15.2 — owner feedback).
+func TestSnapshotMainListBoxStableWidth(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	boxWidth := func() int {
+		for _, l := range strings.Split(stripANSI(root.mainMode.View()), "\n") {
+			if strings.Contains(l, "╭") && strings.Contains(l, "──") {
+				return strings.Count(l, "─")
+			}
+		}
+		t.Fatal("list box top border not found")
+		return 0
+	}
+
+	before := boxWidth()
+	driveRoot(t, root, tea.KeyMsg{Type: tea.KeyDown}) // highlight beta (2 presets)
+	after := boxWidth()
+	if before != after {
+		t.Errorf("list box width changed with highlighted row: %d -> %d", before, after)
+	}
+}
+
+// TestSnapshotMainHighlightSpansWholeRow pins the highlight fix: the
+// highlighted row is wrapped in a single reverse-video SGR pair with
+// plain text inside (styled substrings would inject `\x1b[0m` resets
+// and break the reverse mid-row — owner feedback). The reverse must
+// start immediately before the tag+title with no inner color SGR.
+func TestSnapshotMainHighlightSpansWholeRow(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		tea.KeyMsg{Type: tea.KeyDown}, // highlight beta
+	)
+
+	raw := root.mainMode.View()
+	if !containsSequence(raw, "\x1b[7mlocal  beta") {
+		t.Errorf("reverse video must start immediately before the tag+title\nraw:\n%.400s", raw)
+	}
+	if containsSequence(raw, "\x1b[7m\x1b[38;5;") {
+		t.Errorf("highlighted row must not carry inner color styling (breaks reverse video)\nraw:\n%.400s", raw)
+	}
+}
+
+// TestSnapshotMainShowsSourceTags pins §15.2 item 3: every model row
+// carries its source kind (local / hf) and router rows carry "router".
+func TestSnapshotMainShowsSourceTags(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	cfg.Models[1].HF = "org/repo:Q4_K_M" // beta becomes an hf model
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
 
 	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
-	if !strings.Contains(out, "(running)") {
-		t.Errorf("expected (running) marker on alpha row; out:\n%s", out)
+
+	for _, want := range []string{"local  alpha", "hf     beta"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("row missing source tag %q\nout:\n%s", want, out)
+		}
+	}
+}
+
+// TestSnapshotMainPresetPreviewOnHighlight pins §15.2 item 4: the
+// highlighted row with 2+ presets shows the actual preset names;
+// non-highlighted rows keep the bare count.
+func TestSnapshotMainPresetPreviewOnHighlight(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	// alpha (1 preset) highlighted first: no preview expansion.
+	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
+	if !strings.Contains(out, "1 preset: default") {
+		t.Errorf("single-preset row should show its name\nout:\n%s", out)
+	}
+
+	// Move highlight to beta (2 presets): preview shows the names.
+	out = driveRoot(t, root, tea.KeyMsg{Type: tea.KeyDown})
+	for _, want := range []string{"2 presets: default · smallctx"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("highlighted multi-preset row should preview names %q\nout:\n%s", want, out)
+		}
+	}
+}
+
+// TestSnapshotMainPresetPreviewEllipsizesOnNarrowTerminal pins the
+// single-line ellipsis: at a narrow width the preview truncates with
+// "…" instead of overflowing the row.
+func TestSnapshotMainPresetPreviewEllipsizesOnNarrowTerminal(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	out := driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 40, Height: 30},
+		tea.KeyMsg{Type: tea.KeyDown}, // highlight beta
+	)
+	if !strings.Contains(out, "…") {
+		t.Errorf("narrow terminal should ellipsize the preset preview\nout:\n%s", out)
+	}
+	if strings.Contains(out, "smallctx") {
+		t.Errorf("narrow terminal preview must be truncated, found full names\nout:\n%s", out)
 	}
 }
 
@@ -250,9 +399,10 @@ func TestSnapshotMainModeRouterDefaultSource(t *testing.T) {
 		tea.KeyMsg{Type: tea.KeyTab}, // Single → Router
 	)
 
-	want := filepath.Join(dir, modelsini.DefaultModelsIniName)
-	if !strings.Contains(out, want) {
-		t.Errorf("router view missing derived default source %q; out:\n%s", want, out)
+	// The derived default source appears (its full path may be
+	// ellipsized on narrower boxes — §15.2 keeps rows width-stable).
+	if !strings.Contains(out, modelsini.DefaultModelsIniName) {
+		t.Errorf("router view missing derived default source %q; out:\n%s", modelsini.DefaultModelsIniName, out)
 	}
 	if strings.Contains(out, "alpha") {
 		t.Errorf("router view should not list config models; out:\n%s", out)
@@ -265,7 +415,7 @@ func TestSnapshotMainModeRouterDefaultSource(t *testing.T) {
 func TestMainModeRouterEmptyStateDirect(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	cfg.Globals.ModelsFiles = nil
-	m := NewMainMode(cfg, "v0.0.0-test") // no cfgPath → no default source
+	m := NewMainMode(cfg, "v0.0.0-test", DefaultTheme()) // no cfgPath → no default source
 	m.SetSize(120, 40)
 	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
 
@@ -342,7 +492,7 @@ func TestMainModeRouterToggleCycles(t *testing.T) {
 	}
 	cfg := sampleSnapshotConfig()
 	cfg.Globals.ModelsFiles = []string{good, filepath.Join(dir, "broken.ini")}
-	m := NewMainMode(cfg, "v0.0.0-test")
+	m := NewMainMode(cfg, "v0.0.0-test", DefaultTheme())
 	m.SetSize(120, 40)
 
 	// Default: single model mode shows model aliases.
@@ -376,7 +526,7 @@ func TestMainModeRouterEnterEmitsRouterSpawnRequest(t *testing.T) {
 	}
 	cfg := sampleSnapshotConfig()
 	cfg.Globals.ModelsFiles = []string{ini}
-	m := NewMainMode(cfg, "v0.0.0-test")
+	m := NewMainMode(cfg, "v0.0.0-test", DefaultTheme())
 	m.SetSize(120, 40)
 
 	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab}) // router mode
@@ -743,6 +893,70 @@ func TestRunModeQuitPromptKillQuitsLlamaman(t *testing.T) {
 	}
 }
 
+// TestRunModeEscDetachesToMain: with a live session, the final Esc layer
+// returns to Main (returnToMainMsg) while the server keeps running
+// (§15.2 — in-app detach).
+func TestRunModeEscDetachesToMain(t *testing.T) {
+	bin := filepath.Join(repoRoot(t), "bin", "llamaman-fakeserver")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("fakeserver not built: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "llama.log")
+	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+	cfg := sampleSnapshotConfig()
+	opts := RunModeOpts{
+		Cfg: cfg, Model: cfg.Models[0], Preset: cfg.Models[0].Presets[0],
+		Argv: proc.Argv, Process: proc,
+	}
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 140, Height: 40})
+
+	// Esc with no overlay/search → detach to Main.
+	driveRoot(t, root, tea.KeyMsg{Type: tea.KeyEsc})
+	if root.view != ViewMain {
+		t.Fatalf("after esc: view = %d, want ViewMain (detached)", root.view)
+	}
+	if !server.IsLive(proc.Pid) {
+		t.Fatal("esc-detach must leave the server running")
+	}
+}
+
+// TestRunModeEscKeepsCrashViewWhenServerDead: the final Esc layer is
+// gated on a live process — a dead server keeps run mode (crash view)
+// in control instead of detaching to a dead-session Main.
+func TestRunModeEscKeepsCrashViewWhenServerDead(t *testing.T) {
+	bin := filepath.Join(repoRoot(t), "bin", "llamaman-fakeserver")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("fakeserver not built: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "llama.log")
+	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+	cfg := sampleSnapshotConfig()
+	opts := RunModeOpts{
+		Cfg: cfg, Model: cfg.Models[0], Preset: cfg.Models[0].Presets[0],
+		Argv: proc.Argv, Process: proc,
+	}
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 140, Height: 40})
+
+	// Kill the child out-of-band, then Esc must not detach.
+	proc.Stop(2 * time.Second)
+	driveRoot(t, root, tea.KeyMsg{Type: tea.KeyEsc})
+	if root.view != ViewRun {
+		t.Fatalf("after esc with a dead server: view = %d, want ViewRun (crash view keeps control)", root.view)
+	}
+}
+
 // TestRunModeKillPromptCancel covers the n/esc paths — the user can
 // dismiss the confirm dialog and stay in run mode without affecting
 // the child.
@@ -828,7 +1042,7 @@ func TestParamPickerShowsNamesWithoutDashesAndDescriptions(t *testing.T) {
 	}
 	p := newParamPicker(reg)
 	p.SetSize(100, 30)
-	out := stripANSI(p.View(CurrentTheme()))
+	out := stripANSI(p.View(DefaultTheme()))
 
 	for _, want := range []string{
 		"threads",               // bare name (no --)
@@ -891,7 +1105,7 @@ func TestParamPickerFilterRendersInlineNotFullWidth(t *testing.T) {
 	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
 	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
 	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
-	view := stripANSI(p.View(CurrentTheme()))
+	view := stripANSI(p.View(DefaultTheme()))
 
 	if !strings.Contains(view, "filter: thr") {
 		t.Fatalf("expected compact 'filter: thr' line; view:\n%s", view)
@@ -1049,7 +1263,7 @@ func TestFirstRunWindowSizeDoesNotPanic(t *testing.T) {
 			t.Fatalf("first-run WindowSizeMsg panicked: %v", r)
 		}
 	}()
-	fr := NewFirstRunMode("/tmp/nonexistent/config.json")
+	fr := NewFirstRunMode("/tmp/nonexistent/config.json", DefaultTheme())
 	root := NewRootForFirstRun("/tmp/nonexistent/config.json", "v0.0.0-test", fr)
 	// Send a sequence of messages that exercise every uninitialized
 	// sub-model path: window size, session tick, then more sizing.

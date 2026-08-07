@@ -8,7 +8,7 @@ import (
 )
 
 func TestRenderBarFillCellCount(t *testing.T) {
-	theme := CurrentTheme()
+	theme := DefaultTheme()
 	cases := []struct {
 		pct      float64
 		wantFill int
@@ -42,7 +42,7 @@ func TestRenderBarFillCellCount(t *testing.T) {
 }
 
 func TestRenderBarUsesOnlyBarChars(t *testing.T) {
-	theme := CurrentTheme()
+	theme := DefaultTheme()
 	plain := stripANSI(renderBar(theme, 65.2, ZoneOK))
 	runes := []rune(plain)
 	if len(runes) != liveBarWidth {
@@ -56,7 +56,7 @@ func TestRenderBarUsesOnlyBarChars(t *testing.T) {
 }
 
 func TestRenderBarClampsOutOfRange(t *testing.T) {
-	theme := CurrentTheme()
+	theme := DefaultTheme()
 	for _, pct := range []float64{-10, 200, 1000} {
 		got := stripANSI(renderBar(theme, pct, ZoneOK))
 		if w := ansi.StringWidth(got); w != liveBarWidth {
@@ -68,7 +68,7 @@ func TestRenderBarClampsOutOfRange(t *testing.T) {
 // ---- sparkline tests ----
 
 func TestRenderSparklineWidthMatchesBar(t *testing.T) {
-	theme := CurrentTheme()
+	theme := DefaultTheme()
 	samples := []float64{10, 20, 30, 40, 50, 60, 70, 80, 90, 100}
 	got := stripANSI(renderSparkline(theme, samples, MetricUtil))
 	if w := ansi.StringWidth(got); w != liveBarWidth {
@@ -77,7 +77,7 @@ func TestRenderSparklineWidthMatchesBar(t *testing.T) {
 }
 
 func TestRenderSparklineEmptySamples(t *testing.T) {
-	theme := CurrentTheme()
+	theme := DefaultTheme()
 	got := stripANSI(renderSparkline(theme, nil, MetricUtil))
 	if w := ansi.StringWidth(got); w != liveBarWidth {
 		t.Errorf("empty sparkline width = %d, want %d (spaces fill)", w, liveBarWidth)
@@ -88,7 +88,7 @@ func TestRenderSparklineEmptySamples(t *testing.T) {
 }
 
 func TestRenderSparklinePartialSamplesPadLeading(t *testing.T) {
-	theme := CurrentTheme()
+	theme := DefaultTheme()
 	// 3 samples in a 20-cell sparkline: first 17 cells should be space.
 	samples := []float64{50, 75, 100}
 	got := stripANSI(renderSparkline(theme, samples, MetricUtil))
@@ -98,7 +98,7 @@ func TestRenderSparklinePartialSamplesPadLeading(t *testing.T) {
 }
 
 func TestRenderSparklineUsesAllLadderRungs(t *testing.T) {
-	theme := CurrentTheme()
+	theme := DefaultTheme()
 	// Samples chosen to land on each ladder rung. ladderIdx =
 	// int(v/100 * 7), so to hit rung k we need v in [100*k/7, 100*(k+1)/7).
 	// Picks: 0 → 0/7, 16 → 1/7 (~14.3+), 30 → 2/7 (~28.6+), 45 → 3/7,
@@ -153,7 +153,7 @@ func TestAlignSamplesDropsOldestWhenOverflowing(t *testing.T) {
 // Bucketing variants (averaging multiple samples per cell) violated
 // this because new samples reshuffled bucket contents on every tick.
 func TestSparklineSlideStability(t *testing.T) {
-	theme := CurrentTheme()
+	theme := DefaultTheme()
 	buf := newRingBuffer(sparkBufferSamples)
 	// Fill buffer to capacity.
 	values := []float64{10, 25, 40, 55, 70, 85, 100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5, 15, 25, 35}

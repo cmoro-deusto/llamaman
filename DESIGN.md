@@ -53,6 +53,11 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
     "ip_address": "127.0.0.1",
     "port": 9080
   },
+  "preferences": {          // optional; absent == defaults
+    "theme": "auto",        // palette ID from the TUI table; "auto" is default
+    "animations": true,      // default true; explicit false is honored
+    "log-colors": true       // default true; explicit false is honored (§15.3)
+  },
   "models": [
     {
       "alias": "qwen3.6-27B",
@@ -164,7 +169,7 @@ Order of evaluation:
 | Invocation | Session running? | Mode |
 |---|---|---|
 | `llamaman` (no positional args) | no | TUI main mode |
-| `llamaman` (no positional args) | yes | TUI run mode (reattach) |
+| `llamaman` (no positional args) | yes | TUI main mode (session reattach screen; attach with `a`/Enter) |
 | `llamaman <alias>` | no, alias exists | TUI run mode (start fresh, default preset or only preset) |
 | `llamaman <alias> <preset>` | no, both exist | TUI run mode (start fresh, named preset) |
 | `llamaman <alias>` or `llamaman <alias> <preset>` | yes | TUI run mode (reattach, **arguments ignored**) |
@@ -172,6 +177,8 @@ Order of evaluation:
 | `llamaman <alias> <preset>` | no, alias exists, preset missing | stderr error, exit 2 |
 
 If two `llamaman` instances race to start a session, the loser sees `Another llamaman is already running` on stderr and exits 0.
+
+A no-args launch with a session already running lands on **Main mode**, not run mode (owner decision): the session reattach screen (§15.2) makes the detached session visible, and `a`/Enter attach. `llamaman <alias>` with a running session still reattaches directly (arguments ignored).
 
 ### 4.4 Exit codes
 
@@ -328,7 +335,7 @@ Modal dialogs (quit prompt, kill confirm, restart confirm, help, config-mode for
 
 Centered window. Top: stylized "llamaman" wordmark (figlet-style, baked-in font, no runtime dependency). Below: version + tagline.
 
-When at least one model is configured, a bordered single-line-per-row selection list is embedded directly in the landing screen between the version line and the shortcuts. The first model is pre-selected; the row is reverse-video. Each row shows the alias, an optional `(running)` marker, and a subtle preset-count summary.
+When at least one model is configured, a bordered single-line-per-row selection list is embedded directly in the landing screen between the version line and the shortcuts. The first model is pre-selected; the row is reverse-video. Each row shows a leading source tag (`local` / `hf` / `router`, in Muted — §15.2), the alias, an optional `(running)` marker, and a subtle preset-count summary. The highlighted model row with 2+ presets previews the preset names in its description, ellipsized to the row width (§15.2); the list box grows with wide terminals (cap 90 cols).
 
 When **no** models are configured, the list is hidden and the screen reverts to its bare wordmark + shortcuts form so first-run users aren't confronted with an empty box.
 
@@ -338,11 +345,13 @@ When **no** models are configured, the list is hidden and the screen reverts to 
 | `Enter` | Run the selected model. If the model has 0 or 1 presets it spawns directly; with 2+ presets the box pivots to a preset sub-list with the same Enter/Esc semantics |
 | `Esc` | Back out of the preset sub-list to the model list |
 | `c` | Configuration mode |
+| `s` | Settings mode (theme, animations — edits `preferences`) |
+| `t` / `Shift+t` | Cycle theme forward / backward (writes `preferences.theme`; `Shift+t` is not shown in the shortcut row) |
 | `?` | Help overlay |
 | `q` | Quit |
 | `a` | Attach to running session (only shown when a session is running) |
 
-If a session is running, an additional line appears above the list: `▶ Detached: <alias>/<preset> listening on :<port> — press a to attach`.
+If a session is running, Main shows a single reattach entry: `running <alias>/<preset> · listening on :<port>` (highlighted; §15.2). Enter/`a` attach; `q` quits llamaman leaving the server running.
 
 Order: rows follow the configuration order (`models[]` in the JSON). No alphabetical sort — users who reorder via Shift+↑/↓ in configuration mode see the change reflected here.
 
@@ -481,6 +490,7 @@ Status state machine: `starting → ready → exited|error`.
 
 | Key | Action |
 |---|---|
+| `o` | Toggle log line-kind colors (persists to `preferences.log-colors`, §15.3) |
 | `q` / `Ctrl+C` | Quit prompt: `(k)ill / (d)etach / (c)ancel`. `(k)ill` returns to the main screen; `(d)etach` exits llamaman and leaves llama-server running. |
 | `k` | Direct kill shortcut (with `(y)es / (n)o` confirm). On confirm: stops llama-server, removes the log + session record, and returns to the main screen — llamaman itself stays open. |
 | `r` | Restart server (confirm if currently ready) |
@@ -488,7 +498,7 @@ Status state machine: `starting → ready → exited|error`.
 | `i` | Show model & preset detail overlay (alias + Source/HF + preset name + every preset param in source order). Any key closes. |
 | `/` | Search forward in output. Live highlights (reverse video + bold) wrap matches as you type; `Enter` applies, `Esc` cancels. |
 | `n` / `N` | Next / previous search match |
-| `Esc` | Clear active search and remove highlights (no-op when nothing is applied) |
+| `Esc` | Layered: close the router action menu → close router stats → clear an applied search → **detach to Main** (server keeps running, llamaman stays open; the final layer fires only while the session is live — a dead server keeps the crash view in control) |
 | `g` / `G` | Jump to top / bottom |
 | `↑` / `↓` / wheel | Scroll one line. `j`/`k` are **not** bound here so `k` is free for the kill shortcut. |
 | `Space` / `b` | Page down / up |
@@ -505,6 +515,51 @@ Implementation iterates `r.preset.Params` directly — see CLAUDE.md
 Auto-scroll: locked to bottom unless the user has scrolled up. When scrolled up, a `↓ N new lines` indicator appears; `G` returns to live tail.
 
 ANSI color codes from llama-server are passed through (Lip Gloss / `bubbles/viewport` render them).
+
+**Render-time line coloring (§15.3):** the log viewport colorizes lines by kind — ERROR (red), WARN (yellow), TIMING (dim), the readiness marker `listening on` (green + bold) — and leaves INFO plain. Conservative classifier: worst case is an uncolored line, never a critical line shown as plain INFO. Coloring is render-time only: search matching, jump-to-match indices, scrollback positions, and the denoise toggle operate on the plain lines, and the on-disk log is byte-identical.
+
+**Status badge glyphs (§15.3):** the `[READY]`-style badge gains a per-state glyph prefix — `● [READY]`, `◌ [STARTING]`, `✕ [ERROR]`, `◌ [EXITED]` — with the `[STARTING]` label text/format preserved.
+
+**Load-progress indicator (§15.4).** While the server is starting, the
+left panel (llama-server live-data box in single mode, the model list in
+router mode) shows the load-progress block instead of its usual content:
+the latest parsed phase (`loading model file` → `offloading layers to
+GPU: 21/33` → download %) with an `Accent` block bar when a numeric
+progress is known, or a static `loading…` before anything parses.
+Tolerant classifier (§15.4): unknown lines change nothing, and format
+drift degrades to the static text. The block stays visible for a
+minimum of 2 s after the last phase line even once READY (`o`-style
+toggle not applicable — it is load-window-only). Separate from the
+`[STARTING]` badge, which is untouched.
+
+**Transient flashes (§15.5, owner feedback).** Informational messages
+(`match x/y`, `log colors off`, save errors, …) render **top-right
+inside the run-mode header's blank space** (the first identity row),
+right-aligned via `rightFlash`; the header box keeps its fixed height
+and the footer stays a single static line, so **nothing on screen
+moves** when a flash shows or hides. Oversized flashes truncate with an
+ellipsis; flashes are dropped when no room exists.
+
+**Subtle color animation (§15.5).** Gated by `preferences.animations`
+(default on; the run-mode `a` quick key flips it live). Repeating:
+the load-progress block breathes and, without numeric progress, shows
+an indeterminate moving fill; the `[STARTING]` badge breathes
+yellow↔gold; the READY dot pulses while generating; the Gen/Process
+bars fill smoothly; the Tokens/Prompt sparklines glow softly while
+busy. One-shot: a ready glow on STARTING→READY, a red flash on ERROR,
+a pulse on the current search occurrence after `n`/`N`, a glow when
+TTFT arrives, and a flash on router models that just loaded/unloaded.
+**Frame rate (owner decision, §15.5).** The frame period is decided in
+**one place**: `animTickInterval` in `internal/tui/anim.go`, set to
+**60 fps** (owner decision, tried 10/15/30/60 and settled on 60).
+Overridable at runtime via **`LLAMAMAN_ANIM_FPS`** (e.g. `60`, `30`,
+`15`) without rebuilding. The tick still fires only while an animated
+element is visible, so the cost stays bounded (§2.4).
+(owner-amended from 4 for smoother motion);
+truecolor lerp with a 3-step discrete fallback on 256-color (P1); a
+frozen clock in tests (P9).
+
+**Terminal title (§15.3):** `tea.SetWindowTitle` sets `llamaman — <alias> [STARTING]` at run-mode entry, `[READY]` on the ready transition, `[ERROR]`/`[EXITED]` on process exit; router runs use the models-file basename. Not restored on exit (v1).
 
 Scrollback: unlimited, in-memory, sourced from the on-disk log file. The whole file is buffered.
 
@@ -657,10 +712,21 @@ llamaman/
 
 ### 10.4 Theme
 
-- `lipgloss.HasDarkBackground()` chooses palette (light / dark).
-- Two built-in palettes, no user customization currently.
-- Accent: soft orange (`#E8A33D`-ish).
-- Status indicators: green ready, yellow starting, red error, gray exited.
+- `preferences.theme` selects a palette (default `auto`); the palette
+  table and resolver live in `internal/tui/theme.go` (DESIGN §15.1).
+  23 curated palettes: llamaman (the original hard-coded theme,
+  background-adaptive), 11 dark + 11 light official counterparts.
+  `auto` and `llamaman` resolve to the same adaptive pair.
+- `lipgloss.HasDarkBackground()` picks the dark/light variant for
+  adaptive palettes and drives the mismatch warning: a palette whose
+  background differs from the terminal's is applied with a warning,
+  never silently (owner decision — the user may override explicitly).
+  An unknown theme degrades to `auto` with a Warning (never a Block).
+- Every palette field carries its nearest xterm-256 index (computed
+  with the standard 6×6×6-cube + grayscale approximation; ties resolve
+  to the lower index) so 256-color SSH renders correctly.
+- Status indicators: green ready, yellow starting, red error, gray
+  exited (per-palette values).
 - `NO_COLOR` env var honored (Lip Gloss handles automatically).
 
 ### 10.5 Shell completions
@@ -690,10 +756,10 @@ Explicitly deferred:
 
 - Multiple concurrent sessions (single global port).
 - `--detach` / `--no-tui` flags.
-- Auto-restart on crash.
-- Browser-open shortcut from run mode.
+- Auto-restart on crash. (→ §14.3: planned, opt-in, attached-only.)
+- Browser-open shortcut from run mode. (→ §14.3: planned.)
 - Telemetry of any kind.
-- Themes beyond auto light/dark.
+- Themes beyond auto light/dark. (→ §14.1: planned.)
 - Search / sort options beyond filter + alphabetical.
 - Recently-used sort.
 - Disk-backed log paging (sessions are buffered fully in memory).
@@ -828,3 +894,747 @@ grammar mirrors llama.cpp's own PEG parser in `common/preset.cpp`.
 - Subcommands are dispatched before kong's positional dispatch and have
   their own kong parser (kong v1 cannot mix positional args and `cmd:`
   branches on one struct).
+
+---
+
+## 14. Roadmap
+
+Agreed roadmap for the next releases (owner decision, August 2026). Scope,
+constraints, risks, and implementation order are tracked in detail in
+`ROADMAP.md` at the repo root; this section records the decisions so they are
+not relitigated. Three releases, in priority order 4 → 2 → (3 + 1).
+
+### 14.1 Release 1 — Polish
+
+- **Multi-palette theme system.** `Theme`/`CurrentTheme()` in
+  `internal/tui/common.go` become a palette table (4–6 curated palettes +
+  `auto`). New additive v1 field `preferences.theme` (string); unknown value
+  → warning + `auto`. Picker lives in the Settings mode (§14.1); a Main-mode
+  quick key cycles live — both write `preferences.theme`. Palettes declare a
+  background mode; incompatible choices warn and apply (explicit
+  override, owner decision). Every
+  palette keeps the named 256-color mapping (§10.4).
+- **Settings mode & `preferences` object.** New top-level `preferences`
+  object, separate from `globals` (owner decision — `globals` stays
+  launch-param-only: host, port, binary, models-files). New Bubble Tea mode
+  under Root, reachable from Main, editing exactly `preferences`. Release 1
+  fields: `theme`, `animations`. Quick keys write the same object —
+  shortcuts, not a second source of truth (P8).
+- **Log & status readability.** Render-time colorizing of llama-server log
+  lines by kind (ERROR/WARN/TIMING/INFO), ready-marker highlight, unicode
+  status glyphs, terminal title via OSC escape. Search/jump/scrollback and
+  the on-disk log are unaffected.
+- **Load-progress indicator.** Live phase/progress line parsed from stderr
+  (model load → layer offload → HF download % → listening). **Hard
+  constraint:** separate from the `[STARTING]` badge — nothing replaces it.
+  Tolerant classifiers; unknown phase degrades to today's static UI.
+- **Subtle color animation.** `tea.Tick` 60 fps (owner decision;
+  overridable via `LLAMAMAN_ANIM_FPS`);
+  true-color lerp with a
+  6-step discrete fallback on 256-color (P1, owner-amended from 2–3
+  steps for less jerky breathing). Scoped to: load-progress
+  fill, `[STARTING]` badge breathing, status-dot pulse while generating. No
+  wordmark animation; steady state stays static; snapshot tests freeze a
+  fake clock. No desktop notifications. **User control (P10):** gated by
+  `preferences.animations`, default **on**; toggled in Settings mode.
+- **Main-mode layout rework.** Implement §12.2 as designed.
+
+### 14.2 Release 2 — Acquisition
+
+- **Hybrid storage.** Managed downloads write into llama.cpp's HF cache
+  layout by default (`$LLAMA_CACHE` / `~/.cache/llama.cpp`, `<org>__<model>/`
+  folders; tolerate the legacy `~/.cache/huggingface/hub` layout for reads),
+  with optional `preferences.models-dir` override. One copy shared with
+  `llama-cli`/`--hf-repo`; router `(cache)` tags line up.
+- **Managed downloads.** llamaman downloads GGUFs itself (HF API `tree/main`
+  for list+sizes+sha256, `resolve/main` with `Range` for resume), live
+  progress in the TUI, sha256 verify. An `hf` config model is checked against
+  the cache first and only downloaded when missing, then run via `--model`.
+  Token support for gated repos (`HF_TOKEN` env or config). `mmproj`
+  downloaded alongside when present.
+- **Quantization picker.** Per-quant real file sizes from the HF API, with a
+  "fits VRAM" hint powered by the §14.3 estimator.
+- **Storage manager.** Sizes, free space, delete-with-confirmation; never
+  deletes config entries without asking.
+- **HF model browser.** Search/browse HF in the TUI (search API,
+  `filter=gguf`), metadata display, hand-off into config/download. Largest
+  item; may slip to Release 3 under effort pressure.
+- **Router note.** llama.cpp's router downloads internally; managed downloads
+  apply to single-model runs; router progress is surfaced only. Rewriting
+  router presets to local paths is a deferred implementation decision.
+
+### 14.3 Release 3 — Trust & Touch
+
+- **Crash diagnostics & auto-restart.** Crash view (exit code with
+  interpretation + log tail) and optional auto-restart with exponential
+  backoff while attached. **Default off** (opt-in). Detached-server
+  watchdog is out of scope (no daemon mode).
+- **VRAM preflight.** Rough (±20%) footprint estimate vs NVML VRAM before
+  launch; warn, never block. Silent when NVML is unavailable. Feeds the
+  quant picker's "fits VRAM" hints.
+- **Pre-spawn checks.** Port-in-use probe with next-free-port offer (never a
+  silent port change; CLI keeps exit code 4), free-disk check before
+  downloads, HF repo existence validation.
+- **Quick test prompt.** One key → small `/v1/chat/completions` request →
+  overlay with TTFT + first tokens.
+- **KV-cache pause/resume.** Save/restore via `/slots?action=save` with
+  `--slot-save-path` (a normal preset param); TUI save/restore actions and a
+  saved-slots list. Disabled for multimodal presets (llama.cpp #19466).
+- **Web-UI shortcut.** `xdg-open http://<host>:<port>/` to llama-server's
+  built-in UI; warning line if `xdg-open` is absent.
+
+### 14.4 Deferred (do not re-propose without new information)
+
+Desktop notifications; gradient wordmark (lipgloss v1.1.0 has no gradient
+API); wordmark breathing; LoRA hot-swap; cancel-in-flight generation;
+restart-with-edited-params (stays §11); config migration machinery (§12.1 —
+additive v1 covers the roadmap, so no migration is triggered); health
+watchdog (process alive but HTTP hung); daemon mode / detached watchdog;
+multiple concurrent sessions.
+
+### 14.5 Cross-cutting rules
+
+- All new config fields are additive `version: 1`. New top-level
+  `preferences` object holds user preferences (`theme`, `animations`, later
+  `models-dir`, auto-restart); `globals` stays launch-param-only. §12.1
+  stays dormant (P2).
+- P1 visual contract: capability ladder truecolor → 256 → 8/bold →
+  NO_COLOR; palette hexes map to 256; palettes declare background mode.
+- P3 severity taxonomy: Info / Warning / Block; block only when the
+  operation cannot proceed (exit codes 2/3/4); TUI offers recovery where
+  the CLI exits.
+- P6: documented minimum llama.cpp build; tolerant below floor for
+  single-model use, hard gates for version-dependent features; CI floor →
+  latest. Tolerant parsers; degrade to static UI, never crash.
+- P7 network & privacy: requests only for explicit user actions, only to
+  user-specified hosts; no telemetry, no implicit update checks.
+- P8 single source of truth: config.json is the only definition; file-vs-
+  config disagreement warns, never silently reconciles.
+- P9 determinism: in-process snapshot tests, injectable clock/fetcher/
+  spawner; unit tests need no real llama-server or terminal.
+- P10 user control: anything costing performance/battery or changing
+  behavior is toggleable in Settings mode; animations default on.
+- Full principle texts live in ROADMAP.md §1.
+- Version-gate router features; tolerate endpoint drift (router mode is
+  experimental-grade upstream).
+- Track llama.cpp default-port change 8080 → 9931 (PR #26508) on release;
+  llamaman's 9080 default is unaffected unless overridden.
+
+---
+
+## 15. Release 1 — implementation design
+
+One subsection per work item, in §2.7 order. Each subsection is the
+implementation design note for its item: written *before* code (P5) and
+reviewed by the owner; the owner's validation declares the unit done.
+Cross-cutting rules from §14.5 and ROADMAP.md §1 apply to every item.
+The note is updated in the same change as the code it describes; if
+implementation forces a deviation, the note is amended in that same
+change.
+
+### 15.1 Theme system, `preferences` object, Settings mode
+
+**Scope.** Replace the hard-coded `Theme`/`CurrentTheme()` pair in
+`internal/tui/common.go` with a curated palette table; add the new
+top-level `preferences` config object; add a Settings TUI mode that
+edits exactly that object; wire the Main-mode quick keys as shortcuts
+that write the same object (P8). **Non-goals:** no user-defined
+arbitrary colors (ROADMAP §2.1), no animation behavior yet (item 5),
+no CLI flag for theme (config.json is the only source of truth).
+
+#### The `preferences` object (config schema)
+
+Additive `version: 1`, per P2:
+
+```jsonc
+{
+  "version": 1,
+  "globals": { ... },
+  "preferences": {            // optional object; absent == all defaults
+    "theme": "auto",        // string, default "auto"
+    "animations": true,      // bool, default true
+    "log-colors": true       // bool, default true (§15.3)
+  },
+  "models": [ ... ]
+}
+```
+
+- `Config.Preferences *Preferences` — a **pointer**, so the object is
+  omitted from the file until the user actually changes a preference.
+  Untouched configs stay byte-identical on save; the zero value of
+  `Preferences` *is* the defaults, so nil-safe access is trivial.
+- `Preferences { Theme string; Animations *bool }` with JSON tags
+  `theme,omitempty` and `animations,omitempty`. Field-arrival contract:
+  - `theme` absent or empty → `"auto"`.
+  - `animations` absent (`nil`) → `true`. An explicit
+    `"animations": false` is distinct from absent and must survive a
+    save round-trip — hence `*bool`, not `bool` (a plain `bool` with
+    omitempty would silently drop an explicit `false` on the next
+    save).
+  - `log-colors` follows the same `*bool` contract (default `true`,
+    §15.3) — the run-mode log-coloring toggle.
+- Nil-safe accessor `Config.Prefs() Preferences` (returns the zero
+  value when the pointer is nil) is the only way the TUI reads
+  preferences; callers never dereference the pointer directly.
+- Older binaries reject the whole config with `json: unknown field
+  "preferences"` — the accepted P2 contract; `version` stays 1.
+
+**Validation (P2/P3).** `validatePreferences()` in
+`internal/config/validate.go`: the fields are type-checked by JSON
+decode, so the only config-level rule is that `theme`, when present, is
+a non-empty string. The *semantic* check — is the name a real palette —
+lives in the TUI resolver, **not** in `config.Validate`: `config`
+cannot import `tui` (import direction), and duplicating the palette
+name list in config would break P8 (two sources of truth). An unknown
+name is a **Warning** (never a Block, P3): resolve to `auto`, log to
+the app log, surface in the Settings-mode banner. `llamaman -l` never
+resolves themes (no rendering), so no warning there — acceptable
+because theme is purely visual.
+
+#### Palette table (TUI)
+
+New file `internal/tui/theme.go`. The `Theme` struct stays in
+`common.go` (zones.go and the live bars consume it); the table and the
+resolver are new.
+
+- `type Background int` with `BackgroundAdaptive` / `BackgroundDark` /
+  `BackgroundLight`.
+- `type Palette struct { ID, Display string; Background Background; T Theme }`.
+- `auto` is a **value**, not a palette: it is the default of
+  `preferences.theme` and the fallback for unknown values (§14.1
+  wording kept), and it resolves to the `llamaman` palette. Keeping
+  `auto` as the stored default lets a future release move the default
+  look without a config change.
+- The current hard-coded theme becomes the first-class palette
+  **`llamaman`** (owner decision): display "llamaman (default)", kept
+  **exactly as-is** (the two existing dark/light variants, chosen by
+  terminal background). It is the only **background-adaptive** palette
+  (compatible with any terminal); nothing about its colors or the
+  `auto` behavior changes in this release — it is only named and tabled.
+- Table of 23 curated palettes plus the `auto` value — every dark
+  palette ships its official light counterpart (owner decision:
+  one light theme was not acceptable; either all-dark or dark+light
+  pairs, and light variants add no structural cost). Grouped by
+  family:
+
+| Family | Dark | Light |
+|---|---|---|
+| llamaman | `llamaman` (adaptive — both variants in one palette) | — |
+| Catppuccin | `catppuccin-mocha` | `catppuccin-latte` |
+| Tokyo Night | `tokyo-night` | `tokyo-night-day` |
+| Dracula | `dracula` | `dracula-light` (official name: Alucard) |
+| Gruvbox | `gruvbox-dark` | `gruvbox-light` |
+| Solarized | `solarized-dark` | `solarized-light` |
+| Nord | `nord` | `nord-light` |
+| One Dark | `one-dark` | `one-dark-light` |
+| Kanagawa | `kanagawa` | `kanagawa-lotus` |
+| Monokai | `monokai` | `monokai-light` |
+| Rosé Pine | `rose-pine` | `rose-pine-dawn` |
+| Night Owl | `night-owl` | `light-owl` (official light name) |
+
+  A light terminal sees llamaman + all 23 palettes grouped by
+  background — both variants of every family are offered (owner
+  decision: the background is a hint, not a filter). The `t` /
+  `shift+t` quick keys cycle the 24 entries (auto + all palettes)
+  forward / backward and wrap; the Settings picker scrolls; nothing
+  else changes.
+  Light palettes cost nothing structurally — the mechanism is identical
+  to Solarized Light, which already exercises the light path (resolution,
+  filtering, tests); the work is transcribing each theme's official
+  light hexes (incl. their 256-color intent) and adding table-driven
+  test cases. The official light values are already tuned for contrast
+  on light backgrounds (e.g. Alucard red `#CB3A2A`), so the Status*
+  fields keep the same discipline as the existing llamaman light theme.
+- `llamaman` (and therefore `auto`) keeps today's behavior exactly:
+  `lipgloss.HasDarkBackground()` picks between its dark and light
+  variants.
+- **Resolver** (a pure function of name + background — P9):
+  `ResolveTheme(name string, darkBg bool) (Theme, resolvedID string, ok bool)`.
+  `auto` and `llamaman` both resolve to the `llamaman` palette.
+  Unknown name → (llamaman/auto theme, `"auto"`, `false`); the caller
+  turns `!ok` into the Warning above.
+- **Background compatibility (P1).** Palettes declare a background
+  mode; compatibility is now a **warning-level hint, not a filter**
+  (owner decision): the Settings picker offers all 23 palettes, both
+  variants, explicitly labeled `(dark)` / `(light)`, and the Settings
+  screen shows the detected terminal background. Choosing a
+  mismatched palette applies it with a warning (banner in Settings,
+  flash in Main) — never a silent fallback. Only a hand-edited
+  *unknown* theme degrades to `auto` with a Warning (P3), since it
+  cannot render.
+- **Color discipline (§10.4, P1).** Every palette field keeps the
+  named-color mapping: hexes come from each palette's canonical values,
+  chosen so their nearest 256-color index is the palette's classic
+  xterm value, and each field carries a `// maps to 256-color NNN`
+  comment exactly as today. 8-color terminals degrade through
+  lipgloss's basic-color fallback; NO_COLOR keeps working via termenv
+  with no code change.
+- `CurrentTheme()` is removed. All four mode constructors (main, run,
+  config, firstrun) stop calling it and receive the resolved `Theme`
+  from Root; Root re-resolves on every preferences change and pushes
+  the new theme down via `SetTheme` (MainMode also rebuilds its inline
+  list delegates, which capture the theme).
+
+#### Settings mode (TUI)
+
+- New `internal/tui/settings.go`; `ViewSettings` added to the `View`
+  enum in `root.go`; Root owns the mode exactly like Main/Run/Config.
+- Reached from Main with **`s`** (free key: Main binds ↑/↓, Enter, Esc,
+  tab, `c`, `a`, `?`, `q`). The `?` help overlay lists it; the
+  shortcut row gains an `s` entry and a `t` entry (the `shift+t`
+  backward direction is not shown in the shortcut row — owner call,
+  it is well-known).
+- **Screen.** A `huh` form, styled with the same `configHuhTheme` used
+  by the config-mode forms:
+  - `theme` — `huh.NewSelect` over all 23 palettes + `auto`, each
+    option showing the display name with an explicit `(dark)` /
+    `(light)` variant label.
+  - `animations` — `huh.NewConfirm` (on/off), default on.
+  - Submit → write `Preferences` into the config, save via the standard
+    atomic path (`config.Save`, §3.4), Root re-resolves the theme, back
+    to Main. Esc → discard, no mutation, back to Main.
+- The form edits the live `cfg.Preferences` and saves on submit — no
+  working copy needed (two scalar fields; the atomic save makes it
+  safe).
+- **Live preview (owner decision).** Arrowing through the theme select
+  re-themes the Settings chrome and the form instantly (huh's
+  `WithTheme` re-applies post-construction), and a preview pane renders
+  the *actual* Main screen (a throwaway `MainMode` with the candidate
+  palette — deterministic, side-effect-free) so the user sees the theme
+  before committing. Esc discards; the preview never persists anything.
+- **Quick keys (P8, shortcuts only).** Main **`t`** cycles the theme
+  forward through all palettes + `auto`, and **`shift+t`** cycles
+  backward — both live: resolve → write `preferences.theme` →
+  atomic save → re-render (Bubble Tea reports the key as `T`). Same
+  object, same save path as the Settings form — never a second source
+  of truth. A mismatched landed palette flashes its warning instead of
+  being skipped. The `?` help overlay (canonical keybinding reference,
+  §7.2) lists `t / shift+t`; the shortcut row shows only `t`.
+- **First-run:** no preferences step (ROADMAP §2.6); defaults apply;
+  the object stays absent until the user visits Settings or presses
+  `t`.
+- **Detach/reattach (P4):** theme is presentation-only, resolved from
+  config at attach/launch; `session.json` is untouched; a theme change
+  while a server runs detached shows on the next attach.
+- `preferences.animations` ships its field + Settings toggle now (P2:
+  field, validation, editor support, and default in the same change);
+  its default `true` matches today's behavior, and item 5 (§15.5)
+  delivers the visible effects + the run-mode `a` quick-key toggle.
+
+#### What changes in config load/save/validate
+
+- `load.go`: no path expansion applies (no paths in `preferences`);
+  `DisallowUnknownFields` already gives older binaries their rejection.
+- `save.go`: unchanged — `json.MarshalIndent` on `Config` handles the
+  `*Preferences` pointer and the `*bool` correctly (nil → omitted,
+  explicit `false` → written).
+- `validate.go`: new `validatePreferences()` with the shape-only rules
+  above; the unknown-theme Warning is emitted by the resolver at theme
+  resolution time, not here.
+
+#### Tests (P9)
+
+- Resolver unit tests: `auto` and `llamaman` resolve to the same
+  adaptive palette (dark/light by injected background); unknown name →
+  `"auto"` + `!ok`; every named palette resolves to its own colors.
+- Deterministic color assertions:
+  `lipgloss.SetColorProfile(termenv.ANSI256)` and
+  `lipgloss.SetHasDarkBackground(bool)` (both exist in lipgloss
+  v1.1.0) force the profile in tests, so snapshots are
+  terminal-independent and tests can assert the **specific 256-color
+  SGR codes** per palette field (P1: "snapshot tests assert specific
+  colors"). Existing snapshots strip ANSI and are unaffected.
+- Config tests: load/save round-trip of `preferences`; absent vs
+  explicit-`false` `animations` survives a save; the object is absent
+  from the file until first edited.
+- Settings-mode snapshots: `s` from Main renders the form; submit saves
+  preferences and returns to Main; `t` cycles the theme and persists.
+- Fakeserver integration tests: unchanged — theme is TUI-local.
+
+#### File map
+
+| File | Change |
+|---|---|
+| `internal/config/types.go` | `Preferences` struct + `Config.Preferences *Preferences` |
+| `internal/config/validate.go` | `validatePreferences` (shape-only rules) |
+| `internal/tui/theme.go` (new) | palette table, `ResolveTheme`, `CompatiblePalettes` |
+| `internal/tui/common.go` | remove `CurrentTheme()`; `Theme` struct stays |
+| `internal/tui/root.go` | `ViewSettings`, `s` routing, theme resolution + `SetTheme` push |
+| `internal/tui/settings.go` (new) | Settings mode + huh form |
+| `internal/tui/main.go` | `t` / `shift+t` quick keys, `s` shortcut + help text, `SetTheme` |
+| `internal/tui/run.go`, `config.go`, `firstrun.go` | constructors take the resolved theme |
+| `DESIGN.md` §3.2 / §7.2 / §10.4 | schema example, key tables, theme section — updated in the same commit as the code |
+
+**Deferred to later items:** animation rendering and the run-mode
+toggle key (item 5, consumes `preferences.animations`); the §12.2
+layout rework consumes palette tokens (item 2).
+
+### 15.5 Subtle color animation (§2.4)
+
+**Goal.** Minimal, tasteful motion that signals transitions without
+noise: 60 fps (owner decision; overridable via `LLAMAMAN_ANIM_FPS`), only while transitional/generating, **never** in steady
+state, no wordmark animation (ROADMAP §2.4 scope). Gated by
+`preferences.animations` (default **on** — item 1's field; Settings
+toggles it) and a new run-mode quick key. Determinism first: all
+animation state is derived from an injectable clock at render time
+(P9).
+
+**Animated elements (all render-time; owner-approved set):**
+
+*Repeating — only while the state is active:*
+
+1. **Load-progress block** (only while the load window is open, §15.4):
+   the phase/bar rows **breathe** (slow color lerp, sine wave) and,
+   when no numeric progress is known, the bar row shows an
+   **indeterminate comet** — a solid `█` head leading with a
+   7-fragment tail behind it (`▏▎▍▌▋▊▉█` going right, `█▉▊▋▌▍▎▏`
+   going left — the tail always follows the head, owner's design);
+   at the far edge the head pins while the tail keeps sliding and
+   merges into the solid block. Constant-speed triangle motion,
+   10 steps/s, no fabricated percentages, no fragment on the wrong
+   side of the head.
+2. **`[STARTING]` badge:** the badge color breathes **yellow ↔ gold**
+   (sine) while starting. The `[STARTING]` text is unchanged (§2.3).
+3. **Status dot:** the READY badge's `●` glyph pulses while a request
+   is generating (`busyCount > 0`), lerping between `StatusReady` and a
+   brighter green.
+4. **Gen/Process bar smooth fill** — the llama-server panel's Gen and
+   Process progress rows fill smoothly toward their real target
+   fraction between polls while generating/processing (honest motion
+   on real data, not a fabricated percentage).
+5. **Sparkline live-edge glow** — the newest Tokens/Prompt sparkline
+   cell pulses softly while tokens flow (subtle).
+
+*One-shot — fire on a transition, then static:*
+
+6. **Ready glow** — when the status flips STARTING → READY, the badge
+   does one brighten→settle (~0.6 s).
+7. **Search-jump pulse** — on `n`/`N`, the newly-current occurrence
+   fades briefly so the eye tracks the jump (complements the item-3
+   tint).
+8. **Error flash** — entering `✕ [ERROR]` does a brief red emphasis,
+   then static (errors never breathe).
+9. **TTFT arrival glow** — a brief glow on the Gen row when the first
+   token of a response arrives.
+10. **Router model-state flash** — a router-panel row that just
+    loaded/unloaded flashes green/red once.
+
+*(The "new-lines pulse" candidate was dropped: the `↓ N new lines`
+indicator described in §7.4 does not exist in the codebase, so there
+was nothing to animate.)*
+
+**Mechanics.** `clock func() time.Time` (package-level; tests override)
+feeds `animPhase(period)` → a 0..1 sine phase. A `tea.Tick` at 250 ms
+(`animTickMsg`) is scheduled **only** while an animated element is
+visible (load window open, starting, or busy) and animations are
+enabled — steady state schedules nothing (§2.4 cost note). Colors:
+`lerpColor(a, b, t)` (hex → RGB lerp → hex). Truecolor terminals get
+the continuous interpolation; **256-color terminals quantize `t` to 3
+discrete steps** (P1); NO_COLOR or `animations` off → no color change
+and no tick.
+
+**Run-mode quick key (P10/P8).** `a` in run mode toggles
+`preferences.animations` live — same object, same persist path as `o`
+(log colors, §15.3); footer + help gain `a anim`. `a` is free in run
+mode (verified). Toggling off stops all motion immediately.
+
+**Determinism (P9).** Tests freeze the clock: `animPhase` at fixed
+instants; the STARTING badge color differs between phase 0 and 0.5
+(forced ANSI-256 profile); the 256-color quantization yields ≤ 3
+distinct colors across a full period; no tick cmd is scheduled when
+animations are off or nothing animated is visible.
+
+**Non-goals.** No wordmark animation; no steady-state READY idle
+animation; no desktop notifications; no fabricated progress percentages
+(item 4 stays honest — the indeterminate bar is position motion only).
+
+**File map.** `internal/tui/anim.go` (new) — `clock`, `animPhase`,
+`lerpColor`, `animTickMsg` + scheduling helper. `internal/tui/run.go`
+— badge/dot/bar animation hooks (renderTopStrip + loadRows), `a` quick
+key. Tests in `anim_test.go` / `run_test.go`. DESIGN §7.4 and §15.1
+(animations field description) updated in the same change (P5).
+
+### 15.4 Load-progress indicator (§2.3)
+
+**Goal.** While a model loads, show a live phase/progress line parsed
+from llama-server's stderr — `loading model file` → `offloading N
+layers to GPU` → HF download % (when applicable) → done. **Hard
+constraint (owner decision):** the indicator is **separate** from the
+`[STARTING]` badge; no spinner or progress element replaces the badge,
+which stays exactly as-is. If parsing yields nothing, the UI is
+identical to today (tolerant classifiers, §2.3 risk / P6).
+
+**Phase classifier** — `parseLoadPhase(line string) (phase string,
+progress *float64)` in `run.go`, a pure function over single stderr
+lines (P9), tolerant (patterns stop matching → no indicator):
+
+| Phase | Match (case-insensitive) | Progress |
+|---|---|---|
+| load-file | `loading model (from\|file)` | none (text only) |
+| offload | `offloaded (\d+)\/(\d+) layers` | fraction `n/m` |
+| offload-start | `offloading \d+ repeating layers` | none (text only) |
+| download | `(downloading\|download).*?(\d+(?:\.\d+)?)%` | percent/100 |
+| done | `listening on` | — (existing readyMarker handles transition) |
+
+Unknown lines → no phase; the newest matching line wins (a `lastPhase`/
+`lastProgress` pair, cleared when status leaves `StatusStarting`).
+
+**Indicator placement & rendering (owner decision).** The load-progress
+block lives **inside the left panel** — the "llama-server" live-data
+box in single-model mode, the model list in router mode — replacing
+that panel's content while the starting window is open (live stats /
+the model list can't render meaningfully before READY anyway):
+
+```
+╭── llama-server ─────────────────────╮
+│ loading model file …                │
+│ offloading layers to GPU: 21/33     │
+│ ▓▓▓▓▓░░░░░░░░ 41%                   │
+╰─────────────────────────────────────╯
+```
+
+- phase text and the progress bar in `Accent` (brighter — owner
+  polish; the bar uses blocks `▓`/`░`, capped ~12 cells, with a
+  `Subtle` percent suffix); a blank row sits above the block, each row
+  carries a ` > ` prefix and one trailing space so the text never
+  touches the panel edges. The bar appears only when a numeric
+  progress is known.
+  Multiple phase lines accumulate (newest at the bottom) within the
+  block, capped to the panel height.
+- **Data-gated bar (owner finding, b10281).** llama-server's server
+  mode suppresses the loader's per-layer logs (`offloaded N/M
+  layers`, download %) and reports load only through its own
+  `load_model:` sequence — `loading model` → `initializing` →
+  `model loaded` → `listening` (verified on the owner's real logs for
+  both local and HF models). So in practice the block shows phase
+  text without a bar; the bar lights up automatically when a fraction
+  or percentage line is present (llama-cli output, an uncached HF
+  download, or a future server build). A higher `-lv` verbosity may
+  surface the loader lines; the classifier would pick them up with no
+  changes. An *indeterminate* moving bar for the "loading model"
+  phase is a candidate for item 5 (animation, gated by
+  `preferences.animations`) — no fabricated percentages in item 4.
+- When starting but no phase has parsed yet, the block shows the
+  static text `loading…` (§2.3 "unknown phase → static text"). On
+  READY (or exit) the normal panel content returns.
+- **Minimum visible time (owner decision):** once a phase line is
+  shown, the load block stays visible for **≥ 2 s** even if READY
+  arrives sooner (`loadPhaseUntil = shownAt + 2s`; the panel switches
+  back only when READY *and* the deadline has passed) — the indicator
+  never flashes by.
+- **Separate from `[STARTING]`:** the badge (row 1) is untouched; the
+  indicator is panel content (§2.3 hard constraint).
+- **Both modes:** single-model (llama-server stats panel) and router
+  (model list panel) show the same block during the starting window —
+  the owner tests both.
+
+**Data flow.** The `logChunkMsg` handler already scans incoming chunks
+for the ready marker; it now also feeds each chunk line to
+`parseLoadPhase` while `StatusStarting`, storing the latest
+phase/progress and stamping `loadPhaseUntil = now + 2s` when a phase
+first appears. The left panel renders the load block while
+`status == StatusStarting || now < loadPhaseUntil`. On exit the pair
+is cleared. No new keys, no polling — purely reactive to log chunks
+plus the 2s minimum-visible clock.
+
+**Determinism (P9).** Classifier unit tests on synthetic lines (real
+llama.cpp shapes + near-misses); panel render tests for the load block
+(single + router) with a stored pair; a chunk-driven test asserting
+the phase appears and the block clears after ready + the 2s deadline
+(`loadPhaseUntil` is a settable field — tests pin the past/future
+cases). The fakeserver fixture gains load-progress lines (offload
+fraction + a download % line) so integration tests exercise the real
+path. The classifier is kept as a single small function — the
+§6-synergy "same tolerant classifier" needed by Release 2's download
+progress can reuse/extend it.
+
+**Non-goals.** No spinner animation (item 5, gated by
+`preferences.animations`); nothing replaces or modifies the
+`[STARTING]` badge; no model-load percent from llama.cpp internals
+(only what the log text exposes).
+
+**File map.** `internal/tui/run.go` — `parseLoadPhase`,
+`loadPhase`/`loadProgress`/`loadPhaseUntil` fields, the load block in
+`renderServerPanel` (single) and `renderRouterPanel` (router),
+`logChunkMsg` hook. `cmd/llamaman-fakeserver` — fixture lines.
+New tests in `run_test.go` / `loglines_test.go`. DESIGN §7.4 gains the
+indicator description in the same change (P5).
+
+### 15.3 Log & status readability (§2.2)
+
+**Goal.** Make the run-mode log readable at a glance: colorize
+llama-server output by line kind, highlight the readiness marker,
+refresh the terminal title, and add unicode status glyphs — all
+render-time only, never touching the on-disk log, search, scrollback,
+or the denoise toggle (§2.2 constraints).
+
+**Line-kind classifier** — new `classifyLine(line string) LineKind`
+plus a `colorizeLine` render helper in `run.go`:
+
+| Kind | Match (conservative, case-insensitive) | Color |
+|---|---|---|
+| ERROR | severity letter `E` in llama.cpp's `0.00.… E …` prefix, or `\berror\b` \| `\bfailed\b` \| `\bfatal\b` \| `\baborted\b` | `StatusErr` |
+| WARN | severity letter `W`, or `\bwarn(ing)?\b` \| `\bdeprecated\b` | `StatusStart` |
+| TIMING | `tokens? per second` \| `ms per token` \| `eval time` \| `prompt eval time` \| `total time` \| `load time` | `Muted` |
+| READY | contains `listening on` (the ready marker) | `StatusReady` + bold |
+| INFO | default (incl. llama.cpp severity letters `I` / `D`) | none (plain) |
+
+The severity-letter prefix (`^[0-9.]+ [IWED] `) is checked first — it is
+the authoritative severity in llama.cpp's default logger (owner
+feedback). The remaining rules are a single slice of (regex, kind)
+pairs — cheap to extend as llama.cpp output drifts (P6). **Conservative
+by design (§2.2 risk):** the worst case is an uncolored line; the
+ERROR/WARN patterns are broad enough that a real critical line is never
+rendered as plain INFO.
+
+**Where it applies.** `renderViewportContent()` is the single hook:
+per line → `colorizeLine(kind, highlightOccurrences(line, q))`.
+`visibleLogLines()` stays plain, so search matching, jump-to-match
+indices, scrollback positions, and the denoise toggle are all
+unaffected; the on-disk log is byte-identical (colorizing is
+render-time only). Search highlight (bold+reverse) takes visual
+precedence during an active search; a match inside a colored line
+reverts the remainder of that line to default color until the next
+line's reset — accepted cosmetic during active search.
+
+**Current search occurrence (owner feedback).** `n`/`N` navigation
+marks the current matching line's matches with **bold+reverse tinted
+with the theme's `StatusIdle` color** (a colored background) while
+other matches stay plain bold+reverse — the selected occurrence is
+unmistakable at a glance, and the tint deliberately avoids the
+line-kind colors (`StatusErr`/`StatusStart`/`StatusReady`/`Muted`) so
+it never disappears on a WARN or ERROR line. The tint moves with the
+selection (`jumpSearch` re-renders before scrolling). Granularity is
+per matching line (the existing `searchMatches` model). A scanning
+animation for next/previous occurrence is a candidate for item 5
+(gated by `preferences.animations`), not part of item 3.
+
+**Log-colors toggle (owner decision: preference + quick key).**
+Coloring is controlled by the new `preferences.log-colors` field
+(default `true`, §15.1) — the Settings form edits it — and the
+run-mode `o` quick key flips it live, writing the same object and
+persisting via the config path (P8 shortcut pattern, like theme).
+
+**Terminal title (OSC).** `tea.SetWindowTitle` (bubbletea v1.3.10):
+`llamaman — <alias> [STARTING]` on run-mode init; `[READY]` on both
+ready paths (the textual `listening on` marker and the /props
+transition); `[ERROR]` / `[EXITED]` on those state changes. Router runs
+use the models-file basename as the alias. No restore-on-exit in v1
+(the terminal keeps the last title).
+
+**Unicode status glyphs.** The `[LABEL]` badge (`statusBadge`) gains a
+per-state glyph prefix, colored with the state color:
+`● [READY]`, `◌ [STARTING]`, `✕ [ERROR]`, `◌ [EXITED]`.
+**§2.3 constraint honored:** the `[STARTING]` badge's text and format
+stay — the hollow-dot prefix is additive, and nothing replaces the
+badge (the load-progress indicator is item 4's job). The glyphs are
+owner-vetoable if the plain badge is preferred.
+
+**Determinism (P9).** Classifier unit tests on synthetic lines
+(error/warn/timing/ready/info + near-misses); a render test with a
+forced ANSI-256 profile asserting the viewport wraps an ERROR line in
+the expected SGR and leaves INFO lines plain; a title test asserting
+the OSC string helper. Existing snapshot tests strip ANSI and are
+unaffected (the one `renderViewportContent` test already strips).
+
+**Non-goals.** No on-disk log changes; no new keys; no spinner or
+progress element (item 4); no change to the `[STARTING]` badge
+semantics.
+
+**File map.** `internal/tui/run.go` — `classifyLine`, `colorizeLine`,
+`renderViewportContent` hook, `statusBadge` glyph prefix,
+`tea.SetWindowTitle` on init/ready/error/exited transitions. New tests
+in `run_test.go`. DESIGN §7.4 gains the status/lines description in the
+same change (P5).
+
+### 15.2 Main-mode layout rework (§12.2)
+
+**Goal.** Make Main mode surface what the user wants at a glance and use
+the terminal it has. Commits the four §12.2 "likely to change" items:
+per-row source kind, a session reattach screen, preset preview on the
+highlighted row, and wider lists on wide terminals. Pure presentation —
+no server-side state, no new mode, `?` help overlay stays canonical
+(§12.2 constraints). Consumes the §15.1 palette tokens.
+
+**Layout, top to bottom:**
+
+1. **Session reattach screen** — when a session is running (live PID in
+   `session.json`), Main becomes a **single reattach entry**; the model
+   list is hidden until the session ends (owner decision: with a single
+   session nothing else can launch, so the list would invite dead Ends;
+   the list-with-markers variant returns when concurrent sessions
+   arrive):
+   ```
+   running  alpha/default · listening on :9080
+   ```
+   - one highlighted row (plain text, single reverse-video SGR pair),
+     `running` tag in `Muted`; router sessions report the models-file
+     path as the alias.
+   - **Enter** or **`a`** attaches. No kill affordance on this screen
+     (owner decision — attach → `k` → confirm covers it; concurrent-
+     session work will design per-session kill properly).
+   - Shortcut row: `Enter attach · a attach · c configure · s settings ·
+     ? help · q quit` (`q` quits llamaman leaving the server running;
+     `tab`/↑↓ are gone with the list).
+   - **Reachability (owner decision).** A no-args launch with a live
+     session lands on Main mode (§4.3), not run view. In-app: `esc` in
+     run mode (final layer after menu/stats/search) detaches to Main
+     with the server running and llamaman still open; the quit-prompt
+     `d` still detaches *and quits* llamaman. `llamaman <alias>` with a
+     live session still reattaches directly.
+
+2. **Wider list on wide terminals** — the inline list box width cap
+   grows from 60 to **90** columns (`min(90, width − 8)`, floor stays
+   20). This is the only width-dependent change; no behavioral
+   threshold.
+
+3. **Per-row source tag** — every row gains a leading tag rendered in
+   `Muted` before the alias: `local` (config model with `location`),
+   `hf` (config model with Hugging Face ID), `router` (my-models.ini
+   source). So users see at a glance which models will hit the network
+   on first launch. The `(running)` suffix and the alias stay.
+
+4. **Preset preview on highlight** — when the highlighted row is a
+   config model with ≥ 2 presets, its description line shows the actual
+   preset names instead of the bare count, single line, ellipsized to
+   the row width (`2 presets: fast · smallctx · …`). 1 preset already
+   shows its name; 0 shows `0 presets`. **Committed decision:** the
+   preview is single-line (height-stable, no variable-height delegate
+   requirement in bubbles/list); the two-line expand is deferred. The
+   preview is passive — Enter still pivots to the preset sub-list to
+   launch (§7.2 mechanics unchanged).
+
+5. **Router rows** — tag `router`; description unchanged
+   (`router · N models — <path>`).
+
+**Palette tokens (from §15.1).** source tags → `Muted`; preset preview →
+`Subtle`; reattach entry → `Muted` tag, reverse-video highlight; borders →
+`Border`/`BorderFocus` as today; wordmark → `Accent` (unchanged).
+`SetTheme` (item 1) already rebuilds the inline delegates, so a theme
+change re-renders all of this consistently.
+
+**Constraints preserved (§12.2).** The no-models empty state stays
+minimal (wordmark + shortcuts, no empty list box); configuration-file
+row order remains the visible order; every existing keybinding keeps
+its meaning (no new keys, so §7.2 and the help overlay text are
+unchanged).
+
+**Determinism (P9).** All changes are pure render. Snapshot tests
+assert: source tags on local/hf/router rows; preset names on the
+highlighted multi-preset row (and count-only on non-highlighted rows);
+the session reattach entry when a session is running and the model
+list otherwise; the list-box width on a wide window.
+
+**Non-goals.** No per-user layout preferences (the `preferences` object
+stays item 1's scope); no server-side changes; no new TUI mode; no
+change to the preset-pivot mechanics; no two-line row expansion in v1.
+
+**File map.** `internal/tui/main.go` — session reattach screen
+(`renderReattachBox` replaces the old strip/detached line),
+`inlineDelegate.Render` (source tag + preset preview + stable box),
+`listWidth` cap 60 → 90, reattach-state shortcuts/help/Update.
+`internal/tui/run.go` — `esc` final layer detaches to Main (live
+session only), footer + help gain `esc back`. `main.go` — no-args
+launch lands on Main when a session is live (§4.3).
+`snapshot_test.go` + `main_test.go` — updated and new assertions.
+

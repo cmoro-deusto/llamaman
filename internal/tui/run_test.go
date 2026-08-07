@@ -15,6 +15,8 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
@@ -203,7 +205,10 @@ func TestRunModeEscInPromptKeepsAppliedWhenTyping(t *testing.T) {
 // path: press /, type a query, press Enter, viewport content has
 // highlights wrapped around the matches.
 func TestRunModeSearchEnterRefreshesHighlights(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(termenv.ColorProfile())
 	r := newTestRunMode("error: failed\nokay\nERROR: again\n")
+	r.theme = DefaultTheme()
 	// Open the search prompt.
 	r.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
 	if !r.searchActive {
@@ -219,14 +224,42 @@ func TestRunModeSearchEnterRefreshesHighlights(t *testing.T) {
 	if r.searchQuery != "error" {
 		t.Errorf("searchQuery = %q, want %q", r.searchQuery, "error")
 	}
+	// Current occurrence (line 0) is tinted with the theme's StatusIdle
+	// color; the other match keeps the plain bold+reverse style.
+	curOpen := r.currentOccurrenceOpen()
 	got := r.viewport.View()
-	wantWrap := highlightOpen + "error" + highlightClose
-	if !strings.Contains(got, wantWrap) {
-		t.Errorf("viewport missing wrapped lowercase match\nview: %q", got)
+	// The tint must be distinct from the WARN (StatusStart) color so it
+	// stays visible on WARN lines (owner feedback).
+	warnTint := lipgloss.NewStyle().
+		Foreground(r.theme.StatusStart).
+		Reverse(true).
+		Bold(true).
+		Render("")
+	warnTint = strings.TrimSuffix(warnTint, "\x1b[0m")
+	if curOpen == warnTint {
+		t.Fatalf("current-occurrence tint must differ from the WARN color, both %q", curOpen)
 	}
-	wantWrapUpper := highlightOpen + "ERROR" + highlightClose
-	if !strings.Contains(got, wantWrapUpper) {
-		t.Errorf("viewport missing wrapped uppercase match\nview: %q", got)
+	wantCur := curOpen + "error" + highlightClose
+	if !strings.Contains(got, wantCur) {
+		t.Errorf("viewport missing current-occurrence wrap %q\nview: %q", wantCur, got)
+	}
+	wantOther := highlightOpen + "ERROR" + highlightClose
+	if !strings.Contains(got, wantOther) {
+		t.Errorf("viewport missing plain wrap for other match\nview: %q", got)
+	}
+	if strings.Contains(got, highlightOpen+"error"+highlightClose) {
+		t.Errorf("current match must not use the plain style\nview: %q", got)
+	}
+
+	// n moves the selection: the highlight must move to line 2 (owner
+	// feedback — previously only the first occurrence stayed tinted).
+	r.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	got = r.viewport.View()
+	if !strings.Contains(got, curOpen+"ERROR"+highlightClose) {
+		t.Errorf("after n, the new current occurrence must be tinted\nview: %q", got)
+	}
+	if strings.Contains(got, curOpen+"error"+highlightClose) {
+		t.Errorf("after n, the old current occurrence must lose the tint\nview: %q", got)
 	}
 }
 
@@ -245,7 +278,7 @@ func newHeaderTestRunMode(model config.Model, preset config.Preset, reg flags.Re
 		proc:          &server.Process{Started: time.Now().Add(-90 * time.Second)},
 		viewport:      viewport.New(width, 24),
 		searchInput:   textinput.New(),
-		theme:         CurrentTheme(),
+		theme:         DefaultTheme(),
 		status:        StatusReady,
 		tokensHistory: newRingBuffer(sparkBufferSamples),
 		promptHistory: newRingBuffer(sparkBufferSamples),
@@ -358,7 +391,7 @@ func TestTopStripColumnsAlign(t *testing.T) {
 	}{
 		{"Alias:", "Preset:"},
 		{"Server:", "Uptime:"},
-		{"Context Size:", "[READY]"},
+		{"Context Size:", "● [READY]"}, // badge block incl. the glyph prefix (§15.3)
 	}
 	for _, p := range pairs {
 		c1 := findCol(p.row1)
@@ -384,8 +417,8 @@ func newRouterTestRunMode(fake *fakeFetcher) *RunMode {
 		proc:                   &server.Process{Started: time.Now().Add(-90 * time.Second)},
 		viewport:               viewport.New(120, 30),
 		searchInput:            textinput.New(),
-		theme:                  CurrentTheme(),
-		status:                 StatusStarting,
+		theme:                  DefaultTheme(),
+		status:                 StatusReady, // router panel tests exercise the ready-state list (§15.4 load block needs Starting)
 		fetcher:                fake,
 		routerMetricsAvailable: true,
 		denoise:                true,
@@ -419,6 +452,7 @@ func TestRouterPropsNCtxZeroTransitionsReady(t *testing.T) {
 func TestSingleModelPropsNCtxZeroStaysStarting(t *testing.T) {
 	r := newRouterTestRunMode(&fakeFetcher{})
 	r.routerFile = "" // single-model mode
+	r.status = StatusStarting
 	r.Update(propsFetchedMsg{nctx: 0})
 	if r.status != StatusStarting {
 		t.Errorf("status = %v, want Starting", r.status)
@@ -1798,7 +1832,7 @@ func TestRunModeLogFrameRendersWithBorder(t *testing.T) {
 		proc:          &server.Process{Started: time.Now()},
 		viewport:      viewport.New(0, 0),
 		searchInput:   textinput.New(),
-		theme:         CurrentTheme(),
+		theme:         DefaultTheme(),
 		status:        StatusReady,
 		tokensHistory: newRingBuffer(sparkBufferSamples),
 		promptHistory: newRingBuffer(sparkBufferSamples),
@@ -1961,7 +1995,7 @@ func TestViewHeightStableAndNoLineExceedsWidth(t *testing.T) {
 		proc:          &server.Process{Started: time.Now()},
 		viewport:      viewport.New(0, 0),
 		searchInput:   textinput.New(),
-		theme:         CurrentTheme(),
+		theme:         DefaultTheme(),
 		status:        StatusReady,
 		tokensHistory: newRingBuffer(sparkBufferSamples),
 		promptHistory: newRingBuffer(sparkBufferSamples),
@@ -2605,4 +2639,154 @@ func TestRunHeaderNCtxZeroIgnored(t *testing.T) {
 	}
 	assertNotLogged(t, logs, slog.LevelWarn, "/props fetch failed")
 	assertNotLogged(t, logs, slog.LevelInfo, "ctx-size mismatch")
+}
+
+// TestRunModeToggleLogColors pins the §15.3 `o` quick key: it flips the
+// log-colors preference in memory, persists it to config.json, and the
+// rendered log becomes plain.
+func TestRunModeToggleLogColors(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(termenv.ColorProfile())
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg := sampleSnapshotConfig()
+	if err := config.Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	buf.WriteString("error: boom\ninfo line\n")
+	r := &RunMode{cfg: cfg, cfgPath: path, buf: buf, theme: DefaultTheme(), status: StatusReady}
+	if !cfg.Prefs().LogColorsEnabled() {
+		t.Fatal("log colors must default on")
+	}
+	if got := r.colorizeLine("error: boom"); !strings.Contains(got, "\x1b[38;5;") {
+		t.Errorf("error line should be colored by default, got %q", got)
+	}
+
+	next, _ := r.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	r = next
+	if cfg.Prefs().LogColorsEnabled() {
+		t.Error("o must flip log colors off")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"log-colors": false`) {
+		t.Errorf("log-colors=false not persisted:\n%s", data)
+	}
+	// The rendered log is plain now.
+	if got := r.renderViewportContent(); strings.Contains(got, "\x1b[38;5;") {
+		t.Errorf("rendered log must be plain with colors off, got %q", got)
+	}
+}
+
+// TestRunModeFlashInHeaderTopRight pins the flash relocation (owner
+// feedback): flashes live in the header's top-right blank space, so
+// the header keeps its height and the footer stays a single static
+// line — nothing on screen shifts when a flash shows or hides.
+func TestRunModeFlashInHeaderTopRight(t *testing.T) {
+	r := newHeaderTestRunMode(config.Model{Alias: "alpha"}, config.Preset{Name: "default"}, nil, runHeaderWideWidth)
+	r.flash = "match 3/5"
+
+	headerWith := stripANSI(r.renderTopStrip())
+	headerLinesWith := len(strings.Split(headerWith, "\n"))
+	r.flash = ""
+	headerWithout := stripANSI(r.renderTopStrip())
+	headerLinesWithout := len(strings.Split(headerWithout, "\n"))
+
+	if headerLinesWith != headerLinesWithout {
+		t.Errorf("flash must not change the header height: %d vs %d", headerLinesWith, headerLinesWithout)
+	}
+	if !strings.Contains(headerWith, "match 3/5") {
+		t.Errorf("header must contain the flash text\n%s", headerWith)
+	}
+	// The flash is right-aligned on its row (nothing but spaces and the
+	// box border after it).
+	rightMost := false
+	for _, ln := range strings.Split(headerWith, "\n") {
+		trimmed := strings.TrimRight(ln, " │")
+		if strings.HasSuffix(trimmed, "match 3/5") {
+			rightMost = true
+		}
+	}
+	if !rightMost {
+		t.Errorf("flash must sit at the right end of its row\n%s", headerWith)
+	}
+
+	// The footer is unchanged by the flash.
+	r.flash = "match 3/5"
+	footWith := stripANSI(r.renderFooter())
+	r.flash = ""
+	footWithout := stripANSI(r.renderFooter())
+	if footWith != footWithout {
+		t.Errorf("footer must be static regardless of the flash\nwith: %q\nwithout: %q", footWith, footWithout)
+	}
+}
+
+// TestRightFlash pins the alignment helper: right-aligned within the
+// width, truncated with an ellipsis when too long, dropped when there's
+// no room.
+func TestRightFlash(t *testing.T) {
+	if got := rightFlash("left", "note", 12); got != "left    note" {
+		t.Errorf("rightFlash = %q, want %q", got, "left    note")
+	}
+	// Width 5 with a 4-char left part leaves no room — flash dropped.
+	if got := rightFlash("left", "note", 5); got != "left" {
+		t.Errorf("no-room flash must be dropped, got %q", got)
+	}
+	// Roomier width: flash truncated with an ellipsis to fit.
+	got := rightFlash("left", "a long flash", 10)
+	if !strings.HasSuffix(got, "…") || lipgloss.Width(got) > 10 {
+		t.Errorf("oversized flash must truncate with an ellipsis within width, got %q", got)
+	}
+	if got := rightFlash("left", "", 12); got != "left" {
+		t.Errorf("empty flash must not change the row, got %q", got)
+	}
+}
+
+// TestRunModeReattachSkipsLoadWindow pins the owner-reported bug: on
+// reattach (or esc-detach → reattach), the already-loaded server must
+// NOT replay the loading animation — the run view starts at READY with
+// no load block.
+func TestRunModeReattachSkipsLoadWindow(t *testing.T) {
+	bin := filepath.Join(repoRoot(t), "bin", "llamaman-fakeserver")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("fakeserver not built: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "llama.log")
+	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+	cfg := sampleSnapshotConfig()
+	opts := RunModeOpts{
+		Cfg: cfg, Model: cfg.Models[0], Preset: cfg.Models[0].Presets[0],
+		Argv: proc.Argv, Process: proc,
+		Reattach: true,
+	}
+	run, _, err := NewRunMode(opts, DefaultTheme())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.status != StatusReady {
+		t.Fatalf("reattach must start at READY, got status=%v", run.status)
+	}
+	if run.showingLoadBlock() {
+		t.Error("reattach must not show the load block (server already loaded)")
+	}
+	if run.loadPhase != "" {
+		t.Errorf("reattach must not parse load phases, got %q", run.loadPhase)
+	}
+	// The same opts WITHOUT Reattach starts at Starting (control).
+	opts.Reattach = false
+	run2, _, err := NewRunMode(opts, DefaultTheme())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run2.status != StatusStarting {
+		t.Errorf("fresh spawn must start at STARTING, got status=%v", run2.status)
+	}
 }
