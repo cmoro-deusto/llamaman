@@ -1286,6 +1286,19 @@ the model list can't render meaningfully before READY anyway):
   progress is known.
   Multiple phase lines accumulate (newest at the bottom) within the
   block, capped to the panel height.
+- **Data-gated bar (owner finding, b10281).** llama-server's server
+  mode suppresses the loader's per-layer logs (`offloaded N/M
+  layers`, download %) and reports load only through its own
+  `load_model:` sequence — `loading model` → `initializing` →
+  `model loaded` → `listening` (verified on the owner's real logs for
+  both local and HF models). So in practice the block shows phase
+  text without a bar; the bar lights up automatically when a fraction
+  or percentage line is present (llama-cli output, an uncached HF
+  download, or a future server build). A higher `-lv` verbosity may
+  surface the loader lines; the classifier would pick them up with no
+  changes. An *indeterminate* moving bar for the "loading model"
+  phase is a candidate for item 5 (animation, gated by
+  `preferences.animations`) — no fabricated percentages in item 4.
 - When starting but no phase has parsed yet, the block shows the
   static text `loading…` (§2.3 "unknown phase → static text"). On
   READY (or exit) the normal panel content returns.
