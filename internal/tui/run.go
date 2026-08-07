@@ -3572,11 +3572,10 @@ func cometPhase(period time.Duration) (float64, bool) {
 func indeterminateBar(width, phase float64, forward bool) string {
 	w := int(width)
 	const tail = 7
-	// Slide + drain (7) + edge hold (15): the comet slides, the head
-	// pins at the far edge and the tail shrinks from its far end one
-	// fragment per step — no growing solid block (owner feedback: a
-	// full block appeared to move with the tail).
-	travel := float64(w-1) + 2*float64(tail) + 15
+	// Slide (w-1-tail) + drain (tail) = 11 units of work; travel = 20
+	// leaves a ~360ms edge hold at 1600ms/cycle (owner: a bit less
+	// waiting at the edges than the previous +15).
+	travel := float64(w-1) + 2*float64(tail) - 5
 
 	var head float64
 	if forward {
