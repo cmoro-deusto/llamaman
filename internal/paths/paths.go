@@ -115,3 +115,8 @@ func homeDir() (string, error) {
 	}
 	return u.HomeDir, nil
 }
+
+// HomeDir returns $HOME, falling back to the OS user's home directory
+// (mirrors llama.cpp's HOME / getpwuid resolution). Exported for the
+// storage package's llama.cpp cache-root chain.
+func HomeDir() (string, error) { return homeDir() }

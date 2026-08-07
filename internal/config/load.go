@@ -46,5 +46,12 @@ func Load(path string) (*Config, error) {
 		}
 		cfg.Models[i].Location = expanded
 	}
+	if cfg.Preferences != nil {
+		expanded, err := paths.ExpandPath(cfg.Preferences.ModelsDir)
+		if err != nil {
+			return nil, fmt.Errorf("expand preferences.models-dir: %w", err)
+		}
+		cfg.Preferences.ModelsDir = expanded
+	}
 	return &cfg, nil
 }

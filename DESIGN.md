@@ -56,7 +56,8 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
   "preferences": {          // optional; absent == defaults
     "theme": "auto",        // palette ID from the TUI table; "auto" is default
     "animations": true,      // default true; explicit false is honored
-    "log-colors": true       // default true; explicit false is honored (§15.3)
+    "log-colors": true,      // default true; explicit false is honored (§15.3)
+    "models-dir": ""        // llama.cpp HF cache root; "" = follow llama.cpp's chain (§16.1)
   },
   "models": [
     {
@@ -98,6 +99,7 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
 Applied at config-load time to:
 - `globals.llama-server-bin`
 - every `models[].location`
+- `preferences.models-dir` (Release 2, §16.1)
 
 Expansions:
 - Leading `~` → `$HOME` (via `os/user.Current()`)

@@ -199,3 +199,87 @@ func containsSubstring(s, sub string) bool {
 	}
 	return false
 }
+
+// TestModelsDirAbsentMeansDefault verifies the field-arrival contract
+// for preferences.models-dir (DESIGN §16.1): absent == "" == follow
+// llama.cpp's chain, and an untouched config never writes the field.
+func TestModelsDirAbsentMeansDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg := &Config{
+		Version: 1,
+		Globals: Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Preferences: &Preferences{
+			Theme: "nord", // set another pref so the object exists
+		},
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsSubstring(string(data), "models-dir") {
+		t.Errorf("empty models-dir must stay omitted:\n%s", data)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := loaded.Prefs(); p.ModelsDir != "" {
+		t.Errorf("default models-dir = %q, want empty", p.ModelsDir)
+	}
+}
+
+// TestModelsDirRoundTrip verifies an explicit models-dir survives a
+// save/load round trip.
+func TestModelsDirRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg := &Config{
+		Version: 1,
+		Globals: Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Preferences: &Preferences{
+			ModelsDir: "/opt/llama-models",
+		},
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsSubstring(string(data), `"models-dir": "/opt/llama-models"`) {
+		t.Errorf("models-dir should be written verbatim:\n%s", data)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := loaded.Prefs(); p.ModelsDir != "/opt/llama-models" {
+		t.Errorf("models-dir = %q after round trip", p.ModelsDir)
+	}
+}
+
+// TestModelsDirExpandedAtLoad verifies ~/$VAR expansion applies to
+// preferences.models-dir at load time (DESIGN §3.3 extension).
+func TestModelsDirExpandedAtLoad(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	writeConfig := "{\"version\":1,\"globals\":{\"llama-server-bin\":\"/usr/bin/llama-server\",\"ip_address\":\"127.0.0.1\",\"port\":9080},\"preferences\":{\"models-dir\":\"~/models\"},\"models\":[]}"
+	if err := os.WriteFile(path, []byte(writeConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, "models")
+	if p := loaded.Prefs(); p.ModelsDir != want {
+		t.Errorf("models-dir = %q, want expanded %q", p.ModelsDir, want)
+	}
+}
