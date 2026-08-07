@@ -3547,27 +3547,42 @@ func (r *RunMode) loadRows() []string {
 	return rows
 }
 
-// indeterminateBar renders a 3-cell segment bouncing across a
-// fixed-width track (position motion only — no fabricated percentages,
-// §15.5). The segment travels 0..w-seg and back with the sine phase,
-// never wrapping across the ends (owner feedback: the modulo caused a
-// fold-over at the right edge).
+// blockFrags are the 8 horizontal sub-cell block fragments
+// (U+258F..U+2589, high to low) that give the indeterminate bar
+// sub-cell smoothness — the ASCII trick the owner asked for: segment
+// edges move in ⅛-cell steps instead of whole-cell jumps.
+var blockFrags = []rune{'▏', '▎', '▍', '▌', '▋', '▊', '▉'}
+
+// indeterminateBar renders a 3-cell segment with smooth (sub-cell)
+// edges bouncing across a fixed-width track (position motion only — no
+// fabricated percentages, §15.5). Each edge climbs/drops through the 8
+// block fragments, so the motion is visibly smoother than whole-cell
+// steps; the segment never wraps across the ends.
 func indeterminateBar(width, phase float64) string {
-	const seg = 3
+	const segCells = 3.0
+	const sub = 8 // sub-cell steps per cell
 	w := int(width)
-	if w <= seg {
-		return strings.Repeat("▓", w)
+	if w*sub <= int(segCells*sub) {
+		return strings.Repeat("█", w)
 	}
-	off := int(phase*float64(w-seg) + 0.5) // round so the segment reliably reaches the last cells (owner feedback)
-	if off > w-seg {
-		off = w - seg
+	travel := int((float64(w) - segCells) * sub)
+	pos := int(phase*float64(travel) + 0.5) // leading edge, in eighths
+	if pos > travel {
+		pos = travel
 	}
+	end := pos + int(segCells*sub)
 	out := make([]rune, w)
-	for i := range out {
-		out[i] = '░'
-	}
-	for i := 0; i < seg; i++ {
-		out[off+i] = '▓'
+	for i := 0; i < w; i++ {
+		lo, hi := i*sub, (i+1)*sub
+		overlap := min(hi, end) - max(lo, pos)
+		switch {
+		case overlap <= 0:
+			out[i] = '░'
+		case overlap >= sub:
+			out[i] = '█'
+		default:
+			out[i] = blockFrags[overlap-1]
+		}
 	}
 	return string(out)
 }

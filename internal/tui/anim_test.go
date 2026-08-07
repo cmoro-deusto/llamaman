@@ -80,30 +80,46 @@ func TestQuantizePhase(t *testing.T) {
 }
 
 // TestIndeterminateBar: the segment bounces across the track with the
-// phase, staying contiguous (no wrap across the ends).
+// phase, edges smooth via sub-cell block fragments (no wrap, reaches
+// both ends, 3 cells of fill at all times).
 func TestIndeterminateBar(t *testing.T) {
-	b0 := indeterminateBar(12, 0)
-	bMid := indeterminateBar(12, 0.5)
-	b1 := indeterminateBar(12, 1)
-	if b0 != "▓▓▓░░░░░░░░░" {
-		t.Errorf("phase 0 must put the segment at the left, got %q", b0)
+	if got := indeterminateBar(12, 0); got != "███░░░░░░░░░" {
+		t.Errorf("phase 0 must put the segment at the left, got %q", got)
 	}
-	if b1 != "░░░░░░░░░▓▓▓" {
-		t.Errorf("phase 1 must put the segment at the right (no wrap), got %q", b1)
+	if got := indeterminateBar(12, 1); got != "░░░░░░░░░███" {
+		t.Errorf("phase 1 must put the segment at the right (no wrap), got %q", got)
 	}
-	// Rounding: a phase just below 1 also reaches the last cells
-	// (owner feedback — the bar rarely hit the right end).
-	if got := indeterminateBar(12, 0.95); got != "░░░░░░░░░▓▓▓" {
-		t.Errorf("phase 0.95 must reach the right end, got %q", got)
+	// Halfway: the leading edge is mid-cell (▌ = 4/8) and the trailing
+	// edge too — sub-cell smoothness.
+	if got := indeterminateBar(12, 0.5); got != "░░░░▌██▌░░░░" {
+		t.Errorf("phase 0.5 must have fragment edges, got %q", got)
 	}
-	if b0 == bMid || bMid == b1 {
-		t.Errorf("different phases must move the segment: %q %q %q", b0, bMid, b1)
+	// Adjacent phases differ by a single fragment step (smooth motion).
+	a := indeterminateBar(12, 0.484375) // pos 35
+	b := indeterminateBar(12, 0.5)      // pos 36
+	if a == b || strings.Count(a, "▋") != 1 || strings.Count(b, "▌") != 2 {
+		t.Errorf("adjacent sub-cell phases must differ by one fragment: %q vs %q", a, b)
 	}
-	if len([]rune(b0)) != 12 || len([]rune(b1)) != 12 {
-		t.Errorf("bar must keep the track width: %q %q", b0, b1)
-	}
-	if strings.Count(b0, "▓") != 3 || strings.Count(b1, "▓") != 3 {
-		t.Errorf("bar must have exactly 3 filled cells, got %q %q", b0, b1)
+	// The segment is always exactly 3 cells of fill (24 eighths).
+	fragLevel := map[rune]int{'▏': 1, '▎': 2, '▍': 3, '▌': 4, '▋': 5, '▊': 6, '▉': 7}
+	for _, ph := range []float64{0, 0.1, 0.5, 0.9, 1} {
+		bar := indeterminateBar(12, ph)
+		if len([]rune(bar)) != 12 {
+			t.Fatalf("bar width changed at phase %v: %q", ph, bar)
+		}
+		fill := 0
+		for _, c := range bar {
+			switch c {
+			case '░':
+			case '█':
+				fill += 8
+			default:
+				fill += fragLevel[c]
+			}
+		}
+		if fill != 24 {
+			t.Errorf("phase %v: segment fill = %d eighths, want 24", ph, fill)
+		}
 	}
 }
 
