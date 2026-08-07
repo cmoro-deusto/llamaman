@@ -90,12 +90,12 @@ func TestIndeterminateBar(t *testing.T) {
 		forward bool
 		want    string
 	}{
-		{0, true, "▏▎▍▌▋▊▉█░░░░"},    // comet at the left, tail trailing
-		{0.25, true, "░░░░░▎▍▌▋▊▉█"}, // drain: far fragment (▏) gone
-		{0.55, true, "░░░░░░░░░░░█"}, // drain complete: just the head
+		{0, true, "█░░░░░░░░░░░"},    // forward starts as just the head at the left
+		{0.1, true, "▋▊▉█░░░░░░░░"},  // tail trailing on the left as it enters
+		{0.55, true, "░░░░░░░░░░░█"}, // drain complete: just the head at the right
 		{0.8, true, "░░░░░░░░░░░█"},  // hold: pinned at the right edge
-		{0.8, false, "░░░░░░░█▉▊▋▌"}, // backward: tail on the right
-		{0.5, false, "░█▉▊▋▌▍▎▏░░░"}, // backward mid-slide
+		{0.8, false, "░░░░█▉▊▋▌▍▎▏"}, // backward: tail on the right
+		{0.5, false, "█▉▊░░░░░░░░░"}, // backward mid-drain at the left
 		{0.1, false, "█░░░░░░░░░░░"}, // backward drain complete
 		{0.0, false, "█░░░░░░░░░░░"},
 	}

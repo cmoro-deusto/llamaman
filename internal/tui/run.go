@@ -3573,13 +3573,14 @@ func indeterminateBar(width, phase float64, forward bool) string {
 	w := int(width)
 	const tail = 7
 	// Slide (w-1-tail) + drain (tail) = 11 units of work; travel = 20
-	// leaves a ~360ms edge hold at 1600ms/cycle (owner: a bit less
-	// waiting at the edges than the previous +15).
-	travel := float64(w-1) + 2*float64(tail) - 5
+	// Both passes do 18 units of work (slide 11 + drain 7) so the edge
+	// holds are identical: travel = 33 → 45% hold ≈ 363ms at
+	// 1600ms/cycle, matching the owner-approved right-edge wait.
+	travel := float64(w-1) + 2*float64(tail) + 8
 
 	var head float64
 	if forward {
-		head = float64(tail) + phase*travel // p: 0→1
+		head = phase * travel // p: 0→1 — starts as just the head at the left; the tail enters from the left
 	} else {
 		head = float64(w-1) - (1-phase)*travel // p: 1→0
 	}
