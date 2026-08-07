@@ -1997,7 +1997,12 @@ func Choose(ctx context.Context, c *hf.Client, repo string) ([]QuantOption, erro
 - Sort: size ascending, ties by tag — the natural "smallest first"
   order for a "fits in VRAM" picker.
 - The chosen `Tag` becomes the `:quant` suffix of the config `hf` entry
-  (`org/repo:UD-Q4_K_XL`), which llama.cpp's `find_best_model` matches.
+  (`org/repo:Q4_K_XL`). Verified: llama.cpp's `find_best_model` matches
+  the tag as a regex `tag + "[.-]"` **substring over the file path**, so
+  the strict tag always selects the right file — e.g. `Q4_K_XL` selects
+  `Qwen3.6-27B-UD-Q4_K_XL.gguf` (the `UD-` prefix is irrelevant to
+  matching). Two files with the same strict tag in one repo merge into
+  one option — upstream selection is equally ambiguous there.
 - **VRAM hint hook (R3 §4.2):** hosts attach the estimate; `QuantOption`
   carries `Size` only, so the hint is a render-time addition — no
   coupling to the estimator in this item.
