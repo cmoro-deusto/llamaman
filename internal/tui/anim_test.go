@@ -195,3 +195,25 @@ func TestRunModeToggleAnimations(t *testing.T) {
 		t.Error("after toggling off, the animation tick must not be scheduled")
 	}
 }
+
+// TestAnimFrameInterval: the frame rate is decided in one place and
+// can be overridden at runtime via LLAMAMAN_ANIM_FPS (owner request —
+// experimentation without rebuilding).
+func TestAnimFrameInterval(t *testing.T) {
+	t.Setenv("LLAMAMAN_ANIM_FPS", "30")
+	if got := animFrameInterval(); got != time.Second/30 {
+		t.Errorf("30 fps interval = %v, want %v", got, time.Second/30)
+	}
+	t.Setenv("LLAMAMAN_ANIM_FPS", "60")
+	if got := animFrameInterval(); got != time.Second/60 {
+		t.Errorf("60 fps interval = %v, want %v", got, time.Second/60)
+	}
+	t.Setenv("LLAMAMAN_ANIM_FPS", "not-a-number")
+	if got := animFrameInterval(); got != animTickInterval {
+		t.Errorf("invalid override must fall back to the default, got %v", got)
+	}
+	t.Setenv("LLAMAMAN_ANIM_FPS", "")
+	if got := animFrameInterval(); got != animTickInterval {
+		t.Errorf("unset override must use the default, got %v", got)
+	}
+}

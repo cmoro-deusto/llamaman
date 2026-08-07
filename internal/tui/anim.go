@@ -8,6 +8,8 @@ package tui
 import (
 	"fmt"
 	"math"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,10 +24,23 @@ import (
 // frozen time so rendered frames stay stable (P9).
 var clock = time.Now
 
-// animTickInterval is the animation frame period (owner-amended: 10
-// fps for smoother motion, §15.5 — still cheap since the frame redraw
-// is small).
-const animTickInterval = 100 * time.Millisecond
+// animTickInterval is the animation frame period. Owner's temporary
+// experiment: 60 fps (final value TBD). Overridable at runtime via
+// LLAMAMAN_ANIM_FPS (see animFrameInterval).
+const animTickInterval = time.Second / 60
+
+// animFrameInterval returns the animation frame period. The single
+// place the frame rate is decided (owner request): edit animTickInterval
+// or set LLAMAMAN_ANIM_FPS (e.g. 60, 30, 15) at runtime to experiment
+// without rebuilding.
+func animFrameInterval() time.Duration {
+	if v := os.Getenv("LLAMAMAN_ANIM_FPS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Second / time.Duration(n)
+		}
+	}
+	return animTickInterval
+}
 
 // animTickMsg triggers a re-render so animated elements move.
 type animTickMsg struct{}
@@ -153,7 +168,7 @@ func (r *RunMode) animCmd() tea.Cmd {
 	if !r.anythingAnimated() {
 		return nil
 	}
-	return tea.Tick(animTickInterval, func(time.Time) tea.Msg { return animTickMsg{} })
+	return tea.Tick(animFrameInterval(), func(time.Time) tea.Msg { return animTickMsg{} })
 }
 
 // anythingAnimated reports whether any §15.5 element is currently

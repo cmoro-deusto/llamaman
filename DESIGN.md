@@ -549,7 +549,12 @@ bars fill smoothly; the Tokens/Prompt sparklines glow softly while
 busy. One-shot: a ready glow on STARTING→READY, a red flash on ERROR,
 a pulse on the current search occurrence after `n`/`N`, a glow when
 TTFT arrives, and a flash on router models that just loaded/unloaded.
-No wordmark animation; steady-state READY idle is static; 10 fps
+**Frame rate (owner tuning, §15.5).** The frame period is decided in
+**one place**: `animTickInterval` in `internal/tui/anim.go`, and is
+overridable at runtime via **`LLAMAMAN_ANIM_FPS`** (e.g. `60`, `30`,
+`15`) without rebuilding. Currently set to 60 fps while the owner
+experiments; the final value is TBD (see §2.4 for the cost reasoning —
+the sweet spot is ~10–15 fps for these slow effects).
 (owner-amended from 4 for smoother motion);
 truecolor lerp with a 3-step discrete fallback on 256-color (P1); a
 frozen clock in tests (P9).
