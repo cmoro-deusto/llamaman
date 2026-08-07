@@ -45,6 +45,12 @@ func TestDetectLayout(t *testing.T) {
 		// rule 4: legacy metadata, skipped silently
 		{"org__repo__file-Q4_K_M.gguf.etag", false, LayoutMeta},
 		{"manifest=org=repo=latest.json", false, LayoutMeta},
+		// HF hub root metadata (huggingface_hub), skipped silently
+		{"CACHEDIR.TAG", false, LayoutMeta},
+		{"version.txt", false, LayoutMeta},
+		{".locks", true, LayoutMeta},
+		{"CACHEDIR.TAG", true, LayoutUnknown}, // a dir named CACHEDIR.TAG is not standard
+		{".locks", false, LayoutUnknown},      // a file named .locks is not standard
 		// rule 5: everything else → unknown
 		{"notes.txt", false, LayoutUnknown},
 		{".DS_Store", false, LayoutUnknown},

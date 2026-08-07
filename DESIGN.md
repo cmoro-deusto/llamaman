@@ -1746,8 +1746,9 @@ name and type:
 2. Directory matching `^[\w.-]+__[\w.-]+$` → legacy folder repo.
 3. File matching `<org>__<repo>__<file>.gguf` / `.mmproj` → legacy flat
    file (repo = the first two `__` segments).
-4. Legacy metadata — `*.etag` sidecars and `manifest=…` files →
-   recognized, skipped silently.
+4. Metadata — `*.etag` sidecars, `manifest=…` files, and the HF hub
+   root files (`CACHEDIR.TAG`, `version.txt`, `.locks/`, written by
+   `huggingface_hub`) → recognized, skipped silently.
 5. Anything else → **unrecognized** → warning (tolerance strategy
    below).
 

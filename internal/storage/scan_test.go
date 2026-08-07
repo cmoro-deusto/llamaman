@@ -221,3 +221,30 @@ func TestLookupMissingRoot(t *testing.T) {
 		t.Errorf("missing root: files=%+v err=%v, want empty+nil", files, err)
 	}
 }
+
+// TestScanHubRootMetadataNoWarnings pins that the standard HF hub root
+// metadata files (.locks/, CACHEDIR.TAG, version.txt) are recognized
+// and skipped silently — they are part of the known hub layout, not
+// unrecognized entries (owner report).
+func TestScanHubRootMetadataNoWarnings(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55")
+	writeFile(t, filepath.Join(root, "version.txt"), "3.0.0")
+	if err := os.Mkdir(filepath.Join(root, ".locks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// plus a real cached repo so Scan has something to list
+	hubRepo(t, root, "org/repo", "model-Q4_K_M.gguf")
+
+	var warned []string
+	files, err := Scan(root, func(name string) { warned = append(warned, name) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("Scan() = %d files, want the repo's model only: %+v", len(files), files)
+	}
+	if len(warned) != 0 {
+		t.Errorf("hub root metadata must not warn, got %v", warned)
+	}
+}

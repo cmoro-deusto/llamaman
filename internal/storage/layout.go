@@ -50,6 +50,8 @@ func DetectLayout(name string, isDir bool) Layout {
 	switch {
 	case isDir && strings.HasPrefix(name, hubPrefix) && validHubRepo(name):
 		return LayoutHFHub
+	case isDir && name == ".locks": // hub lock-file directory
+		return LayoutMeta
 	case isDir:
 		if _, _, ok := splitLegacyFolder(name); ok {
 			return LayoutLegacyFolder
@@ -61,6 +63,12 @@ func DetectLayout(name string, isDir bool) Layout {
 		if etagRE.MatchString(name) || strings.HasPrefix(name, "manifest=") {
 			return LayoutMeta
 		}
+		// HF hub root metadata (huggingface_hub writes these).
+		if name == "CACHEDIR.TAG" || name == "version.txt" {
+			return LayoutMeta
+		}
+	case isDir && name == ".locks": // hub lock-file directory
+		return LayoutMeta
 	}
 	return LayoutUnknown
 }
