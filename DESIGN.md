@@ -2017,3 +2017,92 @@ client.
 **File map.** New `internal/hf/quant.go`, `quant_test.go`. No `main.go`,
 TUI, config, or storage changes. DESIGN §14.2 / ROADMAP §3.3 already
 describe the item; this note adds the component contract.
+
+### 16.4 Storage & Downloads manager
+
+**Scope.** Fourth item of Release 2 (ROADMAP §3.7; §3.4 with owner
+decision C). The first user-visible surface of the release and the
+**single place downloads are managed**: a new TUI mode from Main that
+lists what is on disk, deletes it with confirmation, and pre-fetches
+repos into the cache ("download now") with pause/resume/cancel, sha256
+verification, and clear failures. Launch stays delegated (§3.2) — the
+run-mode panel keeps only the passive §15.4 progress. **Non-goals:** no
+search/browse (item 7), no config-editor pickers (§3.8), no VRAM math
+(R3), no router-mode changes.
+
+#### Mode structure
+
+- New `ViewStorage` under Root; entry key **`s`** in Main (`s storage`).
+  The Settings key moves from `s` to **`p`** (`p preferences` — the
+  config object is `preferences`, so the label matches; owner
+  decision). List-based view: cache repos + local config models +
+  in-flight downloads, one pane, footer of actions — mirrors the
+  router model-panel action-menu pattern (Enter → action menu).
+- Rendering groups: **(1) cache repos** (from `storage.Scan` grouped by
+  repo — each shows its quants + total size, `storage.HumanSize`-style),
+  **(2) local config models** (each `location` file with on-disk size;
+  missing files marked), **(3) in-flight downloads** (own state, §16.3
+  progress), plus a **free-disk** line for the cache root's filesystem
+  (`syscall.Statfs`). Sizes via `os.Stat`; all read-only rendering.
+- Actions per entry: cache repo → **delete** (confirm) / **re-download**;
+  local model → **reveal** (open parent dir) — delete of config entries
+  stays in config mode (never here, P8); download row → **pause /
+  resume / cancel**.
+
+#### Delete
+
+- Cache repo: hub layout → remove the whole `models--org--model/` dir
+  (blobs die with it); legacy → remove the flat `.gguf`/`.mmproj` files
+  plus their `.etag` and `manifest=` sidecars. Confirmation prompt
+  first. Config entries are never touched here (P8).
+- Only files llamaman can account for are ever removed (§3.4).
+
+#### Download action ("download now")
+
+1. User types `org/repo[:quant]` (explicit action, P7) — or picks a
+   cached repo to re-download.
+2. `hf.Choose` → the §16.3 quant picker (sizes shown; no quant suffix →
+   pick; suffix present → confirm only). mmproj noted when present
+   (auto-downloaded by llama.cpp at launch, informational).
+3. `hf.Download` fetches into the resolved cache root (§16.1) with a
+   live progress bar (bytes done / total, per file and overall),
+   **pause / resume / cancel** keys, sha256 verify (the LFS oid), and
+   distinct failure messages (not-found / gated / network — §16.2
+   errors). Pause keeps the partial; cancel discards it.
+
+#### The downloader (`internal/hf/download.go`)
+
+- New client call **`Refs(ctx, repo)`** — `GET /api/models/{repo}/refs`
+  → the `main` branch's target commit (llama.cpp's `get_repo_commit`;
+  the downloader needs the commit for `refs/main` + `snapshots/`).
+- Writer mirrors llama.cpp's hub layout exactly (verified): blobs
+  written to `blobs/<oid>` (partial as `<oid>.incomplete`), then
+  `refs/main` = commit, and `snapshots/<commit>/<file>` as a symlink to
+  the blob (`finalize_file` behavior) — so llama.cpp reads the result
+  directly. Split parts download individually; the model is complete
+  only when every part is in place.
+- **Range resume:** a blob already at N bytes (from `<oid>.incomplete`)
+  continues with `Range: bytes=N-`; 206 handled, 200 restarts cleanly.
+- **sha256 verify:** after each blob completes, hash it and compare to
+  the oid; mismatch → error, partial removed, clear message.
+- Progress via a callback (`done, total int64` per file); cancellation
+  via `ctx`. `Download` is synchronous; the TUI runs it as a Bubble Tea
+  task and renders pause/resume/cancel from task state.
+
+#### Determinism (P9)
+
+- Downloader tests against `httptest.Server`: full download, Range
+  resume (pre-seeded `.incomplete`), 206/200 handling, sha256 mismatch,
+  refs parsing, split parts, cancel via ctx, blob/symlink layout
+  assertions against a `t.TempDir` root. No real network.
+- TUI tests with a **stub downloader** (the `stubSpawner` pattern) and
+  fake cache trees: listing groups/sizes, delete-with-confirmation,
+  action flow, free-disk line (`Statfs` on a TempDir works).
+- Snapshot tests render the manager in-process (P9).
+
+**File map.** `internal/hf/refs.go`, `download.go`, `download_test.go`
+(the client gains `Refs`). New `internal/tui/storage.go` +
+`storage_test.go` (the manager mode). `internal/tui/root.go` —
+`ViewStorage`, `m` dispatch, `returnFromStorageMsg`. `main.go` —
+shortcut-row text. `DESIGN.md` §16.4 + §7.5 mode list (same change,
+P5). No config, no `internal/storage` changes.
