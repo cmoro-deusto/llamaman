@@ -2744,3 +2744,49 @@ func TestRightFlash(t *testing.T) {
 		t.Errorf("empty flash must not change the row, got %q", got)
 	}
 }
+
+// TestRunModeReattachSkipsLoadWindow pins the owner-reported bug: on
+// reattach (or esc-detach → reattach), the already-loaded server must
+// NOT replay the loading animation — the run view starts at READY with
+// no load block.
+func TestRunModeReattachSkipsLoadWindow(t *testing.T) {
+	bin := filepath.Join(repoRoot(t), "bin", "llamaman-fakeserver")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("fakeserver not built: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "llama.log")
+	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+	cfg := sampleSnapshotConfig()
+	opts := RunModeOpts{
+		Cfg: cfg, Model: cfg.Models[0], Preset: cfg.Models[0].Presets[0],
+		Argv: proc.Argv, Process: proc,
+		Reattach: true,
+	}
+	run, _, err := NewRunMode(opts, DefaultTheme())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.status != StatusReady {
+		t.Fatalf("reattach must start at READY, got status=%v", run.status)
+	}
+	if run.showingLoadBlock() {
+		t.Error("reattach must not show the load block (server already loaded)")
+	}
+	if run.loadPhase != "" {
+		t.Errorf("reattach must not parse load phases, got %q", run.loadPhase)
+	}
+	// The same opts WITHOUT Reattach starts at Starting (control).
+	opts.Reattach = false
+	run2, _, err := NewRunMode(opts, DefaultTheme())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run2.status != StatusStarting {
+		t.Errorf("fresh spawn must start at STARTING, got status=%v", run2.status)
+	}
+}

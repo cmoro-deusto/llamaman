@@ -225,10 +225,14 @@ type RunMode struct {
 // of the caller (main.go) so it can race for the session lock and choose
 // owner vs adopted mode before the TUI starts.
 type RunModeOpts struct {
-	Cfg        *config.Config
-	CfgPath    string // on-disk config path; set by Root so run-mode preference quick keys can persist (§15.3)
-	Model      config.Model
-	Preset     config.Preset
+	Cfg     *config.Config
+	CfgPath string // on-disk config path; set by Root so run-mode preference quick keys can persist (§15.3)
+	Model   config.Model
+	Preset  config.Preset
+	// Reattach marks an adopted, already-running server: the run view
+	// starts at READY and skips the load-progress window entirely
+	// (owner feedback — reattach replayed the loading animation).
+	Reattach   bool
 	RouterFile string // non-empty for router-mode runs (my-models.ini path)
 	Argv       []string
 	Warnings   []string
@@ -268,13 +272,12 @@ func NewRunMode(opts RunModeOpts, theme Theme) (*RunMode, tea.Cmd, error) {
 	}
 
 	r := &RunMode{
-		cfg:                    opts.Cfg,
-		cfgPath:                opts.CfgPath,
-		model:                  opts.Model,
-		preset:                 opts.Preset,
-		routerFile:             opts.RouterFile,
-		argv:                   opts.Argv,
-		warnings:               opts.Warnings,
+		cfg:        opts.Cfg,
+		cfgPath:    opts.CfgPath,
+		model:      opts.Model,
+		preset:     opts.Preset,
+		routerFile: opts.RouterFile,
+		argv:       opts.Argv, warnings: opts.Warnings,
 		proc:                   opts.Process,
 		tail:                   tail,
 		sessionMgr:             opts.SessionMgr,
@@ -294,6 +297,15 @@ func NewRunMode(opts RunModeOpts, theme Theme) (*RunMode, tea.Cmd, error) {
 		utilHistory:            map[string]*ringBuffer{},
 	}
 	r.fetchCtx, r.fetchCancel = context.WithCancel(context.Background())
+	titleState := "STARTING"
+	if opts.Reattach {
+		// Adopted an already-running server: start at READY and skip the
+		// load-progress window (owner feedback — reattach replayed the
+		// loading animation). The /props poll still arms the live stats.
+		r.status = StatusReady
+		r.readyAt = clock()
+		titleState = "READY"
+	}
 	cmds := []tea.Cmd{
 		waitForChunk(tail.Chunks()),
 		waitForProc(opts.Process),
@@ -304,7 +316,7 @@ func NewRunMode(opts RunModeOpts, theme Theme) (*RunMode, tea.Cmd, error) {
 		tickHwPoll(),
 		// Terminal title (DESIGN §15.3): set at entry, updated on
 		// ready/error/exited transitions.
-		tea.SetWindowTitle(r.runTitle("STARTING")),
+		tea.SetWindowTitle(r.runTitle(titleState)),
 		// Animation frame while an animated element is visible (§15.5).
 		r.animCmd(),
 	}
@@ -3546,7 +3558,7 @@ func indeterminateBar(width, phase float64) string {
 	if w <= seg {
 		return strings.Repeat("▓", w)
 	}
-	off := int(phase * float64(w-seg))
+	off := int(phase*float64(w-seg) + 0.5) // round so the segment reliably reaches the last cells (owner feedback)
 	if off > w-seg {
 		off = w - seg
 	}

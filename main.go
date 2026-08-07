@@ -487,6 +487,7 @@ func buildReattachOpts(cfg *config.Config, registry flags.Registry, sess server.
 			SessionMgr: sessMgr,
 			Registry:   registry,
 			Fetcher:    fetcherFor(sess.Command, registry),
+			Reattach:   true,
 		}, nil
 	}
 	model, _ := findModel(cfg, sess.Alias)
@@ -512,6 +513,7 @@ func buildReattachOpts(cfg *config.Config, registry flags.Registry, sess server.
 		SessionMgr: sessMgr,
 		Registry:   registry,
 		Fetcher:    fetcherFor(sess.Command, registry),
+		Reattach:   true,
 	}, nil
 }
 

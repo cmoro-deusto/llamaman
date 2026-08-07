@@ -91,6 +91,11 @@ func TestIndeterminateBar(t *testing.T) {
 	if b1 != "░░░░░░░░░▓▓▓" {
 		t.Errorf("phase 1 must put the segment at the right (no wrap), got %q", b1)
 	}
+	// Rounding: a phase just below 1 also reaches the last cells
+	// (owner feedback — the bar rarely hit the right end).
+	if got := indeterminateBar(12, 0.95); got != "░░░░░░░░░▓▓▓" {
+		t.Errorf("phase 0.95 must reach the right end, got %q", got)
+	}
 	if b0 == bMid || bMid == b1 {
 		t.Errorf("different phases must move the segment: %q %q %q", b0, bMid, b1)
 	}
