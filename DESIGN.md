@@ -1272,8 +1272,9 @@ animation state is derived from an injectable clock at render time
 1. **Load-progress block** (only while the load window is open, §15.4):
    the phase/bar rows **breathe** (slow color lerp, sine wave) and,
    when no numeric progress is known, the bar row shows an
-   **indeterminate moving fill** — a moving segment on the 12-cell
-   `▓`/`░` track, 4 steps/s — the "something moving while loading"
+   **indeterminate moving fill** — a 3-cell segment bouncing across
+   the 12-cell `▓`/`░` track (never wrapping across the ends, owner
+   feedback), 10 steps/s — the "something moving while loading"
    ask from item 4. Numeric-progress bars keep their real fill (no
    fake motion).
 2. **`[STARTING]` badge:** the badge color breathes **yellow ↔ gold**

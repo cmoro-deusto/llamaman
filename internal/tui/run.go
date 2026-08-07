@@ -3499,21 +3499,27 @@ func (r *RunMode) loadRows() []string {
 	return rows
 }
 
-// indeterminateBar renders a 3-cell segment moving across a fixed-width
-// track (position motion only — no fabricated percentages, §15.5).
+// indeterminateBar renders a 3-cell segment bouncing across a
+// fixed-width track (position motion only — no fabricated percentages,
+// §15.5). The segment travels 0..w-seg and back with the sine phase,
+// never wrapping across the ends (owner feedback: the modulo caused a
+// fold-over at the right edge).
 func indeterminateBar(width, phase float64) string {
 	const seg = 3
 	w := int(width)
 	if w <= seg {
 		return strings.Repeat("▓", w)
 	}
-	off := int(phase*float64(w)) % w
+	off := int(phase * float64(w-seg))
+	if off > w-seg {
+		off = w - seg
+	}
 	out := make([]rune, w)
 	for i := range out {
 		out[i] = '░'
 	}
 	for i := 0; i < seg; i++ {
-		out[(off+i)%w] = '▓'
+		out[off+i] = '▓'
 	}
 	return string(out)
 }

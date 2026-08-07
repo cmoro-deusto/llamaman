@@ -79,20 +79,26 @@ func TestQuantizePhase(t *testing.T) {
 	}
 }
 
-// TestIndeterminateBar: the segment moves with the phase and stays on
-// the track.
+// TestIndeterminateBar: the segment bounces across the track with the
+// phase, staying contiguous (no wrap across the ends).
 func TestIndeterminateBar(t *testing.T) {
 	b0 := indeterminateBar(12, 0)
-	b1 := indeterminateBar(12, 0.3)
-	b2 := indeterminateBar(12, 0.6)
-	if b0 == b1 || b1 == b2 {
-		t.Errorf("different phases must move the segment: %q %q %q", b0, b1, b2)
+	bMid := indeterminateBar(12, 0.5)
+	b1 := indeterminateBar(12, 1)
+	if b0 != "▓▓▓░░░░░░░░░" {
+		t.Errorf("phase 0 must put the segment at the left, got %q", b0)
+	}
+	if b1 != "░░░░░░░░░▓▓▓" {
+		t.Errorf("phase 1 must put the segment at the right (no wrap), got %q", b1)
+	}
+	if b0 == bMid || bMid == b1 {
+		t.Errorf("different phases must move the segment: %q %q %q", b0, bMid, b1)
 	}
 	if len([]rune(b0)) != 12 || len([]rune(b1)) != 12 {
 		t.Errorf("bar must keep the track width: %q %q", b0, b1)
 	}
-	if got := indeterminateBar(12, 0); strings.Count(got, "▓") != 3 {
-		t.Errorf("bar must have exactly 3 filled cells, got %q", got)
+	if strings.Count(b0, "▓") != 3 || strings.Count(b1, "▓") != 3 {
+		t.Errorf("bar must have exactly 3 filled cells, got %q %q", b0, b1)
 	}
 }
 
