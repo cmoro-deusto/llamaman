@@ -20,6 +20,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 
@@ -135,6 +136,7 @@ type StorageMode struct {
 
 	entries []storageEntry
 	cursor  int
+	spinner spinner.Model
 
 	form      *huh.Form // download-now repo input
 	repoVal   string
@@ -160,7 +162,13 @@ type StorageMode struct {
 // nil — the caller replaces it via SetEngine before use (tests inject a
 // stub; the root wires a real *hf.Client).
 func NewStorageMode(cfg *config.Config, theme Theme, root string) *StorageMode {
-	return &StorageMode{cfg: cfg, theme: theme, root: root}
+	return &StorageMode{
+		cfg:     cfg,
+		theme:   theme,
+		root:    root,
+		spinner: spinner.New(spinner.WithSpinner(spinner.Dot),
+			spinner.WithStyle(lipgloss.NewStyle().Foreground(theme.Accent))),
+	}
 }
 
 // SetEngine attaches the download engine.
@@ -325,6 +333,10 @@ func (s *StorageMode) handleDlTick() (*StorageMode, tea.Cmd) {
 	case err := <-s.dlDone:
 		return s, s.handleDlFinished(err)
 	default:
+	}
+	// advance the spinner frame while downloading (dot style)
+	if s.dl.status == dlRunning {
+		s.spinner, _ = s.spinner.Update(s.spinner.Tick())
 	}
 	// speed over a ~2s window: instant per-tick deltas are too noisy
 	// to read (owner report).
@@ -805,23 +817,41 @@ func (s StorageMode) View() string {
 	}
 	body = append(body, "", s.renderFooter())
 	content := strings.Join(body, "\n")
-	if s.form != nil {
-		content += "\n\n" + s.form.View()
-	}
-	if s.quantForm != nil {
-		content += "\n\n" + s.quantForm.View()
-	}
-	if s.menu != nil {
-		content += "\n\n" + s.menu.View()
-	}
-	if s.confirm != nil {
-		content += "\n\n" + s.confirm.View()
-	}
 	box := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(s.theme.Border).
 		Padding(1, 2)
-	return lipgloss.Place(max(s.width, 1), max(s.height, 1), lipgloss.Center, lipgloss.Center, box.Render(content))
+	bg := lipgloss.Place(max(s.width, 1), max(s.height, 1), lipgloss.Center, lipgloss.Center, box.Render(content))
+	// Overlays (repo input, quant picker, action menu, confirm) float
+	// as a centered popup over the fixed-size box — appending them to
+	// the box made it grow and visually "move" (owner report).
+	if ov := s.overlayView(); ov != "" {
+		return overlayCenter(bg, ov, s.width, s.height)
+	}
+	return bg
+}
+
+// overlayView renders the active overlay form as a popup, or "" when
+// none is open.
+func (s StorageMode) overlayView() string {
+	var v string
+	switch {
+	case s.confirm != nil:
+		v = s.confirm.View()
+	case s.menu != nil:
+		v = s.menu.View()
+	case s.quantForm != nil:
+		v = s.quantForm.View()
+	case s.form != nil:
+		v = s.form.View()
+	default:
+		return ""
+	}
+	frame := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(s.theme.Border).
+		Padding(1, 2)
+	return frame.Render(v)
 }
 
 func (s StorageMode) renderList() []string {
@@ -894,6 +924,7 @@ func (s StorageMode) renderDownload() string {
 	}
 	line := fmt.Sprintf("%s:%s — %s%s", s.dl.repo, s.dl.quant, status, bar)
 	if s.dl.status == dlRunning {
+		line = s.spinner.View() + " " + line
 		speed := hf.HumanSize(s.dl.speed) + "/s"
 		line += fmt.Sprintf("  (%9s / %9s, %11s)", hf.HumanSize(s.dl.done), hf.HumanSize(s.dl.total), speed)
 	}
@@ -907,13 +938,13 @@ func (s StorageMode) renderFooter() string {
 		freeText = "free disk: " + hf.HumanSize(free)
 	}
 	keys := []string{
-		"↑/↓ select",
-		"enter actions",
-		"d download",
-		"esc back",
+		shortcut("↑/↓", "select", s.theme),
+		shortcut("enter", "actions", s.theme),
+		shortcut("d", "download", s.theme),
+		shortcut("esc", "back", s.theme),
 	}
 	return strings.Join([]string{
-		lipgloss.NewStyle().Foreground(s.theme.Muted).Render(strings.Join(keys, "  ·  ")),
+		strings.Join(keys, "  ·  "),
 		lipgloss.NewStyle().Foreground(s.theme.Muted).Render("cache root: " + s.root + "  ·  " + freeText),
 	}, "\n")
 }

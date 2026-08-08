@@ -35,6 +35,9 @@ const (
 // Router mode (globals.models-files entries — each spawns one
 // llama-server hosting every model in the file).
 type MainMode struct {
+	// statusLine is a one-line status hint rendered above the shortcuts
+	// (Root uses it to surface an in-flight download on Main).
+	statusLine string
 	cfg     *config.Config
 	cfgPath string // config file path; drives the derived models.ini default
 	keys    Keymap
@@ -149,6 +152,9 @@ func (m MainMode) IsSessionRunning() bool { return m.runningAlias != "" }
 // SetFlash sets a short status message shown beneath the list (or
 // beneath the shortcut row when the list is hidden). Used by Root to
 // surface spawn errors.
+// SetStatusLine sets the one-line status hint shown above the shortcuts.
+func (m *MainMode) SetStatusLine(line string) { m.statusLine = line }
+
 func (m *MainMode) SetFlash(msg string) { m.flash = msg }
 
 // HasModels reports whether the inline selection list is rendered in
@@ -495,6 +501,11 @@ func (m MainMode) View() string {
 
 	if (running || hasModels) && m.flash != "" {
 		parts = append(parts, "", m.renderFlash())
+	}
+
+	if m.statusLine != "" {
+		parts = append(parts, "",
+			lipgloss.NewStyle().Foreground(m.theme.StatusStart).Render(m.statusLine))
 	}
 
 	parts = append(parts, "", m.renderShortcuts())

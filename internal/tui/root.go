@@ -189,6 +189,7 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sessionTickMsg:
 		r.refreshSessionState()
+		r.refreshDlStatusLine()
 		return r, tickSession()
 
 	case SpawnRequestMsg:
@@ -231,7 +232,8 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return r, nil
 
 	case returnFromStorageMsg:
-		r.storage = nil
+		// the download (if any) keeps running; Main surfaces its status
+		r.refreshDlStatusLine()
 		r.view = ViewMain
 		return r, nil
 
@@ -527,28 +529,53 @@ type returnFromSettingsMsg struct{}
 // *hf.Client built lazily in openStorage.
 func (r *Root) SetDownloadEngine(e downloadEngine) { r.dlEngine = e }
 
-// openStorage switches to the Storage & Downloads manager.
+// openStorage switches to the Storage & Downloads manager. A live
+// manager is reused — leaving with Esc keeps any running download
+// alive, and re-entering shows it again (owner flow).
 func (r *Root) openStorage() (tea.Model, tea.Cmd) {
 	if r.cfg == nil {
 		return r, nil
 	}
-	root, err := storage.CacheRoot(r.cfg.Prefs().ModelsDir)
-	if err != nil {
-		r.mainMode.SetFlash("could not resolve cache root: " + err.Error())
-		return r, nil
+	if r.storage == nil {
+		root, err := storage.CacheRoot(r.cfg.Prefs().ModelsDir)
+		if err != nil {
+			r.mainMode.SetFlash("could not resolve cache root: " + err.Error())
+			return r, nil
+		}
+		sm := NewStorageMode(r.cfg, r.theme, root)
+		sm.cfgPath = r.cfgPath
+		if r.dlEngine != nil {
+			sm.SetEngine(r.dlEngine)
+		} else if c, err := hf.New(); err == nil {
+			sm.SetEngine(c)
+		}
+		r.storage = sm
 	}
-	sm := NewStorageMode(r.cfg, r.theme, root)
-	sm.cfgPath = r.cfgPath
-	if r.dlEngine != nil {
-		sm.SetEngine(r.dlEngine)
-	} else if c, err := hf.New(); err == nil {
-		sm.SetEngine(c)
-	}
-	sm.SetSize(r.width, r.height)
-	sm.rebuild()
-	r.storage = sm
+	r.storage.SetSize(r.width, r.height)
+	r.storage.flash = "" // no stale announcements on re-entry
+	r.storage.rebuild()
+	r.mainMode.SetStatusLine("")
 	r.view = ViewStorage
 	return r, nil
+}
+
+// refreshDlStatusLine surfaces an in-flight download on the Main screen
+// so leaving the manager never orphans it invisibly (owner flow).
+func (r *Root) refreshDlStatusLine() {
+	if r.storage == nil || r.storage.dl == nil {
+		r.mainMode.SetStatusLine("")
+		return
+	}
+	d := r.storage.dl
+	label := "⬇ downloading " + d.repo + ":" + d.quant
+	if d.status == dlDone {
+		label = "⬇ download finished: " + d.repo + ":" + d.quant
+	} else if d.status == dlFailed {
+		label = "✕ download failed: " + d.repo + ":" + d.quant
+	} else if d.status == dlPaused {
+		label = "⏸ download paused: " + d.repo + ":" + d.quant
+	}
+	r.mainMode.SetStatusLine(label + " — s to view")
 }
 
 func (r *Root) openSettings() (tea.Model, tea.Cmd) {

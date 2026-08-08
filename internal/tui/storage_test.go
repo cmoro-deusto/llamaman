@@ -133,8 +133,7 @@ func TestStorageDownloadNow(t *testing.T) {
 	driveRoot(t, r, keyMsg("d"))
 	driveRoot(t, r, keyMsg("org/newrepo"))
 	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // submit repo input
-	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // pick Q4_K_M (picker completes)
-	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // drain the completion tick
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // pick Q4_K_M (picker completes, tick drains)
 
 	want := "Download org/newrepo Q4_K_M"
 	if len(eng.calls) == 0 || eng.calls[len(eng.calls)-1] != want {
@@ -544,5 +543,57 @@ func TestProgressSlotKeepsLatest(t *testing.T) {
 	done, total := slot.get()
 	if done != 999 || total != 1000 {
 		t.Errorf("slot = %d/%d, want 999/1000 (latest wins)", done, total)
+	}
+}
+
+// TestStorageSpinnerWhileDownloading: a dot spinner animates left of the
+// download line while the download runs.
+func TestStorageSpinnerWhileDownloading(t *testing.T) {
+	_, sm := openStorageRoot(t, &stubEngine{})
+	sm.dl = &downloadState{repo: "org/r", quant: "Q4_K_M", status: dlRunning, total: 1 << 30, prog: &progressSlot{}}
+	sm.dl.prog.set(1<<29, 1<<30)
+	// two ticks advance the frame
+	sm.Update(dlTickMsg{})
+	sm.Update(dlTickMsg{})
+	line := stripANSI(sm.renderDownload())
+	if !strings.ContainsAny(line, "⣾⣽⣻⢿⡿⣟⣯⣷") {
+		t.Errorf("dot spinner missing from download line: %q", line)
+	}
+}
+
+// TestStorageEscKeepsDownload: leaving the manager with Esc keeps the
+// download running, Main shows its status, and re-entering shows it.
+func TestStorageEscKeepsDownload(t *testing.T) {
+	eng := &stubEngine{blockCh: make(chan struct{})}
+	r, sm := openStorageRoot(t, eng)
+	// start a blocking download directly
+	cmd := sm.startDownload("org/big", "Q4_K_M")
+	_ = cmd
+	if sm.dl == nil || sm.dl.status != dlRunning {
+		t.Fatalf("download not running: %+v", sm.dl)
+	}
+
+	driveRoot(t, r, keyMsg("esc"))
+	if r.view != ViewMain {
+		t.Fatalf("view = %d, want ViewMain", r.view)
+	}
+	if r.storage == nil {
+		t.Fatal("storage manager must survive esc (download keeps running)")
+	}
+	if r.storage.dl == nil || r.storage.dl.status != dlRunning {
+		t.Fatal("download must keep running after esc")
+	}
+	out := stripANSI(r.mainMode.View())
+	if !strings.Contains(out, "downloading org/big") {
+		t.Errorf("Main must surface the running download:\n%s", out)
+	}
+
+	// re-enter: same manager, same download
+	driveRoot(t, r, keyMsg("s"))
+	if r.view != ViewStorage || r.storage != sm {
+		t.Fatalf("re-entry must reuse the live manager")
+	}
+	if r.storage.dl == nil || r.storage.dl.status != dlRunning {
+		t.Fatal("download must still be visible after re-entry")
 	}
 }
