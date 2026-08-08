@@ -538,6 +538,7 @@ func (r *Root) openStorage() (tea.Model, tea.Cmd) {
 		return r, nil
 	}
 	sm := NewStorageMode(r.cfg, r.theme, root)
+	sm.cfgPath = r.cfgPath
 	if r.dlEngine != nil {
 		sm.SetEngine(r.dlEngine)
 	} else if c, err := hf.New(); err == nil {

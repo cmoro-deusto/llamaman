@@ -2046,8 +2046,10 @@ search/browse (item 7), no config-editor pickers (§3.8), no VRAM math
   progress), plus a **free-disk** line for the cache root's filesystem
   (`syscall.Statfs`). Sizes via `os.Stat`; all read-only rendering.
 - Actions per entry: cache repo → **delete** (confirm) / **re-download**;
-  local model → **reveal** (open parent dir) — delete of config entries
-  stays in config mode (never here, P8); download row → **pause /
+  local model → **reveal** (open parent dir); a *missing* local model
+  additionally offers **delete from config** (confirmed — the entry is
+  removed and persisted via the standard atomic save; P8's "never
+  without asking" is the confirmation); download row → **pause /
   resume / cancel**.
 
 #### Delete

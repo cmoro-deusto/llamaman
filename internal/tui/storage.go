@@ -44,12 +44,13 @@ const (
 
 // storageEntry is one selectable row of the manager list.
 type storageEntry struct {
-	kind    entryKind
-	title   string // repo id / alias / download row
-	detail  string // quants list / local model path
-	size    int64  // -1 = unknown/missing
-	path    string // local model path (the reveal target)
-	missing bool   // local model file absent on disk
+	kind     entryKind
+	title    string // repo id / alias / download row
+	detail   string // quants list / local model path
+	size     int64  // -1 = unknown/missing
+	path     string // local model path (the reveal target)
+	missing  bool   // local model file absent on disk
+	modelIdx int    // index into cfg.Models for local models
 }
 
 type dlStatus int
@@ -104,9 +105,10 @@ type StorageMode struct {
 	pendingRepo string
 	menu      *huh.Form // per-row action menu
 	menuAction string
-	confirm   *huh.Form // delete confirmation
-	confirmYes bool
+	confirm      *huh.Form // delete confirmation
+	confirmYes   bool
 	confirmEntry int
+	confirmAction string // "deletecache" | "deleteconfig"
 
 	dl      *downloadState
 	dlProg  chan dlProgressMsg
@@ -129,6 +131,12 @@ func (s *StorageMode) SetEngine(e downloadEngine) { s.engine = e }
 
 // SetSize tracks terminal dimensions.
 func (s *StorageMode) SetSize(w, h int) { s.width, s.height = w, h }
+
+// formWidth sizes overlay forms to the window so long repo ids stay
+// visible while typing (owner report: ~90-char ids did not fit).
+func (s *StorageMode) formWidth() int {
+	return max(60, min(s.width-12, 160))
+}
 
 // Init starts nothing — the list renders immediately.
 func (s *StorageMode) Init() tea.Cmd { return nil }
@@ -171,11 +179,11 @@ func (s *StorageMode) rebuild() {
 		}
 		s.entries = append(s.entries, entry)
 	}
-	for _, m := range s.cfg.Models {
+	for i, m := range s.cfg.Models {
 		if m.Location == "" {
 			continue
 		}
-		entry := storageEntry{kind: entryLocalModel, title: m.Alias, detail: m.Location, path: m.Location}
+		entry := storageEntry{kind: entryLocalModel, title: m.Alias, detail: m.Location, path: m.Location, modelIdx: i}
 		if info, err := os.Stat(m.Location); err == nil {
 			entry.size = info.Size()
 		} else {
@@ -491,8 +499,9 @@ func (s *StorageMode) openRepoForm() tea.Cmd {
 			Title("download model").
 			Description("org/repo[:quant] — fetched into the cache; launch stays delegated (llama.cpp)").
 			Placeholder("e.g. unsloth/Qwen3.6-27B-GGUF:UD-Q4_K_XL").
+			CharLimit(2048).
 			Value(&s.repoVal),
-	)).WithTheme(configHuhTheme(s.theme))
+	)).WithTheme(configHuhTheme(s.theme)).WithWidth(s.formWidth())
 	s.pendingRepo = ""
 	return s.form.Init()
 }
@@ -561,7 +570,7 @@ func (s *StorageMode) openQuantPicker(repo string) tea.Cmd {
 			Description(repo).
 			Options(choices...).
 			Value(&s.quantVal),
-	)).WithTheme(configHuhTheme(s.theme))
+	)).WithTheme(configHuhTheme(s.theme)).WithWidth(s.formWidth())
 	s.pendingRepo = repo
 	return s.quantForm.Init()
 }
@@ -611,7 +620,12 @@ func (s *StorageMode) openMenu() tea.Cmd {
 			}
 		}
 	case entryLocalModel:
-		opts = []huh.Option[string]{huh.NewOption("open folder", "reveal")}
+		if e.missing {
+			// a missing model has nothing on disk to remove — deleting
+			// the config entry (with confirmation) is the cleanup.
+			opts = append(opts, huh.NewOption("delete from config", "deleteconfig"))
+		}
+		opts = append(opts, huh.NewOption("open folder", "reveal"))
 	}
 	if len(opts) == 0 {
 		return nil
@@ -619,7 +633,7 @@ func (s *StorageMode) openMenu() tea.Cmd {
 	s.menuAction = ""
 	s.menu = huh.NewForm(huh.NewGroup(
 		huh.NewSelect[string]().Title(e.title).Options(opts...).Value(&s.menuAction),
-	)).WithTheme(configHuhTheme(s.theme))
+	)).WithTheme(configHuhTheme(s.theme)).WithWidth(s.formWidth())
 	return s.menu.Init()
 }
 
@@ -646,11 +660,12 @@ func (s *StorageMode) updateMenu(msg tea.Msg) (*StorageMode, tea.Cmd) {
 			case "delete":
 				s.confirmEntry = s.cursor
 				s.confirmYes = false
+				s.confirmAction = "deletecache"
 				s.confirm = huh.NewForm(huh.NewGroup(
 					huh.NewConfirm().Title("delete " + e.title + "?").
 						Description("removes the cached files; config entries are never touched").
 						Value(&s.confirmYes),
-				)).WithTheme(configHuhTheme(s.theme))
+				)).WithTheme(configHuhTheme(s.theme)).WithWidth(s.formWidth())
 				return s, s.confirm.Init()
 			}
 		case entryDownload:
@@ -666,7 +681,18 @@ func (s *StorageMode) updateMenu(msg tea.Msg) (*StorageMode, tea.Cmd) {
 				s.cancelDownload()
 			}
 		case entryLocalModel:
-			if action == "reveal" {
+			switch action {
+			case "deleteconfig":
+				s.confirmEntry = s.cursor
+				s.confirmYes = false
+				s.confirmAction = "deleteconfig"
+				s.confirm = huh.NewForm(huh.NewGroup(
+					huh.NewConfirm().Title("remove " + e.title + " from config?").
+						Description("deletes the config entry; cached files are untouched").
+						Value(&s.confirmYes),
+				)).WithTheme(configHuhTheme(s.theme)).WithWidth(s.formWidth())
+				return s, s.confirm.Init()
+			case "reveal":
 				return s, s.reveal(e.path)
 			}
 		}
@@ -687,18 +713,44 @@ func (s *StorageMode) updateConfirm(msg tea.Msg) (*StorageMode, tea.Cmd) {
 	}
 	if s.confirm != nil && s.confirm.State == huh.StateCompleted {
 		yes := s.confirmYes
+		action := s.confirmAction
 		s.confirm = nil
 		if yes {
-			repo := s.entries[s.confirmEntry].title
-			if err := s.deleteCacheEntry(repo); err != nil {
-				s.flash = "delete failed: " + err.Error()
-			} else {
-				s.flash = "deleted " + repo
+			e := s.entries[s.confirmEntry]
+			switch action {
+			case "deleteconfig":
+				if err := s.deleteModelFromConfig(e.modelIdx); err != nil {
+					s.flash = "could not remove from config: " + err.Error()
+				}
+			default:
+				if err := s.deleteCacheEntry(e.title); err != nil {
+					s.flash = "delete failed: " + err.Error()
+				} else {
+					s.flash = "deleted " + e.title
+				}
 			}
+			s.flashAt = time.Now()
 			s.rebuild()
 		}
 	}
 	return s, cmd
+}
+
+// deleteModelFromConfig removes a model entry from the live config and
+// persists via the standard atomic save (P8: config is only mutated by
+// explicit user actions — this one is confirmed). Cached files are
+// never touched here.
+func (s *StorageMode) deleteModelFromConfig(idx int) error {
+	if idx < 0 || idx >= len(s.cfg.Models) {
+		return nil
+	}
+	alias := s.cfg.Models[idx].Alias
+	s.cfg.Models = append(s.cfg.Models[:idx], s.cfg.Models[idx+1:]...)
+	if err := config.Save(s.cfgPath, s.cfg); err != nil {
+		return err
+	}
+	s.flash = "removed " + alias + " from config"
+	return nil
 }
 
 // View renders the manager.

@@ -413,3 +413,72 @@ func TestStorageCachedQuantMarked(t *testing.T) {
 		t.Errorf("uncached quant must not be marked cached:\n%s", out)
 	}
 }
+
+// TestStorageDeleteMissingModelFromConfig: a missing local model offers
+// "delete from config"; confirming removes the entry and persists.
+func TestStorageDeleteMissingModelFromConfig(t *testing.T) {
+	cfg, _ := storageTestConfig(t) // alpha/beta locations do not exist → missing
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	r := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
+	r.SetDownloadEngine(&stubEngine{})
+	driveRoot(t, r, tea.WindowSizeMsg{Width: 120, Height: 40}, keyMsg("s"))
+	sm := r.storage
+
+	// move the cursor to the first missing local model (alpha)
+	idx := -1
+	for i, e := range sm.entries {
+		if e.kind == entryLocalModel && e.title == "alpha" {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		t.Fatal("alpha (missing local model) not found in the listing")
+	}
+	sm.cursor = idx
+
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // open the action menu
+	out := stripANSI(sm.View())
+	if !strings.Contains(out, "delete from config") {
+		t.Fatalf("missing model menu must offer 'delete from config':\n%s", out)
+	}
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // choose → confirm opens
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyRight}) // confirm: move to Yes
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // confirm: submit Yes
+
+	for _, m := range r.cfg.Models {
+		if m.Alias == "alpha" {
+			t.Errorf("alpha must be removed from the live config")
+		}
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range loaded.Models {
+		if m.Alias == "alpha" {
+			t.Errorf("alpha must be removed on disk")
+		}
+	}
+	if !strings.Contains(stripANSI(sm.View()), "removed alpha from config") {
+		t.Errorf("confirmation flash missing:\n%s", stripANSI(sm.View()))
+	}
+}
+
+// TestStorageRepoFormShowsLongIdTail: the download-now input is sized
+// to the window; typing a ~90-char repo id must keep the typed tail
+// visible (the textinput scrolls to the caret).
+func TestStorageRepoFormShowsLongIdTail(t *testing.T) {
+	_, sm := openStorageRoot(t, &stubEngine{})
+	cmd := sm.openRepoForm()
+	_ = cmd
+	long := "DavidAU/Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF:Q4_K_M"
+	sm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(long)})
+	rendered := sm.form.View()
+	tail := long[len(long)-12:]
+	if !strings.Contains(rendered, tail) {
+		t.Errorf("typed tail %q must be visible in the input:\n%s", tail, rendered)
+	}
+}
