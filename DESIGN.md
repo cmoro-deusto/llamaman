@@ -2031,6 +2031,11 @@ run-mode panel keeps only the passive §15.4 progress. **Non-goals:** no
 search/browse (item 7), no config-editor pickers (§3.8), no VRAM math
 (R3), no router-mode changes.
 
+**Esc keeps downloads alive.** Leaving the manager with Esc does not
+cancel an in-flight download: the manager is reused on re-entry, and
+Main surfaces a `⬇ downloading … — s to view` status line (refreshed on
+the session tick) so a download is never silently orphaned.
+
 #### Mode structure
 
 - New `ViewStorage` under Root; entry key **`s`** in Main (`s storage`).
