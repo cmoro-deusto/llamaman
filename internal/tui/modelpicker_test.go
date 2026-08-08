@@ -483,6 +483,89 @@ func TestModelFormHFRepoFilterResetsNewRepoRow(t *testing.T) {
 	}
 }
 
+// TestModelFormPickerHiddenFiles checks the owner feedback: hidden
+// files/dirs are shown by default, "." toggles them off and on
+// (re-reading the current directory each time), and a shown hidden
+// .gguf is selectable.
+func TestModelFormPickerHiddenFiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "model.gguf"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".hidden.gguf"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Version: 1, Globals: config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
+	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceLocal)
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyCtrlO})
+	if c.modelPicker == nil {
+		t.Fatal("local picker did not open")
+	}
+	if !c.modelPicker.fp.ShowHidden {
+		t.Error("hidden files should be shown by default")
+	}
+	if !strings.Contains(c.View(), ".hidden.gguf") {
+		t.Error("hidden file not listed while hidden shown")
+	}
+
+	// "." toggles hidden off.
+	c = drive(t, c, keyRunes("."))
+	if c.modelPicker == nil {
+		t.Fatal("overlay closed on the toggle key")
+	}
+	if c.modelPicker.fp.ShowHidden {
+		t.Error("toggle did not switch hidden off")
+	}
+	if strings.Contains(c.View(), ".hidden.gguf") {
+		t.Error("hidden file still listed after toggle off")
+	}
+	if !strings.Contains(c.View(), "hidden off") {
+		t.Error("hint does not show hidden off state")
+	}
+
+	// "." again restores them.
+	c = drive(t, c, keyRunes("."))
+	if !c.modelPicker.fp.ShowHidden {
+		t.Error("toggle did not switch hidden back on")
+	}
+	if !strings.Contains(c.View(), ".hidden.gguf") {
+		t.Error("hidden file not restored after toggle on")
+	}
+}
+
+// TestModelFormHFWideList checks the owner feedback: the HF repo list
+// is sized to nearly the full screen width so long org/repo ids and
+// their quant lists stay on one line.
+func TestModelFormHFWideList(t *testing.T) {
+	root := t.TempDir()
+	mkHubRepo(t, root, "DavidAU/Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF",
+		"model-Q4_K_S.gguf", "model-Q4_K_M.gguf")
+	cfg := &config.Config{
+		Version:     1,
+		Globals:     config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Preferences: &config.Preferences{ModelsDir: root},
+	}
+	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceHF)
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyCtrlO})
+	if c.modelPicker == nil {
+		t.Fatal("repo picker did not open")
+	}
+	if got := c.modelPicker.repos.list.Width(); got != c.width-8 {
+		t.Errorf("repo list width = %d, want %d (screen width - 8)", got, c.width-8)
+	}
+	// The long id and both quants render on a single line each.
+	view := c.View()
+	for _, want := range []string{
+		"DavidAU/Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF",
+		"Q4_K_S", "Q4_K_M",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("repo picker view missing %q", want)
+		}
+	}
+}
+
 // TestModelFormHFEmptyCacheSkipsPicker checks §3.8: an empty cache
 // makes ctrl+o a no-op — the field stays a plain free-type input.
 func TestModelFormHFEmptyCacheSkipsPicker(t *testing.T) {

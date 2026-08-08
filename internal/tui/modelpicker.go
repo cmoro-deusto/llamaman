@@ -123,11 +123,12 @@ func (p *pickerInput) RefreshValue() {
 // HF branch. It is rendered by ConfigMode over the three-pane
 // background (overlayCenter) and reports back via modelPickerDoneMsg.
 type modelPicker struct {
-	kind     string // sourceLocal | sourceHF
-	fp       filepicker.Model
-	repos    *repoPicker
-	startDir string // the filepicker's opening directory (the esc-cancel boundary)
-	errLine  string // transient overlay error (e.g. selecting a disabled file)
+	kind         string // sourceLocal | sourceHF
+	fp           filepicker.Model
+	repos        *repoPicker
+	startDir     string // the filepicker's opening directory (the esc-cancel boundary)
+	toggleHidden key.Binding // "." — show/hide hidden files in the local picker
+	errLine      string // transient overlay error (e.g. selecting a disabled file)
 }
 
 // newLocalPicker builds the .gguf filepicker starting at dir.
@@ -137,6 +138,10 @@ func newLocalPicker(dir string) *modelPicker {
 	fp.AllowedTypes = []string{".gguf"}
 	fp.ShowSize = true
 	fp.ShowPermissions = false
+	// Hidden files/dirs are listed by default and "." toggles them
+	// (owner feedback; Init re-reads the current dir with the new
+	// visibility).
+	fp.ShowHidden = true
 	// DirAllowed stays false (the default): dirs are still navigable
 	// via enter, but must never read as a file selection — with it
 	// true, entering a directory sets fp.Path and DidSelectFile
@@ -158,7 +163,12 @@ func newLocalPicker(dir string) *modelPicker {
 		Open:     key.NewBinding(key.WithKeys("right", "enter"), key.WithHelp("enter", "open")),
 		Select:   key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "select")),
 	}
-	return &modelPicker{kind: sourceLocal, fp: fp, startDir: dir}
+	return &modelPicker{
+		kind:         sourceLocal,
+		fp:           fp,
+		startDir:     dir,
+		toggleHidden: key.NewBinding(key.WithKeys("."), key.WithHelp(".", "toggle hidden")),
+	}
 }
 
 // newRepoPicker scans root and builds the cached-repo list overlay.
@@ -234,6 +244,12 @@ func (p *modelPicker) Update(msg tea.Msg) (*modelPicker, tea.Cmd) {
 	// Local filepicker.
 	if k, ok := msg.(tea.KeyMsg); ok {
 		p.errLine = ""
+		if key.Matches(k, p.toggleHidden) {
+			p.fp.ShowHidden = !p.fp.ShowHidden
+			// Init re-reads the current directory with the new
+			// visibility (readDirMsg flows back through the loop).
+			return p, p.fp.Init()
+		}
 		if key.Matches(k, p.fp.KeyMap.Back) && p.fp.CurrentDirectory == p.startDir {
 			// esc back at the opening directory cancels instead of
 			// leaving it: the picker is closed, nothing changes.
@@ -263,8 +279,12 @@ func (p *modelPicker) View(theme Theme) string {
 		if p.errLine != "" {
 			parts = append(parts, lipgloss.NewStyle().Foreground(theme.Subtle).Render(p.errLine))
 		}
+		hidden := "off"
+		if p.fp.ShowHidden {
+			hidden = "on"
+		}
 		parts = append(parts, lipgloss.NewStyle().Foreground(theme.Subtle).Render(
-			"↑↓: move · enter: open/select · esc: back, cancel at start"))
+			"↑↓: move · enter: open/select · esc: back, cancel at start · .: hidden "+hidden))
 		return box.Render(strings.Join(parts, "\n"))
 	}
 	return box.Render(p.repos.View(theme))

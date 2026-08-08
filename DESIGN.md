@@ -2188,7 +2188,10 @@ gotchas).
 - `AllowedTypes = [".gguf"]` — other files render disabled (the
   picker's `canSelect` suffix rule; selecting one is a no-op that shows
   a brief `.gguf files only` error line, matching `DidSelectDisabledFile`).
-- `ShowSize = true`; `ShowPermissions = false`; `ShowHidden = false`.
+- `ShowSize = true`; `ShowPermissions = false`; **`ShowHidden = true`**
+  — hidden files/dirs are listed by default, and **`.`** toggles them
+  (owner feedback; `fp.Init()` re-reads the current directory with the
+  new visibility; the hint line shows the current state).
   `DirAllowed` stays **false** — directories remain navigable via
   enter, but never selectable: with it true, entering a directory sets
   `fp.Path` and `DidSelectFile` reports the directory itself as picked
@@ -2233,7 +2236,10 @@ via `hf.Quants(repoFiles(fs))` + `hf.HumanSize` — both package-level in
 
 The overlay is a `bubbles/list` picker in the `paramPicker` shape
 (arrows-only keymap, type-to-filter, reverse-video selection, no
-chrome). ROADMAP §3.8 names `huh.Select`, but per-option descriptions
+chrome). It is sized to **nearly the full screen width** (`width - 8`
+inner, vs the standard `pickerSize` width), so long `org/repo` ids and
+their quant lists stay on one line (owner feedback). ROADMAP §3.8 names
+`huh.Select`, but per-option descriptions
 (quants + sizes) are exactly what `huh.Select` cannot render — the same
 reason `paramPicker` exists — so the custom list picker is used
 instead; the mechanism (overlay outside huh driven by a done message)
