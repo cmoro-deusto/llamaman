@@ -365,7 +365,11 @@ func (s *StorageMode) handleDlTick() (*StorageMode, tea.Cmd) {
 	if s.dl == nil {
 		return s, nil
 	}
-	return s, func() tea.Msg { return dlTickMsg{} }
+	interval := s.spinner.Spinner.FPS
+	if interval <= 0 {
+		interval = 100 * time.Millisecond
+	}
+	return s, tea.Tick(interval, func(time.Time) tea.Msg { return dlTickMsg{} })
 }
 
 func (s *StorageMode) handleDlFinished(err error) tea.Cmd {
