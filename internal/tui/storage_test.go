@@ -602,7 +602,7 @@ func TestStorageEscKeepsDownload(t *testing.T) {
 // removed, flash announced) and the footer hints the key.
 func TestStorageQuickCancel(t *testing.T) {
 	_, sm := openStorageRoot(t, &stubEngine{})
-	sm.dl = &downloadState{repo: "org/big", quant: "Q4_K_M", status: dlRunning, prog: &progressSlot{}}
+	sm.dl = &downloadState{repo: "org/big", quant: "Q4_K_M", status: dlRunning, prog: &progressSlot{}, cancel: func() {}}
 	partial := filepath.Join(sm.root, storage.RepoFolderNames("org/big")[0], "blobs", "x.incomplete")
 	if err := os.MkdirAll(filepath.Dir(partial), 0o755); err != nil {
 		t.Fatal(err)
