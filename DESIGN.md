@@ -2183,25 +2183,30 @@ gotchas).
 
 #### Local branch — the GGUF filepicker
 
-`bubbles/filepicker` v1.0.0 (already a dependency), configured:
+A custom `fileBrowser` (DESIGN §16.5 amendment — `bubbles/filepicker`
+has **no filtering hook**, so the local branch is a thin hand-rolled
+browser with the same behaviors plus type-to-filter; the widget's own
+`AllowedTypes`/`ShowHidden`/keymap behavior is replicated):
 
-- `AllowedTypes = [".gguf"]` — other files render disabled (the
-  picker's `canSelect` suffix rule; selecting one is a no-op that shows
-  a brief `.gguf files only` error line, matching `DidSelectDisabledFile`).
-- `ShowSize = true`; `ShowPermissions = false`; **`ShowHidden = true`**
-  — hidden files/dirs are listed by default, and **`.`** toggles them
-  (owner feedback; `fp.Init()` re-reads the current directory with the
-  new visibility; the hint line shows the current state).
-  `DirAllowed` stays **false** — directories remain navigable via
-  enter, but never selectable: with it true, entering a directory sets
-  `fp.Path` and `DidSelectFile` reports the directory itself as picked
-  (huh keeps it false for the same reason).
-- Keymap trimmed to the config-mode arrow convention (same rationale as
-  `paramPicker` dropping j/k): `↑`/`↓` move, `enter` opens a directory
-  or selects a file, `esc`/`backspace`/`←` go up one level, `esc` at
-  the root level cancels the overlay. `g`/`G`/`j`/`k`/`h`/`l` removed.
-- Sized via the existing `pickerSize()` + `overlayCenter` (the same box
-  treatment `paramPicker.View` uses), height through `picker.SetHeight`.
+- Dirs-first listing (alphabetical within each group); **`.gguf` files
+  are selectable**, everything else renders disabled — selecting one is
+  a no-op with a brief `.gguf files only` error line. Dirs are
+  navigable but never selectable.
+- **Hidden files/dirs are listed by default**, and **`tab`** toggles
+  them (owner feedback; round-1 `tab` moved from `.` because typing
+  now filters, so a printable toggle key is impossible). The hint line
+  shows the current state (`hidden on/off`).
+- **Type-to-filter**: printable runes narrow the listing live
+  (case-insensitive substring on the name); backspace erases a filter
+  character; `esc` clears the filter first, then goes up / cancels at
+  the start dir. `↑`/`↓` move, `pgup`/`pgdn` page, `enter` opens a
+  directory or picks a file, `esc`/`backspace`/`←` go up one level,
+  `esc` at the start dir cancels. No-match queries show a
+  `no matching files` empty state.
+- Rows truncate with an ellipsis at the box width (never wrap);
+  sizes via `hf.HumanSize`.
+- Sized via the existing `pickerSize()` height + `overlayCenter` (the
+  same box treatment `paramPicker.View` uses).
 
 **Start-directory resolution**, first candidate that exists wins:
 
@@ -2220,8 +2225,8 @@ gotchas).
 4. `~`.
 
 If every candidate is unset or nonexistent, `~` is used. The resolved
-dir is passed as `CurrentDirectory`; the filepicker's own
-`readDir`-on-Init fills the listing.
+dir is the browser's start dir (the esc-cancel boundary); the browser
+reads the directory synchronously at construction.
 
 #### HF branch — the cached-repo list
 
@@ -2235,10 +2240,11 @@ via `hf.Quants(repoFiles(fs))` + `hf.HumanSize` — both package-level in
 `internal/tui`/`internal/hf` already.
 
 The overlay is a `bubbles/list` picker in the `paramPicker` shape
-(arrows-only keymap, type-to-filter, reverse-video selection, no
-chrome). It is sized to **nearly the full screen width** (`width - 8`
+(arrows-only keymap, reverse-video selection, no
+chrome). It is sized to **essentially the full screen width** (`width - 6`
 inner, vs the standard `pickerSize` width), so long `org/repo` ids and
-their quant lists stay on one line (owner feedback). ROADMAP §3.8 names
+their quant lists stay on one line (owner feedback); the delegate
+ellipsizes anything longer than the screen (it never wraps). ROADMAP §3.8 names
 `huh.Select`, but per-option descriptions
 (quants + sizes) are exactly what `huh.Select` cannot render — the same
 reason `paramPicker` exists — so the custom list picker is used
@@ -2249,9 +2255,13 @@ is the one §3.8 itself prescribes to reuse. Rows:
   `Q4_K_M — 4.2 GB, Q8_0 — 8.4 GB` (comma-joined, `hf.HumanSize`), or
   `no model quants cached` when the repo has files but no quants (e.g.
   only mmproj — same "empty cache repo" rule as the manager).
-- A trailing **`type a new repo…`** row, always present (never
-  filterable out — it is added after the filtered list is computed).
-- `enter` picks; `esc` cancels (both emit `modelPickerDoneMsg`).
+- A trailing **`select a repo…`** row, always present (never
+  filterable out); selecting it closes the picker and lets the user
+  type an id in the field (owner-chosen label).
+- **Live filter** (consistent with the file browser): typing filters
+  as you go and `enter` picks the selected repo directly; `esc`
+  clears the filter first. `enter` picks; `esc` cancels (both emit
+  `modelPickerDoneMsg`).
 - **Empty cache** (zero repos) → the picker does not open; the field
   stays a plain free-type input (§3.8: "an empty cache skips the
   list"). Scan errors / unresolvable root → same no-op (P3; never a

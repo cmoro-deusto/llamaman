@@ -14,7 +14,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/filepicker"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
@@ -51,7 +50,272 @@ type modelPickerDoneMsg struct {
 type pickerFormRefreshMsg struct{}
 
 // repoTypeNew is the always-present trailing row of the HF picker.
-const repoTypeNew = "type a new repo…"
+// Selecting it closes the picker and lets the user type an id in the
+// field (owner-chosen label).
+const repoTypeNew = "select a repo…"
+
+// fileBrowser is the local branch's filterable directory browser
+// (DESIGN §16.5). Dirs-first listing of the current directory; .gguf
+// files are selectable, everything else is shown disabled; hidden
+// entries are listed by default and tab toggles them; typing filters
+// live (case-insensitive substring on the name).
+type fileBrowser struct {
+	dir        string
+	startDir   string // the opening directory — the esc-cancel boundary
+	all        []browserEntry
+	entries    []browserEntry // filtered view of all
+	cursor     int
+	filter     string
+	showHidden bool
+	errLine    string
+	width      int
+	height     int
+
+	keys browserKeys
+}
+
+// browserKeys are the browser's keybindings (arrows-only, config-mode
+// convention). "right" also opens, matching the filepicker it replaced.
+type browserKeys struct {
+	up, down, pageUp, pageDown, back, open, toggleHidden key.Binding
+}
+
+// browserEntry is one directory entry.
+type browserEntry struct {
+	name  string
+	isDir bool
+	size  int64
+}
+
+// SetSize stores the browser dimensions (paging + row truncation).
+func (b *fileBrowser) SetSize(w, h int) {
+	b.width, b.height = w, h
+	if h < 4 {
+		b.height = 4
+	}
+}
+
+// readDir (re)reads the current directory into all (dirs first, then
+// files, both alphabetical) and re-applies the filter.
+func (b *fileBrowser) readDir() {
+	b.all = b.all[:0]
+	entries, err := os.ReadDir(b.dir) // already name-sorted
+	if err != nil {
+		b.errLine = "cannot read " + b.dir
+		b.applyFilter()
+		return
+	}
+	for _, e := range entries {
+		if !b.showHidden && strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		info, err := os.Stat(filepath.Join(b.dir, e.Name())) // follows symlinks
+		isDir := err == nil && info.IsDir()
+		var size int64
+		if !isDir && err == nil {
+			size = info.Size()
+		}
+		b.all = append(b.all, browserEntry{name: e.Name(), isDir: isDir, size: size})
+	}
+	// dirs first, then files; stable keeps the name order within groups.
+	sort.SliceStable(b.all, func(i, j int) bool {
+		if b.all[i].isDir != b.all[j].isDir {
+			return b.all[i].isDir
+		}
+		return b.all[i].name < b.all[j].name
+	})
+	b.applyFilter()
+}
+
+// applyFilter recomputes the visible entries from the current query.
+func (b *fileBrowser) applyFilter() {
+	if b.filter == "" {
+		b.entries = b.all
+	} else {
+		q := strings.ToLower(b.filter)
+		b.entries = b.entries[:0]
+		for _, e := range b.all {
+			if strings.Contains(strings.ToLower(e.name), q) {
+				b.entries = append(b.entries, e)
+			}
+		}
+	}
+	if b.cursor >= len(b.entries) {
+		b.cursor = max(0, len(b.entries)-1)
+	}
+	if b.cursor < 0 {
+		b.cursor = 0
+	}
+}
+
+// isSelectableGGUF reports whether a file entry may be picked.
+func isSelectableGGUF(name string) bool {
+	return strings.HasSuffix(strings.ToLower(name), ".gguf")
+}
+
+// Update routes keys for the browser. Live filtering: printable runes
+// narrow the listing, enter acts on the selection, backspace erases a
+// filter character (or goes up with an empty filter), esc clears the
+// filter first (then goes up / cancels at the start dir), tab toggles
+// hidden.
+func (b *fileBrowser) Update(msg tea.Msg) (*fileBrowser, tea.Cmd) {
+	k, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return b, nil
+	}
+	b.errLine = ""
+	switch {
+	case key.Matches(k, b.keys.toggleHidden):
+		b.showHidden = !b.showHidden
+		b.readDir()
+	case key.Matches(k, b.keys.up):
+		if b.cursor > 0 {
+			b.cursor--
+		}
+	case key.Matches(k, b.keys.down):
+		if b.cursor < len(b.entries)-1 {
+			b.cursor++
+		}
+	case key.Matches(k, b.keys.pageUp):
+		b.cursor = max(0, b.cursor-max(1, b.height-2))
+	case key.Matches(k, b.keys.pageDown):
+		if n := len(b.entries); n > 0 {
+			b.cursor = min(n-1, b.cursor+max(1, b.height-2))
+		}
+	case key.Matches(k, b.keys.open):
+		e, ok := b.selected()
+		if !ok {
+			return b, nil
+		}
+		if e.isDir {
+			b.dir = filepath.Join(b.dir, e.name)
+			b.filter, b.cursor = "", 0
+			b.readDir()
+			return b, nil
+		}
+		if !isSelectableGGUF(e.name) {
+			b.errLine = ".gguf files only"
+			return b, nil
+		}
+		return b, func() tea.Msg {
+			return modelPickerDoneMsg{kind: sourceLocal, value: filepath.Join(b.dir, e.name)}
+		}
+	case k.Type == tea.KeyBackspace:
+		if b.filter != "" {
+			b.filter = b.filter[:len(b.filter)-1]
+			b.applyFilter()
+		} else if b.dir == b.startDir {
+			return b, func() tea.Msg { return modelPickerDoneMsg{kind: sourceLocal, cancelled: true} }
+		} else {
+			b.ascend()
+		}
+	case key.Matches(k, b.keys.back): // esc / left
+		if b.filter != "" {
+			b.filter = ""
+			b.applyFilter()
+			return b, nil
+		}
+		if b.dir == b.startDir {
+			return b, func() tea.Msg { return modelPickerDoneMsg{kind: sourceLocal, cancelled: true} }
+		}
+		b.ascend()
+	case isPrintableRune(k):
+		b.filter += string(k.Runes)
+		b.applyFilter()
+	}
+	return b, nil
+}
+
+// ascend moves one level up and re-reads.
+func (b *fileBrowser) ascend() {
+	b.dir = filepath.Dir(b.dir)
+	b.filter, b.cursor = "", 0
+	b.readDir()
+}
+
+// selected returns the entry under the cursor.
+func (b *fileBrowser) selected() (browserEntry, bool) {
+	if len(b.entries) == 0 {
+		return browserEntry{}, false
+	}
+	return b.entries[b.cursor], true
+}
+
+// View renders the filter line, the listing, and a hint line inside
+// the popup box (the box itself is drawn by modelPicker.View).
+func (b *fileBrowser) View(theme Theme) string {
+	parts := []string{}
+	if b.filter != "" {
+		label := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true).Render("filter: ")
+		cursor := lipgloss.NewStyle().Foreground(theme.Accent).Render("▎")
+		parts = append(parts, label+b.filter+cursor)
+	}
+	if len(b.entries) == 0 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(theme.Subtle).Render("no matching files"))
+	} else {
+		inner := max(20, b.width-6)
+		for i, e := range b.entries {
+			parts = append(parts, b.renderRow(theme, e, i == b.cursor, inner))
+		}
+	}
+	if b.errLine != "" {
+		parts = append(parts, lipgloss.NewStyle().Foreground(theme.Subtle).Render(b.errLine))
+	}
+	hidden := "off"
+	if b.showHidden {
+		hidden = "on"
+	}
+	parts = append(parts, lipgloss.NewStyle().Foreground(theme.Subtle).Render(
+		"type to filter · ↑↓: move · enter: open/select · esc: back, cancel at start · tab: hidden "+hidden))
+	return strings.Join(parts, "\n")
+}
+
+// renderRow draws one listing row: title = name (+ "/" for dirs),
+// description = size or "directory". Selected rows reverse-video;
+// non-.gguf files render dimmed.
+func (b *fileBrowser) renderRow(theme Theme, e browserEntry, selected bool, inner int) string {
+	name := truncateWidth(e.name, inner-1)
+	title := name
+	if e.isDir {
+		title += "/"
+	}
+	desc := "directory"
+	if !e.isDir {
+		desc = hf.HumanSize(e.size)
+	}
+	dim := !e.isDir && !isSelectableGGUF(e.name)
+	if selected {
+		style := lipgloss.NewStyle().Reverse(true)
+		return style.Render(truncateWidth(title, inner)) + "\n" + style.Render(truncateWidth(desc, inner))
+	}
+	titleStyle := lipgloss.NewStyle()
+	descStyle := lipgloss.NewStyle()
+	if dim {
+		titleStyle = titleStyle.Foreground(theme.Subtle)
+		descStyle = descStyle.Foreground(theme.Subtle)
+	}
+	return titleStyle.Render(truncateWidth(title, inner)) + "\n" +
+		descStyle.Render(truncateWidth(desc, inner))
+}
+
+// truncateWidth shortens s to at most w cells, appending an ellipsis
+// when it had to cut (rows must never wrap inside the popup).
+func truncateWidth(s string, w int) string {
+	if w <= 0 || lipgloss.Width(s) <= w {
+		return s
+	}
+	var out []rune
+	width := 0
+	for _, r := range s {
+		rw := lipgloss.Width(string(r))
+		if width+rw > w-1 {
+			break
+		}
+		out = append(out, r)
+		width += rw
+	}
+	return string(out) + "…"
+}
 
 // pickerInput is the model form's picker-assisted input (DESIGN §16.5).
 // It embeds *huh.Input — the free-type fallback stays fully usable —
@@ -119,56 +383,40 @@ func (p *pickerInput) RefreshValue() {
 }
 
 // modelPicker is the picker overlay opened from the model form: a
-// .gguf filepicker for the local branch, a cached-repo list for the
+// .gguf file browser for the local branch, a cached-repo list for the
 // HF branch. It is rendered by ConfigMode over the three-pane
 // background (overlayCenter) and reports back via modelPickerDoneMsg.
 type modelPicker struct {
-	kind         string // sourceLocal | sourceHF
-	fp           filepicker.Model
-	repos        *repoPicker
-	startDir     string // the filepicker's opening directory (the esc-cancel boundary)
-	toggleHidden key.Binding // "." — show/hide hidden files in the local picker
-	errLine      string // transient overlay error (e.g. selecting a disabled file)
+	kind    string // sourceLocal | sourceHF
+	browser *fileBrowser
+	repos   *repoPicker
 }
 
-// newLocalPicker builds the .gguf filepicker starting at dir.
-func newLocalPicker(dir string) *modelPicker {
-	fp := filepicker.New()
-	fp.CurrentDirectory = dir
-	fp.AllowedTypes = []string{".gguf"}
-	fp.ShowSize = true
-	fp.ShowPermissions = false
-	// Hidden files/dirs are listed by default and "." toggles them
-	// (owner feedback; Init re-reads the current dir with the new
-	// visibility).
-	fp.ShowHidden = true
-	// DirAllowed stays false (the default): dirs are still navigable
-	// via enter, but must never read as a file selection — with it
-	// true, entering a directory sets fp.Path and DidSelectFile
-	// reports the dir as picked (huh keeps it false for the same
-	// reason).
-	fp.DirAllowed = false
-	fp.FileAllowed = true
-	// Arrows-only keymap, matching the config-mode convention (the
-	// same rationale as paramPicker dropping j/k). esc doubles as
-	// "up one level" and, at the root, "cancel the overlay".
-	fp.KeyMap = filepicker.KeyMap{
-		GoToTop:  key.NewBinding(),
-		GoToLast: key.NewBinding(),
-		Up:       key.NewBinding(key.WithKeys("up"), key.WithHelp("↑", "up")),
-		Down:     key.NewBinding(key.WithKeys("down"), key.WithHelp("↓", "down")),
-		PageUp:   key.NewBinding(key.WithKeys("pgup"), key.WithHelp("pgup", "page up")),
-		PageDown: key.NewBinding(key.WithKeys("pgdown"), key.WithHelp("pgdown", "page down")),
-		Back:     key.NewBinding(key.WithKeys("backspace", "esc", "left"), key.WithHelp("esc", "back")),
-		Open:     key.NewBinding(key.WithKeys("right", "enter"), key.WithHelp("enter", "open")),
-		Select:   key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "select")),
+// newFileBrowser builds the local branch's filterable directory
+// browser starting at dir.
+//
+// bubbles/filepicker has no filtering hook, so the local branch is a
+// thin custom browser (DESIGN §16.5 amendment) with the same behaviors
+// — dirs-first listing, .gguf-only selection, hidden toggle, arrows-only
+// keys — plus type-to-filter. Dirs are navigable but never selectable;
+// a shown hidden .gguf is selectable like any other file.
+func newFileBrowser(dir string) *fileBrowser {
+	b := &fileBrowser{
+		dir:        dir,
+		startDir:   dir,
+		showHidden: true,
 	}
-	return &modelPicker{
-		kind:         sourceLocal,
-		fp:           fp,
-		startDir:     dir,
-		toggleHidden: key.NewBinding(key.WithKeys("."), key.WithHelp(".", "toggle hidden")),
-	}
+	b.keys.up = key.NewBinding(key.WithKeys("up"), key.WithHelp("↑", "up"))
+	b.keys.down = key.NewBinding(key.WithKeys("down"), key.WithHelp("↓", "down"))
+	b.keys.pageUp = key.NewBinding(key.WithKeys("pgup"), key.WithHelp("pgup", "page up"))
+	b.keys.pageDown = key.NewBinding(key.WithKeys("pgdown"), key.WithHelp("pgdown", "page down"))
+	b.keys.back = key.NewBinding(key.WithKeys("backspace", "esc", "left"), key.WithHelp("esc", "back"))
+	b.keys.open = key.NewBinding(key.WithKeys("right", "enter"), key.WithHelp("enter", "open/select"))
+	// tab is the hidden toggle: typing filters, so a printable toggle
+	// key is impossible (round-1 "." moved to the filter).
+	b.keys.toggleHidden = key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "toggle hidden"))
+	b.readDir()
+	return b
 }
 
 // newRepoPicker scans root and builds the cached-repo list overlay.
@@ -211,21 +459,16 @@ func newRepoPicker(root string, warn func(string)) (*modelPicker, error) {
 	return &modelPicker{kind: sourceHF, repos: &repoPicker{list: newRepoList(items)}}, nil
 }
 
-// Init starts the overlay's async work (the filepicker's readDir).
-// The repo list is fully populated at construction, so it has none.
+// Init starts the overlay's async work. Both branches read their
+// listings synchronously at construction, so there is none.
 func (p *modelPicker) Init() tea.Cmd {
-	if p.kind == sourceLocal {
-		return p.fp.Init()
-	}
 	return nil
 }
 
 // SetSize propagates the overlay dimensions.
 func (p *modelPicker) SetSize(w, h int) {
 	if p.kind == sourceLocal {
-		if h := h - 3; h > 3 {
-			p.fp.SetHeight(h)
-		}
+		p.browser.SetSize(w, h-3)
 		return
 	}
 	p.repos.list.SetSize(w, h)
@@ -241,30 +484,8 @@ func (p *modelPicker) Update(msg tea.Msg) (*modelPicker, tea.Cmd) {
 		p.repos = next
 		return p, cmd
 	}
-	// Local filepicker.
-	if k, ok := msg.(tea.KeyMsg); ok {
-		p.errLine = ""
-		if key.Matches(k, p.toggleHidden) {
-			p.fp.ShowHidden = !p.fp.ShowHidden
-			// Init re-reads the current directory with the new
-			// visibility (readDirMsg flows back through the loop).
-			return p, p.fp.Init()
-		}
-		if key.Matches(k, p.fp.KeyMap.Back) && p.fp.CurrentDirectory == p.startDir {
-			// esc back at the opening directory cancels instead of
-			// leaving it: the picker is closed, nothing changes.
-			return p, func() tea.Msg { return modelPickerDoneMsg{kind: sourceLocal, cancelled: true} }
-		}
-	}
-	var cmd tea.Cmd
-	p.fp, cmd = p.fp.Update(msg)
-	if did, path := p.fp.DidSelectFile(msg); did {
-		return p, func() tea.Msg { return modelPickerDoneMsg{kind: sourceLocal, value: path} }
-	}
-	if did, _ := p.fp.DidSelectDisabledFile(msg); did {
-		p.errLine = ".gguf files only"
-		return p, nil
-	}
+	next, cmd := p.browser.Update(msg)
+	p.browser = next
 	return p, cmd
 }
 
@@ -275,17 +496,7 @@ func (p *modelPicker) View(theme Theme) string {
 		BorderForeground(theme.Accent).
 		Padding(1, 2)
 	if p.kind == sourceLocal {
-		parts := []string{p.fp.View()}
-		if p.errLine != "" {
-			parts = append(parts, lipgloss.NewStyle().Foreground(theme.Subtle).Render(p.errLine))
-		}
-		hidden := "off"
-		if p.fp.ShowHidden {
-			hidden = "on"
-		}
-		parts = append(parts, lipgloss.NewStyle().Foreground(theme.Subtle).Render(
-			"↑↓: move · enter: open/select · esc: back, cancel at start · .: hidden "+hidden))
-		return box.Render(strings.Join(parts, "\n"))
+		return box.Render(p.browser.View(theme))
 	}
 	return box.Render(p.repos.View(theme))
 }
@@ -338,6 +549,12 @@ func newRepoList(items []list.Item) list.Model {
 func (p *repoPicker) Update(msg tea.Msg) (*repoPicker, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok {
 		if p.list.FilterState() == list.Filtering {
+			if k.String() == "enter" {
+				// Live filter (consistent with the file browser):
+				// enter picks the selected repo instead of confirming
+				// the filter; esc (handled by the list) clears it.
+				return p, p.pick()
+			}
 			var cmd tea.Cmd
 			p.list, cmd = p.list.Update(msg)
 			// Filtering moves the cursor: the synthetic row selection
@@ -354,16 +571,7 @@ func (p *repoPicker) Update(msg tea.Msg) (*repoPicker, tea.Cmd) {
 			}
 			return p, func() tea.Msg { return modelPickerDoneMsg{kind: sourceHF, cancelled: true} }
 		case "enter":
-			if p.newRepo {
-				// "type a new repo…": keep whatever the field holds.
-				return p, func() tea.Msg { return modelPickerDoneMsg{kind: sourceHF} }
-			}
-			if it, ok := p.list.SelectedItem().(repoItem); ok {
-				return p, func() tea.Msg {
-					return modelPickerDoneMsg{kind: sourceHF, value: prefillRepo(it.repo, it.quants)}
-				}
-			}
-			return p, nil
+			return p, p.pick()
 		case "down":
 			if p.newRepo {
 				return p, nil // clamped on the synthetic row
@@ -397,6 +605,21 @@ func (p *repoPicker) Update(msg tea.Msg) (*repoPicker, tea.Cmd) {
 	// selection only stays valid while we clamped on it.
 	p.newRepo = false
 	return p, cmd
+}
+
+// pick emits the done message for the current selection: the synthetic
+// "select a repo…" row reports no change (the field keeps what was
+// typed), a repo row pre-fills per the §3.8 rule.
+func (p *repoPicker) pick() tea.Cmd {
+	if p.newRepo {
+		return func() tea.Msg { return modelPickerDoneMsg{kind: sourceHF} }
+	}
+	if it, ok := p.list.SelectedItem().(repoItem); ok {
+		return func() tea.Msg {
+			return modelPickerDoneMsg{kind: sourceHF, value: prefillRepo(it.repo, it.quants)}
+		}
+	}
+	return nil
 }
 
 // View renders the list, the pinned new-repo row, and a hint line.
