@@ -587,6 +587,9 @@ func TestStorageEscKeepsDownload(t *testing.T) {
 	if !strings.Contains(out, "downloading org/big") {
 		t.Errorf("Main must surface the running download:\n%s", out)
 	}
+	if !strings.ContainsAny(out, "⣾⣽⣻⢿⡿⣟⣯⣷") {
+		t.Errorf("Main status line must show the spinner, not a static arrow:\n%s", out)
+	}
 
 	// re-enter: same manager, same download
 	driveRoot(t, r, keyMsg("s"))

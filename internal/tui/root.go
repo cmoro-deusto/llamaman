@@ -192,6 +192,20 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		r.refreshDlStatusLine()
 		return r, tickSession()
 
+	case dlMainTickMsg:
+		if r.view != ViewMain || r.storage == nil || r.storage.dl == nil ||
+			r.storage.dl.status != dlRunning {
+			r.refreshDlStatusLine()
+			return r, nil
+		}
+		r.storage.spinner, _ = r.storage.spinner.Update(r.storage.spinner.Tick())
+		r.refreshDlStatusLine()
+		interval := r.storage.spinner.Spinner.FPS
+		if interval <= 0 {
+			interval = 100 * time.Millisecond
+		}
+		return r, tea.Tick(interval, func(time.Time) tea.Msg { return dlMainTickMsg{} })
+
 	case SpawnRequestMsg:
 		return r.handleSpawn(msg)
 
@@ -233,9 +247,9 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case returnFromStorageMsg:
 		// the download (if any) keeps running; Main surfaces its status
-		r.refreshDlStatusLine()
 		r.view = ViewMain
-		return r, nil
+		r.refreshDlStatusLine()
+		return r, r.armDlMainTick()
 
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" && r.view != ViewRun && r.view != ViewConfig {
@@ -567,7 +581,7 @@ func (r *Root) refreshDlStatusLine() {
 		return
 	}
 	d := r.storage.dl
-	label := "⬇ downloading " + d.repo + ":" + d.quant
+	label := r.storage.spinner.View() + " downloading " + d.repo + ":" + d.quant
 	if d.status == dlDone {
 		label = "⬇ download finished: " + d.repo + ":" + d.quant
 	} else if d.status == dlFailed {
@@ -576,6 +590,16 @@ func (r *Root) refreshDlStatusLine() {
 		label = "⏸ download paused: " + d.repo + ":" + d.quant
 	}
 	r.mainMode.SetStatusLine(label + " — s to view")
+}
+
+// armDlMainTick starts the Main spinner animation while a download is
+// running; call it when leaving the storage view.
+func (r *Root) armDlMainTick() tea.Cmd {
+	if r.view == ViewMain && r.storage != nil && r.storage.dl != nil &&
+		r.storage.dl.status == dlRunning {
+		return func() tea.Msg { return dlMainTickMsg{} }
+	}
+	return nil
 }
 
 func (r *Root) openSettings() (tea.Model, tea.Cmd) {
@@ -699,6 +723,10 @@ func (spawnerMissingError) Error() string { return "TUI: Spawner not configured"
 // the (running) marker and the "▶ Detached" line if another process
 // changes the session state out-of-band.
 type sessionTickMsg struct{}
+
+// dlMainTickMsg advances the download spinner shown in Main's status
+// line while a download runs (the storage tick does not run there).
+type dlMainTickMsg struct{}
 
 func tickSession() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return sessionTickMsg{} })
