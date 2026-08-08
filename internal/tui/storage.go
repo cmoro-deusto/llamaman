@@ -663,13 +663,8 @@ func (s *StorageMode) handleKey(k tea.KeyMsg) (*StorageMode, tea.Cmd) {
 		return s, s.openMenu()
 	case "d":
 		return s, s.openRepoForm()
-	case "x":
-		// quick-cancel the selected download (same as the menu action)
-		if d := s.selectedDownload(); d != nil && (d.status == dlRunning || d.status == dlPaused) {
-			s.cancelDownload(d)
-		}
 	case "?":
-		return s, s.setFlash("↑/↓ select · enter actions · d download · x cancel · esc back")
+		return s, s.setFlash("↑/↓ select · enter actions · d download · esc back")
 	}
 	return s, nil
 }
@@ -1189,11 +1184,8 @@ func (s StorageMode) renderFooter() string {
 		shortcut("↑/↓", "select", s.theme),
 		shortcut("enter", "actions", s.theme),
 		shortcut("d", "download", s.theme),
+		shortcut("esc", "back", s.theme),
 	}
-	if s.selectedDownload() != nil {
-		keys = append(keys, shortcut("x", "cancel", s.theme))
-	}
-	keys = append(keys, shortcut("esc", "back", s.theme))
 	return strings.Join([]string{
 		strings.Join(keys, "  ·  "),
 		lipgloss.NewStyle().Foreground(s.theme.Muted).Render("cache root: " + s.root + "  ·  " + freeText),

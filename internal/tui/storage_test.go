@@ -633,35 +633,6 @@ func TestStorageEscKeepsDownload(t *testing.T) {
 	}
 }
 
-// TestStorageQuickCancel: x cancels the active download (partials
-// removed, flash announced) and the footer hints the key.
-func TestStorageQuickCancel(t *testing.T) {
-	_, sm := openStorageRoot(t, &stubEngine{})
-	sm.downloads = []*downloadState{{repo: "org/big", quant: "Q4_K_M", status: dlRunning, prog: &progressSlot{}, cancel: func() {}}}
-	partial := filepath.Join(sm.root, storage.RepoFolderNames("org/big")[0], "blobs", "x.incomplete")
-	if err := os.MkdirAll(filepath.Dir(partial), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(partial, []byte("p"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	out := stripANSI(sm.View())
-	if !strings.Contains(out, "x cancel") {
-		t.Errorf("footer must hint x cancel while downloading:\n%s", out)
-	}
-	sm.handleKey(keyMsg("x"))
-	sm.handleDlFinished(firstDL(sm), context.Canceled)
-	if d := firstDL(sm); d == nil || d.status != dlDone {
-		t.Errorf("cancel must settle the download, got %+v", sm.downloads)
-	}
-	if _, err := os.Stat(partial); !os.IsNotExist(err) {
-		t.Errorf("cancel must remove partials, stat err = %v", err)
-	}
-	if !strings.Contains(sm.flash, "download cancelled") {
-		t.Errorf("flash = %q, want cancellation notice", sm.flash)
-	}
-}
-
 // TestStorageReentryResumesDownload: re-entering the manager mid-
 // download resumes progress (the tick is re-armed), lands the cursor
 // on the download row, and the action menu offers cancel.
