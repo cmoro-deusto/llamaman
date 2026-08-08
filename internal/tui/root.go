@@ -568,9 +568,14 @@ func (r *Root) openStorage() (tea.Model, tea.Cmd) {
 	r.storage.SetSize(r.width, r.height)
 	r.storage.flash = "" // no stale announcements on re-entry
 	r.storage.rebuild()
+	if r.storage.dl != nil {
+		// re-entry mid-download: resume the progress tick and land the
+		// cursor on the download row (pause/cancel one Enter away).
+		r.storage.focusDownloadRow()
+	}
 	r.mainMode.SetStatusLine("")
 	r.view = ViewStorage
-	return r, nil
+	return r, r.storage.tickCmd()
 }
 
 // refreshDlStatusLine surfaces an in-flight download on the Main screen

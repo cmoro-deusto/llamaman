@@ -419,6 +419,30 @@ func (s *StorageMode) startDownload(repo, quant string) tea.Cmd {
 	return func() tea.Msg { return dlTickMsg{} }
 }
 
+// tickCmd returns a cmd that kicks the manager tick — used on re-entry
+// after Esc, when the tick chain stopped but a download is still
+// running (its progress and spinner would otherwise stay frozen).
+func (s *StorageMode) tickCmd() tea.Cmd {
+	if s.dl != nil || s.flash != "" {
+		return func() tea.Msg { return dlTickMsg{} }
+	}
+	return nil
+}
+
+// focusDownloadRow moves the cursor to the active download row so the
+// action menu (pause/cancel) is one Enter away.
+func (s *StorageMode) focusDownloadRow() {
+	if s.dl == nil {
+		return
+	}
+	for i, e := range s.entries {
+		if e.kind == entryDownload {
+			s.cursor = i
+			return
+		}
+	}
+}
+
 // pauseDownload keeps the partial and stops the fetch (resume reuses
 // Range).
 func (s *StorageMode) pauseDownload() {

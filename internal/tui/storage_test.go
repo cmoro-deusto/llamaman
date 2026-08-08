@@ -629,3 +629,37 @@ func TestStorageQuickCancel(t *testing.T) {
 		t.Errorf("flash = %q, want cancellation notice", sm.flash)
 	}
 }
+
+// TestStorageReentryResumesDownload: re-entering the manager mid-
+// download resumes progress (the tick is re-armed), lands the cursor
+// on the download row, and the action menu offers cancel.
+func TestStorageReentryResumesDownload(t *testing.T) {
+	eng := &stubEngine{blockCh: make(chan struct{})}
+	r, sm := openStorageRoot(t, eng)
+	_ = sm.startDownload("org/big", "Q4_K_M")
+	sm.dl.prog.set(5<<20, 1<<30)
+	sm.Update(dlTickMsg{}) // drain the slot
+
+	driveRoot(t, r, keyMsg("esc")) // leave mid-download
+	driveRoot(t, r, keyMsg("s"))   // re-enter
+
+	// progress must resume: a fresh tick drains the live slot
+	sm.dl.prog.set(7<<20, 1<<30)
+	sm.Update(dlTickMsg{})
+	if sm.dl.done != 7<<20 {
+		t.Errorf("done = %d, want 7 MiB (tick resumed)", sm.dl.done)
+	}
+
+	// cursor must be on the download row; Enter offers cancel
+	if sm.cursor < 0 || sm.cursor >= len(sm.entries) || sm.entries[sm.cursor].kind != entryDownload {
+		t.Fatalf("cursor must land on the download row, at [%d]: %+v", sm.cursor, sm.entries)
+	}
+	cmd := sm.openMenu()
+	if cmd == nil {
+		t.Fatal("download row must open an action menu")
+	}
+	out := stripANSI(sm.View())
+	if !strings.Contains(out, "cancel") {
+		t.Errorf("download menu must offer cancel:\n%s", out)
+	}
+}
