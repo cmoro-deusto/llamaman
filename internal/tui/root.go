@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -193,8 +195,7 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return r, tickSession()
 
 	case dlMainTickMsg:
-		if r.view != ViewMain || r.storage == nil || r.storage.dl == nil ||
-			r.storage.dl.status != dlRunning {
+		if r.view != ViewMain || r.storage == nil || !r.storage.hasRunning() {
 			r.refreshDlStatusLine()
 			return r, nil
 		}
@@ -568,9 +569,9 @@ func (r *Root) openStorage() (tea.Model, tea.Cmd) {
 	r.storage.SetSize(r.width, r.height)
 	r.storage.flash = "" // no stale announcements on re-entry
 	r.storage.rebuild()
-	if r.storage.dl != nil {
+	if len(r.storage.downloads) > 0 {
 		// re-entry mid-download: resume the progress tick and land the
-		// cursor on the download row (pause/cancel one Enter away).
+		// cursor on a download row (pause/cancel one Enter away).
 		r.storage.focusDownloadRow()
 	}
 	r.mainMode.SetStatusLine("")
@@ -581,18 +582,46 @@ func (r *Root) openStorage() (tea.Model, tea.Cmd) {
 // refreshDlStatusLine surfaces an in-flight download on the Main screen
 // so leaving the manager never orphans it invisibly (owner flow).
 func (r *Root) refreshDlStatusLine() {
-	if r.storage == nil || r.storage.dl == nil {
+	if r.storage == nil || len(r.storage.downloads) == 0 {
 		r.mainMode.SetStatusLine("")
 		return
 	}
-	d := r.storage.dl
-	label := r.storage.spinner.View() + " downloading " + d.repo + ":" + d.quant
-	if d.status == dlDone {
-		label = "⬇ download finished: " + d.repo + ":" + d.quant
-	} else if d.status == dlFailed {
-		label = "✕ download failed: " + d.repo + ":" + d.quant
-	} else if d.status == dlPaused {
-		label = "⏸ download paused: " + d.repo + ":" + d.quant
+	var running, paused, failed, done []string
+	for _, d := range r.storage.downloads {
+		name := d.repo + ":" + d.quant
+		switch d.status {
+		case dlRunning:
+			running = append(running, name)
+		case dlPaused:
+			paused = append(paused, name)
+		case dlFailed:
+			failed = append(failed, name)
+		case dlDone:
+			done = append(done, name)
+		}
+	}
+	var label string
+	join := func(ns []string) string {
+		j := strings.Join(ns, ", ")
+		if len(j) > 48 {
+			j = j[:48] + "…"
+		}
+		return j
+	}
+	switch {
+	case len(running) == 1:
+		label = r.storage.spinner.View() + " downloading " + running[0]
+	case len(running) > 1:
+		label = fmt.Sprintf("%s %d downloads: %s", r.storage.spinner.View(), len(running), join(running))
+	case len(paused) > 0:
+		label = "⏸ download paused: " + join(paused)
+	case len(failed) > 0:
+		label = "✕ download failed: " + join(failed)
+	case len(done) > 0:
+		label = "⬇ download finished: " + join(done)
+	default:
+		r.mainMode.SetStatusLine("")
+		return
 	}
 	r.mainMode.SetStatusLine(label + " — s to view")
 }
@@ -600,8 +629,7 @@ func (r *Root) refreshDlStatusLine() {
 // armDlMainTick starts the Main spinner animation while a download is
 // running; call it when leaving the storage view.
 func (r *Root) armDlMainTick() tea.Cmd {
-	if r.view == ViewMain && r.storage != nil && r.storage.dl != nil &&
-		r.storage.dl.status == dlRunning {
+	if r.view == ViewMain && r.storage != nil && r.storage.hasRunning() {
 		return func() tea.Msg { return dlMainTickMsg{} }
 	}
 	return nil

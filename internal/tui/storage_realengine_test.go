@@ -74,16 +74,16 @@ func TestStorageDownloadRealEngineThroughManager(t *testing.T) {
 	for time.Now().Before(deadline) {
 		sm.Update(dlTickMsg{})
 		_ = sm.View() // render while downloading
-		if sm.dl != nil && sm.dl.status == dlDone {
+		if len(sm.downloads) > 0 && sm.downloads[0].status == dlDone {
 			break
 		}
-		if sm.dl != nil && sm.dl.status == dlFailed {
-			t.Fatalf("download failed: %v", sm.dl.err)
+		if len(sm.downloads) > 0 && sm.downloads[0].status == dlFailed {
+			t.Fatalf("download failed: %v", sm.downloads[0].err)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if sm.dl == nil || sm.dl.status != dlDone {
-		t.Fatalf("download did not complete: %+v", sm.dl)
+	if len(sm.downloads) == 0 || sm.downloads[0].status != dlDone {
+		t.Fatalf("download did not complete: %+v", sm.downloads)
 	}
 	_ = sm.View()
 	_ = fmt.Sprintf

@@ -54,6 +54,7 @@ type storageEntry struct {
 	path     string // local model path (the reveal target)
 	missing  bool   // local model file absent on disk
 	modelIdx int    // index into cfg.Models for local models
+	dlIdx    int    // index into downloads for download rows
 }
 
 type dlStatus int
@@ -65,9 +66,11 @@ const (
 	dlFailed
 )
 
-// downloadState is the single active download (DESIGN §16.4). Pause
-// cancels the context and keeps the partial blob; resume starts a new
-// Download that Range-resumes it; cancel also removes the partials.
+// downloadState is one active download (DESIGN §16.4). Several run
+// concurrently, each with its own progress slot, completion channel,
+// cancel, and spinner. Pause cancels the context and keeps the partial
+// blob; resume re-runs the same entry (Range resumes); cancel also
+// removes the partials.
 type downloadState struct {
 	repo, quant string
 	status      dlStatus
@@ -78,6 +81,8 @@ type downloadState struct {
 	speedWinAt   time.Time
 	speedWinDone int64
 	prog         *progressSlot
+	finish       chan error // the download goroutine reports completion
+	spinner      spinner.Model
 	err       error
 	cancel    context.CancelFunc
 	paused    bool // user pressed pause
@@ -86,7 +91,6 @@ type downloadState struct {
 }
 
 type dlTickMsg struct{}
-type dlFinishedMsg struct{ err error }
 
 // progressSlot holds the latest progress snapshot: the download
 // goroutine overwrites it, the render loop reads it. No drops (a
@@ -155,8 +159,7 @@ type StorageMode struct {
 	confirmAction string // "deletecache" | "deleteconfig" | "deletequants"
 	confirmQuants []string
 
-	dl     *downloadState
-	dlDone chan error
+	downloads []*downloadState
 
 	flash   string
 	flashAt time.Time // flash auto-expiry clock
@@ -242,17 +245,18 @@ func (s *StorageMode) rebuild() {
 		}
 		s.entries = append(s.entries, entry)
 	}
-	if s.dl != nil && s.dl.status != dlDone {
-		// a finished download leaves no row: the repo now appears as a
-		// normal cache entry (with quants, size, and actions).
+	for i, d := range s.downloads {
+		if d.status == dlDone {
+			continue // finished: the repo row replaces the download row
+		}
 		status := "downloading"
-		if s.dl.status == dlPaused {
+		if d.status == dlPaused {
 			status = "paused"
-		} else if s.dl.status == dlFailed {
+		} else if d.status == dlFailed {
 			status = "failed"
 		}
 		s.entries = append(s.entries, storageEntry{
-			kind: entryDownload, title: s.dl.repo + ":" + s.dl.quant, detail: status, size: s.dl.total,
+			kind: entryDownload, title: d.repo + ":" + d.quant, detail: status, size: d.total, dlIdx: i,
 		})
 	}
 	sort.SliceStable(s.entries, func(i, j int) bool {
@@ -300,9 +304,6 @@ func (s *StorageMode) Update(msg tea.Msg) (*StorageMode, tea.Cmd) {
 	switch m := msg.(type) {
 	case dlTickMsg:
 		return s.handleDlTick()
-	case dlFinishedMsg:
-		s.handleDlFinished(m.err)
-		return s, nil
 	case returnFromStorageMsg:
 		// handled by Root; here just a safety no-op
 		return s, nil
@@ -331,79 +332,85 @@ func (s *StorageMode) Update(msg tea.Msg) (*StorageMode, tea.Cmd) {
 }
 
 func (s *StorageMode) handleDlTick() (*StorageMode, tea.Cmd) {
-	if s.dl == nil {
+	if len(s.downloads) == 0 {
 		return s, nil
 	}
-	if p := s.dl.prog; p != nil {
-		s.dl.done, s.dl.total = p.get()
-	}
-	select {
-	case err := <-s.dlDone:
-		return s, s.handleDlFinished(err)
-	default:
-	}
-	// advance the spinner frame while downloading (dot style)
-	if s.dl.status == dlRunning {
-		s.spinner, _ = s.spinner.Update(s.spinner.Tick())
-	}
-	// speed over a ~2s window: instant per-tick deltas are too noisy
-	// to read (owner report).
-	if s.dl.status == dlRunning {
-		now := time.Now()
-		if s.dl.speedWinAt.IsZero() {
-			s.dl.speedWinAt, s.dl.speedWinDone = now, s.dl.done
-		} else if now.Sub(s.dl.speedWinAt) >= 2*time.Second {
-			if dt := now.Sub(s.dl.speedWinAt).Seconds(); dt > 0 {
-				s.dl.speed = int64(float64(s.dl.done-s.dl.speedWinDone) / dt)
-			}
-			s.dl.speedWinAt, s.dl.speedWinDone = now, s.dl.done
-		}
-	}
-	// auto-dismiss: finished downloads leave the row after 3s; flashes
-	// expire after 4s — the list (with the repo now cached) is the
-	// obvious next step.
 	now := time.Now()
-	if s.dl.status == dlDone && !s.dl.doneAt.IsZero() && now.Sub(s.dl.doneAt) > 3*time.Second {
-		s.dl = nil
+	var flashes []tea.Cmd
+	keep := s.downloads[:0]
+	changed := false
+	for _, d := range s.downloads {
+		if p := d.prog; p != nil {
+			d.done, d.total = p.get()
+		}
+		select {
+		case err := <-d.finish:
+			if cmd := s.handleDlFinished(d, err); cmd != nil {
+				flashes = append(flashes, cmd)
+			}
+			changed = true
+		default:
+		}
+		if d.status == dlRunning {
+			d.spinner, _ = d.spinner.Update(d.spinner.Tick())
+			if d.speedWinAt.IsZero() {
+				d.speedWinAt, d.speedWinDone = now, d.done
+			} else if now.Sub(d.speedWinAt) >= 2*time.Second {
+				if dt := now.Sub(d.speedWinAt).Seconds(); dt > 0 {
+					d.speed = int64(float64(d.done-d.speedWinDone) / dt)
+				}
+				d.speedWinAt, d.speedWinDone = now, d.done
+			}
+		}
+		if d.status == dlDone && !d.doneAt.IsZero() && now.Sub(d.doneAt) > 3*time.Second {
+			continue // auto-dismiss
+		}
+		keep = append(keep, d)
+	}
+	if len(keep) != len(s.downloads) {
+		changed = true
+	}
+	s.downloads = keep
+	if changed {
 		s.rebuild()
 	}
-	if s.flash != "" && !s.flashAt.IsZero() && now.Sub(s.flashAt) > 4*time.Second {
+	if s.flash != "" && !s.flashAt.IsZero() && now.Sub(s.flashAt) > stgFlashTTL {
 		s.flash = ""
 	}
-	if s.dl == nil {
+	if len(s.downloads) == 0 {
 		return s, nil
 	}
 	interval := s.spinner.Spinner.FPS
 	if interval <= 0 {
 		interval = 100 * time.Millisecond
 	}
-	return s, tea.Tick(interval, func(time.Time) tea.Msg { return dlTickMsg{} })
+	cmds := []tea.Cmd{tea.Tick(interval, func(time.Time) tea.Msg { return dlTickMsg{} })}
+	cmds = append(cmds, flashes...)
+	return s, tea.Batch(cmds...)
 }
 
-func (s *StorageMode) handleDlFinished(err error) tea.Cmd {
-	if s.dl == nil {
-		return nil
-	}
+func (s *StorageMode) handleDlFinished(d *downloadState, err error) tea.Cmd {
 	switch {
 	case err == nil:
-		s.dl.status = dlDone
-		s.dl.doneAt = time.Now()
-		msg := "downloaded " + s.dl.repo + ":" + s.dl.quant
-		if s.dl.total == 0 {
-			msg = "already cached: " + s.dl.repo + ":" + s.dl.quant
+		d.status = dlDone
+		d.doneAt = time.Now()
+		msg := "downloaded " + d.repo + ":" + d.quant
+		if d.total == 0 {
+			msg = "already cached: " + d.repo + ":" + d.quant
 		}
 		s.rebuild() // the repo row (quants, size, actions) appears now
 		return s.setFlash(msg)
-	case s.dl.discard:
-		s.removePartials()
-		s.dl = nil
+	case d.discard:
+		s.removePartials(d)
+		d.status = dlDone
+		d.doneAt = time.Now()
 		s.rebuild()
 		return s.setFlash("download cancelled")
-	case s.dl.paused:
-		s.dl.status = dlPaused
+	case d.paused:
+		d.status = dlPaused
 	default:
-		s.dl.status = dlFailed
-		s.dl.err = err
+		d.status = dlFailed
+		d.err = err
 	}
 	return nil
 }
@@ -412,26 +419,49 @@ func (s *StorageMode) handleDlFinished(err error) tea.Cmd {
 // and completion arrive as messages drained by a tick (no shared state
 // between the goroutine and the render loop — P9-safe).
 func (s *StorageMode) startDownload(repo, quant string) tea.Cmd {
-	ctx, cancel := context.WithCancel(context.Background())
-	s.dl = &downloadState{repo: repo, quant: quant, status: dlRunning, cancel: cancel}
-	s.dl.prog = &progressSlot{}
-	s.dlDone = make(chan error, 1)
-	prog := s.dl.prog // captured: a resumed download writes its own slot
-	go func() {
-		err := s.engine.Download(ctx, s.root, repo, quant, func(done, total int64) {
-			prog.set(done, total)
-		})
-		s.dlDone <- err
-	}()
+	d := &downloadState{
+		repo: repo, quant: quant, status: dlRunning,
+		spinner: spinner.New(spinner.WithSpinner(spinner.Dot),
+			spinner.WithStyle(lipgloss.NewStyle().Foreground(s.theme.Accent))),
+	}
+	s.downloads = append(s.downloads, d)
+	s.runDownload(d)
 	s.rebuild()
 	return func() tea.Msg { return dlTickMsg{} }
+}
+
+// resumeDownload re-runs a paused download on the same entry (Range
+// resumes the partial).
+func (s *StorageMode) resumeDownload(d *downloadState) tea.Cmd {
+	d.status = dlRunning
+	d.err = nil
+	s.runDownload(d)
+	s.rebuild()
+	return func() tea.Msg { return dlTickMsg{} }
+}
+
+// runDownload launches the engine goroutine for an entry (fresh
+// progress slot and completion channel; the old goroutine is done).
+func (s *StorageMode) runDownload(d *downloadState) {
+	ctx, cancel := context.WithCancel(context.Background())
+	d.cancel = cancel
+	d.prog = &progressSlot{}
+	d.finish = make(chan error, 1)
+	prog := d.prog
+	finish := d.finish
+	go func() {
+		err := s.engine.Download(ctx, s.root, d.repo, d.quant, func(done, total int64) {
+			prog.set(done, total)
+		})
+		finish <- err
+	}()
 }
 
 // tickCmd returns a cmd that kicks the manager tick — used on re-entry
 // after Esc, when the tick chain stopped but a download is still
 // running (its progress and spinner would otherwise stay frozen).
 func (s *StorageMode) tickCmd() tea.Cmd {
-	if s.dl != nil || s.flash != "" {
+	if len(s.downloads) > 0 || s.flash != "" {
 		return func() tea.Msg { return dlTickMsg{} }
 	}
 	return nil
@@ -440,7 +470,7 @@ func (s *StorageMode) tickCmd() tea.Cmd {
 // focusDownloadRow moves the cursor to the active download row so the
 // action menu (pause/cancel) is one Enter away.
 func (s *StorageMode) focusDownloadRow() {
-	if s.dl == nil {
+	if len(s.downloads) == 0 {
 		return
 	}
 	for i, e := range s.entries {
@@ -451,30 +481,47 @@ func (s *StorageMode) focusDownloadRow() {
 	}
 }
 
+// selectedDownload returns the download under the cursor, or the first
+// running one when the cursor is elsewhere.
+func (s *StorageMode) selectedDownload() *downloadState {
+	if s.cursor >= 0 && s.cursor < len(s.entries) && s.entries[s.cursor].kind == entryDownload {
+		i := s.entries[s.cursor].dlIdx
+		if i >= 0 && i < len(s.downloads) {
+			return s.downloads[i]
+		}
+	}
+	for _, d := range s.downloads {
+		if d.status == dlRunning || d.status == dlPaused {
+			return d
+		}
+	}
+	return nil
+}
+
 // pauseDownload keeps the partial and stops the fetch (resume reuses
 // Range).
-func (s *StorageMode) pauseDownload() {
-	if s.dl == nil || s.dl.status != dlRunning {
+func (s *StorageMode) pauseDownload(d *downloadState) {
+	if d == nil || d.status != dlRunning {
 		return
 	}
-	s.dl.paused = true
-	s.dl.cancel()
+	d.paused = true
+	d.cancel()
 }
 
 // cancelDownload stops and removes the partials.
-func (s *StorageMode) cancelDownload() {
-	if s.dl == nil || s.dl.status != dlRunning {
+func (s *StorageMode) cancelDownload(d *downloadState) {
+	if d == nil || d.status != dlRunning {
 		return
 	}
-	s.dl.discard = true
-	s.dl.cancel()
+	d.discard = true
+	d.cancel()
 }
 
-func (s *StorageMode) removePartials() {
-	if s.dl == nil {
+func (s *StorageMode) removePartials(d *downloadState) {
+	if d == nil {
 		return
 	}
-	repoDir := filepath.Join(s.root, storage.RepoFolderNames(s.dl.repo)[0])
+	repoDir := filepath.Join(s.root, storage.RepoFolderNames(d.repo)[0])
 	partials, _ := filepath.Glob(filepath.Join(repoDir, "blobs", "*.incomplete"))
 	for _, p := range partials {
 		_ = os.Remove(p)
@@ -599,22 +646,16 @@ func (s *StorageMode) handleKey(k tea.KeyMsg) (*StorageMode, tea.Cmd) {
 	}
 	switch k.String() {
 	case "up", "k":
-		// navigating dismisses a finished/failed download line and any
+		// navigating dismisses settled downloads (done/failed) and any
 		// status flash — the list is the next step.
 		s.dismissFlash()
-		if s.dl != nil && (s.dl.status == dlDone || s.dl.status == dlFailed) {
-			s.dl = nil
-			s.rebuild()
-		}
+		s.dismissSettledDownloads()
 		if s.cursor > 0 {
 			s.cursor--
 		}
 	case "down", "j":
 		s.dismissFlash()
-		if s.dl != nil && (s.dl.status == dlDone || s.dl.status == dlFailed) {
-			s.dl = nil
-			s.rebuild()
-		}
+		s.dismissSettledDownloads()
 		if s.cursor < len(s.entries)-1 {
 			s.cursor++
 		}
@@ -623,9 +664,9 @@ func (s *StorageMode) handleKey(k tea.KeyMsg) (*StorageMode, tea.Cmd) {
 	case "d":
 		return s, s.openRepoForm()
 	case "x":
-		// quick-cancel the active download (same as the menu action)
-		if s.dl != nil && (s.dl.status == dlRunning || s.dl.status == dlPaused) {
-			s.cancelDownload()
+		// quick-cancel the selected download (same as the menu action)
+		if d := s.selectedDownload(); d != nil && (d.status == dlRunning || d.status == dlPaused) {
+			s.cancelDownload(d)
 		}
 	case "?":
 		return s, s.setFlash("↑/↓ select · enter actions · d download · x cancel · esc back")
@@ -747,12 +788,12 @@ func (s *StorageMode) openMenu() tea.Cmd {
 			huh.NewOption("delete", "delete"),
 		}
 	case entryDownload:
-		if s.dl != nil && s.dl.status == dlRunning {
+		if d := s.selectedDownload(); d != nil && d.status == dlRunning {
 			opts = []huh.Option[string]{
 				huh.NewOption("pause", "pause"),
 				huh.NewOption("cancel", "cancel"),
 			}
-		} else if s.dl != nil && s.dl.status == dlPaused {
+		} else if d := s.selectedDownload(); d != nil && d.status == dlPaused {
 			opts = []huh.Option[string]{
 				huh.NewOption("resume", "resume"),
 				huh.NewOption("cancel", "cancel"),
@@ -905,16 +946,17 @@ func (s *StorageMode) updateMenu(msg tea.Msg) (*StorageMode, tea.Cmd) {
 				return s, s.openDeleteScopeMenu(e.title)
 			}
 		case entryDownload:
-			if s.dl == nil {
+			d := s.selectedDownload()
+			if d == nil {
 				return s, nil
 			}
 			switch action {
 			case "pause":
-				s.pauseDownload()
+				s.pauseDownload(d)
 			case "resume":
-				return s, s.startDownload(s.dl.repo, s.dl.quant)
+				return s, s.resumeDownload(d)
 			case "cancel":
-				s.cancelDownload()
+				s.cancelDownload(d)
 			}
 		case entryLocalModel:
 			switch action {
@@ -1011,8 +1053,9 @@ func (s StorageMode) View() string {
 		"",
 	}
 	body = append(body, s.renderList()...)
-	if s.dl != nil {
-		body = append(body, "", s.renderDownload())
+	if lines := s.renderDownloads(); len(lines) > 0 {
+		body = append(body, "")
+		body = append(body, lines...)
 	}
 	if s.flash != "" {
 		body = append(body, "", lipgloss.NewStyle().Foreground(s.theme.StatusStart).Render("⚠ "+s.flash))
@@ -1094,45 +1137,46 @@ func (s StorageMode) renderList() []string {
 	return rows
 }
 
-func (s StorageMode) renderDownload() string {
-	if s.dl == nil {
-		return ""
-	}
-	// a finished download has nothing to render — the repo now appears
-	// as a normal cache row (auto-dismissed shortly after).
-	if s.dl == nil || s.dl.status == dlDone {
-		return ""
-	}
-	bar := ""
-	if s.dl.total > 0 {
-		pct := int(float64(s.dl.done) / float64(s.dl.total) * 100)
-		if pct > 100 {
-			pct = 100
+// renderDownloads renders one progress line per active download, each
+// with its own spinner.
+func (s StorageMode) renderDownloads() []string {
+	var out []string
+	for _, d := range s.downloads {
+		if d.status == dlDone {
+			continue // finished: the repo row replaces the download row
 		}
-		if pct < 0 {
-			pct = 0
+		bar := ""
+		if d.total > 0 {
+			pct := int(float64(d.done) / float64(d.total) * 100)
+			if pct > 100 {
+				pct = 100
+			}
+			if pct < 0 {
+				pct = 0
+			}
+			fillCells := pct * 12 / 100
+			fill := strings.Repeat("▓", fillCells)
+			rest := strings.Repeat("░", 12-fillCells)
+			// %3d / %9s / %11s keep the line width constant across ticks
+			// so the centered view does not re-flow (and flicker).
+			bar = fmt.Sprintf(" %s%s %3d%%", fill, rest, pct)
 		}
-		fillCells := pct * 12 / 100
-		fill := strings.Repeat("▓", fillCells)
-		rest := strings.Repeat("░", 12-fillCells)
-		// %3d / %9s / %11s keep the line width constant across ticks so
-		// the centered view does not re-flow (and flicker).
-		bar = fmt.Sprintf(" %s%s %3d%%", fill, rest, pct)
+		status := "downloading"
+		switch d.status {
+		case dlPaused:
+			status = "paused"
+		case dlFailed:
+			status = "failed: " + d.err.Error()
+		}
+		line := fmt.Sprintf("%s:%s — %s%s", d.repo, d.quant, status, bar)
+		if d.status == dlRunning {
+			line = d.spinner.View() + " " + line
+			speed := hf.HumanSize(d.speed) + "/s"
+			line += fmt.Sprintf("  (%9s / %9s, %11s)", hf.HumanSize(d.done), hf.HumanSize(d.total), speed)
+		}
+		out = append(out, lipgloss.NewStyle().Foreground(s.theme.Accent).Render(line))
 	}
-	status := "downloading"
-	switch s.dl.status {
-	case dlPaused:
-		status = "paused"
-	case dlFailed:
-		status = "failed: " + s.dl.err.Error()
-	}
-	line := fmt.Sprintf("%s:%s — %s%s", s.dl.repo, s.dl.quant, status, bar)
-	if s.dl.status == dlRunning {
-		line = s.spinner.View() + " " + line
-		speed := hf.HumanSize(s.dl.speed) + "/s"
-		line += fmt.Sprintf("  (%9s / %9s, %11s)", hf.HumanSize(s.dl.done), hf.HumanSize(s.dl.total), speed)
-	}
-	return lipgloss.NewStyle().Foreground(s.theme.Accent).Render(line)
+	return out
 }
 
 func (s StorageMode) renderFooter() string {
@@ -1146,7 +1190,7 @@ func (s StorageMode) renderFooter() string {
 		shortcut("enter", "actions", s.theme),
 		shortcut("d", "download", s.theme),
 	}
-	if s.dl != nil && (s.dl.status == dlRunning || s.dl.status == dlPaused) {
+	if s.selectedDownload() != nil {
 		keys = append(keys, shortcut("x", "cancel", s.theme))
 	}
 	keys = append(keys, shortcut("esc", "back", s.theme))
@@ -1158,3 +1202,32 @@ func (s StorageMode) renderFooter() string {
 
 // dismissFlash clears the status flash (navigation affordance).
 func (s *StorageMode) dismissFlash() { s.flash = "" }
+
+// hasRunning reports whether any download is actively running (Main's
+// status line and tick use it).
+func (s *StorageMode) hasRunning() bool {
+	for _, d := range s.downloads {
+		if d.status == dlRunning {
+			return true
+		}
+	}
+	return false
+}
+
+// dismissSettledDownloads removes finished/failed downloads from the
+// list on navigation.
+func (s *StorageMode) dismissSettledDownloads() {
+	changed := false
+	keep := s.downloads[:0]
+	for _, d := range s.downloads {
+		if d.status == dlDone || d.status == dlFailed {
+			changed = true
+			continue
+		}
+		keep = append(keep, d)
+	}
+	if changed {
+		s.downloads = keep
+		s.rebuild()
+	}
+}

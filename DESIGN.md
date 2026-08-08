@@ -2036,6 +2036,12 @@ cancel an in-flight download: the manager is reused on re-entry, and
 Main surfaces a `⬇ downloading … — s to view` status line (refreshed on
 the session tick) so a download is never silently orphaned.
 
+**Concurrent downloads.** Several downloads may run at once; each has
+its own row (spinner, progress, speed), is individually
+pausable/resumable/cancellable via its action menu (or `x` for the
+selected one), and Main aggregates them (`⣾ 2 downloads: a:q, b:q —
+s to view`).
+
 #### Mode structure
 
 - New `ViewStorage` under Root; entry key **`s`** in Main (`s storage`).

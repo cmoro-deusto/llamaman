@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/bubbles/spinner"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/hf"
@@ -48,6 +49,24 @@ func (e *stubEngine) Download(ctx context.Context, root, repo, quant string, pro
 		progress(100, 100)
 	}
 	return e.dlErr
+}
+
+// firstDL returns the first download entry (tests drive single
+// downloads; several run concurrently in production).
+func firstDL(sm *StorageMode) *downloadState {
+	if len(sm.downloads) == 0 {
+		return nil
+	}
+	return sm.downloads[0]
+}
+
+// mkDL builds a download entry with a usable spinner (renderDownloads
+// renders d.spinner even when running).
+func mkDL(repo, quant string, status dlStatus) *downloadState {
+	return &downloadState{
+		repo: repo, quant: quant, status: status,
+		spinner: spinner.New(spinner.WithSpinner(spinner.Dot)),
+	}
 }
 
 // storageTestConfig returns a config with a local model and a temp
@@ -139,13 +158,14 @@ func TestStorageDownloadNow(t *testing.T) {
 	if len(eng.calls) == 0 || eng.calls[len(eng.calls)-1] != want {
 		t.Fatalf("engine calls = %v, want last %q", eng.calls, want)
 	}
-	if sm.dl == nil || sm.dl.repo != "org/newrepo" || sm.dl.quant != "Q4_K_M" {
-		t.Fatalf("download state = %+v", sm.dl)
+	d := firstDL(sm)
+	if d == nil || d.repo != "org/newrepo" || d.quant != "Q4_K_M" {
+		t.Fatalf("download state = %+v", sm.downloads)
 	}
 	// the stub engine completes instantly: the download is done, the
 	// row auto-dismisses, and the flash announces it.
-	if sm.dl.status != dlDone {
-		t.Fatalf("download status = %v, want done", sm.dl.status)
+	if d.status != dlDone {
+		t.Fatalf("download status = %v, want done", d.status)
 	}
 	if !strings.Contains(stripANSI(sm.View()), "downloaded org/newrepo") {
 		t.Errorf("done flash missing from view:\n%s", stripANSI(sm.View()))
@@ -178,8 +198,8 @@ func TestStorageDownloadPauseResumeCancel(t *testing.T) {
 		keyMsg("org/newrepo:Q4_K_M"),
 		tea.KeyMsg{Type: tea.KeyEnter},
 	)
-	if sm.dl == nil || sm.dl.status != dlRunning {
-		t.Fatalf("download not running: %+v", sm.dl)
+	if d := firstDL(sm); d == nil || d.status != dlRunning {
+		t.Fatalf("download not running: %+v", sm.downloads)
 	}
 
 	// pause via the download row's action menu (select: choose + submit)
@@ -190,9 +210,9 @@ func TestStorageDownloadPauseResumeCancel(t *testing.T) {
 		tea.KeyMsg{Type: tea.KeyEnter}, // submit menu
 	)
 	// the blocking Download sees the cancel and finishes as paused
-	sm.handleDlFinished(context.Canceled)
-	if sm.dl == nil || sm.dl.status != dlPaused {
-		t.Fatalf("after pause: %+v", sm.dl)
+	sm.handleDlFinished(firstDL(sm), context.Canceled)
+	if d := firstDL(sm); d == nil || d.status != dlPaused {
+		t.Fatalf("after pause: %+v", sm.downloads)
 	}
 
 	// resume (menu now offers resume for the paused row)
@@ -205,6 +225,7 @@ func TestStorageDownloadPauseResumeCancel(t *testing.T) {
 	if len(eng.calls) < 2 || eng.calls[len(eng.calls)-1] != "Download org/newrepo Q4_K_M" {
 		t.Fatalf("resume must re-invoke Download: %v", eng.calls)
 	}
+	d := firstDL(sm)
 
 	// cancel: seed a partial first, then cancel
 	partial := filepath.Join(sm.root, storage.RepoFolderNames("org/newrepo")[0], "blobs", "x.incomplete")
@@ -214,10 +235,10 @@ func TestStorageDownloadPauseResumeCancel(t *testing.T) {
 	if err := os.WriteFile(partial, []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	sm.cancelDownload()
-	sm.handleDlFinished(context.Canceled)
-	if sm.dl != nil {
-		t.Fatalf("after cancel dl = %+v, want nil", sm.dl)
+	sm.cancelDownload(d)
+	sm.handleDlFinished(d, context.Canceled)
+	if d.status != dlDone {
+		t.Fatalf("cancelled entry must be marked done, got %+v", d)
 	}
 	if _, err := os.Stat(partial); !os.IsNotExist(err) {
 		t.Errorf("cancel must remove partials, stat err = %v", err)
@@ -277,11 +298,12 @@ func TestStorageDeleteDeclined(t *testing.T) {
 func TestDownloadLineWidthStable(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	sm := NewStorageMode(cfg, DefaultTheme(), t.TempDir())
-	sm.dl = &downloadState{repo: "org/repo", quant: "Q4_K_M", status: dlRunning, total: 15 << 30}
+	sm.downloads = []*downloadState{mkDL("org/repo", "Q4_K_M", dlRunning)}
+	sm.downloads[0].total = 15 << 30
 	widths := map[int64]int{}
 	for _, done := range []int64{0, 1 << 10, 512 << 20, 999 << 20, 1 << 30, 15 << 30} {
-		sm.dl.done = done
-		widths[done] = len(stripANSI(sm.renderDownload()))
+		sm.downloads[0].done = done
+		widths[done] = len(stripANSI(sm.renderDownloads()[0]))
 	}
 	first := widths[0]
 	for done, w := range widths {
@@ -312,7 +334,9 @@ func TestStorageDoneDownloadBecomesCacheRow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sm.dl = &downloadState{repo: "org/finished", quant: "Q8_0", status: dlDone, total: 1, doneAt: time.Now()}
+	sm.downloads = []*downloadState{mkDL("org/finished", "Q8_0", dlDone)}
+	sm.downloads[0].total = 1
+	sm.downloads[0].doneAt = time.Now()
 	sm.rebuild()
 
 	out := stripANSI(sm.View())
@@ -343,13 +367,14 @@ func TestStorageDoneDownloadBecomesCacheRow(t *testing.T) {
 func TestStorageNavDismissesDoneDownload(t *testing.T) {
 	eng := &stubEngine{}
 	r, sm := openStorageRoot(t, eng)
-	sm.dl = &downloadState{repo: "org/finished", quant: "Q8_0", status: dlDone, doneAt: time.Now()}
+	sm.downloads = []*downloadState{mkDL("org/finished", "Q8_0", dlDone)}
+	sm.downloads[0].doneAt = time.Now()
 	sm.flash = "downloaded org/finished:Q8_0"
 	sm.flashAt = time.Now()
 	sm.rebuild()
 	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyDown})
-	if sm.dl != nil {
-		t.Errorf("done download must be dismissed on navigation, got %+v", sm.dl)
+	if len(sm.downloads) != 0 {
+		t.Errorf("done download must be dismissed on navigation, got %+v", sm.downloads)
 	}
 	if sm.flash != "" {
 		t.Errorf("flash must clear on navigation, got %q", sm.flash)
@@ -518,20 +543,22 @@ func TestStorageFlashExpiresWithoutDownload(t *testing.T) {
 // window (not per-tick deltas) and does not jitter without new data.
 func TestStorageSpeedWindowed(t *testing.T) {
 	_, sm := openStorageRoot(t, &stubEngine{})
-	sm.dl = &downloadState{repo: "org/r", quant: "Q4_K_M", status: dlRunning, prog: &progressSlot{}}
-	sm.dl.speedWinAt = time.Now().Add(-2 * time.Second)
-	sm.dl.speedWinDone = 0
-	sm.dl.prog.set(2<<20, 1<<30) // 2 MiB fetched over the last 2s
+	d := mkDL("org/r", "Q4_K_M", dlRunning)
+	d.prog = &progressSlot{}
+	sm.downloads = []*downloadState{d}
+	d.speedWinAt = time.Now().Add(-2 * time.Second)
+	d.speedWinDone = 0
+	d.prog.set(2<<20, 1<<30) // 2 MiB fetched over the last 2s
 
 	sm.Update(dlTickMsg{})
-	if want := int64(1 << 20); sm.dl.speed < want-1024 || sm.dl.speed > want+1024 {
-		t.Errorf("speed = %d, want ~%d (2 MiB / 2s)", sm.dl.speed, want)
+	if want := int64(1 << 20); d.speed < want-1024 || d.speed > want+1024 {
+		t.Errorf("speed = %d, want ~%d (2 MiB / 2s)", d.speed, want)
 	}
 
 	// no new progress: the window does not advance, speed stays put
 	sm.Update(dlTickMsg{})
-	if want := int64(1 << 20); sm.dl.speed < want-1024 || sm.dl.speed > want+1024 {
-		t.Errorf("speed changed without new data: %d, want ~%d", sm.dl.speed, want)
+	if want := int64(1 << 20); d.speed < want-1024 || d.speed > want+1024 {
+		t.Errorf("speed changed without new data: %d, want ~%d", d.speed, want)
 	}
 }
 
@@ -552,12 +579,15 @@ func TestProgressSlotKeepsLatest(t *testing.T) {
 // download line while the download runs.
 func TestStorageSpinnerWhileDownloading(t *testing.T) {
 	_, sm := openStorageRoot(t, &stubEngine{})
-	sm.dl = &downloadState{repo: "org/r", quant: "Q4_K_M", status: dlRunning, total: 1 << 30, prog: &progressSlot{}}
-	sm.dl.prog.set(1<<29, 1<<30)
+	d := mkDL("org/r", "Q4_K_M", dlRunning)
+	d.total = 1 << 30
+	d.prog = &progressSlot{}
+	sm.downloads = []*downloadState{d}
+	d.prog.set(1<<29, 1<<30)
 	// two ticks advance the frame
 	sm.Update(dlTickMsg{})
 	sm.Update(dlTickMsg{})
-	line := stripANSI(sm.renderDownload())
+	line := stripANSI(sm.renderDownloads()[0])
 	if !strings.ContainsAny(line, "⣾⣽⣻⢿⡿⣟⣯⣷") {
 		t.Errorf("dot spinner missing from download line: %q", line)
 	}
@@ -571,8 +601,8 @@ func TestStorageEscKeepsDownload(t *testing.T) {
 	// start a blocking download directly
 	cmd := sm.startDownload("org/big", "Q4_K_M")
 	_ = cmd
-	if sm.dl == nil || sm.dl.status != dlRunning {
-		t.Fatalf("download not running: %+v", sm.dl)
+	if d := firstDL(sm); d == nil || d.status != dlRunning {
+		t.Fatalf("download not running: %+v", sm.downloads)
 	}
 
 	driveRoot(t, r, keyMsg("esc"))
@@ -582,7 +612,7 @@ func TestStorageEscKeepsDownload(t *testing.T) {
 	if r.storage == nil {
 		t.Fatal("storage manager must survive esc (download keeps running)")
 	}
-	if r.storage.dl == nil || r.storage.dl.status != dlRunning {
+	if d := firstDL(r.storage); d == nil || d.status != dlRunning {
 		t.Fatal("download must keep running after esc")
 	}
 	out := stripANSI(r.mainMode.View())
@@ -598,7 +628,7 @@ func TestStorageEscKeepsDownload(t *testing.T) {
 	if r.view != ViewStorage || r.storage != sm {
 		t.Fatalf("re-entry must reuse the live manager")
 	}
-	if r.storage.dl == nil || r.storage.dl.status != dlRunning {
+	if d := firstDL(r.storage); d == nil || d.status != dlRunning {
 		t.Fatal("download must still be visible after re-entry")
 	}
 }
@@ -607,7 +637,7 @@ func TestStorageEscKeepsDownload(t *testing.T) {
 // removed, flash announced) and the footer hints the key.
 func TestStorageQuickCancel(t *testing.T) {
 	_, sm := openStorageRoot(t, &stubEngine{})
-	sm.dl = &downloadState{repo: "org/big", quant: "Q4_K_M", status: dlRunning, prog: &progressSlot{}, cancel: func() {}}
+	sm.downloads = []*downloadState{{repo: "org/big", quant: "Q4_K_M", status: dlRunning, prog: &progressSlot{}, cancel: func() {}}}
 	partial := filepath.Join(sm.root, storage.RepoFolderNames("org/big")[0], "blobs", "x.incomplete")
 	if err := os.MkdirAll(filepath.Dir(partial), 0o755); err != nil {
 		t.Fatal(err)
@@ -620,9 +650,9 @@ func TestStorageQuickCancel(t *testing.T) {
 		t.Errorf("footer must hint x cancel while downloading:\n%s", out)
 	}
 	sm.handleKey(keyMsg("x"))
-	sm.handleDlFinished(context.Canceled)
-	if sm.dl != nil {
-		t.Errorf("cancel must clear the download, got %+v", sm.dl)
+	sm.handleDlFinished(firstDL(sm), context.Canceled)
+	if d := firstDL(sm); d == nil || d.status != dlDone {
+		t.Errorf("cancel must settle the download, got %+v", sm.downloads)
 	}
 	if _, err := os.Stat(partial); !os.IsNotExist(err) {
 		t.Errorf("cancel must remove partials, stat err = %v", err)
@@ -639,17 +669,18 @@ func TestStorageReentryResumesDownload(t *testing.T) {
 	eng := &stubEngine{blockCh: make(chan struct{})}
 	r, sm := openStorageRoot(t, eng)
 	_ = sm.startDownload("org/big", "Q4_K_M")
-	sm.dl.prog.set(5<<20, 1<<30)
+	d := firstDL(sm)
+	d.prog.set(5<<20, 1<<30)
 	sm.Update(dlTickMsg{}) // drain the slot
 
 	driveRoot(t, r, keyMsg("esc")) // leave mid-download
 	driveRoot(t, r, keyMsg("s"))   // re-enter
 
 	// progress must resume: a fresh tick drains the live slot
-	sm.dl.prog.set(7<<20, 1<<30)
+	d.prog.set(7<<20, 1<<30)
 	sm.Update(dlTickMsg{})
-	if sm.dl.done != 7<<20 {
-		t.Errorf("done = %d, want 7 MiB (tick resumed)", sm.dl.done)
+	if d.done != 7<<20 {
+		t.Errorf("done = %d, want 7 MiB (tick resumed)", d.done)
 	}
 
 	// cursor must be on the download row; Enter offers cancel
@@ -784,5 +815,51 @@ func TestStorageDeleteQuantMultiselect(t *testing.T) {
 	}
 	if _, err := os.Stat(repoDir); !os.IsNotExist(err) {
 		t.Errorf("empty repo dir must be removed, stat err = %v", err)
+	}
+}
+
+// TestStorageConcurrentDownloads: two downloads run at once — both
+// rows render with their own progress, both are selectable, and Main
+// aggregates them.
+func TestStorageConcurrentDownloads(t *testing.T) {
+	eng := &stubEngine{blockCh: make(chan struct{})}
+	r, sm := openStorageRoot(t, eng)
+	_ = sm.startDownload("org/one", "Q4_K_M")
+	_ = sm.startDownload("org/two", "Q8_0")
+	sm.downloads[0].prog.set(1<<20, 1<<30)
+	sm.downloads[1].prog.set(2<<20, 1<<30)
+	sm.Update(dlTickMsg{})
+
+	out := stripANSI(sm.View())
+	if !strings.Contains(out, "org/one:Q4_K_M") || !strings.Contains(out, "org/two:Q8_0") {
+		t.Errorf("both downloads must render:\n%s", out)
+	}
+	if sm.downloads[0].done != 1<<20 || sm.downloads[1].done != 2<<20 {
+		t.Errorf("each download keeps its own progress: %d, %d", sm.downloads[0].done, sm.downloads[1].done)
+	}
+	rows := 0
+	for _, e := range sm.entries {
+		if e.kind == entryDownload {
+			rows++
+		}
+	}
+	if rows != 2 {
+		t.Errorf("download rows = %d, want 2", rows)
+	}
+	// each row is individually selectable → its own menu
+	sm.cursor = len(sm.entries) - 1
+	if cmd := sm.openMenu(); cmd == nil {
+		t.Fatal("a download row must open its action menu")
+	}
+	driveRoot(t, r, keyMsg("esc")) // close the menu
+
+	// Main aggregates both
+	driveRoot(t, r, keyMsg("esc")) // leave the manager
+	if !strings.Contains(r.mainMode.statusLine, "2 downloads") {
+		t.Fatalf("Main status line must aggregate both downloads, got %q", r.mainMode.statusLine)
+	}
+	out = stripANSI(r.mainMode.View())
+	if !strings.Contains(out, "org/one") || !strings.Contains(out, "org/two") {
+		t.Errorf("Main must list both downloads:\n%s", out)
 	}
 }
