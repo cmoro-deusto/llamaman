@@ -532,6 +532,17 @@ func (s *StorageMode) removePartials(d *downloadState) {
 	if d == nil {
 		return
 	}
+	// A repo's blobs dir may hold partials of several concurrent
+	// downloads (one per quant). Only clean up when this download is
+	// the last one active for its repo — otherwise the glob would
+	// delete a sibling download's partial mid-flight (owner report:
+	// its sha256 verify then failed with ENOENT).
+	for _, other := range s.downloads {
+		if other != d && other.repo == d.repo &&
+			(other.status == dlRunning || other.status == dlPaused) {
+			return
+		}
+	}
 	repoDir := filepath.Join(s.root, storage.RepoFolderNames(d.repo)[0])
 	partials, _ := filepath.Glob(filepath.Join(repoDir, "blobs", "*.incomplete"))
 	for _, p := range partials {
@@ -539,9 +550,23 @@ func (s *StorageMode) removePartials(d *downloadState) {
 	}
 }
 
+// activeForRepo reports whether any running/paused download targets
+// the repo (its partials and blobs must not be deleted mid-flight).
+func (s *StorageMode) activeForRepo(repo string) bool {
+	for _, d := range s.downloads {
+		if d.repo == repo && (d.status == dlRunning || d.status == dlPaused) {
+			return true
+		}
+	}
+	return false
+}
+
 // deleteCacheEntry removes a cache repo (hub dir, or legacy flat files
 // + metadata) after confirmation. Config entries are never touched (P8).
 func (s *StorageMode) deleteCacheEntry(repo string) error {
+	if s.activeForRepo(repo) {
+		return fmt.Errorf("a download for %s is active — cancel or wait first", repo)
+	}
 	hubDir := filepath.Join(s.root, storage.RepoFolderNames(repo)[0])
 	if _, err := os.Stat(hubDir); err == nil {
 		return os.RemoveAll(hubDir)
@@ -568,6 +593,9 @@ func (s *StorageMode) deleteCacheEntry(repo string) error {
 // removed too (refcounted, like llama.cpp); an empty repo folder is
 // cleaned up entirely. Config entries are never touched (P8).
 func (s *StorageMode) deleteCacheQuants(repo string, quants []string) error {
+	if s.activeForRepo(repo) {
+		return fmt.Errorf("a download for %s is active — cancel or wait first", repo)
+	}
 	files, _ := storage.Lookup(s.root, repo)
 	want := map[string]bool{}
 	for _, q := range quants {

@@ -834,3 +834,53 @@ func TestStorageConcurrentDownloads(t *testing.T) {
 		t.Errorf("Main must list both downloads:\n%s", out)
 	}
 }
+
+// TestStorageCancelKeepsSiblingPartial: cancelling one download must
+// not delete another download's partial for the same repo (owner
+// report: the survivor's sha256 verify failed with ENOENT).
+func TestStorageCancelKeepsSiblingPartial(t *testing.T) {
+	eng := &stubEngine{blockCh: make(chan struct{})}
+	_, sm := openStorageRoot(t, eng)
+	_ = sm.startDownload("org/shared", "Q4_K_M")
+	_ = sm.startDownload("org/shared", "Q8_0")
+	a, b := sm.downloads[0], sm.downloads[1]
+
+	// a partial for B's quant exists on disk
+	repoDir := filepath.Join(sm.root, storage.RepoFolderNames("org/shared")[0])
+	partialB := filepath.Join(repoDir, "blobs", "b.incomplete")
+	if err := os.MkdirAll(filepath.Dir(partialB), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(partialB, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// cancel A (discard): B is still active for the repo → its partial
+	// must survive
+	sm.cancelDownload(a)
+	sm.handleDlFinished(a, context.Canceled)
+	if _, err := os.Stat(partialB); err != nil {
+		t.Fatalf("sibling partial must survive a cancel, stat err = %v", err)
+	}
+
+	// now cancel B (last one for the repo) → its own partial goes
+	sm.cancelDownload(b)
+	sm.handleDlFinished(b, context.Canceled)
+	if _, err := os.Stat(partialB); !os.IsNotExist(err) {
+		t.Errorf("last download's partial should be removed, stat err = %v", err)
+	}
+}
+
+// TestStorageDeleteBlockedWhileDownloading: deleting a repo with an
+// active download refuses (its partials must not be removed mid-flight).
+func TestStorageDeleteBlockedWhileDownloading(t *testing.T) {
+	eng := &stubEngine{blockCh: make(chan struct{})}
+	_, sm := openStorageRoot(t, eng)
+	_ = sm.startDownload("org/shared", "Q4_K_M")
+	if err := sm.deleteCacheEntry("org/shared"); err == nil {
+		t.Fatal("delete must refuse while a download for the repo is active")
+	}
+	if err := sm.deleteCacheQuants("org/shared", []string{"Q4_K_M"}); err == nil {
+		t.Fatal("quant delete must refuse while a download for the repo is active")
+	}
+}
