@@ -585,7 +585,7 @@ Three-pane master-detail:
 `Tab` / `Shift+Tab` cycle focus across panes. `Right` / `Left` (and `l` / `h`) do the same — the user can navigate to any pane with arrow keys without lifting from the navigation cluster.
 
 **Models pane**:
-- `e` rename alias / change source (modal form: alias, source select [`local` | `huggingface`], then either a path input or a `org/repo[:quant]` input depending on the selection).
+- `e` rename alias / change source (modal form: alias, source select [`local` | `huggingface`], then either a path input or a `org/repo[:quant]` input depending on the selection). Both value inputs stay free-type and are picker-assisted (§16.5): `ctrl+o` in the path input opens a `.gguf` filepicker (starting in `preferences.models-dir` → the current value's dir → the first local model's dir → `~`), and `ctrl+o` in the HF input opens a cached-repo list (one row per cached repo with quants + sizes, plus "type a new repo…"; a single cached quant pre-fills `org/repo:QUANT`, several pre-fill bare `org/repo`; an empty cache skips the list).
 - `n` new model (same modal as edit).
 - `c` duplicate, prompt for new alias (presets and params copied; source kind and value preserved).
 - `d` delete (confirm with preset count).
@@ -2120,3 +2120,192 @@ s to view`).
 `ViewStorage`, `m` dispatch, `returnFromStorageMsg`. `main.go` —
 shortcut-row text. `DESIGN.md` §16.4 + §7.5 mode list (same change,
 P5). No config, no `internal/storage` changes.
+
+### 16.5 Config-editor pickers — GGUF filepicker + cached-repo list
+
+**Scope.** Fifth item of Release 2 (ROADMAP §3.7, delivered after the
+Storage & Downloads manager per the owner's order; §3.8 **step A**). The
+config editor's free-type `location` / `hf` fields (DESIGN §7.5) become
+picker-assisted: a `bubbles/filepicker` overlay for local `.gguf` files,
+and a cached-repo list (from `storage.Scan`) for the HF branch. This
+makes the config editor the storage reader's first production consumer
+(§16.1). **Non-goals:** step B — typed-repo existence check and quant
+offer (`tree/main` round-trip) is item 6 (§3.8 step B); no VRAM hint;
+no network in the pickers; no config schema change (P8); the pickers
+never write anything — they only pre-fill the form's staging pointers,
+and nothing is persisted except through the normal save flow.
+
+**UX shape (unchanged schema, picker-assisted inputs).** In the model
+form, the location and HF identifier inputs keep working exactly as
+free-type inputs; a new hotkey **`ctrl+o`** ("open picker") while
+focused in either input opens its picker as a centered overlay (the
+§7.5 `paramPicker` pattern — a custom picker outside huh, driven by a
+done message). Esc in the overlay returns to the
+form with the field value unchanged; picking pre-fills the field and
+returns to the form **on the same field** (no field advance). huh's
+help line shows the new binding automatically.
+
+#### The trigger: a custom huh field
+
+huh v1.0.0 has no custom-key escape hatch: an `Input` field consumes
+every key except Prev/Next/Submit (verified in `field_input.go`), so a
+hotkey typed in a plain input never reaches `ConfigMode`. (huh v1.0.0's
+built-in `FilePicker` field was considered and rejected: it replaces
+free typing entirely, which §3.8 explicitly requires as a fallback, and
+it cannot render the cached-repo list.) Instead the model form uses a
+small custom huh field — `pickerInput` — that **embeds `*huh.Input`**
+and overrides three methods:
+
+- `Update`: when a `tea.KeyMsg` matches the field's `openKey`
+  (`ctrl+o`), return a cmd emitting `openModelPickerMsg{kind}` **and do
+  not forward the key to the embedded input**; otherwise delegate to the
+  embedded input unchanged.
+- `KeyBinds`: embedded input's binds plus the `openKey` binding, so
+  huh's help row renders `ctrl+o open picker`.
+- `View`: delegate to the embedded input (form rendering is otherwise
+  byte-identical to today — no existing snapshot churn).
+
+The rest of the `huh.Field` interface (Focus/Blur/WithKeyMap/
+WithPosition/GetKey/GetValue/…) is inherited from the embedded input.
+`buildModelForm` swaps the plain `huh.NewInput()` in the local and HF
+groups for `pickerInput` with the matching `kind`; alias and the other
+forms stay plain inputs.
+
+`ConfigMode.Update` gains the picker-open arm **before** the
+`c.form != nil` branch (alongside the existing `paramPickerDoneMsg`
+arm, config.go:180): `openModelPickerMsg` → build the overlay and
+return a nil cmd; `modelPickerDoneMsg` → consume and route. This keeps
+the "overlay handlers run on EVERY message" discipline: the done msg
+arrives as its own message through the tea loop and must be consumed
+before the form ever sees it (a form left un-updated mid-flow is what
+produces the swallowed-`nextFieldMsg` failure mode recorded in §16.4's
+gotchas).
+
+#### Local branch — the GGUF filepicker
+
+`bubbles/filepicker` v1.0.0 (already a dependency), configured:
+
+- `AllowedTypes = [".gguf"]` — other files render disabled (the
+  picker's `canSelect` suffix rule; selecting one is a no-op that shows
+  a brief `.gguf files only` error line, matching `DidSelectDisabledFile`).
+- `ShowSize = true`; `ShowPermissions = false`; `ShowHidden = false`.
+  `DirAllowed` stays **false** — directories remain navigable via
+  enter, but never selectable: with it true, entering a directory sets
+  `fp.Path` and `DidSelectFile` reports the directory itself as picked
+  (huh keeps it false for the same reason).
+- Keymap trimmed to the config-mode arrow convention (same rationale as
+  `paramPicker` dropping j/k): `↑`/`↓` move, `enter` opens a directory
+  or selects a file, `esc`/`backspace`/`←` go up one level, `esc` at
+  the root level cancels the overlay. `g`/`G`/`j`/`k`/`h`/`l` removed.
+- Sized via the existing `pickerSize()` + `overlayCenter` (the same box
+  treatment `paramPicker.View` uses), height through `picker.SetHeight`.
+
+**Start-directory resolution**, first candidate that exists wins:
+
+1. `preferences.models-dir` when set (the user's explicit choice wins,
+   P8 — same precedence as `storage.CacheRoot`).
+2. When editing an existing model whose current value is a non-empty
+   path, that value's directory (the natural "last-used" for the edit
+   case).
+3. The directory of the **first local model** in the config (a proxy
+   for "last-used model directory": llamaman keeps no usage history and
+   P8 forbids adding a field to record one — flagged for the owner).
+   (As implemented, the filepicker is rebuilt on every open at the
+   resolved start dir; the in-session "remembers the last browsed
+   directory" nicety of the original note was dropped — amending per
+   P5.)
+4. `~`.
+
+If every candidate is unset or nonexistent, `~` is used. The resolved
+dir is passed as `CurrentDirectory`; the filepicker's own
+`readDir`-on-Init fills the listing.
+
+#### HF branch — the cached-repo list
+
+On `ctrl+o` in the HF input, resolve the cache root with
+`storage.CacheRoot(c.work.Prefs().ModelsDir)` — the same call root.go
+makes for `ViewStorage` (§16.4) — and `storage.Scan(root, warn)`.
+Grouping and formatting reuse the Storage manager's repo-row logic
+exactly (the same helpers, so both surfaces always agree): group
+`CachedFile`s by `RepoID` (`byRepo` map, sorted keys), quants + sizes
+via `hf.Quants(repoFiles(fs))` + `hf.HumanSize` — both package-level in
+`internal/tui`/`internal/hf` already.
+
+The overlay is a `bubbles/list` picker in the `paramPicker` shape
+(arrows-only keymap, type-to-filter, reverse-video selection, no
+chrome). ROADMAP §3.8 names `huh.Select`, but per-option descriptions
+(quants + sizes) are exactly what `huh.Select` cannot render — the same
+reason `paramPicker` exists — so the custom list picker is used
+instead; the mechanism (overlay outside huh driven by a done message)
+is the one §3.8 itself prescribes to reuse. Rows:
+
+- One per cached repo: title `org/repo`, description =
+  `Q4_K_M — 4.2 GB, Q8_0 — 8.4 GB` (comma-joined, `hf.HumanSize`), or
+  `no model quants cached` when the repo has files but no quants (e.g.
+  only mmproj — same "empty cache repo" rule as the manager).
+- A trailing **`type a new repo…`** row, always present (never
+  filterable out — it is added after the filtered list is computed).
+- `enter` picks; `esc` cancels (both emit `modelPickerDoneMsg`).
+- **Empty cache** (zero repos) → the picker does not open; the field
+  stays a plain free-type input (§3.8: "an empty cache skips the
+  list"). Scan errors / unresolvable root → same no-op (P3; never a
+  blocking error in a form).
+
+**Pre-fill rule** (writes into the form's staging `hf` pointer, so the
+input displays the value and the form continues from that field):
+
+- repo with exactly one quant → `org/repo:QUANT`
+- repo with several quants, or none → `org/repo` (no suffix; §3.8:
+  "quant empty when the repo has several")
+- `type a new repo…` → field untouched (keeps whatever was typed)
+
+#### Routing and state
+
+`ConfigMode` gains one overlay slot, `modelPicker *modelPicker`
+(active only during `formNewModel`/`formEditModel`), holding the kind
+(`local`|`hf`) and either the filepicker or the list model. Routing,
+mirroring the existing `picker` slot (config.go:160–199):
+
+1. `modelPickerDoneMsg` → consume, write staging if not cancelled,
+   clear the slot, return to the form (no cmd).
+2. `modelPicker != nil` → forward the message exclusively to the
+   overlay (the form underneath is shielded while it is open).
+3. otherwise the existing routing (form → keys) continues unchanged.
+
+`SetSize` propagates to the overlay like it does for `picker`;
+`View` renders the overlay via `overlayCenter` when the slot is set,
+ahead of the form (same precedence as the param picker).
+
+#### Determinism and tests (P9)
+
+- `pickerInput` unit tests: `ctrl+o` emits `openModelPickerMsg` and
+  does not mutate the input value; other keys (typing, arrows, enter)
+  delegate to the embedded input unchanged; `KeyBinds` includes the
+  binding.
+- Start-dir resolution table test: models-dir set/unset, edit-value
+  dir, first-local-model dir, nonexistent candidates falling through,
+  home fallback — over `t.TempDir` trees.
+- ConfigMode flow tests (synchronous, the existing config_test.go
+  style): open the model form, drive to the location field, send
+  `ctrl+o` → overlay active; a temp dir holding `model.gguf` +
+  `notes.txt` renders with the `.txt` disabled; `enter` on the `.gguf`
+  → done msg → staging `location` set and the form is still on the
+  location field. Esc cancels without touching the value.
+- HF branch: fake hub-layout cache trees in `t.TempDir` (the
+  `scan_test.go` fixture style: `refs/main` + `snapshots/<commit>/`
+  symlinked files): single-quant repo pre-fills `org/repo:QUANT`,
+  multi-quant pre-fills `org/repo`, empty cache makes `ctrl+o` a no-op,
+  `type a new repo…` leaves the field as typed.
+- Overlay render assertions (in-process, deterministic temp dirs);
+  existing snapshots are unaffected (the form view is unchanged apart
+  from the help row).
+
+**File map.** New `internal/tui/modelpicker.go` + `modelpicker_test.go`
+(the `pickerInput` field, both overlays, the done/open messages,
+start-dir resolution; the form-flow test harness reuses the
+`snapshot_test.go` `drainCmds` via a `tea.Model` adapter). `internal/tui/config.go` — `buildModelForm` uses
+`pickerInput`, `Update` gains the two message arms and the overlay
+slot, `SetSize`/`View` propagate it, `handleModelPickerDone` rebuilds
+the form's cached view after a pre-fill. `DESIGN.md` §16.5 + the §7.5 Models
+pane bullet (same change, P5). No changes to `internal/storage`,
+`internal/hf`, the config schema, or ROADMAP.
