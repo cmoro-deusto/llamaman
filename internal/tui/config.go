@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 
@@ -16,6 +16,7 @@ import (
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
 	"github.com/cmoro-deusto/llamaman/internal/modelsini"
+	"github.com/cmoro-deusto/llamaman/internal/storage"
 )
 
 // savedFlashTTL is how long the "● saved" indicator stays in the
@@ -101,6 +102,9 @@ type ConfigMode struct {
 	formStaging formStaging
 	pendingKey  string       // staged param key between PickKey and PickValue
 	picker      *paramPicker // active when adding a new param
+	modelPicker *modelPicker // picker overlay for the model form's location/hf inputs
+	locField    *pickerInput // picker-assisted location input, for post-pick refresh
+	hfField     *pickerInput // picker-assisted HF input, for post-pick refresh
 
 	saveErr error
 	flash   string
@@ -141,6 +145,10 @@ func (c *ConfigMode) SetSize(w, h int) {
 	if c.picker != nil {
 		pw, ph := c.pickerSize()
 		c.picker.SetSize(pw, ph)
+	}
+	if c.modelPicker != nil {
+		pw, ph := c.pickerSize()
+		c.modelPicker.SetSize(pw, ph)
 	}
 }
 
@@ -185,6 +193,21 @@ func (c *ConfigMode) Update(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 		c.picker = next
 		return c, cmd
 	}
+	// Model-form pickers: the open/done messages must be consumed on
+	// every message (a form left un-updated mid-flow swallows its own
+	// nextFieldMsg — §16.4 gotcha), and while the overlay is open the
+	// form underneath is shielded from all input.
+	if m, ok := msg.(openModelPickerMsg); ok {
+		return c.openModelPicker(m.kind)
+	}
+	if m, ok := msg.(modelPickerDoneMsg); ok {
+		return c.handleModelPickerDone(m)
+	}
+	if c.modelPicker != nil {
+		next, cmd := c.modelPicker.Update(msg)
+		c.modelPicker = next
+		return c, cmd
+	}
 	if c.form != nil {
 		return c.updateForm(msg)
 	}
@@ -208,6 +231,75 @@ func (c *ConfigMode) handlePickerDone(msg paramPickerDoneMsg) (*ConfigMode, tea.
 	}
 	c.pendingKey = msg.key
 	return c, c.openValueFormFor(msg.key, "")
+}
+
+// openModelPicker builds and installs the picker overlay for the
+// model form's local/HF input (DESIGN §16.5). It is reached from
+// openModelPickerMsg, which only the pickerInput fields emit while a
+// model form is active; anything else is ignored. Failures are
+// non-blocking (P3): an unresolvable cache root, a scan error, or an
+// empty cache simply leave the free-type input in place.
+func (c *ConfigMode) openModelPicker(kind string) (*ConfigMode, tea.Cmd) {
+	if c.formKind != formNewModel && c.formKind != formEditModel {
+		return c, nil
+	}
+	var mp *modelPicker
+	if kind == sourceLocal {
+		cur := ""
+		if c.formStaging.location != nil {
+			cur = *c.formStaging.location
+		}
+		mp = newLocalPicker(pickerStartDir(c.work.Prefs().ModelsDir, cur, c.work.Models))
+	} else {
+		root, err := storage.CacheRoot(c.work.Prefs().ModelsDir)
+		if err != nil {
+			return c, nil
+		}
+		mp, err = newRepoPicker(root, nil)
+		if err != nil || mp == nil {
+			return c, nil
+		}
+	}
+	mp.SetSize(c.pickerSize())
+	c.modelPicker = mp
+	return c, mp.Init()
+}
+
+// handleModelPickerDone consumes the model-form picker's result:
+// cancelled (or the "type a new repo…" row, value "") leaves the field
+// untouched; otherwise the chosen value is written into the matching
+// staging pointer and the input is refreshed so the user sees it. The
+// form is still on the same field afterwards — no field advance. The
+// form's cached view is rebuilt so the pre-filled value renders
+// immediately (pickerFormRefreshMsg; huh caches group views).
+func (c *ConfigMode) handleModelPickerDone(msg modelPickerDoneMsg) (*ConfigMode, tea.Cmd) {
+	c.modelPicker = nil
+	changed := false
+	if !msg.cancelled && msg.value != "" {
+		switch msg.kind {
+		case sourceLocal:
+			if c.formStaging.location != nil {
+				*c.formStaging.location = msg.value
+				if c.locField != nil {
+					c.locField.RefreshValue()
+				}
+				changed = true
+			}
+		case sourceHF:
+			if c.formStaging.hf != nil {
+				*c.formStaging.hf = msg.value
+				if c.hfField != nil {
+					c.hfField.RefreshValue()
+				}
+				changed = true
+			}
+		}
+	}
+	if changed && c.form != nil {
+		_, cmd := c.form.Update(pickerFormRefreshMsg{})
+		return c, cmd
+	}
+	return c, nil
 }
 
 func (c *ConfigMode) updateForm(msg tea.Msg) (*ConfigMode, tea.Cmd) {
@@ -235,6 +327,8 @@ func (c *ConfigMode) dismissForm() {
 	c.form = nil
 	c.formKind = formNone
 	c.formStaging = formStaging{}
+	c.modelPicker = nil
+	c.locField, c.hfField = nil, nil
 }
 
 // installForm wires a freshly constructed huh.Form into ConfigMode,
@@ -513,7 +607,9 @@ func (c *ConfigMode) openNewModelForm() tea.Cmd {
 	alias, location, hf := "", "", ""
 	source := sourceLocal
 	c.formStaging = formStaging{alias: &alias, source: &source, location: &location, hf: &hf}
-	return c.installForm(buildModelForm(&alias, &source, &location, &hf), formNewModel)
+	form, locField, hfField := buildModelForm(&alias, &source, &location, &hf)
+	c.locField, c.hfField = locField, hfField
+	return c.installForm(form, formNewModel)
 }
 
 func (c *ConfigMode) openEditModelForm() tea.Cmd {
@@ -524,7 +620,9 @@ func (c *ConfigMode) openEditModelForm() tea.Cmd {
 		source = sourceHF
 	}
 	c.formStaging = formStaging{alias: &alias, source: &source, location: &location, hf: &hf}
-	return c.installForm(buildModelForm(&alias, &source, &location, &hf), formEditModel)
+	form, locField, hfField := buildModelForm(&alias, &source, &location, &hf)
+	c.locField, c.hfField = locField, hfField
+	return c.installForm(form, formEditModel)
 }
 
 // buildModelForm assembles the alias + source + value form used by both
@@ -532,8 +630,28 @@ func (c *ConfigMode) openEditModelForm() tea.Cmd {
 // functions (not per-Field), so the two value inputs live in their own
 // hidden-by-default groups gated on the source select. huh advances
 // from group 1 to whichever group 2/3 is currently visible on submit,
-// then to the next non-hidden group, etc.
-func buildModelForm(alias, source, location, hf *string) *huh.Form {
+// then to the next non-hidden group, etc. The two value inputs are
+// pickerInput fields (DESIGN §16.5): free-type with a ctrl+o hotkey;
+// the returned field references let ConfigMode refresh the rendered
+// value after a picker pre-fill.
+func buildModelForm(alias, source, location, hf *string) (*huh.Form, *pickerInput, *pickerInput) {
+	// The builder chain runs on the raw *huh.Input *before* wrapping —
+	// the promoted builder methods return *huh.Input and would unwrap
+	// the pickerInput if chained after.
+	locIn := huh.NewInput().
+		Title("model location (path)").
+		Description("expanded ~ and $VAR at load time · ctrl+o: browse .gguf").
+		Value(location).
+		CharLimit(2048).
+		Validate(nonEmpty("location"))
+	hfIn := huh.NewInput().
+		Title("HF identifier").
+		Description("org/model[:quant], e.g. Qwen/Qwen3-32B-GGUF:Q4_K_M · ctrl+o: cached repos").
+		Value(hf).
+		CharLimit(256).
+		Validate(hfFormValidator)
+	locField := wrapPickerInput(locIn, sourceLocal, location)
+	hfField := wrapPickerInput(hfIn, sourceHF, hf)
 	g1 := huh.NewGroup(
 		huh.NewInput().Title("alias").Value(alias).Validate(nonEmpty("alias")),
 		huh.NewSelect[string]().
@@ -545,23 +663,9 @@ func buildModelForm(alias, source, location, hf *string) *huh.Form {
 			).
 			Value(source),
 	)
-	g2Local := huh.NewGroup(
-		huh.NewInput().
-			Title("model location (path)").
-			Description("expanded ~ and $VAR at load time").
-			Value(location).
-			CharLimit(2048).
-			Validate(nonEmpty("location")),
-	).WithHideFunc(func() bool { return *source != sourceLocal })
-	g2HF := huh.NewGroup(
-		huh.NewInput().
-			Title("HF identifier").
-			Description("org/model[:quant], e.g. Qwen/Qwen3-32B-GGUF:Q4_K_M").
-			Value(hf).
-			CharLimit(256).
-			Validate(hfFormValidator),
-	).WithHideFunc(func() bool { return *source != sourceHF })
-	return huh.NewForm(g1, g2Local, g2HF)
+	g2Local := huh.NewGroup(locField).WithHideFunc(func() bool { return *source != sourceLocal })
+	g2HF := huh.NewGroup(hfField).WithHideFunc(func() bool { return *source != sourceHF })
+	return huh.NewForm(g1, g2Local, g2HF), locField, hfField
 }
 
 // hfFormValidator combines the non-empty check with the format check
@@ -1173,6 +1277,9 @@ func (c *ConfigMode) View() string {
 	}
 	if c.picker != nil {
 		return overlayCenter(bg, c.picker.View(c.theme), c.width, c.height)
+	}
+	if c.modelPicker != nil {
+		return overlayCenter(bg, c.modelPicker.View(c.theme), c.width, c.height)
 	}
 	// The form is no longer overlaid here — renderPanes() inlines it
 	// below the Presets pane at the same column width, so the panes
