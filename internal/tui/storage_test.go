@@ -884,3 +884,27 @@ func TestStorageDeleteBlockedWhileDownloading(t *testing.T) {
 		t.Fatal("quant delete must refuse while a download for the repo is active")
 	}
 }
+
+// TestStorageCancelledNotShownAsDownloaded: after cancelling every
+// download and leaving to Main, the status line must not claim a model
+// was downloaded (owner report).
+func TestStorageCancelledNotShownAsDownloaded(t *testing.T) {
+	eng := &stubEngine{blockCh: make(chan struct{})}
+	r, sm := openStorageRoot(t, eng)
+	for _, q := range []string{"Q4_K_M", "Q8_0", "Q6_K"} {
+		_ = sm.startDownload("org/three", q)
+	}
+	// cancel all three (discard) — the entries settle as dlDone
+	for _, d := range sm.downloads {
+		sm.cancelDownload(d)
+		sm.handleDlFinished(d, context.Canceled)
+	}
+	driveRoot(t, r, keyMsg("esc"))
+	if strings.Contains(r.mainMode.statusLine, "downloaded") ||
+		strings.Contains(r.mainMode.statusLine, "download finished") {
+		t.Errorf("cancelled downloads must not appear as downloaded, got %q", r.mainMode.statusLine)
+	}
+	if strings.Contains(r.mainMode.statusLine, "org/three") {
+		t.Errorf("cancelled downloads must not appear at all, got %q", r.mainMode.statusLine)
+	}
+}

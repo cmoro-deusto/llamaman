@@ -588,6 +588,11 @@ func (r *Root) refreshDlStatusLine() {
 	}
 	var running, paused, failed, done []string
 	for _, d := range r.storage.downloads {
+		// cancelled downloads are marked dlDone for auto-dismiss but
+		// must never surface as "downloaded" (owner report).
+		if d.discard {
+			continue
+		}
 		name := d.repo + ":" + d.quant
 		switch d.status {
 		case dlRunning:
