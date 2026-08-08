@@ -512,3 +512,37 @@ func TestStorageFlashExpiresWithoutDownload(t *testing.T) {
 		t.Errorf("flash must clear on navigation, got %q", sm.flash)
 	}
 }
+
+// TestStorageSpeedWindowed: the speed readout is computed over a ~2s
+// window (not per-tick deltas) and does not jitter without new data.
+func TestStorageSpeedWindowed(t *testing.T) {
+	_, sm := openStorageRoot(t, &stubEngine{})
+	sm.dl = &downloadState{repo: "org/r", quant: "Q4_K_M", status: dlRunning, prog: &progressSlot{}}
+	sm.dl.speedWinAt = time.Now().Add(-2 * time.Second)
+	sm.dl.speedWinDone = 0
+	sm.dl.prog.set(2<<20, 1<<30) // 2 MiB fetched over the last 2s
+
+	sm.Update(dlTickMsg{})
+	if want := int64(1 << 20); sm.dl.speed < want-1024 || sm.dl.speed > want+1024 {
+		t.Errorf("speed = %d, want ~%d (2 MiB / 2s)", sm.dl.speed, want)
+	}
+
+	// no new progress: the window does not advance, speed stays put
+	sm.Update(dlTickMsg{})
+	if want := int64(1 << 20); sm.dl.speed < want-1024 || sm.dl.speed > want+1024 {
+		t.Errorf("speed changed without new data: %d, want ~%d", sm.dl.speed, want)
+	}
+}
+
+// TestProgressSlotKeepsLatest: the latest progress snapshot wins — no
+// drops, unlike a bounded channel.
+func TestProgressSlotKeepsLatest(t *testing.T) {
+	slot := &progressSlot{}
+	for i := int64(0); i < 1000; i++ {
+		slot.set(i, 1000)
+	}
+	done, total := slot.get()
+	if done != 999 || total != 1000 {
+		t.Errorf("slot = %d/%d, want 999/1000 (latest wins)", done, total)
+	}
+}

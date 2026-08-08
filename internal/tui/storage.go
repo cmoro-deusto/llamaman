@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -69,10 +70,12 @@ type downloadState struct {
 	repo, quant string
 	status      dlStatus
 	done, total int64
-	// speed is a bytes/s estimate from the tick samples.
-	speed     int64
-	speedAt   time.Time
-	speedDone int64
+	// speed is a bytes/s estimate over a ~2s window (instantaneous
+	// per-tick deltas are too noisy to read).
+	speed        int64
+	speedWinAt   time.Time
+	speedWinDone int64
+	prog         *progressSlot
 	err       error
 	cancel    context.CancelFunc
 	paused    bool // user pressed pause
@@ -81,8 +84,29 @@ type downloadState struct {
 }
 
 type dlTickMsg struct{}
-type dlProgressMsg struct{ done, total int64 }
 type dlFinishedMsg struct{ err error }
+
+// progressSlot holds the latest progress snapshot: the download
+// goroutine overwrites it, the render loop reads it. No drops (a
+// full channel would lose updates and make the bar/speed jump) and
+// no shared-state race.
+type progressSlot struct {
+	mu    sync.Mutex
+	done  int64
+	total int64
+}
+
+func (p *progressSlot) set(done, total int64) {
+	p.mu.Lock()
+	p.done, p.total = done, total
+	p.mu.Unlock()
+}
+
+func (p *progressSlot) get() (done, total int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.done, p.total
+}
 
 // stgFlashExpiredMsg fires from the flash timer (stgFlashTTL) — flashes
 // expire even when no download is running.
@@ -124,9 +148,8 @@ type StorageMode struct {
 	confirmEntry int
 	confirmAction string // "deletecache" | "deleteconfig"
 
-	dl      *downloadState
-	dlProg  chan dlProgressMsg
-	dlDone  chan error
+	dl     *downloadState
+	dlDone chan error
 
 	flash   string
 	flashAt time.Time // flash auto-expiry clock
@@ -295,30 +318,25 @@ func (s *StorageMode) handleDlTick() (*StorageMode, tea.Cmd) {
 	if s.dl == nil {
 		return s, nil
 	}
-	for {
-		select {
-		case p := <-s.dlProg:
-			s.dl.done, s.dl.total = p.done, p.total
-		default:
-			goto drained
-		}
+	if p := s.dl.prog; p != nil {
+		s.dl.done, s.dl.total = p.get()
 	}
-drained:
 	select {
 	case err := <-s.dlDone:
 		return s, s.handleDlFinished(err)
 	default:
 	}
-	// speed estimate from the tick samples (only while data advances)
+	// speed over a ~2s window: instant per-tick deltas are too noisy
+	// to read (owner report).
 	if s.dl.status == dlRunning {
 		now := time.Now()
-		if s.dl.speedAt.IsZero() {
-			s.dl.speedAt, s.dl.speedDone = now, s.dl.done
-		} else if s.dl.done != s.dl.speedDone {
-			if dt := now.Sub(s.dl.speedAt).Seconds(); dt > 0 {
-				s.dl.speed = int64(float64(s.dl.done-s.dl.speedDone) / dt)
+		if s.dl.speedWinAt.IsZero() {
+			s.dl.speedWinAt, s.dl.speedWinDone = now, s.dl.done
+		} else if now.Sub(s.dl.speedWinAt) >= 2*time.Second {
+			if dt := now.Sub(s.dl.speedWinAt).Seconds(); dt > 0 {
+				s.dl.speed = int64(float64(s.dl.done-s.dl.speedWinDone) / dt)
 			}
-			s.dl.speedAt, s.dl.speedDone = now, s.dl.done
+			s.dl.speedWinAt, s.dl.speedWinDone = now, s.dl.done
 		}
 	}
 	// auto-dismiss: finished downloads leave the row after 3s; flashes
@@ -372,14 +390,12 @@ func (s *StorageMode) handleDlFinished(err error) tea.Cmd {
 func (s *StorageMode) startDownload(repo, quant string) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.dl = &downloadState{repo: repo, quant: quant, status: dlRunning, cancel: cancel}
-	s.dlProg = make(chan dlProgressMsg, 128)
+	s.dl.prog = &progressSlot{}
 	s.dlDone = make(chan error, 1)
+	prog := s.dl.prog // captured: a resumed download writes its own slot
 	go func() {
 		err := s.engine.Download(ctx, s.root, repo, quant, func(done, total int64) {
-			select {
-			case s.dlProg <- dlProgressMsg{done: done, total: total}:
-			default:
-			}
+			prog.set(done, total)
 		})
 		s.dlDone <- err
 	}()
