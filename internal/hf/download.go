@@ -75,16 +75,34 @@ func (c *Client) Download(ctx context.Context, root, repo, quant string, progres
 		}
 		jobs = append(jobs, job{file: f, offset: off})
 	}
-	var total int64
-	for _, j := range jobs {
-		total += j.file.Size - j.offset
-	}
-	var done int64
-	if progress != nil {
-		progress(0, total)
-	}
 	if len(jobs) == 0 {
-		return nil // everything cached
+		// everything cached: (0,0) is the manager's "already cached"
+		// signal (its total==0 branch).
+		if progress != nil {
+			progress(0, 0)
+		}
+		return nil
+	}
+	// Absolute progress: total is the full size and done starts at the
+	// bytes already on disk (partials), so a resume continues the bar
+	// instead of resetting it to zero (owner report).
+	total := int64(0)
+	for _, f := range files {
+		total += f.Size
+	}
+	inJobs := make(map[string]bool, len(jobs))
+	done := int64(0)
+	for _, j := range jobs {
+		inJobs[j.file.Path] = true
+		done += j.offset
+	}
+	for _, f := range files {
+		if !inJobs[f.Path] {
+			done += f.Size // already cached
+		}
+	}
+	if progress != nil {
+		progress(done, total)
 	}
 	refsWritten := false
 	for _, j := range jobs {

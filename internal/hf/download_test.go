@@ -165,8 +165,10 @@ func TestDownloadResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lastTotal != 5 || lastDone != 5 {
-		t.Errorf("progress = %d/%d, want 5/5 (remaining only)", lastDone, lastTotal)
+	// absolute progress: the pre-seeded 5 bytes count as done and the
+	// total is the full size — the bar continues, not resets
+	if lastTotal != 10 || lastDone != 10 {
+		t.Errorf("progress = %d/%d, want 10/10 (absolute, resumed)", lastDone, lastTotal)
 	}
 	if len(f.rangeHeaders) != 1 || f.rangeHeaders[0] != "bytes=5-" {
 		t.Errorf("Range headers = %v, want [bytes=5-]", f.rangeHeaders)

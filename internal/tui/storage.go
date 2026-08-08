@@ -482,12 +482,23 @@ func (s *StorageMode) focusDownloadRow() {
 }
 
 // selectedDownload returns the download under the cursor, or the first
-// running one when the cursor is elsewhere.
+// running one when the cursor is elsewhere. The entry's dlIdx is
+// verified against the current list and, on any mismatch, the row's
+// title (repo:quant) is matched instead — the list compacts when
+// downloads settle, and a stale index must never select the wrong one.
 func (s *StorageMode) selectedDownload() *downloadState {
 	if s.cursor >= 0 && s.cursor < len(s.entries) && s.entries[s.cursor].kind == entryDownload {
-		i := s.entries[s.cursor].dlIdx
-		if i >= 0 && i < len(s.downloads) {
-			return s.downloads[i]
+		e := s.entries[s.cursor]
+		if e.dlIdx >= 0 && e.dlIdx < len(s.downloads) {
+			d := s.downloads[e.dlIdx]
+			if d.repo+":"+d.quant == e.title {
+				return d
+			}
+		}
+		for _, d := range s.downloads {
+			if d.repo+":"+d.quant == e.title {
+				return d
+			}
 		}
 	}
 	for _, d := range s.downloads {
