@@ -10,6 +10,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -145,10 +146,14 @@ type StorageMode struct {
 	pendingRepo string
 	menu      *huh.Form // per-row action menu
 	menuAction string
+	menuStage  int // 0 = row action menu, 1 = delete-scope menu
+	quantDel  *huh.Form // per-quant delete multi-select
+	quantDelVal []string
 	confirm      *huh.Form // delete confirmation
 	confirmYes   bool
 	confirmEntry int
-	confirmAction string // "deletecache" | "deleteconfig"
+	confirmAction string // "deletecache" | "deleteconfig" | "deletequants"
+	confirmQuants []string
 
 	dl     *downloadState
 	dlDone chan error
@@ -315,6 +320,9 @@ func (s *StorageMode) Update(msg tea.Msg) (*StorageMode, tea.Cmd) {
 	}
 	if s.quantForm != nil {
 		return s.updateQuantForm(msg)
+	}
+	if s.quantDel != nil {
+		return s.updateQuantDel(msg)
 	}
 	if s.form != nil {
 		return s.updateRepoForm(msg)
@@ -497,6 +505,61 @@ func (s *StorageMode) deleteCacheEntry(repo string) error {
 	return nil
 }
 
+// deleteCacheQuants removes the given quant files of a cache repo.
+// Blobs no longer referenced by any remaining snapshot entry are
+// removed too (refcounted, like llama.cpp); an empty repo folder is
+// cleaned up entirely. Config entries are never touched (P8).
+func (s *StorageMode) deleteCacheQuants(repo string, quants []string) error {
+	files, _ := storage.Lookup(s.root, repo)
+	want := map[string]bool{}
+	for _, q := range quants {
+		want[q] = true
+	}
+	removed := 0
+	for _, f := range files {
+		for _, q := range hf.Quants([]hf.RepoFile{{Path: f.Path, Size: f.Size}}) {
+			if want[q.Tag] {
+				if err := os.Remove(f.Path); err == nil {
+					removed++
+				}
+			}
+		}
+	}
+	if removed == 0 {
+		return fmt.Errorf("no files matched the selected quants")
+	}
+	// refcount blobs: drop blobs no snapshot entry references anymore
+	repoDir := filepath.Join(s.root, storage.RepoFolderNames(repo)[0])
+	snapDir := filepath.Join(repoDir, "snapshots")
+	if info, err := os.Stat(snapDir); err == nil && info.IsDir() {
+		referenced := map[string]bool{}
+		_ = filepath.WalkDir(snapDir, func(p string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if target, rerr := os.Readlink(p); rerr == nil {
+				referenced[filepath.Base(target)] = true
+			} else {
+				referenced[filepath.Base(p)] = true
+			}
+			return nil
+		})
+		blobsDir := filepath.Join(repoDir, "blobs")
+		if entries, err := os.ReadDir(blobsDir); err == nil {
+			for _, b := range entries {
+				if !referenced[b.Name()] {
+					_ = os.Remove(filepath.Join(blobsDir, b.Name()))
+				}
+			}
+		}
+	}
+	// nothing left → drop the whole repo dir
+	if remaining, err := storage.Lookup(s.root, repo); err == nil && len(remaining) == 0 {
+		_ = os.RemoveAll(repoDir)
+	}
+	return nil
+}
+
 // reveal opens the parent folder of a local model (best effort — a
 // missing xdg-open is a warning line, never a crash).
 func (s *StorageMode) reveal(path string) tea.Cmd {
@@ -516,7 +579,7 @@ func (s *StorageMode) reveal(path string) tea.Cmd {
 func (s *StorageMode) handleKey(k tea.KeyMsg) (*StorageMode, tea.Cmd) {
 	// overlays take priority (they also process the completing message,
 	// which is often a follow-up, not the key itself)
-	if s.confirm != nil || s.menu != nil || s.quantForm != nil || s.form != nil {
+	if s.confirm != nil || s.menu != nil || s.quantForm != nil || s.quantDel != nil || s.form != nil {
 		if s.confirm != nil {
 			return s.updateConfirm(k)
 		}
@@ -525,6 +588,9 @@ func (s *StorageMode) handleKey(k tea.KeyMsg) (*StorageMode, tea.Cmd) {
 		}
 		if s.quantForm != nil {
 			return s.updateQuantForm(k)
+		}
+		if s.quantDel != nil {
+			return s.updateQuantDel(k)
 		}
 		return s.updateRepoForm(k)
 	}
@@ -704,10 +770,83 @@ func (s *StorageMode) openMenu() tea.Cmd {
 		return nil
 	}
 	s.menuAction = ""
+	s.menuStage = 0
 	s.menu = huh.NewForm(huh.NewGroup(
 		huh.NewSelect[string]().Title(e.title).Options(opts...).Value(&s.menuAction),
 	)).WithTheme(configHuhTheme(s.theme)).WithWidth(s.formWidth())
 	return s.menu.Init()
+}
+
+// openDeleteScopeMenu offers "delete all files" (as before) or picking
+// the specific quants to remove.
+func (s *StorageMode) openDeleteScopeMenu(repo string) tea.Cmd {
+	s.menuAction = ""
+	s.menuStage = 1
+	opts := []huh.Option[string]{
+		huh.NewOption("delete all files", "all"),
+	}
+	files, _ := storage.Lookup(s.root, repo)
+	quants := hf.Quants(repoFiles(files))
+	for _, q := range quants {
+		opts = append(opts, huh.NewOption(
+			fmt.Sprintf("%s — %s", q.Tag, hf.HumanSize(q.Size)), q.Tag))
+	}
+	if len(quants) > 1 {
+		opts = append(opts, huh.NewOption("select quants…", "select"))
+	}
+	s.menu = huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().Title("delete " + repo).Options(opts...).Value(&s.menuAction),
+	)).WithTheme(configHuhTheme(s.theme)).WithWidth(s.formWidth())
+	return s.menu.Init()
+}
+
+// openQuantDeletePicker multi-selects the cached quants of a repo.
+func (s *StorageMode) openQuantDeletePicker(repo string) tea.Cmd {
+	files, _ := storage.Lookup(s.root, repo)
+	quants := hf.Quants(repoFiles(files))
+	s.quantDelVal = nil
+	opts := make([]huh.Option[string], 0, len(quants))
+	for _, q := range quants {
+		opts = append(opts, huh.NewOption(
+			fmt.Sprintf("%s — %s", q.Tag, hf.HumanSize(q.Size)), q.Tag))
+	}
+	s.quantDel = huh.NewForm(huh.NewGroup(
+		huh.NewMultiSelect[string]().
+			Title("quants to delete").
+			Description(repo + " — space to select").
+			Options(opts...).
+			Value(&s.quantDelVal),
+	)).WithTheme(configHuhTheme(s.theme)).WithWidth(s.formWidth())
+	return s.quantDel.Init()
+}
+
+func (s *StorageMode) updateQuantDel(msg tea.Msg) (*StorageMode, tea.Cmd) {
+	if k, ok := msg.(tea.KeyMsg); ok && k.String() == "esc" {
+		s.quantDel = nil
+		return s, nil
+	}
+	next, cmd := s.quantDel.Update(msg)
+	if f, ok := next.(*huh.Form); ok {
+		s.quantDel = f
+	}
+	if s.quantDel != nil && s.quantDel.State == huh.StateCompleted {
+		sel := s.quantDelVal
+		s.quantDel = nil
+		repo := s.entries[s.confirmEntry].title
+		if len(sel) == 0 {
+			return s, s.setFlash("no quants selected — nothing deleted")
+		}
+		s.confirmYes = false
+		s.confirmAction = "deletequants"
+		s.confirmQuants = sel
+		s.confirm = huh.NewForm(huh.NewGroup(
+			huh.NewConfirm().Title(fmt.Sprintf("delete %d quant(s) from %s?", len(sel), repo)).
+				Description("removes those quant files; other quants stay").
+				Value(&s.confirmYes),
+		)).WithTheme(configHuhTheme(s.theme)).WithWidth(s.formWidth())
+		return s, s.confirm.Init()
+	}
+	return s, cmd
 }
 
 func (s *StorageMode) updateMenu(msg tea.Msg) (*StorageMode, tea.Cmd) {
@@ -721,16 +860,14 @@ func (s *StorageMode) updateMenu(msg tea.Msg) (*StorageMode, tea.Cmd) {
 	}
 	if s.menu != nil && s.menu.State == huh.StateCompleted {
 		action := s.menuAction
+		stage := s.menuStage
 		s.menu = nil
+		s.menuStage = 0
 		e := s.entries[s.cursor]
-		switch e.kind {
-		case entryCacheRepo:
+		if stage == 1 {
+			// delete-scope menu: all files vs specific quants
 			switch action {
-			case "download":
-				repo, _ := splitRepoQuant(e.title)
-				s.pendingRepo = repo
-				return s, s.openQuantPicker(repo)
-			case "delete":
+			case "all":
 				s.confirmEntry = s.cursor
 				s.confirmYes = false
 				s.confirmAction = "deletecache"
@@ -740,6 +877,32 @@ func (s *StorageMode) updateMenu(msg tea.Msg) (*StorageMode, tea.Cmd) {
 						Value(&s.confirmYes),
 				)).WithTheme(configHuhTheme(s.theme)).WithWidth(s.formWidth())
 				return s, s.confirm.Init()
+			case "select":
+				s.confirmEntry = s.cursor
+				return s, s.openQuantDeletePicker(e.title)
+			default: // a single quant chosen directly
+				s.confirmEntry = s.cursor
+				s.confirmYes = false
+				s.confirmAction = "deletequants"
+				s.confirmQuants = []string{action}
+				s.confirm = huh.NewForm(huh.NewGroup(
+					huh.NewConfirm().Title("delete " + action + " from " + e.title + "?").
+						Description("removes that quant's files; other quants stay").
+						Value(&s.confirmYes),
+				)).WithTheme(configHuhTheme(s.theme)).WithWidth(s.formWidth())
+				return s, s.confirm.Init()
+			}
+		}
+		switch e.kind {
+		case entryCacheRepo:
+			switch action {
+			case "download":
+				repo, _ := splitRepoQuant(e.title)
+				s.pendingRepo = repo
+				return s, s.openQuantPicker(repo)
+			case "delete":
+				s.confirmEntry = s.cursor
+				return s, s.openDeleteScopeMenu(e.title)
 			}
 		case entryDownload:
 			if s.dl == nil {
@@ -797,6 +960,12 @@ func (s *StorageMode) updateConfirm(msg tea.Msg) (*StorageMode, tea.Cmd) {
 					flashMsg = "could not remove from config: " + err.Error()
 				} else {
 					flashMsg = "removed " + e.title + " from config"
+				}
+			case "deletequants":
+				if err := s.deleteCacheQuants(e.title, s.confirmQuants); err != nil {
+					flashMsg = "delete failed: " + err.Error()
+				} else {
+					flashMsg = fmt.Sprintf("deleted %d quant(s) from %s", len(s.confirmQuants), e.title)
 				}
 			default:
 				if err := s.deleteCacheEntry(e.title); err != nil {
@@ -875,6 +1044,8 @@ func (s StorageMode) overlayView() string {
 		v = s.menu.View()
 	case s.quantForm != nil:
 		v = s.quantForm.View()
+	case s.quantDel != nil:
+		v = s.quantDel.View()
 	case s.form != nil:
 		v = s.form.View()
 	default:

@@ -238,7 +238,8 @@ func TestStorageDelete(t *testing.T) {
 	driveRoot(t, r,
 		tea.KeyMsg{Type: tea.KeyEnter}, // open action menu
 		tea.KeyMsg{Type: tea.KeyDown},  // choose delete
-		tea.KeyMsg{Type: tea.KeyEnter}, // submit menu (confirm opens)
+		tea.KeyMsg{Type: tea.KeyEnter}, // submit menu (scope menu opens)
+		tea.KeyMsg{Type: tea.KeyEnter}, // scope: delete all files (confirm opens)
 		tea.KeyMsg{Type: tea.KeyRight}, // toggle confirm to Yes
 		tea.KeyMsg{Type: tea.KeyEnter}, // confirm: choose Yes
 		tea.KeyMsg{Type: tea.KeyEnter}, // confirm: submit
@@ -260,7 +261,8 @@ func TestStorageDeleteDeclined(t *testing.T) {
 	driveRoot(t, r,
 		tea.KeyMsg{Type: tea.KeyEnter}, // open action menu
 		tea.KeyMsg{Type: tea.KeyDown},  // choose delete
-		tea.KeyMsg{Type: tea.KeyEnter}, // submit menu (confirm opens)
+		tea.KeyMsg{Type: tea.KeyEnter}, // submit menu (scope menu opens)
+		tea.KeyMsg{Type: tea.KeyEnter}, // scope: delete all files (confirm opens)
 		tea.KeyMsg{Type: tea.KeyEnter}, // confirm: keep No
 		tea.KeyMsg{Type: tea.KeyEnter}, // confirm: submit
 	)
@@ -661,5 +663,126 @@ func TestStorageReentryResumesDownload(t *testing.T) {
 	out := stripANSI(sm.View())
 	if !strings.Contains(out, "cancel") {
 		t.Errorf("download menu must offer cancel:\n%s", out)
+	}
+}
+
+// twoQuantRepo builds a hub repo with two quants and returns the repo
+// dir and both snapshot paths.
+func twoQuantRepo(t *testing.T, root, repoID string) (repoDir, snapA, snapB string) {
+	t.Helper()
+	repoDir = filepath.Join(root, storage.RepoFolderNames(repoID)[0])
+	blobsDir := filepath.Join(repoDir, "blobs")
+	for _, f := range []struct{ name, oid, content string }{
+		{"model-Q4_K_M.gguf", "1111111111111111111111111111111111111111111111111111111111111111", "aaaa"},
+		{"model-Q8_0.gguf", "2222222222222222222222222222222222222222222222222222222222222222", "bbbb"},
+	} {
+		if err := os.MkdirAll(blobsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(blobsDir, f.oid), []byte(f.content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		snap := filepath.Join(repoDir, "snapshots", "aa", f.name)
+		if err := os.MkdirAll(filepath.Dir(snap), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join("..", "..", "blobs", f.oid), snap); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return repoDir, filepath.Join(repoDir, "snapshots", "aa", "model-Q4_K_M.gguf"),
+		filepath.Join(repoDir, "snapshots", "aa", "model-Q8_0.gguf")
+}
+
+// TestStorageDeleteSingleQuant: deleting one quant removes only its
+// files and its orphaned blob; the other quant stays.
+func TestStorageDeleteSingleQuant(t *testing.T) {
+	eng := &stubEngine{}
+	cfg := sampleSnapshotConfig()
+	root := t.TempDir()
+	repoDir, snapA, snapB := twoQuantRepo(t, root, "org/two")
+	cfg.Preferences = &config.Preferences{ModelsDir: root}
+	r := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	r.SetDownloadEngine(eng)
+	driveRoot(t, r, tea.WindowSizeMsg{Width: 120, Height: 40}, keyMsg("s"))
+	sm := r.storage
+
+	// select the org/two row
+	for i, e := range sm.entries {
+		if e.title == "org/two" {
+			sm.cursor = i
+		}
+	}
+	driveRoot(t, r,
+		tea.KeyMsg{Type: tea.KeyEnter}, // action menu
+		tea.KeyMsg{Type: tea.KeyDown},  // delete
+		tea.KeyMsg{Type: tea.KeyEnter}, // submit → scope menu
+		tea.KeyMsg{Type: tea.KeyDown},  // scope: Q4_K_M
+		tea.KeyMsg{Type: tea.KeyDown},  // scope: Q8_0 quant
+		tea.KeyMsg{Type: tea.KeyEnter}, // choose Q8_0 (confirm opens)
+		tea.KeyMsg{Type: tea.KeyRight}, // confirm: Yes
+		tea.KeyMsg{Type: tea.KeyEnter}, // choose Yes
+		tea.KeyMsg{Type: tea.KeyEnter}, // submit
+	)
+	if _, err := os.Stat(snapB); !os.IsNotExist(err) {
+		t.Errorf("Q8_0 snapshot must be removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(snapA); err != nil {
+		t.Errorf("Q4_K_M snapshot must stay, stat err = %v", err)
+	}
+	blobB := filepath.Join(repoDir, "blobs", "2222222222222222222222222222222222222222222222222222222222222222")
+	if _, err := os.Stat(blobB); !os.IsNotExist(err) {
+		t.Errorf("orphaned Q8_0 blob must be removed, stat err = %v", err)
+	}
+}
+
+// TestStorageDeleteQuantMultiselect: "select quants…" lets the user
+// pick several quants, confirmed once.
+func TestStorageDeleteQuantMultiselect(t *testing.T) {
+	eng := &stubEngine{}
+	cfg := sampleSnapshotConfig()
+	root := t.TempDir()
+	repoDir, snapA, snapB := twoQuantRepo(t, root, "org/two")
+	cfg.Preferences = &config.Preferences{ModelsDir: root}
+	r := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	r.SetDownloadEngine(eng)
+	driveRoot(t, r, tea.WindowSizeMsg{Width: 120, Height: 40}, keyMsg("s"))
+	sm := r.storage
+	for i, e := range sm.entries {
+		if e.title == "org/two" {
+			sm.cursor = i
+		}
+	}
+	// scope menu has [all, Q4_K_M, Q8_0, select quants…] — pick "select"
+	driveRoot(t, r,
+		tea.KeyMsg{Type: tea.KeyEnter}, // action menu
+		tea.KeyMsg{Type: tea.KeyDown},  // delete
+		tea.KeyMsg{Type: tea.KeyEnter}, // submit → scope menu
+		tea.KeyMsg{Type: tea.KeyDown},  // Q4_K_M
+		tea.KeyMsg{Type: tea.KeyDown},  // Q8_0
+		tea.KeyMsg{Type: tea.KeyDown},  // select quants…
+		tea.KeyMsg{Type: tea.KeyEnter}, // choose "select quants…"
+	)
+	if sm.quantDel == nil {
+		t.Fatalf("multi-select did not open:\n%s", stripANSI(sm.View()))
+	}
+	// multiselect: space on first two options, then submit
+	driveRoot(t, r,
+		tea.KeyMsg{Type: tea.KeySpace}, // select Q4_K_M
+		tea.KeyMsg{Type: tea.KeyDown},
+		tea.KeyMsg{Type: tea.KeySpace}, // select Q8_0
+		tea.KeyMsg{Type: tea.KeyEnter}, // submit (confirm opens)
+		tea.KeyMsg{Type: tea.KeyRight}, // confirm: Yes
+		tea.KeyMsg{Type: tea.KeyEnter}, // choose Yes
+		tea.KeyMsg{Type: tea.KeyEnter}, // submit
+	)
+	if _, err := os.Stat(snapA); !os.IsNotExist(err) {
+		t.Errorf("Q4_K_M must be deleted, stat err = %v", err)
+	}
+	if _, err := os.Stat(snapB); !os.IsNotExist(err) {
+		t.Errorf("Q8_0 must be deleted, stat err = %v", err)
+	}
+	if _, err := os.Stat(repoDir); !os.IsNotExist(err) {
+		t.Errorf("empty repo dir must be removed, stat err = %v", err)
 	}
 }
