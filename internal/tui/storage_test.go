@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -124,20 +125,16 @@ func TestStorageEscReturnsToMain(t *testing.T) {
 // the row becomes an in-flight download.
 func TestStorageDownloadNow(t *testing.T) {
 	eng := &stubEngine{
-		chosen: []hf.QuantOption{
-			{Tag: "Q4_K_M", Size: 100},
-			{Tag: "Q8_0", Size: 200},
-		},
+		chosen:   []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}, {Tag: "Q8_0", Size: 200}},
+		progress: []int64{}, // non-nil: the stub fires the progress callback
 	}
 	r, sm := openStorageRoot(t, eng)
 
-	driveRoot(t, r,
-		keyMsg("d"),
-		keyMsg("org/newrepo"),
-		tea.KeyMsg{Type: tea.KeyEnter}, // submit repo input
-		tea.KeyMsg{Type: tea.KeyEnter}, // quant select: choose Q4_K_M
-		tea.KeyMsg{Type: tea.KeyEnter}, // quant select: submit form
-	)
+	driveRoot(t, r, keyMsg("d"))
+	driveRoot(t, r, keyMsg("org/newrepo"))
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // submit repo input
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // pick Q4_K_M (picker completes)
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // drain the completion tick
 
 	want := "Download org/newrepo Q4_K_M"
 	if len(eng.calls) == 0 || eng.calls[len(eng.calls)-1] != want {
@@ -146,8 +143,13 @@ func TestStorageDownloadNow(t *testing.T) {
 	if sm.dl == nil || sm.dl.repo != "org/newrepo" || sm.dl.quant != "Q4_K_M" {
 		t.Fatalf("download state = %+v", sm.dl)
 	}
-	if !strings.Contains(stripANSI(sm.View()), "org/newrepo:Q4_K_M") {
-		t.Errorf("download row missing from view:\n%s", stripANSI(sm.View()))
+	// the stub engine completes instantly: the download is done, the
+	// row auto-dismisses, and the flash announces it.
+	if sm.dl.status != dlDone {
+		t.Fatalf("download status = %v, want done", sm.dl.status)
+	}
+	if !strings.Contains(stripANSI(sm.View()), "downloaded org/newrepo") {
+		t.Errorf("done flash missing from view:\n%s", stripANSI(sm.View()))
 	}
 }
 
@@ -285,5 +287,129 @@ func TestDownloadLineWidthStable(t *testing.T) {
 		if w != first {
 			t.Errorf("width at done=%d is %d, want %d (stable)", done, w, first)
 		}
+	}
+}
+
+// TestStorageDoneDownloadBecomesCacheRow: after a successful download
+// the manager lists the repo as a normal cache row (quants, size,
+// actions) and no longer renders a download row or a done line.
+func TestStorageDoneDownloadBecomesCacheRow(t *testing.T) {
+	_, sm := openStorageRoot(t, &stubEngine{})
+	// simulate a finished download of a second repo
+	repoDir := filepath.Join(sm.root, storage.RepoFolderNames("org/finished")[0])
+	oid := "50d019817c2626eb9e8a41f361ff5bfa538757e6f708a3076cd3356354a75694"
+	if err := os.MkdirAll(filepath.Join(repoDir, "blobs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "blobs", oid), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoDir, "snapshots", "aa"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "..", "blobs", oid), filepath.Join(repoDir, "snapshots", "aa", "finished-Q8_0.gguf")); err != nil {
+		t.Fatal(err)
+	}
+
+	sm.dl = &downloadState{repo: "org/finished", quant: "Q8_0", status: dlDone, total: 1, doneAt: time.Now()}
+	sm.rebuild()
+
+	out := stripANSI(sm.View())
+	if !strings.Contains(out, "org/finished") || !strings.Contains(out, "Q8_0") {
+		t.Errorf("finished repo must appear as a cache row with its quant:\n%s", out)
+	}
+	if strings.Contains(out, "org/finished:Q8_0") {
+		t.Errorf("download row must be gone after completion:\n%s", out)
+	}
+	if strings.Contains(out, "— done") {
+		t.Errorf("done line must not render:\n%s", out)
+	}
+	// the cache row has actions (openMenu on it offers download/delete)
+	sm.cursor = 0 // org/cachedrepo sorts first; find the finished row
+	for i, e := range sm.entries {
+		if e.title == "org/finished" {
+			sm.cursor = i
+		}
+	}
+	cmd := sm.openMenu()
+	if cmd == nil {
+		t.Fatal("finished cache row must open an action menu")
+	}
+}
+
+// TestStorageNavDismissesDoneDownload: pressing a navigation key after
+// a finished download clears the download line and its flash.
+func TestStorageNavDismissesDoneDownload(t *testing.T) {
+	eng := &stubEngine{}
+	r, sm := openStorageRoot(t, eng)
+	sm.dl = &downloadState{repo: "org/finished", quant: "Q8_0", status: dlDone, doneAt: time.Now()}
+	sm.flash = "downloaded org/finished:Q8_0"
+	sm.flashAt = time.Now()
+	sm.rebuild()
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyDown})
+	if sm.dl != nil {
+		t.Errorf("done download must be dismissed on navigation, got %+v", sm.dl)
+	}
+	if sm.flash != "" {
+		t.Errorf("flash must clear on navigation, got %q", sm.flash)
+	}
+}
+
+// TestStorageFooterOrder: the footer shows cache root on the left and
+// free disk on the right.
+func TestStorageFooterOrder(t *testing.T) {
+	_, sm := openStorageRoot(t, &stubEngine{})
+	out := stripANSI(sm.View())
+	rootIdx := strings.Index(out, "cache root:")
+	freeIdx := strings.Index(out, "free disk:")
+	if rootIdx < 0 || freeIdx < 0 || rootIdx > freeIdx {
+		t.Errorf("footer must be 'cache root: … · free disk: …':\n%s", out)
+	}
+}
+
+// TestStorageMissingModelShowsWarning: a local model whose file is
+// absent renders "missing" (and the reveal target is the path, not the
+// whole detail line).
+func TestStorageMissingModelShowsWarning(t *testing.T) {
+	_, sm := openStorageRoot(t, &stubEngine{})
+	out := stripANSI(sm.View())
+	if !strings.Contains(out, "missing") {
+		t.Errorf("missing model must show 'missing':\n%s", out)
+	}
+	// find a missing local-model entry and check its reveal path
+	for _, e := range sm.entries {
+		if e.kind == entryLocalModel && e.missing {
+			if e.path == "" || !strings.Contains(e.path, ".gguf") {
+				t.Errorf("missing entry must carry its path, got %+v", e)
+			}
+			return
+		}
+	}
+	t.Error("no missing local model entry found")
+}
+
+// TestStorageCachedQuantMarked: the quant picker labels quants already
+// on disk with "(cached)".
+func TestStorageCachedQuantMarked(t *testing.T) {
+	eng := &stubEngine{
+		chosen: []hf.QuantOption{
+			{Tag: "Q4_K_M", Size: 100}, // cached (fixture repo)
+			{Tag: "Q8_0", Size: 200},   // not cached
+		},
+	}
+	r, sm := openStorageRoot(t, eng)
+	driveRoot(t, r,
+		tea.KeyMsg{Type: tea.KeyEnter}, // open action menu on the cached repo row
+		tea.KeyMsg{Type: tea.KeyEnter}, // choose "download now" (picker opens)
+	)
+	if sm.quantForm == nil {
+		t.Fatalf("quant picker did not open:\n%s", stripANSI(sm.View()))
+	}
+	out := stripANSI(sm.View())
+	if !strings.Contains(out, "Q4_K_M —") || !strings.Contains(out, "(cached)") {
+		t.Errorf("cached quant must be marked:\n%s", out)
+	}
+	if strings.Contains(out, "Q8_0 — 200 (cached)") {
+		t.Errorf("uncached quant must not be marked cached:\n%s", out)
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
@@ -43,10 +44,12 @@ const (
 
 // storageEntry is one selectable row of the manager list.
 type storageEntry struct {
-	kind   entryKind
-	title  string // repo id / alias / "downloading …"
-	detail string
-	size   int64 // -1 = unknown/missing
+	kind    entryKind
+	title   string // repo id / alias / download row
+	detail  string // quants list / local model path
+	size    int64  // -1 = unknown/missing
+	path    string // local model path (the reveal target)
+	missing bool   // local model file absent on disk
 }
 
 type dlStatus int
@@ -65,10 +68,15 @@ type downloadState struct {
 	repo, quant string
 	status      dlStatus
 	done, total int64
-	err         error
-	cancel      context.CancelFunc
-	paused      bool // user pressed pause
-	discard     bool // user pressed cancel (remove partials)
+	// speed is a bytes/s estimate from the tick samples.
+	speed     int64
+	speedAt   time.Time
+	speedDone int64
+	err       error
+	cancel    context.CancelFunc
+	paused    bool // user pressed pause
+	discard   bool // user pressed cancel (remove partials)
+	doneAt    time.Time // when the download finished (auto-dismiss clock)
 }
 
 type dlTickMsg struct{}
@@ -104,7 +112,8 @@ type StorageMode struct {
 	dlProg  chan dlProgressMsg
 	dlDone  chan error
 
-	flash string
+	flash   string
+	flashAt time.Time // flash auto-expiry clock
 	width, height int
 }
 
@@ -155,9 +164,10 @@ func (s *StorageMode) rebuild() {
 		}
 		entry := storageEntry{kind: entryCacheRepo, title: repo, size: total}
 		if len(quants) > 0 {
-			entry.detail = fmt.Sprintf("%s · %s", strings.Join(quants, ", "), hf.HumanSize(total))
+			entry.detail = strings.Join(quants, ", ")
 		} else {
 			entry.detail = "empty cache repo"
+			entry.size = -1
 		}
 		s.entries = append(s.entries, entry)
 	}
@@ -165,18 +175,27 @@ func (s *StorageMode) rebuild() {
 		if m.Location == "" {
 			continue
 		}
-		entry := storageEntry{kind: entryLocalModel, title: m.Alias, detail: "local model"}
+		entry := storageEntry{kind: entryLocalModel, title: m.Alias, detail: m.Location, path: m.Location}
 		if info, err := os.Stat(m.Location); err == nil {
 			entry.size = info.Size()
-			entry.detail = m.Location + " · " + hf.HumanSize(info.Size())
 		} else {
 			entry.size = -1
-			entry.detail = m.Location + " · missing"
+			entry.missing = true
 		}
 		s.entries = append(s.entries, entry)
 	}
-	if s.dl != nil {
-		s.entries = append(s.entries, storageEntry{kind: entryDownload, title: s.dl.repo + ":" + s.dl.quant, size: s.dl.total})
+	if s.dl != nil && s.dl.status != dlDone {
+		// a finished download leaves no row: the repo now appears as a
+		// normal cache entry (with quants, size, and actions).
+		status := "downloading"
+		if s.dl.status == dlPaused {
+			status = "paused"
+		} else if s.dl.status == dlFailed {
+			status = "failed"
+		}
+		s.entries = append(s.entries, storageEntry{
+			kind: entryDownload, title: s.dl.repo + ":" + s.dl.quant, detail: status, size: s.dl.total,
+		})
 	}
 	sort.SliceStable(s.entries, func(i, j int) bool {
 		if s.entries[i].kind != s.entries[j].kind {
@@ -187,7 +206,11 @@ func (s *StorageMode) rebuild() {
 	if s.cursor >= len(s.entries) {
 		s.cursor = max(0, len(s.entries)-1)
 	}
-	s.flash = ""
+	// Note: rebuild deliberately does NOT clear s.flash — the flash has
+	// its own auto-expiry (flashAt) and is dismissed on navigation, so
+	// a rebuild (e.g. right after a download finishes) must not wipe a
+	// fresh announcement. Unrecognized-cache warnings, when any, are
+	// surfaced through the flash.
 	if len(warns) > 0 {
 		s.flash = strings.Join(warns, "; ")
 	}
@@ -262,6 +285,32 @@ drained:
 		return s, nil
 	default:
 	}
+	// speed estimate from the tick samples (only while data advances)
+	if s.dl.status == dlRunning {
+		now := time.Now()
+		if s.dl.speedAt.IsZero() {
+			s.dl.speedAt, s.dl.speedDone = now, s.dl.done
+		} else if s.dl.done != s.dl.speedDone {
+			if dt := now.Sub(s.dl.speedAt).Seconds(); dt > 0 {
+				s.dl.speed = int64(float64(s.dl.done-s.dl.speedDone) / dt)
+			}
+			s.dl.speedAt, s.dl.speedDone = now, s.dl.done
+		}
+	}
+	// auto-dismiss: finished downloads leave the row after 3s; flashes
+	// expire after 4s — the list (with the repo now cached) is the
+	// obvious next step.
+	now := time.Now()
+	if s.dl.status == dlDone && !s.dl.doneAt.IsZero() && now.Sub(s.dl.doneAt) > 3*time.Second {
+		s.dl = nil
+		s.rebuild()
+	}
+	if s.flash != "" && !s.flashAt.IsZero() && now.Sub(s.flashAt) > 4*time.Second {
+		s.flash = ""
+	}
+	if s.dl == nil {
+		return s, nil
+	}
 	return s, func() tea.Msg { return dlTickMsg{} }
 }
 
@@ -272,7 +321,14 @@ func (s *StorageMode) handleDlFinished(err error) {
 	switch {
 	case err == nil:
 		s.dl.status = dlDone
-		s.flash = "downloaded " + s.dl.repo + ":" + s.dl.quant
+		s.dl.doneAt = time.Now()
+		if s.dl.total == 0 {
+			s.flash = "already cached: " + s.dl.repo + ":" + s.dl.quant
+		} else {
+			s.flash = "downloaded " + s.dl.repo + ":" + s.dl.quant
+		}
+		s.flashAt = time.Now()
+		s.rebuild() // the repo row (quants, size, actions) appears now
 	case s.dl.discard:
 		s.removePartials()
 		s.flash = "download cancelled"
@@ -399,10 +455,22 @@ func (s *StorageMode) handleKey(k tea.KeyMsg) (*StorageMode, tea.Cmd) {
 	}
 	switch k.String() {
 	case "up", "k":
+		// navigating dismisses a finished/failed download line and its
+		// flash — the list is the next step.
+		if s.dl != nil && (s.dl.status == dlDone || s.dl.status == dlFailed) {
+			s.dl = nil
+			s.flash = ""
+			s.rebuild()
+		}
 		if s.cursor > 0 {
 			s.cursor--
 		}
 	case "down", "j":
+		if s.dl != nil && (s.dl.status == dlDone || s.dl.status == dlFailed) {
+			s.dl = nil
+			s.flash = ""
+			s.rebuild()
+		}
 		if s.cursor < len(s.entries)-1 {
 			s.cursor++
 		}
@@ -470,10 +538,22 @@ func (s *StorageMode) openQuantPicker(repo string) tea.Cmd {
 		s.flash = "no GGUF files in " + repo
 		return nil
 	}
+	// mark quants already on disk so the picker shows what a download
+	// would actually fetch (cache-first: cached quants are a no-op).
+	cached := map[string]bool{}
+	if files, err := storage.Lookup(s.root, repo); err == nil {
+		for _, q := range hf.Quants(repoFiles(files)) {
+			cached[q.Tag] = true
+		}
+	}
 	s.quantVal = ""
 	choices := make([]huh.Option[string], 0, len(opts))
 	for _, q := range opts {
-		choices = append(choices, huh.NewOption(fmt.Sprintf("%s — %s", q.Tag, hf.HumanSize(q.Size)), q.Tag))
+		label := fmt.Sprintf("%s — %s", q.Tag, hf.HumanSize(q.Size))
+		if cached[q.Tag] {
+			label += " (cached)"
+		}
+		choices = append(choices, huh.NewOption(label, q.Tag))
 	}
 	s.quantForm = huh.NewForm(huh.NewGroup(
 		huh.NewSelect[string]().
@@ -587,7 +667,7 @@ func (s *StorageMode) updateMenu(msg tea.Msg) (*StorageMode, tea.Cmd) {
 			}
 		case entryLocalModel:
 			if action == "reveal" {
-				return s, s.reveal(e.detail)
+				return s, s.reveal(e.path)
 			}
 		}
 		s.rebuild()
@@ -667,6 +747,9 @@ func (s StorageMode) renderList() []string {
 		rows = append(rows, lipgloss.NewStyle().Foreground(s.theme.Muted).Render("nothing on disk yet — press d to download a model"))
 		return rows
 	}
+	muted := lipgloss.NewStyle().Foreground(s.theme.Muted)
+	subtle := lipgloss.NewStyle().Foreground(s.theme.Subtle)
+	warn := lipgloss.NewStyle().Foreground(s.theme.StatusStart)
 	for i, e := range s.entries {
 		cursor := " "
 		if i == s.cursor {
@@ -677,15 +760,30 @@ func (s StorageMode) renderList() []string {
 		case entryCacheRepo:
 			label = lipgloss.NewStyle().Foreground(s.theme.Accent).Render(e.title)
 		case entryDownload:
-			label = lipgloss.NewStyle().Foreground(s.theme.StatusStart).Render(e.title)
+			label = warn.Render(e.title)
 		}
-		rows = append(rows, fmt.Sprintf("%s %s  %s", cursor, label, lipgloss.NewStyle().Foreground(s.theme.Muted).Render(e.detail)))
+		parts := []string{cursor, label}
+		if e.detail != "" {
+			parts = append(parts, muted.Render(e.detail))
+		}
+		// size in its own color (name / quants / size: three colors)
+		if e.missing {
+			parts = append(parts, warn.Render("missing"))
+		} else if e.size >= 0 {
+			parts = append(parts, subtle.Render(hf.HumanSize(e.size)))
+		}
+		rows = append(rows, strings.Join(parts, "  "))
 	}
 	return rows
 }
 
 func (s StorageMode) renderDownload() string {
 	if s.dl == nil {
+		return ""
+	}
+	// a finished download has nothing to render — the repo now appears
+	// as a normal cache row (auto-dismissed shortly after).
+	if s.dl == nil || s.dl.status == dlDone {
 		return ""
 	}
 	bar := ""
@@ -700,22 +798,21 @@ func (s StorageMode) renderDownload() string {
 		fillCells := pct * 12 / 100
 		fill := strings.Repeat("▓", fillCells)
 		rest := strings.Repeat("░", 12-fillCells)
-		// %3d and %9s keep the line width constant across ticks so the
-		// centered view does not re-flow (and flicker) as done grows.
+		// %3d / %9s / %11s keep the line width constant across ticks so
+		// the centered view does not re-flow (and flicker).
 		bar = fmt.Sprintf(" %s%s %3d%%", fill, rest, pct)
 	}
 	status := "downloading"
 	switch s.dl.status {
 	case dlPaused:
 		status = "paused"
-	case dlDone:
-		status = "done"
 	case dlFailed:
 		status = "failed: " + s.dl.err.Error()
 	}
 	line := fmt.Sprintf("%s:%s — %s%s", s.dl.repo, s.dl.quant, status, bar)
 	if s.dl.status == dlRunning {
-		line += fmt.Sprintf("  (%9s / %9s)", hf.HumanSize(s.dl.done), hf.HumanSize(s.dl.total))
+		speed := hf.HumanSize(s.dl.speed) + "/s"
+		line += fmt.Sprintf("  (%9s / %9s, %11s)", hf.HumanSize(s.dl.done), hf.HumanSize(s.dl.total), speed)
 	}
 	return lipgloss.NewStyle().Foreground(s.theme.Accent).Render(line)
 }
@@ -734,6 +831,6 @@ func (s StorageMode) renderFooter() string {
 	}
 	return strings.Join([]string{
 		lipgloss.NewStyle().Foreground(s.theme.Muted).Render(strings.Join(keys, "  ·  ")),
-		lipgloss.NewStyle().Foreground(s.theme.Muted).Render(freeText + " · cache root: " + s.root),
+		lipgloss.NewStyle().Foreground(s.theme.Muted).Render("cache root: " + s.root + "  ·  " + freeText),
 	}, "\n")
 }
