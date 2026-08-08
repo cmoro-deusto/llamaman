@@ -84,8 +84,22 @@ type dlTickMsg struct{}
 type dlProgressMsg struct{ done, total int64 }
 type dlFinishedMsg struct{ err error }
 
+// stgFlashExpiredMsg fires from the flash timer (stgFlashTTL) — flashes
+// expire even when no download is running.
+type stgFlashExpiredMsg struct{}
+
+// stgFlashTTL is how long a status flash stays on screen.
+const stgFlashTTL = 4 * time.Second
+
 // returnFromStorageMsg pops back to Main.
 type returnFromStorageMsg struct{}
+
+// setFlash shows a transient status line and arms its expiry timer.
+func (s *StorageMode) setFlash(msg string) tea.Cmd {
+	s.flash = msg
+	s.flashAt = time.Now()
+	return tea.Tick(stgFlashTTL, func(t time.Time) tea.Msg { return stgFlashExpiredMsg{} })
+}
 
 // StorageMode implements the manager view.
 type StorageMode struct {
@@ -256,6 +270,9 @@ func (s *StorageMode) Update(msg tea.Msg) (*StorageMode, tea.Cmd) {
 	case returnFromStorageMsg:
 		// handled by Root; here just a safety no-op
 		return s, nil
+	case stgFlashExpiredMsg:
+		s.flash = ""
+		return s, nil
 	case tea.KeyMsg:
 		return s.handleKey(m)
 	}
@@ -289,8 +306,7 @@ func (s *StorageMode) handleDlTick() (*StorageMode, tea.Cmd) {
 drained:
 	select {
 	case err := <-s.dlDone:
-		s.handleDlFinished(err)
-		return s, nil
+		return s, s.handleDlFinished(err)
 	default:
 	}
 	// speed estimate from the tick samples (only while data advances)
@@ -322,33 +338,32 @@ drained:
 	return s, func() tea.Msg { return dlTickMsg{} }
 }
 
-func (s *StorageMode) handleDlFinished(err error) {
+func (s *StorageMode) handleDlFinished(err error) tea.Cmd {
 	if s.dl == nil {
-		return
+		return nil
 	}
 	switch {
 	case err == nil:
 		s.dl.status = dlDone
 		s.dl.doneAt = time.Now()
+		msg := "downloaded " + s.dl.repo + ":" + s.dl.quant
 		if s.dl.total == 0 {
-			s.flash = "already cached: " + s.dl.repo + ":" + s.dl.quant
-		} else {
-			s.flash = "downloaded " + s.dl.repo + ":" + s.dl.quant
+			msg = "already cached: " + s.dl.repo + ":" + s.dl.quant
 		}
-		s.flashAt = time.Now()
 		s.rebuild() // the repo row (quants, size, actions) appears now
+		return s.setFlash(msg)
 	case s.dl.discard:
 		s.removePartials()
-		s.flash = "download cancelled"
 		s.dl = nil
 		s.rebuild()
-		return
+		return s.setFlash("download cancelled")
 	case s.dl.paused:
 		s.dl.status = dlPaused
 	default:
 		s.dl.status = dlFailed
 		s.dl.err = err
 	}
+	return nil
 }
 
 // startDownload launches the engine download in a goroutine; progress
@@ -431,12 +446,11 @@ func (s *StorageMode) deleteCacheEntry(repo string) error {
 func (s *StorageMode) reveal(path string) tea.Cmd {
 	dir := filepath.Dir(path)
 	if _, err := exec.LookPath("xdg-open"); err != nil {
-		s.flash = "xdg-open not found"
-		return nil
+		return s.setFlash("xdg-open not found")
 	}
 	cmd := exec.Command("xdg-open", dir)
 	if err := cmd.Start(); err != nil {
-		s.flash = "could not open folder: " + err.Error()
+		return s.setFlash("could not open folder: " + err.Error())
 	}
 	return nil
 }
@@ -463,20 +477,20 @@ func (s *StorageMode) handleKey(k tea.KeyMsg) (*StorageMode, tea.Cmd) {
 	}
 	switch k.String() {
 	case "up", "k":
-		// navigating dismisses a finished/failed download line and its
-		// flash — the list is the next step.
+		// navigating dismisses a finished/failed download line and any
+		// status flash — the list is the next step.
+		s.dismissFlash()
 		if s.dl != nil && (s.dl.status == dlDone || s.dl.status == dlFailed) {
 			s.dl = nil
-			s.flash = ""
 			s.rebuild()
 		}
 		if s.cursor > 0 {
 			s.cursor--
 		}
 	case "down", "j":
+		s.dismissFlash()
 		if s.dl != nil && (s.dl.status == dlDone || s.dl.status == dlFailed) {
 			s.dl = nil
-			s.flash = ""
 			s.rebuild()
 		}
 		if s.cursor < len(s.entries)-1 {
@@ -487,7 +501,7 @@ func (s *StorageMode) handleKey(k tea.KeyMsg) (*StorageMode, tea.Cmd) {
 	case "d":
 		return s, s.openRepoForm()
 	case "?":
-		s.flash = "↑/↓ select · enter actions · d download · esc back"
+		return s, s.setFlash("↑/↓ select · enter actions · d download · esc back")
 	}
 	return s, nil
 }
@@ -540,12 +554,10 @@ func splitRepoQuant(s string) (repo, quant string) {
 func (s *StorageMode) openQuantPicker(repo string) tea.Cmd {
 	opts, err := s.engine.Choose(context.Background(), repo)
 	if err != nil {
-		s.flash = "could not list " + repo + ": " + err.Error()
-		return nil
+		return s.setFlash("could not list " + repo + ": " + err.Error())
 	}
 	if len(opts) == 0 {
-		s.flash = "no GGUF files in " + repo
-		return nil
+		return s.setFlash("no GGUF files in " + repo)
 	}
 	// mark quants already on disk so the picker shows what a download
 	// would actually fetch (cache-first: cached quants are a no-op).
@@ -717,20 +729,25 @@ func (s *StorageMode) updateConfirm(msg tea.Msg) (*StorageMode, tea.Cmd) {
 		s.confirm = nil
 		if yes {
 			e := s.entries[s.confirmEntry]
+			var flashMsg string
 			switch action {
 			case "deleteconfig":
 				if err := s.deleteModelFromConfig(e.modelIdx); err != nil {
-					s.flash = "could not remove from config: " + err.Error()
+					flashMsg = "could not remove from config: " + err.Error()
+				} else {
+					flashMsg = "removed " + e.title + " from config"
 				}
 			default:
 				if err := s.deleteCacheEntry(e.title); err != nil {
-					s.flash = "delete failed: " + err.Error()
+					flashMsg = "delete failed: " + err.Error()
 				} else {
-					s.flash = "deleted " + e.title
+					flashMsg = "deleted " + e.title
 				}
 			}
-			s.flashAt = time.Now()
 			s.rebuild()
+			if flashMsg != "" {
+				return s, s.setFlash(flashMsg)
+			}
 		}
 	}
 	return s, cmd
@@ -744,12 +761,10 @@ func (s *StorageMode) deleteModelFromConfig(idx int) error {
 	if idx < 0 || idx >= len(s.cfg.Models) {
 		return nil
 	}
-	alias := s.cfg.Models[idx].Alias
 	s.cfg.Models = append(s.cfg.Models[:idx], s.cfg.Models[idx+1:]...)
 	if err := config.Save(s.cfgPath, s.cfg); err != nil {
 		return err
 	}
-	s.flash = "removed " + alias + " from config"
 	return nil
 }
 
@@ -886,3 +901,6 @@ func (s StorageMode) renderFooter() string {
 		lipgloss.NewStyle().Foreground(s.theme.Muted).Render("cache root: " + s.root + "  ·  " + freeText),
 	}, "\n")
 }
+
+// dismissFlash clears the status flash (navigation affordance).
+func (s *StorageMode) dismissFlash() { s.flash = "" }

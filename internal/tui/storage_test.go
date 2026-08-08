@@ -482,3 +482,33 @@ func TestStorageRepoFormShowsLongIdTail(t *testing.T) {
 		t.Errorf("typed tail %q must be visible in the input:\n%s", tail, rendered)
 	}
 }
+
+// TestStorageFlashExpiresWithoutDownload: a status flash (e.g. "removed
+// from config") auto-expires via its own timer even when no download is
+// running, and navigation dismisses it immediately.
+func TestStorageFlashExpiresWithoutDownload(t *testing.T) {
+	_, sm := openStorageRoot(t, &stubEngine{})
+	cmd := sm.setFlash("removed alpha from config")
+	if cmd == nil {
+		t.Fatal("setFlash must arm an expiry timer")
+	}
+	if sm.flash != "removed alpha from config" {
+		t.Fatalf("flash = %q", sm.flash)
+	}
+	sm.Update(stgFlashExpiredMsg{})
+	if sm.flash != "" {
+		t.Errorf("flash must clear on expiry, got %q", sm.flash)
+	}
+
+	// and navigation dismisses any flash
+	sm.setFlash("a message")
+	r, _ := openStorageRoot(t, &stubEngine{})
+	_ = r
+	driveStorage := func(k tea.KeyMsg) {
+		sm.Update(k)
+	}
+	driveStorage(tea.KeyMsg{Type: tea.KeyDown})
+	if sm.flash != "" {
+		t.Errorf("flash must clear on navigation, got %q", sm.flash)
+	}
+}
