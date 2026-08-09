@@ -459,6 +459,42 @@ func TestConfigExitPromptSaveBlockedByValidationDoesNotExit(t *testing.T) {
 	}
 }
 
+// TestConfigSaveClearsModified pins the regression: after `s` saves,
+// Modified() must be false — esc then leaves config mode directly
+// instead of showing the unsaved-changes prompt. The clone that backs
+// c.saved used to normalize a fresh model's nil Presets to an empty
+// slice, so MarshalForDiff saw `"presets": null` (work) vs
+// `"presets": []` (saved) and the config read as modified forever.
+func TestConfigSaveClearsModified(t *testing.T) {
+	cfg := duplicateTestConfig()
+	cfgPath := filepath.Join(t.TempDir(), "llamaman.json")
+	c := NewConfigMode(cfgPath, cfg, DefaultTheme())
+
+	// The item-5/6 shape: a model added via the form has no presets
+	// (nil slice) — the exact case that exposed the normalization.
+	c.work.Models = append(c.work.Models, config.Model{Alias: "fresh", HF: "Qwen/Qwen3-32B-GGUF"})
+	if !c.Modified() {
+		t.Fatal("precondition: an added model must read as modified")
+	}
+
+	c.save()
+	if c.Modified() {
+		t.Fatal("Modified() still true right after save() — unsaved-changes prompt would fire")
+	}
+
+	// esc must leave directly (no formExitPrompt).
+	next, _ := c.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if next.formKind != formNone {
+		t.Errorf("esc after save opened formKind %v, want formNone (no unsaved-changes prompt)", next.formKind)
+	}
+
+	// And a real change still reads as modified after the same save.
+	c.work.Models[0].Alias = "renamed"
+	if !c.Modified() {
+		t.Error("Modified() false after an actual edit following a save")
+	}
+}
+
 // TestParseParamValueClassifiesStringsWithNumericPrefix guards against the
 // regression where looksNumeric used a streaming json.Decoder and accepted
 // any input whose prefix parsed as a number — so "--rpc 10.0.0.30:50052"

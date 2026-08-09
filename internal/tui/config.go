@@ -1922,11 +1922,18 @@ func cloneConfig(in *config.Config) *config.Config {
 	if in == nil {
 		return nil
 	}
+	// Deep copy preserving nil-ness: `append(x, nil...)` keeps a nil
+	// source nil, while `make(len)` normalizes it to an empty slice.
+	// Modified() compares MarshalForDiff bytes, and `"presets": null`
+	// (a freshly added model) must not read as different from
+	// `"presets": []` (the saved clone) — otherwise the "● modified"
+	// indicator and the unsaved-changes prompt fire even right after
+	// a successful save.
 	out := *in
-	out.Models = make([]config.Model, len(in.Models))
+	out.Models = append([]config.Model(nil), in.Models...)
 	for i, m := range in.Models {
 		mm := m
-		mm.Presets = make([]config.Preset, len(m.Presets))
+		mm.Presets = append([]config.Preset(nil), m.Presets...)
 		for j, p := range m.Presets {
 			pp := p
 			pp.Params = append(config.Params(nil), p.Params...)
