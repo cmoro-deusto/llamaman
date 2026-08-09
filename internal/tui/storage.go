@@ -187,9 +187,7 @@ func (s *StorageMode) SetSize(w, h int) { s.width, s.height = w, h }
 
 // formWidth sizes overlay forms to the window so long repo ids stay
 // visible while typing (owner report: ~90-char ids did not fit).
-func (s *StorageMode) formWidth() int {
-	return max(60, min(s.width-12, 160))
-}
+func (s *StorageMode) formWidth() int { return formWidthFor(s.width) }
 
 // Init starts nothing — the list renders immediately.
 func (s *StorageMode) Init() tea.Cmd { return nil }
@@ -770,21 +768,12 @@ func (s *StorageMode) openQuantPicker(repo string) tea.Cmd {
 		}
 	}
 	s.quantVal = ""
-	choices := make([]huh.Option[string], 0, len(opts))
-	for _, q := range opts {
-		label := fmt.Sprintf("%s — %s", q.Tag, hf.HumanSize(q.Size))
-		if cached[q.Tag] {
-			label += " (cached)"
-		}
-		choices = append(choices, huh.NewOption(label, q.Tag))
-	}
-	s.quantForm = huh.NewForm(huh.NewGroup(
-		huh.NewSelect[string]().
-			Title("quantization").
-			Description(repo).
-			Options(choices...).
-			Value(&s.quantVal),
-	)).WithTheme(configHuhTheme(s.theme)).WithWidth(s.formWidth())
+	// The shared §16.3/§16.6 quant chooser (no keep-bare row here: esc
+	// cancels the whole download action; the config editor's variant
+	// adds the row).
+	s.quantForm = quantChooserForm(repo, opts, cached, "", &s.quantVal, false).
+		WithTheme(configHuhTheme(s.theme)).
+		WithWidth(s.formWidth())
 	s.pendingRepo = repo
 	return s.quantForm.Init()
 }

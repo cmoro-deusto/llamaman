@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
+	"github.com/cmoro-deusto/llamaman/internal/hf"
 	"github.com/cmoro-deusto/llamaman/internal/modelsini"
 	"github.com/cmoro-deusto/llamaman/internal/storage"
 )
@@ -106,6 +109,13 @@ type ConfigMode struct {
 	locField    *pickerInput // picker-assisted location input, for post-pick refresh
 	hfField     *pickerInput // picker-assisted HF input, for post-pick refresh
 
+	// §16.6 typed-repo check + quant offer (ROADMAP §3.8 step B).
+	hfRunner   hfCheckRunner // nil disables the check (P3: the form advances as before)
+	hfCheck    *hfCheckState // in-flight repo check: shields the form, esc cancels
+	hfCheckGen int           // per-check generation, ties a done msg to its check
+	hfQuant    *huh.Form     // quant chooser overlay after a successful check
+	hfQuantVal string        // chooser selection staging (quant tag, or quantKeepBare = keep bare)
+
 	saveErr error
 	flash   string
 
@@ -133,6 +143,11 @@ func NewConfigMode(cfgPath string, original *config.Config, theme Theme) ConfigM
 // flow uses a fuzzy picker over its keys, and value forms become type-
 // aware (boolean toggle, numeric input, enum picker, text).
 func (c *ConfigMode) SetRegistry(r flags.Registry) { c.registry = r }
+
+// SetHFCheckRunner attaches the §16.6 typed-repo check runner. Tests
+// inject a stub; root wires a real *hf.Client-backed adapter. nil
+// disables the check (P3): the model form advances exactly as before.
+func (c *ConfigMode) SetHFCheckRunner(r hfCheckRunner) { c.hfRunner = r }
 
 // ShowFirstRunBanner displays the one-time prompt described in DESIGN.md
 // §8 step 4. Dismissed on first 'n' in Models pane or on quit.
@@ -175,6 +190,18 @@ func (c *ConfigMode) Update(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 		}
 		return c, nil
 	}
+	// §16.6: the typed-repo check's messages must be consumed on EVERY
+	// message (the overlay-done discipline — a form left un-updated
+	// mid-flow swallows its own nextFieldMsg), before the error modal
+	// arm like savedExpiredMsg: the done msg is internal state, not a
+	// user key. The shield below swallows everything else while the
+	// check is in flight, and the quant chooser gets its own routing.
+	if m, ok := msg.(hfCheckDoneMsg); ok {
+		return c.handleHFCheckDone(m)
+	}
+	if m, ok := msg.(hfCheckRequestedMsg); ok {
+		return c.startHFCheck(m)
+	}
 	// Error modal takes priority over every other input path: until the
 	// user acknowledges the failure, no other key should mutate state
 	// (otherwise typing through the modal could trigger destructive
@@ -184,6 +211,21 @@ func (c *ConfigMode) Update(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 			c.errorModal = ""
 		}
 		return c, nil
+	}
+	// While the repo check is in flight the form is shielded: only esc
+	// (cancel the check, stay on the HF field) and the done msg above
+	// reach the user.
+	if c.hfCheck != nil {
+		if k, ok := msg.(tea.KeyMsg); ok && k.String() == "esc" {
+			c.hfCheck.cancel()
+			c.hfCheck = nil
+		}
+		return c, nil
+	}
+	// Quant chooser overlay (after a successful check): its completion
+	// msgs are routed on every message while it is active.
+	if c.hfQuant != nil {
+		return c.updateHFQuant(msg)
 	}
 	if pm, ok := msg.(paramPickerDoneMsg); ok {
 		return c.handlePickerDone(pm)
@@ -310,6 +352,131 @@ func (c *ConfigMode) handleModelPickerDone(msg modelPickerDoneMsg) (*ConfigMode,
 	return c, nil
 }
 
+// startHFCheck begins the §16.6 typed-repo check for a confirmed id
+// (emitted by the HF field's enter). When the id is no longer a bare
+// repo or no runner is attached, the enter the field swallowed is
+// replayed as a NextField — the form advances exactly as it would have
+// (P3: the check is advisory, never blocking).
+func (c *ConfigMode) startHFCheck(msg hfCheckRequestedMsg) (*ConfigMode, tea.Cmd) {
+	if c.form == nil || (c.formKind != formNewModel && c.formKind != formEditModel) {
+		return c, nil
+	}
+	repo := strings.TrimSpace(msg.id)
+	if repo == "" || !bareRepo(repo) || c.hfRunner == nil {
+		return c, c.form.NextField()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.hfCheckGen++
+	c.hfCheck = &hfCheckState{repo: repo, gen: c.hfCheckGen, cancel: cancel}
+	return c, hfCheckCmd(ctx, c.hfRunner, repo, c.hfCheckGen)
+}
+
+// handleHFCheckDone consumes the async check result (DESIGN §16.6).
+// A done msg that does not match the *current* check (a stale result
+// from a canceled earlier check, or one that arrived after esc already
+// cleared the slot) is dropped — esc is the abort, not the done msg.
+// Abort (esc) → no flash, no chooser, the field keeps its value.
+// Success with quants → the quant chooser. Anything else (no quants,
+// not-found, gated, network) → a distinct flash and the form advances,
+// saving the typed id as-is (non-blocking P3 — llama-server surfaces
+// problems at launch).
+func (c *ConfigMode) handleHFCheckDone(msg hfCheckDoneMsg) (*ConfigMode, tea.Cmd) {
+	if c.hfCheck == nil || msg.gen != c.hfCheck.gen {
+		return c, nil // stale: a later check (or esc) owns the flow now
+	}
+	c.hfCheck = nil
+	repo := msg.id
+	switch {
+	case errors.Is(msg.err, context.Canceled):
+		return c, nil
+	case msg.err != nil:
+		c.flash = hfCheckFlash(repo, msg.err)
+	case len(msg.opts) == 0:
+		note := ""
+		if msg.mmproj {
+			note = " (mmproj only)"
+		}
+		c.flash = repo + ": no GGUF files found" + note
+	default:
+		return c.openHFQuantChooser(repo, msg.opts, msg.mmproj)
+	}
+	if c.form == nil {
+		return c, nil
+	}
+	return c, c.form.NextField()
+}
+
+// openHFQuantChooser shows the shared quant chooser (§16.3 data, §16.4
+// UI shape) for a successfully checked repo, with (cached) markers from
+// the local cache (P3: an unresolvable root or lookup failure → empty
+// marker set) and the mmproj presence as an informational line only.
+func (c *ConfigMode) openHFQuantChooser(repo string, opts []hf.QuantOption, mmproj bool) (*ConfigMode, tea.Cmd) {
+	cached := map[string]bool{}
+	if root, err := storage.CacheRoot(c.work.Prefs().ModelsDir); err == nil {
+		if files, err := storage.Lookup(root, repo); err == nil {
+			for _, q := range hf.Quants(repoFiles(files)) {
+				cached[q.Tag] = true
+			}
+		}
+	}
+	note := ""
+	if mmproj {
+		note = "mmproj present — llama.cpp auto-downloads it"
+	}
+	c.hfQuantVal = ""
+	form := quantChooserForm(repo, opts, cached, note, &c.hfQuantVal, true).
+		WithTheme(configHuhTheme(c.theme)).
+		WithWidth(formWidthFor(c.width))
+	c.hfQuant = form
+	return c, form.Init()
+}
+
+// updateHFQuant routes messages to the quant chooser overlay. Its
+// completion msgs are consumed on every message while it is active
+// (the §16.4 discipline). esc aborts → back to the HF field, nothing
+// committed. Completion → the pick (or the keep-bare option's empty
+// value) is written into staging and the form advances to completion.
+func (c *ConfigMode) updateHFQuant(msg tea.Msg) (*ConfigMode, tea.Cmd) {
+	if k, ok := msg.(tea.KeyMsg); ok && k.String() == "esc" {
+		c.hfQuant = nil
+		return c, nil
+	}
+	next, cmd := c.hfQuant.Update(msg)
+	if f, ok := next.(*huh.Form); ok {
+		c.hfQuant = f
+	}
+	if c.hfQuant != nil && c.hfQuant.State == huh.StateCompleted {
+		return c.applyHFQuantChoice()
+	}
+	return c, cmd
+}
+
+// applyHFQuantChoice writes the chooser's pick into the staging hf
+// pointer — org/repo:QUANT, or the bare id for the keep-bare option —
+// and advances the form to completion (applyForm then saves the model).
+// RefreshValue re-syncs the input's internal text: without it the
+// form's GetValue at completion would save the stale bare id (the
+// item-5 gotcha, §16.6).
+func (c *ConfigMode) applyHFQuantChoice() (*ConfigMode, tea.Cmd) {
+	c.hfQuant = nil
+	if c.formStaging.hf != nil {
+		repo := strings.TrimSpace(*c.formStaging.hf)
+		// quantKeepBare is the sentinel for the "keep <repo> (no
+		// quant)" row — any other pick is the quant suffix.
+		if quant := c.hfQuantVal; quant != "" && quant != quantKeepBare && repo != "" {
+			repo += ":" + quant
+		}
+		*c.formStaging.hf = repo
+		if c.hfField != nil {
+			c.hfField.RefreshValue()
+		}
+	}
+	if c.form == nil {
+		return c, nil
+	}
+	return c, c.form.NextField()
+}
+
 func (c *ConfigMode) updateForm(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok && k.String() == "esc" && c.formKind != formExitPrompt {
 		c.dismissForm()
@@ -337,6 +504,11 @@ func (c *ConfigMode) dismissForm() {
 	c.formStaging = formStaging{}
 	c.modelPicker = nil
 	c.locField, c.hfField = nil, nil
+	// Defensive: the check/chooser overlays are shielded while active,
+	// so nothing here can normally be dismissed mid-flow, but clear
+	// them rather than strand a stale overlay.
+	c.hfCheck = nil
+	c.hfQuant = nil
 }
 
 // installForm wires a freshly constructed huh.Form into ConfigMode,
@@ -614,6 +786,10 @@ func (c *ConfigMode) openExportIniForm() tea.Cmd {
 func (c *ConfigMode) openNewModelForm() tea.Cmd {
 	alias, location, hf := "", "", ""
 	source := sourceLocal
+	// A fresh form action supersedes any stale flash; the only flash
+	// that may be pending at submit is the §16.6 check's (applyForm
+	// preserves exactly that one).
+	c.flash = ""
 	c.formStaging = formStaging{alias: &alias, source: &source, location: &location, hf: &hf}
 	form, locField, hfField := buildModelForm(&alias, &source, &location, &hf)
 	c.locField, c.hfField = locField, hfField
@@ -627,6 +803,8 @@ func (c *ConfigMode) openEditModelForm() tea.Cmd {
 	if m.IsHF() {
 		source = sourceHF
 	}
+	// Fresh form action: supersede any stale flash (see openNewModelForm).
+	c.flash = ""
 	c.formStaging = formStaging{alias: &alias, source: &source, location: &location, hf: &hf}
 	form, locField, hfField := buildModelForm(&alias, &source, &location, &hf)
 	c.locField, c.hfField = locField, hfField
@@ -1042,11 +1220,17 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		applyModelSourceFromStaging(&m, c.formStaging)
 		c.work.Models = append(c.work.Models, m)
 		c.modelIdx = len(c.work.Models) - 1
-		c.flash = "model added"
+		// A pending flash (e.g. the §16.6 check's not-found/gated/
+		// network message) outranks the generic confirmation.
+		if c.flash == "" {
+			c.flash = "model added"
+		}
 	case formEditModel:
 		c.work.Models[c.modelIdx].Alias = deref(c.formStaging.alias)
 		applyModelSourceFromStaging(&c.work.Models[c.modelIdx], c.formStaging)
-		c.flash = "model updated"
+		if c.flash == "" {
+			c.flash = "model updated"
+		}
 	case formDuplicateModel:
 		src := c.work.Models[c.modelIdx]
 		presets := make([]config.Preset, len(src.Presets))
@@ -1288,6 +1472,15 @@ func (c *ConfigMode) View() string {
 	}
 	if c.modelPicker != nil {
 		return overlayCenter(bg, c.modelPicker.View(c.theme), c.width, c.height)
+	}
+	// §16.6 overlays: the quant chooser and the in-flight check sit at
+	// the same modal precedence as the pickers (the form underneath is
+	// inlined by renderPanes, not an overlay).
+	if c.hfQuant != nil {
+		return overlayCenter(bg, c.hfQuant.View(), c.width, c.height)
+	}
+	if c.hfCheck != nil {
+		return overlayCenter(bg, checkingOverlay(c.theme, c.hfCheck.repo), c.width, c.height)
 	}
 	// The form is no longer overlaid here — renderPanes() inlines it
 	// below the Presets pane at the same column width, so the panes

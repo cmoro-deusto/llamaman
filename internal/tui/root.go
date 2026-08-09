@@ -271,6 +271,7 @@ func (r *Root) handleFirstRunCompleted(msg FirstRunCompletedMsg) (tea.Model, tea
 	r.mainMode.SetSize(r.width, r.height)
 	cm := NewConfigMode(msg.CfgPath, msg.Cfg, r.theme)
 	cm.SetRegistry(r.registry)
+	cm.SetHFCheckRunner(r.hfCheckRunner())
 	cm.ShowFirstRunBanner()
 	cm.SetSize(r.width, r.height)
 	r.configMod = &cm
@@ -456,6 +457,7 @@ type configEntry struct {
 func (r *Root) openConfig(entry configEntry) (tea.Model, tea.Cmd) {
 	cm := NewConfigMode(r.cfgPath, r.cfg, r.theme)
 	cm.SetRegistry(r.registry)
+	cm.SetHFCheckRunner(r.hfCheckRunner())
 	cm.SetSize(r.width, r.height)
 	if entry.focusAlias != "" {
 		for i, m := range r.cfg.Models {
@@ -543,6 +545,17 @@ type returnFromSettingsMsg struct{}
 // manager (DESIGN §16.4). Tests inject a stub; the default is a real
 // *hf.Client built lazily in openStorage.
 func (r *Root) SetDownloadEngine(e downloadEngine) { r.dlEngine = e }
+
+// hfCheckRunner returns the §16.6 typed-repo check runner for the
+// config editor: a real *hf.Client-backed adapter when the env is
+// usable, nil otherwise (the check is then disabled, P3 — the model
+// form advances exactly as before).
+func (r *Root) hfCheckRunner() hfCheckRunner {
+	if c, err := hf.New(); err == nil {
+		return hfCheckClient{c}
+	}
+	return nil
+}
 
 // openStorage switches to the Storage & Downloads manager. A live
 // manager is reused — leaving with Esc keeps any running download

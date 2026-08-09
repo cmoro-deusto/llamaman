@@ -72,6 +72,7 @@ type pickerInput struct {
 	kind    string  // sourceLocal | sourceHF
 	value   *string // bound staging pointer, for RefreshValue
 	openKey key.Binding
+	edited  bool // true once the user typed anything in this field this session (§16.6)
 }
 
 // wrapPickerInput wraps a fully-built huh input with the picker hotkey
@@ -91,15 +92,46 @@ func pickerOpenKey() key.Binding {
 // other messages delegate unchanged; the returned model is always the
 // wrapper, because the group replaces its stored field with whatever
 // Update returns (losing the wrapper would also lose the hotkey).
+//
+// §16.6: on the HF field, enter with a typed, valid, bare id is also
+// intercepted — it emits hfCheckRequestedMsg instead of advancing, so
+// ConfigMode can run the async repo check and offer the quant chooser.
+// The enter is swallowed, keeping the form on this field until the
+// check resolves. Any other key marks the field edited (the "typed in
+// this session" signal); a pre-fill from the cached-repo picker goes
+// through RefreshValue *outside* Update, so picked ids never flip it.
 func (p *pickerInput) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if k, ok := msg.(tea.KeyMsg); ok && key.Matches(k, p.openKey) {
-		return p, func() tea.Msg { return openModelPickerMsg{kind: p.kind} }
+	if k, ok := msg.(tea.KeyMsg); ok {
+		if key.Matches(k, p.openKey) {
+			return p, func() tea.Msg { return openModelPickerMsg{kind: p.kind} }
+		}
+		if k.String() == "enter" && p.shouldCheck() {
+			return p, func() tea.Msg { return hfCheckRequestedMsg{id: strings.TrimSpace(deref(p.value))} }
+		}
+		p.edited = true
 	}
 	m, cmd := p.Input.Update(msg)
 	if in, ok := m.(*huh.Input); ok {
 		p.Input = in
 	}
 	return p, cmd
+}
+
+// shouldCheck reports whether the enter key should run the §16.6
+// typed-repo check instead of advancing the form: only the HF field,
+// only when the user actually typed in it this session, and only for a
+// valid bare id. A :quant suffix is an explicit choice (nothing for the
+// chooser to offer); an invalid id is delegated so huh shows its
+// inline validation error.
+func (p *pickerInput) shouldCheck() bool {
+	if p.kind != sourceHF || !p.edited || p.value == nil {
+		return false
+	}
+	id := strings.TrimSpace(*p.value)
+	if !bareRepo(id) {
+		return false
+	}
+	return hfFormValidator(id) == nil
 }
 
 // View delegates to the embedded input — the form renders byte-for-byte

@@ -2406,6 +2406,15 @@ validator gate keeps huh's inline error display intact for invalid ids.
   `checking org/repo…` + `esc: cancel` (static, no spinner — the check
   is one bounded call and static text keeps snapshot tests
   deterministic).
+- **Cancel surfaces as cancellation:** the §16.2 client wraps the
+  transport error (including a canceled request) into an `hf.Error`
+  with no `Unwrap`/`Is`, so the adapter re-raises `ctx.Err()` when the
+  ctx is done — `errors.Is(err, context.Canceled)` must match for esc
+  to abort cleanly. Each check gets a generation counter
+  (`hfCheckGen`); the done msg carries it and `handleHFCheckDone`
+  drops any result whose gen does not match the current check (a stale
+  msg from a canceled earlier check must never resolve — or clear the
+  shield of — a later one).
 
 **On `hfCheckDoneMsg`** (handled on every message, before the errorModal
 arm, alongside the other overlay-done messages — the §16.4 discipline):
@@ -2452,10 +2461,17 @@ staging `hf` pointer, calls `hfField.RefreshValue()` (the item-5 gotcha:
 the input's internal text must be re-synced or the form's `GetValue` at
 completion saves the stale bare id), then `NextField()` — the form
 completes and `applyForm` persists `org/repo:QUANT`. The "keep bare id"
-option → `NextField()` with no write. `esc` aborts the chooser (huh
+option → `NextField()` with no write. Its option value is a non-empty
+sentinel (`quantKeepBare`), not `""` — the hosts bind an empty string
+before opening, and huh.Select anchors its initial cursor on the option
+matching the bound value: an empty value would pre-select the keep-bare
+row and hide the quants. `esc` aborts the chooser (huh
 `StateAborted`) → clear the slot, stay on the HF field, nothing
 committed. The chooser's completion msgs are routed on every message
 while `hfQuant` is set, same discipline as the other overlays.
+`applyForm`'s model-added/updated confirmation only fires when no flash
+is already pending, so the check's distinct failure message outranks
+it; a fresh model form clears any stale flash on open.
 
 **Routing and state.** `Update` order (config.go:168): `savedExpiredMsg`
 → `hfCheckDoneMsg` → errorModal → `hfCheckRequestedMsg` → `hfCheck`
