@@ -114,7 +114,9 @@ type ConfigMode struct {
 	hfCheck    *hfCheckState // in-flight repo check: shields the form, esc cancels
 	hfCheckGen int           // per-check generation, ties a done msg to its check
 	hfQuant    *huh.Form     // quant chooser overlay after a successful check
-	hfQuantVal string        // chooser selection staging (quant tag, or quantKeepBare = keep bare)
+	hfQuantVal string        // chooser selection staging (quant tag, or "" = esc → keep bare)
+	hfFail     *huh.Form     // Save/Dismiss dialog after a failed check
+	hfFailVal  string        // dialog selection staging ("save" | "dismiss")
 
 	saveErr error
 	flash   string
@@ -226,6 +228,11 @@ func (c *ConfigMode) Update(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 	// msgs are routed on every message while it is active.
 	if c.hfQuant != nil {
 		return c.updateHFQuant(msg)
+	}
+	// Save/Dismiss dialog after a failed check (owner round: the flash
+	// was too quick to read; the dialog gives a Save and a Dismiss).
+	if c.hfFail != nil {
+		return c.updateHFFail(msg)
 	}
 	if pm, ok := msg.(paramPickerDoneMsg); ok {
 		return c.handlePickerDone(pm)
@@ -375,11 +382,12 @@ func (c *ConfigMode) startHFCheck(msg hfCheckRequestedMsg) (*ConfigMode, tea.Cmd
 // A done msg that does not match the *current* check (a stale result
 // from a canceled earlier check, or one that arrived after esc already
 // cleared the slot) is dropped — esc is the abort, not the done msg.
-// Abort (esc) → no flash, no chooser, the field keeps its value.
+// Abort (esc) → no dialog, no chooser, the field keeps its value.
 // Success with quants → the quant chooser. Anything else (no quants,
-// not-found, gated, network) → a distinct flash and the form advances,
-// saving the typed id as-is (non-blocking P3 — llama-server surfaces
-// problems at launch).
+// not-found, gated, network) → a Save/Dismiss dialog (owner round: a
+// flash was too quick to read); Save completes the form keeping the
+// typed id as-is, Dismiss goes back to the HF field (non-blocking P3 —
+// llama-server surfaces problems at launch).
 func (c *ConfigMode) handleHFCheckDone(msg hfCheckDoneMsg) (*ConfigMode, tea.Cmd) {
 	if c.hfCheck == nil || msg.gen != c.hfCheck.gen {
 		return c, nil // stale: a later check (or esc) owns the flow now
@@ -390,20 +398,62 @@ func (c *ConfigMode) handleHFCheckDone(msg hfCheckDoneMsg) (*ConfigMode, tea.Cmd
 	case errors.Is(msg.err, context.Canceled):
 		return c, nil
 	case msg.err != nil:
-		c.flash = hfCheckFlash(repo, msg.err)
+		return c.openHFFailDialog(hfCheckFlash(repo, msg.err))
 	case len(msg.opts) == 0:
 		note := ""
 		if msg.mmproj {
 			note = " (mmproj only)"
 		}
-		c.flash = repo + ": no GGUF files found" + note
+		return c.openHFFailDialog(repo + ": no GGUF files found" + note)
 	default:
 		return c.openHFQuantChooser(repo, msg.opts, msg.mmproj)
 	}
-	if c.form == nil {
+}
+
+// openHFFailDialog shows the Save/Dismiss dialog for a failed check
+// (owner round). Save completes the model form, keeping the typed id
+// as-is; Dismiss closes the dialog and returns to the HF field so the
+// user can fix the id — nothing is committed. The model form stays
+// alive underneath (its enter was swallowed, so it is still on the HF
+// field).
+func (c *ConfigMode) openHFFailDialog(message string) (*ConfigMode, tea.Cmd) {
+	c.hfFailVal = "save"
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title(message).
+			Description("save the id anyway — llama-server surfaces problems at launch — or go back to fix it").
+			Options(
+				huh.NewOption("Save", "save"),
+				huh.NewOption("Dismiss", "dismiss"),
+			).
+			Value(&c.hfFailVal),
+	)).WithTheme(configHuhTheme(c.theme)).WithWidth(formWidthFor(c.width))
+	c.hfFail = form
+	return c, form.Init()
+}
+
+// updateHFFail routes messages to the failure dialog. esc = Dismiss
+// (safe default: nothing committed). Completion: Save → the form
+// advances to completion (applyForm saves the id); Dismiss → close and
+// stay on the HF field.
+func (c *ConfigMode) updateHFFail(msg tea.Msg) (*ConfigMode, tea.Cmd) {
+	if k, ok := msg.(tea.KeyMsg); ok && k.String() == "esc" {
+		c.hfFail = nil
 		return c, nil
 	}
-	return c, c.form.NextField()
+	next, cmd := c.hfFail.Update(msg)
+	if f, ok := next.(*huh.Form); ok {
+		c.hfFail = f
+	}
+	if c.hfFail != nil && c.hfFail.State == huh.StateCompleted {
+		save := c.hfFailVal == "save"
+		c.hfFail = nil
+		if !save || c.form == nil {
+			return c, nil
+		}
+		return c, c.form.NextField()
+	}
+	return c, cmd
 }
 
 // openHFQuantChooser shows the shared quant chooser (§16.3 data, §16.4
@@ -424,7 +474,10 @@ func (c *ConfigMode) openHFQuantChooser(repo string, opts []hf.QuantOption, mmpr
 		note = "mmproj present — llama.cpp auto-downloads it"
 	}
 	c.hfQuantVal = ""
-	form := quantChooserForm(repo, opts, cached, note, &c.hfQuantVal, true).
+	// Cap the option rows so the box fits small terminals; the
+	// viewport scrolls past the cap (owner round).
+	maxRows := max(4, c.height-12)
+	form := quantChooserForm(repo, opts, cached, note, &c.hfQuantVal, maxRows).
 		WithTheme(configHuhTheme(c.theme)).
 		WithWidth(formWidthFor(c.width))
 	c.hfQuant = form
@@ -433,38 +486,42 @@ func (c *ConfigMode) openHFQuantChooser(repo string, opts []hf.QuantOption, mmpr
 
 // updateHFQuant routes messages to the quant chooser overlay. Its
 // completion msgs are consumed on every message while it is active
-// (the §16.4 discipline). esc aborts → back to the HF field, nothing
-// committed. Completion → the pick (or the keep-bare option's empty
-// value) is written into staging and the form advances to completion.
+// (the §16.4 discipline). esc = save the bare id (owner round: the
+// keep-bare row is gone — esc is the "no quant" exit), enter on a
+// quant saves org/repo:QUANT; both advance the form to completion.
 func (c *ConfigMode) updateHFQuant(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok && k.String() == "esc" {
-		c.hfQuant = nil
-		return c, nil
+		// Not forwarded to the form (it would abort). esc = "no
+		// quant": save the bare id regardless of the current
+		// selection — only enter commits a picked quant (the Select
+		// syncs its bound value on focus, so hfQuantVal can never
+		// tell "picked" from "initial selection").
+		return c.applyHFQuantChoice(false)
 	}
 	next, cmd := c.hfQuant.Update(msg)
 	if f, ok := next.(*huh.Form); ok {
 		c.hfQuant = f
 	}
 	if c.hfQuant != nil && c.hfQuant.State == huh.StateCompleted {
-		return c.applyHFQuantChoice()
+		return c.applyHFQuantChoice(true)
 	}
 	return c, cmd
 }
 
-// applyHFQuantChoice writes the chooser's pick into the staging hf
-// pointer — org/repo:QUANT, or the bare id for the keep-bare option —
-// and advances the form to completion (applyForm then saves the model).
+// applyHFQuantChoice advances the form to completion (applyForm then
+// saves the model), writing the staged hf pointer as org/repo:QUANT
+// when picked (enter on a quant) or the bare id otherwise (esc).
 // RefreshValue re-syncs the input's internal text: without it the
 // form's GetValue at completion would save the stale bare id (the
 // item-5 gotcha, §16.6).
-func (c *ConfigMode) applyHFQuantChoice() (*ConfigMode, tea.Cmd) {
+func (c *ConfigMode) applyHFQuantChoice(picked bool) (*ConfigMode, tea.Cmd) {
 	c.hfQuant = nil
 	if c.formStaging.hf != nil {
 		repo := strings.TrimSpace(*c.formStaging.hf)
-		// quantKeepBare is the sentinel for the "keep <repo> (no
-		// quant)" row — any other pick is the quant suffix.
-		if quant := c.hfQuantVal; quant != "" && quant != quantKeepBare && repo != "" {
-			repo += ":" + quant
+		if picked {
+			if quant := c.hfQuantVal; quant != "" && repo != "" {
+				repo += ":" + quant
+			}
 		}
 		*c.formStaging.hf = repo
 		if c.hfField != nil {
@@ -504,11 +561,12 @@ func (c *ConfigMode) dismissForm() {
 	c.formStaging = formStaging{}
 	c.modelPicker = nil
 	c.locField, c.hfField = nil, nil
-	// Defensive: the check/chooser overlays are shielded while active,
-	// so nothing here can normally be dismissed mid-flow, but clear
-	// them rather than strand a stale overlay.
+	// Defensive: the check/chooser/dialog overlays are shielded while
+	// active, so nothing here can normally be dismissed mid-flow, but
+	// clear them rather than strand a stale overlay.
 	c.hfCheck = nil
 	c.hfQuant = nil
+	c.hfFail = nil
 }
 
 // installForm wires a freshly constructed huh.Form into ConfigMode,
@@ -1473,11 +1531,16 @@ func (c *ConfigMode) View() string {
 	if c.modelPicker != nil {
 		return overlayCenter(bg, c.modelPicker.View(c.theme), c.width, c.height)
 	}
-	// §16.6 overlays: the quant chooser and the in-flight check sit at
-	// the same modal precedence as the pickers (the form underneath is
-	// inlined by renderPanes, not an overlay).
+	// §16.6 overlays: the quant chooser, the failure dialog, and the
+	// in-flight check sit at the same modal precedence as the pickers
+	// (the form underneath is inlined by renderPanes, not an overlay),
+	// each inside the standard bordered box (owner round: the chooser
+	// rendered unboxed and diverged from the app's style).
 	if c.hfQuant != nil {
-		return overlayCenter(bg, c.hfQuant.View(), c.width, c.height)
+		return overlayCenter(bg, overlayBox(c.theme, c.hfQuant.View()), c.width, c.height)
+	}
+	if c.hfFail != nil {
+		return overlayCenter(bg, overlayBox(c.theme, c.hfFail.View()), c.width, c.height)
 	}
 	if c.hfCheck != nil {
 		return overlayCenter(bg, checkingOverlay(c.theme, c.hfCheck.repo), c.width, c.height)

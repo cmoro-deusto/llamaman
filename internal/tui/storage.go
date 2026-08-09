@@ -768,10 +768,10 @@ func (s *StorageMode) openQuantPicker(repo string) tea.Cmd {
 		}
 	}
 	s.quantVal = ""
-	// The shared §16.3/§16.6 quant chooser (no keep-bare row here: esc
-	// cancels the whole download action; the config editor's variant
-	// adds the row).
-	s.quantForm = quantChooserForm(repo, opts, cached, "", &s.quantVal, false).
+	// The shared §16.3/§16.6 quant chooser (esc cancels the whole
+	// download action; the config editor's variant saves the bare id
+	// on esc instead). Height-capped so the box fits small terminals.
+	s.quantForm = quantChooserForm(repo, opts, cached, "", &s.quantVal, max(4, s.height-12)).
 		WithTheme(configHuhTheme(s.theme)).
 		WithWidth(s.formWidth())
 	s.pendingRepo = repo

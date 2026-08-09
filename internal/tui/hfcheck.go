@@ -97,15 +97,24 @@ type hfCheckState struct {
 	cancel context.CancelFunc
 }
 
+// overlayBox renders content inside the standard bordered popup box
+// used by the config editor's overlays (accent rounded border, 1×2
+// padding) — the same treatment the param/model pickers and the
+// checking overlay use, so the quant chooser and the failure dialog
+// stay consistent with the rest of the app (owner round).
+func overlayBox(theme Theme, content string) string {
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(theme.Accent).
+		Padding(1, 2).
+		Render(content)
+}
+
 // checkingOverlay renders the static "checking org/repo…" popup.
 // Static on purpose (no spinner): the check is one bounded HTTP call
 // and static text keeps snapshot tests deterministic.
 func checkingOverlay(theme Theme, repo string) string {
-	box := lipgloss.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(theme.Accent).
-		Padding(1, 2)
-	return box.Render(strings.Join([]string{
+	return overlayBox(theme, strings.Join([]string{
 		lipgloss.NewStyle().Bold(true).Render("checking " + repo + "…"),
 		lipgloss.NewStyle().Foreground(theme.Subtle).Render("esc: cancel"),
 	}, "\n"))
@@ -118,24 +127,18 @@ func formWidthFor(width int) int {
 	return max(60, min(width-12, 160))
 }
 
-// quantKeepBare is the value of the quant chooser's trailing
-// "keep <repo> (no quant)" row. It is a distinct non-empty sentinel
-// (rather than "") on purpose: huh.Select anchors its initial cursor
-// on the option whose value matches the bound value, and the hosts
-// bind an empty string before opening — an empty keep-bare value would
-// pre-select the keep-bare row and hide the quants.
-const quantKeepBare = "\x01keep-bare"
-
 // quantChooserForm builds the shared quant chooser (DESIGN §16.3 data,
 // §16.4 UI shape): one row per quant — Tag — human size, with a
-// (cached) marker for quants already on disk — plus an optional
-// trailing "keep <repo> (no quant)" row (keepBare) whose value is the
-// quantKeepBare sentinel, meaning "save the bare id". note is an extra
+// (cached) marker for quants already on disk. note is an extra
 // informational Description line (e.g. the mmproj note); the
 // Description is repo when empty. The picked value is written into
 // value; the host applies theme/width by chaining With* after the call.
-func quantChooserForm(repo string, opts []hf.QuantOption, cached map[string]bool, note string, value *string, keepBare bool) *huh.Form {
-	choices := make([]huh.Option[string], 0, len(opts)+1)
+// maxRows caps the visible option rows (0 = no cap) so the box always
+// fits small terminals — huh Select's viewport scrolls past the cap
+// (owner round: an uncapped list overflowed the screen and its bottom
+// rows, previously including a keep-bare row, were clipped).
+func quantChooserForm(repo string, opts []hf.QuantOption, cached map[string]bool, note string, value *string, maxRows int) *huh.Form {
+	choices := make([]huh.Option[string], 0, len(opts))
 	for _, q := range opts {
 		label := fmt.Sprintf("%s — %s", q.Tag, hf.HumanSize(q.Size))
 		if cached[q.Tag] {
@@ -143,24 +146,30 @@ func quantChooserForm(repo string, opts []hf.QuantOption, cached map[string]bool
 		}
 		choices = append(choices, huh.NewOption(label, q.Tag))
 	}
-	if keepBare {
-		choices = append(choices, huh.NewOption("keep "+repo+" (no quant)", quantKeepBare))
-	}
 	desc := repo
 	if note != "" {
 		desc += "\n" + note
 	}
-	return huh.NewForm(huh.NewGroup(
-		huh.NewSelect[string]().
-			Title("quantization").
-			Description(desc).
-			Options(choices...).
-			Value(value),
-	))
+	sel := huh.NewSelect[string]().
+		Title("quantization").
+		Description(desc).
+		Options(choices...).
+		Value(value)
+	if maxRows > 0 && len(choices) > maxRows {
+		// Height covers the option rows plus the title+description
+		// rows the Select subtracts from its viewport.
+		offset := 2 // title + repo description
+		if note != "" {
+			offset++
+		}
+		sel.Height(maxRows + offset)
+	}
+	return huh.NewForm(huh.NewGroup(sel))
 }
 
-// hfCheckFlash maps a check failure to its distinct non-blocking flash
-// (ROADMAP §3.8: not-found vs gated vs network).
+// hfCheckFlash maps a check failure to its distinct message (ROADMAP
+// §3.8: not-found vs gated vs network) — the title of the Save/Dismiss
+// dialog (owner round: a flash was too quick to read).
 func hfCheckFlash(repo string, err error) string {
 	var he *hf.Error
 	switch {

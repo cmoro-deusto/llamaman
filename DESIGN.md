@@ -585,7 +585,7 @@ Three-pane master-detail:
 `Tab` / `Shift+Tab` cycle focus across panes. `Right` / `Left` (and `l` / `h`) do the same — the user can navigate to any pane with arrow keys without lifting from the navigation cluster.
 
 **Models pane**:
-- `e` rename alias / change source (modal form: alias, source select [`local` | `huggingface`], then either a path input or a `org/repo[:quant]` input depending on the selection). Both value inputs stay free-type and are picker-assisted (§16.5): `ctrl+o` in the path input opens a `.gguf` filepicker (starting in `preferences.models-dir` → the current value's dir → the first local model's dir → `~`), and `ctrl+o` in the HF input opens a cached-repo list (one row per cached repo with quants + sizes, plus "type a new repo…"; a single cached quant pre-fills `org/repo:QUANT`, several pre-fill bare `org/repo`; an empty cache skips the list). Confirming a *typed* bare `org/repo` in the HF field runs one async `tree/main` check offering the shared quant chooser with real sizes; failures are non-blocking distinct flashes and the id is still saved (§16.6).
+- `e` rename alias / change source (modal form: alias, source select [`local` | `huggingface`], then either a path input or a `org/repo[:quant]` input depending on the selection). Both value inputs stay free-type and are picker-assisted (§16.5): `ctrl+o` in the path input opens a `.gguf` filepicker (starting in `preferences.models-dir` → the current value's dir → the first local model's dir → `~`), and `ctrl+o` in the HF input opens a cached-repo list (one row per cached repo with quants + sizes, plus "type a new repo…"; a single cached quant pre-fills `org/repo:QUANT`, several pre-fill bare `org/repo`; an empty cache skips the list). Confirming a *typed* bare `org/repo` in the HF field runs one async `tree/main` check offering the shared quant chooser with real sizes; failures open a Save/Dismiss dialog with a distinct message — Save keeps the id, Dismiss returns to the field (§16.6).
 - `n` new model (same modal as edit).
 - `c` duplicate, prompt for new alias (presets and params copied; source kind and value preserved).
 - `d` delete (confirm with preset count).
@@ -2419,59 +2419,64 @@ validator gate keeps huh's inline error display intact for invalid ids.
 **On `hfCheckDoneMsg`** (handled on every message, before the errorModal
 arm, alongside the other overlay-done messages — the §16.4 discipline):
 
-- `ctx.Canceled` → no flash, no chooser; clear the slot, stay on the
+- `ctx.Canceled` → no dialog, no chooser; clear the slot, stay on the
   HF field (the user aborted).
 - success, `len(opts) > 0` → open the **quant chooser** (below).
-- success, no quants → flash `org/repo: no GGUF files found` (append
-  ` (mmproj only)` when `HasMMProj`) and advance.
-- `hf.IsNotFound` → flash `org/repo: not found on Hugging Face`.
-- `hf.IsGated` → flash `org/repo: gated — requires HF_TOKEN`.
-- other error (network/HTTP) → flash `org/repo: could not reach
-  Hugging Face` (network) or `org/repo: HTTP <code>`.
-
-Every failure/empty path then **advances the form**: `c.form.NextField()`
-(huh v1.0.0 exports it, form.go:488 — `f.Update(NextField())`, and the
-gotcha's "forms complete on a follow-up nextFieldMsg" chain drives
-completion; the HF field is the last visible field, so the form
-completes and `applyForm` saves the model with the typed id as-is).
-Non-blocking per ROADMAP §3.8: "the id can still be saved (llama-server
-surfaces it at launch)". The flash persists (config-mode flashes only
-auto-clear for the "saved" indicator) so the user sees why nothing
-happened before the form closed.
+- every other outcome (no quants, not-found, gated, network/HTTP) →
+  a **Save/Dismiss dialog** (owner round: a flash was too quick to
+  read), titled with the distinct message (`org/repo: no GGUF files
+  found` + ` (mmproj only)` when `HasMMProj`; `org/repo: not found on
+  Hugging Face`; `org/repo: gated — requires HF_TOKEN`; `org/repo:
+  could not reach Hugging Face` / `org/repo: HTTP <code>`). **Save**
+  completes the form via `c.form.NextField()` (huh v1.0.0 exports it,
+  form.go:488 — the gotcha's "forms complete on a follow-up
+  nextFieldMsg" chain drives completion; the HF field is the last
+  visible field, so `applyForm` saves the model with the typed id
+  as-is) — non-blocking per ROADMAP §3.8: "the id can still be saved
+  (llama-server surfaces it at launch)". **Dismiss** (or `esc`) closes
+  the dialog and returns to the HF field, nothing committed — the
+  model form stayed alive underneath (its enter was swallowed), so the
+  user can fix the id and re-confirm. The dialog is a dedicated
+  `hfFail *huh.Form` slot with a `huh.Select` (Save pre-selected),
+  rendered boxed like the chooser.
 
 **The quant chooser.** Reuses the §16.4 label shape exactly — the same
 `Tag — hf.HumanSize(Size)` rows plus ` (cached)` markers from
 `storage.Lookup(root, repo)` when the cache root resolves (P3: lookup
-failure → empty marker set), and a trailing
-`keep org/repo (no quant)` option. Extracted into a shared
+failure → empty marker set). Extracted into a shared
 `quantChooserForm(repo string, opts []hf.QuantOption, cached
-map[string]bool, note string) *huh.Form` helper (new `hfcheck.go`);
-`StorageMode.openQuantPicker` (storage.go:756) switches to it so both
-hosts always agree (the same "same helpers" rule item 5 applied to the
-repo list). The mmproj note (`mmproj present — llama.cpp auto-downloads
-it`) rides the form's `Description` as an informational line only.
+map[string]bool, note string, value *string, maxRows int) *huh.Form`
+helper (new `hfcheck.go`); `StorageMode.openQuantPicker`
+(storage.go:756) switches to it so both hosts always agree (the same
+"same helpers" rule item 5 applied to the repo list). The mmproj note
+(`mmproj present — llama.cpp auto-downloads it`) rides the form's
+`Description` as an informational line only.
 **VRAM hint:** sizes-only; per §16.3 the hint is a render-time addition
 hosts attach when the §14.3 estimator ships — no coupling here. The
 chooser is a dedicated ConfigMode slot `hfQuant *huh.Form`, rendered
-via `overlayCenter` ahead of the form, sized like §16.4's form
-(`formWidth()`).
+via `overlayCenter` ahead of the form **inside the standard bordered
+popup box** (`overlayBox` — the same treatment the pickers and the
+checking overlay use; owner round: it rendered unboxed and diverged
+from the app's style), sized like §16.4's form (`formWidth()`).
+`maxRows` caps the visible option rows to the host height minus
+overhead, so the box always fits small terminals — huh Select's
+viewport scrolls past the cap (owner round: an uncapped list
+overflowed the screen and its bottom rows were clipped).
 
-Chooser exits: picking a quant writes `repo + ":" + tag` into the
-staging `hf` pointer, calls `hfField.RefreshValue()` (the item-5 gotcha:
-the input's internal text must be re-synced or the form's `GetValue` at
-completion saves the stale bare id), then `NextField()` — the form
-completes and `applyForm` persists `org/repo:QUANT`. The "keep bare id"
-option → `NextField()` with no write. Its option value is a non-empty
-sentinel (`quantKeepBare`), not `""` — the hosts bind an empty string
-before opening, and huh.Select anchors its initial cursor on the option
-matching the bound value: an empty value would pre-select the keep-bare
-row and hide the quants. `esc` aborts the chooser (huh
-`StateAborted`) → clear the slot, stay on the HF field, nothing
-committed. The chooser's completion msgs are routed on every message
-while `hfQuant` is set, same discipline as the other overlays.
-`applyForm`'s model-added/updated confirmation only fires when no flash
-is already pending, so the check's distinct failure message outranks
-it; a fresh model form clears any stale flash on open.
+Chooser exits: **enter on a quant** writes `repo + ":" + tag` into the
+staging `hf` pointer, calls `hfField.RefreshValue()` (the item-5
+gotcha: the input's internal text must be re-synced or the form's
+`GetValue` at completion saves the stale bare id), then `NextField()`
+— the form completes and `applyForm` persists `org/repo:QUANT`.
+**`esc` saves the bare id** (owner round: the keep-bare row was
+dropped — the Save/Dismiss dialog already covers "keep the id", so the
+chooser needs only two exits, pick-quant and no-quant; esc is never
+forwarded to the form, which would abort it). `esc` always means "no
+quant" regardless of the current selection, because huh.Select syncs
+its bound value on focus — `hfQuantVal` cannot distinguish "picked"
+from "initial selection"; only enter commits a pick. The chooser's
+completion msgs are routed on every message while `hfQuant` is set,
+same discipline as the other overlays.
 
 **Routing and state.** `Update` order (config.go:168): `savedExpiredMsg`
 → `hfCheckDoneMsg` → errorModal → `hfCheckRequestedMsg` → `hfCheck`
@@ -2492,12 +2497,14 @@ overlays like it does for `modelPicker` (config.go:151).
   the model form to the HF field, type a bare id, enter → checking
   overlay renders; esc → canceled, no flash, still on the field; stub
   runner (synchronous, `SetHFCheckRunner`) → success+quants → chooser
-  renders sizes + mmproj note + keep-bare row; pick → staging
-  `org/repo:QUANT`, form completes, model applied with the suffix;
-  keep-bare → bare id saved; `ErrNotFound` / `ErrGated` / network →
-  the distinct flash **and** the form completes with the bare id saved;
-  no-quants → flash + completes; runner nil → enter completes the form
-  with no check.
+  renders sizes + mmproj note **inside the bordered box**; enter on a
+  quant → staging `org/repo:QUANT`, form completes, model applied
+  with the suffix; esc on the chooser → bare id saved (no quant);
+  `ErrNotFound` / `ErrGated` / network / no-quants → the Save/Dismiss
+  dialog opens with its distinct message and **Save** completes the
+  form with the bare id, **Dismiss**/esc returns to the HF field with
+  nothing committed (the id stays editable and re-checkable); runner
+  nil → enter completes the form with no check.
 - `hfCheckClient` adapter: `httptest.Server` tree fixture → quants +
   mmproj derived from one response; the §16.2 typed errors map through
   unchanged.

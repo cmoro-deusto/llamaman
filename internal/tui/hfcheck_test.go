@@ -187,13 +187,14 @@ func TestHFCheckClientCancel(t *testing.T) {
 }
 
 // TestQuantChooserFormShape checks the shared chooser's options: sizes,
-// (cached) markers, the informational note, and the keep-bare row only
-// when requested.
+// (cached) markers, the informational note, and the height cap (owner
+// round: the keep-bare row is gone — esc on the chooser saves the bare
+// id instead).
 func TestQuantChooserFormShape(t *testing.T) {
 	opts := []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}, {Tag: "Q8_0", Size: 200}}
 	val := ""
 	form := quantChooserForm("org/repo", opts, map[string]bool{"Q4_K_M": true},
-		"mmproj present — llama.cpp auto-downloads it", &val, true).
+		"mmproj present — llama.cpp auto-downloads it", &val, 0).
 		WithTheme(configHuhTheme(DefaultTheme())).
 		WithWidth(60)
 	m := drainCmds(formAdapter{form}, form.Init(), 0)
@@ -204,20 +205,31 @@ func TestQuantChooserFormShape(t *testing.T) {
 		"Q8_0 — " + hf.HumanSize(200),
 		"(cached)",
 		"mmproj present",
-		"keep org/repo (no quant)",
 	} {
 		if !strings.Contains(view, want) {
 			t.Errorf("chooser view missing %q:\n%s", want, view)
 		}
 	}
+	if strings.Contains(view, "keep org/repo") {
+		t.Error("keep-bare row still present (dropped by owner round)")
+	}
 
+	// Height cap: with more quants than maxRows, the viewport scrolls
+	// instead of overflowing the screen.
+	var many []hf.QuantOption
+	for _, tag := range []string{"Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8", "Q9"} {
+		many = append(many, hf.QuantOption{Tag: tag, Size: 100})
+	}
 	val2 := ""
-	storageForm := quantChooserForm("org/repo", opts, nil, "", &val2, false).
+	capped := quantChooserForm("org/repo", many, nil, "", &val2, 4).
 		WithTheme(configHuhTheme(DefaultTheme())).
 		WithWidth(60)
-	m2 := drainCmds(formAdapter{storageForm}, storageForm.Init(), 0)
-	if strings.Contains(m2.(formAdapter).View(), "keep org/repo") {
-		t.Error("keep-bare row present when keepBare=false (storage variant)")
+	m2 := drainCmds(formAdapter{capped}, capped.Init(), 0)
+	cappedView := m2.(formAdapter).View()
+	// The form's total height (title + desc + capped rows + help)
+	// stays well under an uncapped 9-option list.
+	if got := len(strings.Split(cappedView, "\n")); got > 10 {
+		t.Errorf("capped chooser is %d lines tall, want ≤ 10 (overflow):\n%s", got, cappedView)
 	}
 }
 
@@ -286,10 +298,13 @@ func TestConfigHFCheckHappyPath(t *testing.T) {
 	}
 	c = driveInit(t, c, cmd) // chooser Init (focus msgs)
 	view := c.View()
-	for _, want := range []string{"Q4_K_M — " + hf.HumanSize(100), "Q8_0 — " + hf.HumanSize(200), "keep Qwen/Qwen3-32B-GGUF (no quant)"} {
+	for _, want := range []string{"Q4_K_M — " + hf.HumanSize(100), "Q8_0 — " + hf.HumanSize(200)} {
 		if !strings.Contains(view, want) {
 			t.Errorf("chooser view missing %q", want)
 		}
+	}
+	if !strings.Contains(view, "╭") || !strings.Contains(view, "╰") {
+		t.Error("chooser is not rendered inside the standard bordered box (owner round)")
 	}
 	if stub.repo != "Qwen/Qwen3-32B-GGUF" {
 		t.Errorf("runner saw repo %q", stub.repo)
@@ -308,25 +323,9 @@ func TestConfigHFCheckHappyPath(t *testing.T) {
 	}
 }
 
-// TestConfigHFCheckKeepBare: the trailing keep-bare row saves the id
-// without a quant suffix.
-func TestConfigHFCheckKeepBare(t *testing.T) {
-	stub := &stubHFCheck{opts: []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}}}
-	c := typeBareRepo(t, hfFlowConfig(t, stub))
-	c, checkCmd := startCheck(t, c)
-	next, cmd := c.Update(safeCmd(checkCmd))
-	c = next
-	c = driveInit(t, c, cmd)
-	// Down onto the keep-bare row, enter.
-	c = drive(t, c, tea.KeyMsg{Type: tea.KeyDown})
-	c = drive(t, c, tea.KeyMsg{Type: tea.KeyEnter})
-	if len(c.work.Models) != 1 || c.work.Models[0].HF != "Qwen/Qwen3-32B-GGUF" {
-		t.Errorf("saved model = %+v, want bare org/repo", c.work.Models)
-	}
-}
-
-// TestConfigHFCheckChooserEsc: esc on the chooser returns to the HF
-// field with nothing committed.
+// TestConfigHFCheckChooserEsc: esc on the quant chooser saves the bare
+// id (owner round: the keep-bare row is gone — esc is the "no quant"
+// exit) and advances the form to completion.
 func TestConfigHFCheckChooserEsc(t *testing.T) {
 	stub := &stubHFCheck{opts: []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}}}
 	c := typeBareRepo(t, hfFlowConfig(t, stub))
@@ -341,14 +340,11 @@ func TestConfigHFCheckChooserEsc(t *testing.T) {
 	if c.hfQuant != nil {
 		t.Fatal("esc did not close the chooser")
 	}
-	if c.form == nil {
-		t.Fatal("esc on the chooser dismissed the model form — must stay on the HF field")
+	if c.form != nil {
+		t.Fatal("model form did not complete after esc (must save the bare id)")
 	}
-	if len(c.work.Models) != 0 {
-		t.Fatalf("model added while chooser was open: %+v", c.work.Models)
-	}
-	if got := deref(c.formStaging.hf); got != "Qwen/Qwen3-32B-GGUF" {
-		t.Errorf("staged hf = %q after chooser esc, want untouched bare id", got)
+	if len(c.work.Models) != 1 || c.work.Models[0].HF != "Qwen/Qwen3-32B-GGUF" {
+		t.Errorf("saved model = %+v, want bare org/repo", c.work.Models)
 	}
 }
 
@@ -375,6 +371,9 @@ func TestConfigHFCheckCancel(t *testing.T) {
 	if c.hfQuant != nil {
 		t.Fatal("cancel opened the chooser")
 	}
+	if c.hfFail != nil {
+		t.Fatal("cancel opened the failure dialog")
+	}
 	if c.form == nil {
 		t.Fatal("cancel dismissed the model form — must stay on the HF field")
 	}
@@ -383,46 +382,106 @@ func TestConfigHFCheckCancel(t *testing.T) {
 	}
 }
 
-// TestConfigHFCheckFailures: every failure path flashes a distinct,
-// non-blocking message and still completes the form, saving the bare
-// id as-is (ROADMAP §3.8: "the id can still be saved").
+// TestConfigHFCheckFailures: every failure path shows the Save/Dismiss
+// dialog with its distinct message (owner round: the flash was too
+// quick to read). Save completes the form, keeping the bare id as-is
+// (ROADMAP §3.8: "the id can still be saved"); Dismiss returns to the
+// HF field with nothing committed.
 func TestConfigHFCheckFailures(t *testing.T) {
 	cases := []struct {
 		name   string
 		err    error
 		opts   []hf.QuantOption
 		mmproj bool
-		flash  string
+		msg    string
 	}{
 		{name: "not found", err: &hf.Error{Kind: hf.ErrNotFound, Status: 404},
-			flash: "Qwen/Qwen3-32B-GGUF: not found on Hugging Face"},
+			msg: "Qwen/Qwen3-32B-GGUF: not found on Hugging Face"},
 		{name: "gated", err: &hf.Error{Kind: hf.ErrGated, Status: 401},
-			flash: "Qwen/Qwen3-32B-GGUF: gated — requires HF_TOKEN"},
+			msg: "Qwen/Qwen3-32B-GGUF: gated — requires HF_TOKEN"},
 		{name: "network", err: errors.New("dial tcp: connection refused"),
-			flash: "Qwen/Qwen3-32B-GGUF: could not reach Hugging Face"},
+			msg: "Qwen/Qwen3-32B-GGUF: could not reach Hugging Face"},
 		{name: "http other", err: &hf.Error{Kind: hf.ErrHTTP, Status: 502, Message: "bad gateway"},
-			flash: "Qwen/Qwen3-32B-GGUF: HTTP 502"},
-		{name: "no quants", flash: "Qwen/Qwen3-32B-GGUF: no GGUF files found"},
+			msg: "Qwen/Qwen3-32B-GGUF: HTTP 502"},
+		{name: "no quants", msg: "Qwen/Qwen3-32B-GGUF: no GGUF files found"},
 		{name: "mmproj only", opts: nil, mmproj: true,
-			flash: "Qwen/Qwen3-32B-GGUF: no GGUF files found (mmproj only)"},
+			msg: "Qwen/Qwen3-32B-GGUF: no GGUF files found (mmproj only)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			stub := &stubHFCheck{err: tc.err, opts: tc.opts, mmproj: tc.mmproj}
 			c := typeBareRepo(t, hfFlowConfig(t, stub))
-			// One drive runs the whole chain: enter → check → flash →
-			// form completion → applyForm.
+			// One drive runs the chain up to the dialog: enter → check
+			// → hfFail set (the form is NOT completed — Dismiss must
+			// still be possible).
 			c = drive(t, c, tea.KeyMsg{Type: tea.KeyEnter})
-			if c.flash != tc.flash {
-				t.Errorf("flash = %q, want %q", c.flash, tc.flash)
+			if c.hfFail == nil {
+				t.Fatal("failure did not open the Save/Dismiss dialog")
 			}
+			if c.flash != "" {
+				t.Errorf("flash = %q, want none (dialog replaces the flash)", c.flash)
+			}
+			if c.form == nil {
+				t.Fatal("model form gone while the dialog is up")
+			}
+			view := c.View()
+			if !strings.Contains(view, tc.msg) {
+				t.Errorf("dialog missing message %q:\n%s", tc.msg, view)
+			}
+			for _, want := range []string{"Save", "Dismiss"} {
+				if !strings.Contains(view, want) {
+					t.Errorf("dialog missing option %q", want)
+				}
+			}
+			if !strings.Contains(view, "╭") || !strings.Contains(view, "╰") {
+				t.Error("dialog not rendered inside the standard bordered box")
+			}
+
+			// Save → form completes, bare id kept.
+			next, cmd := c.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			c = next
+			c = driveInit(t, c, cmd) // enter on the pre-selected Save
 			if c.form != nil {
-				t.Fatal("form did not complete after the failure (must be non-blocking)")
+				t.Fatal("form did not complete after Save")
 			}
 			if len(c.work.Models) != 1 || c.work.Models[0].HF != "Qwen/Qwen3-32B-GGUF" {
 				t.Errorf("saved model = %+v, want bare org/repo (id still saved)", c.work.Models)
 			}
 		})
+	}
+}
+
+// TestConfigHFCheckFailDismiss: Dismiss on the failure dialog returns
+// to the HF field with nothing committed — the user can fix the id.
+func TestConfigHFCheckFailDismiss(t *testing.T) {
+	stub := &stubHFCheck{err: &hf.Error{Kind: hf.ErrNotFound, Status: 404}}
+	c := typeBareRepo(t, hfFlowConfig(t, stub))
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyEnter}) // → dialog
+	if c.hfFail == nil {
+		t.Fatal("failure did not open the dialog")
+	}
+	// esc = Dismiss (safe default).
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyEsc})
+	if c.hfFail != nil {
+		t.Fatal("esc did not dismiss the dialog")
+	}
+	if c.form == nil {
+		t.Fatal("model form dismissed — Dismiss must return to the HF field")
+	}
+	if len(c.work.Models) != 0 {
+		t.Fatalf("model added after Dismiss: %+v", c.work.Models)
+	}
+	if got := deref(c.formStaging.hf); got != "Qwen/Qwen3-32B-GGUF" {
+		t.Errorf("staged hf = %q after Dismiss, want the typed id intact", got)
+	}
+	// The user can fix the id and re-confirm: typing marks the field
+	// edited, the id is bare again → the check re-runs.
+	c = drive(t, c, keyRunes("-FIX"))
+	if c.hfQuant != nil || c.hfFail != nil {
+		t.Fatal("overlay opened without a confirming enter")
+	}
+	if got := deref(c.formStaging.hf); got != "Qwen/Qwen3-32B-GGUF-FIX" {
+		t.Errorf("staged hf = %q after editing, want the fixed id", got)
 	}
 }
 
