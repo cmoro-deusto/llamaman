@@ -41,17 +41,19 @@ func TestSearchQueryAssembly(t *testing.T) {
 		{
 			name: "query and filter tags",
 			opts: SearchOpts{
-				Query:  "llama 3",
-				Limit:  25,
-				Sort:   "likes",
-				Filter: []string{"ja", "license:apache-2.0"},
+				Query:       "llama 3",
+				Limit:       25,
+				Sort:        "likes",
+				Filter:      []string{"ja", "license:apache-2.0"},
+				PipelineTag: "text-generation",
 			},
 			want: url.Values{
-				"search":    {"llama 3"},
-				"filter":    {"gguf,ja,license:apache-2.0"},
-				"sort":      {"likes"},
-				"direction": {"-1"},
-				"limit":     {"25"},
+				"search":       {"llama 3"},
+				"filter":       {"gguf,ja,license:apache-2.0"},
+				"sort":         {"likes"},
+				"pipeline_tag": {"text-generation"},
+				"direction":    {"-1"},
+				"limit":        {"25"},
 			},
 		},
 		{

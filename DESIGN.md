@@ -2693,23 +2693,32 @@ popup):
 **Layout — three zones; the pane follows the cursor.** The model-info
 + quants pane **auto-updates as the results are navigated** (owner
 flow): moving in the results list re-renders the right pane instantly
-from the search response (name, `from <base_model>`, downloads, likes,
-license, task) and fires one gen-guarded `tree/main` fetch for the
-quants — no enter needed on a result, so enter is free for selecting a
-quant. The search box, the results, and the model info each live in
-their own thin rounded rectangle; the sort indicator sits at the top
-right of the search box with the input width reserved so it never
-overlaps the border, and the value is accent-bold (the active sort is
-evident at a glance). Result rows are colored (titles Subtle,
-descriptions Muted, selection accent-bold on reversed background); the
-quant rows show a green `● cached` badge instead of plain `(cached)`.
+from the search response and fires one gen-guarded `tree/main` fetch
+for the quants — no enter needed on a result, so enter is free for
+selecting a quant. The search box, the results, and the model info each
+live in their own thin rounded rectangle; the sort indicator sits at
+the top right of the search box with the input width reserved so it
+never overlaps the border, and the value is accent-bold with a friendly
+label (owner round: the sort cycle mirrors the HF site's Models
+ranking — **downloads → likes → trending → newest → updated**, i.e.
+`downloads`, `likes`, `trendingScore`, `createdAt`, `lastModified`, all
+verified server-side). The `search: ` prompt is accent-bold. **The
+search bar is part of the tab cycle** (owner round): tab cycles search
+→ results → quants → search; esc still backs out one step. Result rows
+are colored (titles Subtle, descriptions Muted, selection accent-bold
+on reversed background); the quant rows show the size in Muted and a
+green `● cached` badge. **Browsing without a search term works** — an
+empty query lists the top GGUF repos by the current sort (the
+placeholder reads `search Hugging Face… (empty = browse)`).
 
-- **focusSearch** — a `bubbles/textinput` line inside its thin box.
-  Typing goes to it; `enter` runs the search (gen-guarded async,
-  shield + `esc: cancel` like §16.6); `esc` returns to Main. The
-  input is re-shown pre-filled with the last query so edits re-search.
-  (Sort cycling and the tag filters live in the results zone — every
-  printable key must type, the §16.5 modifier precedent.)
+- **focusSearch** — a `bubbles/textinput` line inside its thin box
+  (accent-bold `search: ` prompt). Typing goes to it; `enter` runs the
+  search — or, with an empty query, **browses** the top GGUF repos by
+  the current sort (gen-guarded async, shield + `esc: cancel` like
+  §16.6); `esc` returns to Main. The input is re-shown pre-filled with
+  the last query so edits re-search. (Sort cycling and the filters
+  live in the results zone — every printable key must type, the §16.5
+  modifier precedent.)
 - **focusResults** — a `bubbles/list` (the §16.5 repoPicker delegate
   shape: **arrows-only** keymap — page jumps, help, and quit unbound —
   no chrome, colored rows) over the results; row = `org/repo`,
@@ -2723,17 +2732,23 @@ quant rows show a green `● cached` badge instead of plain `(cached)`.
   fast navigation): the pane shows an inline `loading quants…` line and
   a superseded fetch is cancelled and gen-dropped. `esc` returns to
   focusSearch. In this zone **`t` cycles sort downloads → likes →
-  lastModified** (re-runs the same query, same gen guard) and `l`/`L`
-  open the tag filters (below).
+  trending → newest → updated** (re-runs the same query, same gen
+  guard) and `l`/`L`/`k`/`m` open the filters (below).
 - **Model info + quants pane** (right box, follows the results
-  cursor): repo name (accent), `from <base_model>` when a
+  cursor), colored throughout (owner round): repo name (accent bold);
+  a **params line** — `8B params · from <base_model>` (the param count
+  in StatusReady-green, "from" Muted, base Subtle) when a
   `base_model:quantized:<id>` tag is present (answers "what is this
-  repo actually?"), a separator, `⬇ N downloads` and `♥ N likes`,
-  `license: <id>`, `task: <pipeline_tag>`, a
+  repo actually?"; the count is **name-derived** — the search API has
+  no params field, so `paramCountOf` regexes the `8B`-style suffix out
+  of the base-model id / repo id, a flagged display heuristic); a
+  separator; `⬇ N downloads` (count green) and `♥ N likes` (count
+  accent); `⚖ license: <id>` and `▷ task: <pipeline_tag>` (label
+  Muted, value Subtle — icons match the ⬇/♥ style, owner round); a
   **⚠ non-commercial license — check terms** warning for `cc-by-nc*`
-  (P3: display only), another separator, then the quant list — rows
-  reuse the §16.3 label (`Tag — hf.HumanSize(Size)` via the shared
-  `quantRowLabel` from hfcheck.go) with the green `● cached` badge when
+  (P3: display only); another separator; then the quant list — rows
+  `Tag — hf.HumanSize(Size)` with the size in Muted (owner round, like
+  the result descriptions) plus the green `● cached` badge when
   `storage.Lookup(root, repo)` marks it (the storage.go:764–769 logic)
   and the mmproj informational line (`hf.HasMMProj`).
 - **focusQuants** — the quant list with its own cursor (↑/↓); `enter`
@@ -2752,30 +2767,39 @@ aware** (owner): the quants zone advertises `↑/↓ quant · enter hand off
 exclusive (the same "overlay handlers run on EVERY message" discipline
 — zone messages are consumed in `Update` before anything else).
 
-**Tag filters (`l` / `L`, results zone).** Two curated overlays — the
-§16.6 dialog pattern (boxed, height-capped huh select, dedicated slot
-`tagFilter *huh.Form` + `tagFilterVal`). The keys live in **focusResults**,
-not focusSearch: the search box must own every printable key (typing
-`llama` starts with `l`), the same reason §16.5's picker hotkey is a
-modifier (`ctrl+o`) — the owner's `l`/`L` keys are preserved, just
-where no text entry happens:
+**Filters (`l` / `L` / `k` / `m`, results zone).** Curated overlays —
+the §16.6 dialog pattern (boxed, height-capped huh select, dedicated
+slot `tagFilter *huh.Form` + `tagFilterVal`). The keys live in
+**focusResults**, not focusSearch: the search box must own every
+printable key (typing `llama` starts with `l`), the same reason §16.5's
+picker hotkey is a modifier (`ctrl+o`) — the owner's keys are
+preserved, just where no text entry happens:
 
 - `l` — **language**: `all languages`, en, es, de, fr, it, pt, ja, zh,
-  ko, ru, ar, hi, th, multilingual. Picking one sets
-  `browser.filterLang` and re-runs the search with it; `all languages`
-  clears it; esc **dismisses without changing the filter**.
-- `L` — **license**: `any license`, apache-2.0, mit, llama3.1, llama3.2,
-  llama3.3, gemma, openrail, cc-by-nc-4.0, other. Sets
-  `browser.filterLic`; `any license` clears; esc dismisses.
+  ko, ru, ar, hi, th, multilingual → `Filter: ["ja"]`.
+- `L` — **license**: `any license`, apache-2.0, mit, llama3.1/3.2/3.3,
+  gemma, openrail, cc-by-nc-4.0, other → `Filter: ["license:<id>"]`.
+- `k` — **task** (owner round; verified server-side): `any task`,
+  text-generation, translation, text2text-generation,
+  feature-extraction, sentence-similarity, image-text-to-text → the
+  `pipeline_tag` query param (a new `SearchOpts.PipelineTag` field).
+- `m` — **params min/max** (owner round): a boxed two-input form (min /
+  max in billions, empty = none). **Client-side and page-scoped** — the
+  search API has no params field, so the filter prunes the fetched page
+  through the name-derived `paramCountOf` heuristic (repos whose count
+  is unparseable are kept); the header shows `filter: 7B-70B`.
 
-Both filters combine into the search request as extra `Filter` tags
-(`filter=gguf,ja,license:apache-2.0` — verified server-side), re-run
-with the same gen guard as sort changes. The header renders the active
-filters (`filter: en · apache-2.0`, key hint `(l/L)`); `l`/`L` re-open
-the pickers to change or clear. Escaping a tag uses the same per-segment
-rule as the query. The curated lists are package-level constants (the
-"same helpers" rule — the picker options and the request assembly both
-read from them), so the two surfaces can never disagree.
+Language/license/task combine into the request (`filter=gguf,ja,
+license:apache-2.0` + `pipeline_tag=text-generation` — all verified
+server-side), re-run with the same gen guard as sort changes; the
+params filter applies locally on top. Each picker's clear row (`all
+languages` / `any license` / `any task` / empty-empty) resets it; esc
+**dismisses without changing the filter**. The header renders the
+active filters (`filter: en · apache-2.0 · text-generation · 7B-70B`,
+key hint `(l/L/k/m)`). Escaping a tag uses the same per-segment rule as
+the query. The curated lists are package-level constants (the "same
+helpers" rule — the picker options and the request assembly both read
+from them), so the two surfaces can never disagree.
 
 **Hand-off dialog.** `enter` on a quant (or the no-quant row) opens a
 boxed, height-capped huh select — the §16.6 dialog pattern
@@ -2808,17 +2832,21 @@ user can still hand off the bare id (mirrors §16.6's Save path). The
 runner-nil case (search disabled) also disables hand-off (flash only).
 
 **Routing and state.** `BrowserMode` fields: `query string`, `input
-textinput.Model`, `sort string`, `filterLang, filterLic string`,
-`results list.Model` + `zone browserZone`, `selected *hf.SearchResult`,
-`quants []hf.QuantOption`, `cached map[string]bool`, `mmproj bool`,
-`quantsLoaded/quantsLoading bool`, `quantIdx int`, `searchGen/quantGen`
-counters + `quantCancel context.CancelFunc` (the pane's fetch is
-cancelled on navigation; the search keeps the `shield` popup), `handoff
-*huh.Form` + `handoffVal`, `tagFilter *huh.Form` + `tagFilterVal`, `flash
-string`. `SetSize` propagates to the textinput/list/dialogs like
-`StorageMode`'s. Stale-result discipline (the item-6 gotcha): a done msg
-whose gen mismatches the current request is dropped — a stale search may
-never overwrite a newer query's results, and a stale quant fetch (user
+textinput.Model`, `sort string`, `filterLang, filterLic, filterTask
+string`, `paramMin, paramMax float64` (billions; 0 = none),
+`allResults []hf.SearchResult` (the fetched page; the displayed
+`results list.Model` is the params-filtered view), `zone browserZone`,
+`selected *hf.SearchResult`, `quants []hf.QuantOption`, `cached
+map[string]bool`, `mmproj bool`, `quantsLoaded/quantsLoading bool`,
+`quantIdx int`, `searchGen/quantGen` counters + `quantCancel
+context.CancelFunc` (the pane's fetch is cancelled on navigation; the
+search keeps the `shield` popup), `handoff *huh.Form` + `handoffVal`,
+`tagFilter *huh.Form` + `tagFilterVal` (kinds `lang`/`lic`/`task`),
+`paramsForm *huh.Form` + `paramsMinVal/paramsMaxVal`, `flash string`.
+`SetSize` propagates to the textinput/list/dialogs like `StorageMode`'s.
+Stale-result discipline (the item-6 gotcha): a done msg whose gen
+mismatches the current request is dropped — a stale search may never
+overwrite a newer query's results, and a stale quant fetch (user
 selected another repo meanwhile) may never fill the pane. The search
 shield's esc also bumps the gen, so a done msg landing just after a
 cancel is dropped (cancel-then-complete race).

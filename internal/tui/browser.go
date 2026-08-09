@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -124,11 +125,14 @@ type BrowserMode struct {
 	input textinput.Model
 	sort  string // "" = downloads (the client's default)
 
-	filterLang string // e.g. "ja"; "" = all
-	filterLic  string // e.g. "apache-2.0"; "" = any
+	filterLang         string  // e.g. "ja"; "" = all
+	filterLic          string  // e.g. "apache-2.0"; "" = any
+	filterTask         string  // e.g. "text-generation"; "" = any
+	paramMin, paramMax float64 // params filter (billions, name-derived); 0 = none
 
-	results list.Model // zone results
-	zone    browserZone
+	allResults []hf.SearchResult // the full fetched page (client-side filters apply on top)
+	results    list.Model        // the displayed (filtered) list
+	zone       browserZone
 
 	selected      *hf.SearchResult // repo whose quants are shown
 	quants        []hf.QuantOption
@@ -149,7 +153,10 @@ type BrowserMode struct {
 
 	tagFilter     *huh.Form
 	tagFilterVal  string
-	tagFilterKind string // "lang" | "lic"
+	tagFilterKind string // "lang" | "lic" | "task"
+	paramsForm    *huh.Form
+	paramsMinVal  string // staging for the min input
+	paramsMaxVal  string // staging for the max input
 
 	flash string
 }
@@ -159,8 +166,9 @@ type BrowserMode struct {
 func NewBrowserMode(theme Theme, root string) BrowserMode {
 	in := textinput.New()
 	in.Prompt = "search: "
-	in.Placeholder = "llama 3 …"
+	in.Placeholder = "search Hugging Face… (empty = browse)"
 	in.CharLimit = 256
+	in.PromptStyle = lipgloss.NewStyle().Foreground(theme.Accent).Bold(true)
 	in.Focus()
 	return BrowserMode{
 		runner:  nil,
@@ -198,6 +206,9 @@ func (s *BrowserMode) Update(msg tea.Msg) (*BrowserMode, tea.Cmd) {
 	}
 	if s.tagFilter != nil {
 		return s.updateTagFilter(msg)
+	}
+	if s.paramsForm != nil {
+		return s.updateParamsForm(msg)
 	}
 	if s.handoff != nil {
 		return s.updateHandoff(msg)
@@ -276,7 +287,12 @@ func (s *BrowserMode) runSearch() (*BrowserMode, tea.Cmd) {
 		return s, nil
 	}
 	s.query = s.input.Value()
-	opts := hf.SearchOpts{Query: s.query, Sort: s.sort, Filter: s.activeFilters()}
+	opts := hf.SearchOpts{
+		Query:       s.query,
+		Sort:        s.sort,
+		Filter:      s.activeFilters(),
+		PipelineTag: s.filterTask,
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.searchGen++
 	gen := s.searchGen
@@ -310,7 +326,7 @@ func (s *BrowserMode) handleSearchDone(msg browserSearchDoneMsg) (*BrowserMode, 
 		s.flash = browserFlash(msg.err)
 		return s, nil
 	}
-	s.results = newResultList(resultItems(msg.results), s.theme)
+	s.allResults = msg.results
 	s.selected = nil
 	s.quants = nil
 	s.cached = nil
@@ -319,6 +335,12 @@ func (s *BrowserMode) handleSearchDone(msg browserSearchDoneMsg) (*BrowserMode, 
 	s.quantsLoading = false
 	s.quantIdx = 0
 	s.zone = zoneResults
+	// Client-side params filter applies over the fetched page (the
+	// search API has no params field).
+	if s.paramMin > 0 || s.paramMax > 0 {
+		return s.applyParamFilter()
+	}
+	s.results = newResultList(resultItems(msg.results), s.theme)
 	if len(msg.results) > 0 {
 		// The pane follows the first hit immediately — no enter needed.
 		return s.runQuantFetch(msg.results[0])
@@ -335,6 +357,10 @@ func (s *BrowserMode) updateResults(msg tea.Msg) (*BrowserMode, tea.Cmd) {
 			return s.openTagFilter("lang")
 		case "L":
 			return s.openTagFilter("lic")
+		case "k":
+			return s.openTagFilter("task")
+		case "m":
+			return s.openParamsForm()
 		case "t":
 			// The footer's "t sort" works from the results zone — the
 			// search box owns typing only while it is focused.
@@ -500,19 +526,31 @@ var browserLangs = []string{"en", "es", "de", "fr", "it", "pt", "ja", "zh", "ko"
 
 var browserLicenses = []string{"apache-2.0", "mit", "llama3.1", "llama3.2", "llama3.3", "gemma", "openrail", "cc-by-nc-4.0", "other"}
 
+// browserTasks is the curated server-side pipeline_tag filter — the
+// GGUF-relevant tasks (verified live: the search endpoint accepts the
+// pipeline_tag query param).
+var browserTasks = []string{"text-generation", "translation", "text2text-generation", "feature-extraction", "sentence-similarity", "image-text-to-text"}
+
 func (s *BrowserMode) openTagFilter(kind string) (*BrowserMode, tea.Cmd) {
 	var options []huh.Option[string]
 	title := "filter by language"
-	if kind == "lang" {
+	switch kind {
+	case "lang":
 		options = append(options, huh.NewOption("all languages", ""))
 		for _, l := range browserLangs {
 			options = append(options, huh.NewOption(l, l))
 		}
-	} else {
+	case "lic":
 		title = "filter by license"
 		options = append(options, huh.NewOption("any license", ""))
 		for _, l := range browserLicenses {
 			options = append(options, huh.NewOption(l, l))
+		}
+	case "task":
+		title = "filter by task"
+		options = append(options, huh.NewOption("any task", ""))
+		for _, t := range browserTasks {
+			options = append(options, huh.NewOption(t, t))
 		}
 	}
 	sel := huh.NewSelect[string]().
@@ -544,40 +582,148 @@ func (s *BrowserMode) updateTagFilter(msg tea.Msg) (*BrowserMode, tea.Cmd) {
 	if s.tagFilter != nil && s.tagFilter.State == huh.StateCompleted {
 		v, kind := s.tagFilterVal, s.tagFilterKind
 		s.tagFilter = nil
-		if kind == "lang" {
+		switch kind {
+		case "lang":
 			s.filterLang = v
-		} else {
+		case "lic":
 			s.filterLic = v
+		case "task":
+			s.filterTask = v
 		}
 		return s.runSearch() // re-run with the new filter, same query
 	}
 	return s, cmd
 }
 
+// openParamsForm opens the client-side params (size) filter: min and
+// max billions, applied over the current result page (the search API
+// has no params field, so the filter is name-derived and page-scoped —
+// flagged in the design note).
+func (s *BrowserMode) openParamsForm() (*BrowserMode, tea.Cmd) {
+	s.paramsMinVal = ""
+	s.paramsMaxVal = ""
+	s.paramsForm = huh.NewForm(huh.NewGroup(
+		huh.NewInput().Title("min params (B)").Placeholder("e.g. 7").Value(&s.paramsMinVal).Validate(optionalFloat),
+		huh.NewInput().Title("max params (B)").Placeholder("e.g. 70").Value(&s.paramsMaxVal).Validate(optionalFloat),
+	)).WithTheme(configHuhTheme(s.theme)).WithWidth(formWidthFor(s.width))
+	return s, s.paramsForm.Init()
+}
+
+func optionalFloat(s string) error {
+	if s == "" {
+		return nil
+	}
+	if _, err := strconv.ParseFloat(s, 64); err != nil {
+		return errors.New("a number, or empty")
+	}
+	return nil
+}
+
+func (s *BrowserMode) updateParamsForm(msg tea.Msg) (*BrowserMode, tea.Cmd) {
+	if k, ok := msg.(tea.KeyMsg); ok && k.String() == "esc" {
+		s.paramsForm = nil
+		return s, nil
+	}
+	next, cmd := s.paramsForm.Update(msg)
+	if f, ok := next.(*huh.Form); ok {
+		s.paramsForm = f
+	}
+	if s.paramsForm != nil && s.paramsForm.State == huh.StateCompleted {
+		minV, maxV := s.paramsMinVal, s.paramsMaxVal
+		s.paramsForm = nil
+		s.paramMin, _ = strconv.ParseFloat(minV, 64)
+		s.paramMax, _ = strconv.ParseFloat(maxV, 64)
+		if s.paramMin == 0 && s.paramMax == 0 {
+			return s, nil // cleared
+		}
+		return s.applyParamFilter()
+	}
+	return s, cmd
+}
+
+// applyParamFilter re-renders the displayed list through the params
+// filter (name-derived) and re-follows the first hit.
+func (s *BrowserMode) applyParamFilter() (*BrowserMode, tea.Cmd) {
+	filtered := make([]hf.SearchResult, 0, len(s.allResults))
+	for _, r := range s.allResults {
+		if p, ok := paramCountOf(r); ok {
+			if s.paramMin > 0 && p < s.paramMin {
+				continue
+			}
+			if s.paramMax > 0 && p > s.paramMax {
+				continue
+			}
+		}
+		filtered = append(filtered, r)
+	}
+	s.results = newResultList(resultItems(filtered), s.theme)
+	s.quantIdx = 0
+	if len(filtered) > 0 {
+		return s.runQuantFetch(filtered[0])
+	}
+	s.selected = nil
+	s.quants = nil
+	s.quantsLoaded = false
+	return s, nil
+}
+
+// paramCountOf extracts a parameter count (in billions) from the
+// repo's name — base_model first, then the repo id — matching the
+// "<N>B"-style suffix most model names carry (8B, 32B, 2.6B …). A
+// display heuristic, not an API field: the search endpoint exposes no
+// params metadata (flagged in the design note).
+func paramCountOf(r hf.SearchResult) (float64, bool) {
+	id := r.ID
+	if bm := baseModelOf(r); bm != "" {
+		id = bm
+	}
+	m := paramRe.FindStringSubmatch(id)
+	if m == nil {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return 0, false
+	}
+	switch strings.ToLower(m[2]) {
+	case "k":
+		v /= 1000
+	case "m":
+		v /= 1000
+	}
+	return v, true
+}
+
+var paramRe = regexp.MustCompile(`(?i)\b(\d+(?:\.\d+)?)([km]?b)\b`)
+
 // ---- misc helpers ----
 
-// cycleZone moves the focus. Tab toggles the results/quants pair (the
-// pane follows the cursor, so tab just picks which side you act on);
-// from the search box either direction lands on the results.
+// cycleZone moves the focus (owner round): the search bar is part of
+// the tab cycle — tab: search → results → quants → search; shift+tab
+// reverses. esc still backs out one step (quants → results → search →
+// exit).
 func (s *BrowserMode) cycleZone(back bool) {
-	switch {
-	case !back && s.zone == zoneSearch:
-		s.zone = zoneResults
-	case !back && s.zone == zoneResults:
-		s.zone = zoneQuants
-	case !back: // zoneQuants
-		s.zone = zoneResults
-	case back && s.zone == zoneQuants:
-		s.zone = zoneResults
-	case back && s.zone == zoneResults:
-		s.zone = zoneSearch
-	default: // back && zoneSearch
-		s.zone = zoneResults
+	n := 3
+	if back {
+		s.zone = browserZone((int(s.zone) + n - 1) % n)
+	} else {
+		s.zone = browserZone((int(s.zone) + 1) % n)
 	}
 }
 
-// browserSorts is the t-key cycle (the search endpoint's sort fields).
-var browserSorts = []string{"downloads", "likes", "lastModified"}
+// browserSorts is the t-key cycle — the search endpoint's sort fields,
+// mirroring the HF site's Models ranking (most downloads, most likes,
+// trending, recently created, recently updated; verified live).
+var browserSorts = []string{"downloads", "likes", "trendingScore", "createdAt", "lastModified"}
+
+// sortLabels are the friendly names shown in the sort indicator.
+var sortLabels = map[string]string{
+	"downloads":     "downloads",
+	"likes":         "likes",
+	"trendingScore": "trending",
+	"createdAt":     "newest",
+	"lastModified":  "updated",
+}
 
 func nextSort(cur string) string {
 	if cur == "" {
@@ -593,7 +739,10 @@ func nextSort(cur string) string {
 
 func effSort(cur string) string {
 	if cur == "" {
-		return browserSorts[0]
+		cur = browserSorts[0]
+	}
+	if l, ok := sortLabels[cur]; ok {
+		return l
 	}
 	return cur
 }
@@ -823,11 +972,17 @@ func (s *BrowserMode) renderFilterLine() string {
 	if s.filterLic != "" {
 		active = append(active, s.filterLic)
 	}
+	if s.filterTask != "" {
+		active = append(active, s.filterTask)
+	}
+	if s.paramMin > 0 || s.paramMax > 0 {
+		active = append(active, fmt.Sprintf("%.0fB-%.0fB", s.paramMin, s.paramMax))
+	}
 	if len(active) == 0 {
 		return ""
 	}
 	return lipgloss.NewStyle().Foreground(s.theme.Subtle).Render(
-		"filter: " + strings.Join(active, " · ") + "  (l/L)")
+		"filter: " + strings.Join(active, " · ") + "  (l/L/k/m)")
 }
 
 // renderPanes lays out the results box (left) and the model-info +
@@ -839,7 +994,7 @@ func (s *BrowserMode) renderPanes(cw int) []string {
 
 	var left []string
 	if len(s.results.Items()) == 0 {
-		hint := "enter a query and press enter"
+		hint := "search, or press enter to browse"
 		if s.query != "" {
 			hint = "no results for " + s.query
 		}
@@ -903,24 +1058,32 @@ func (s *BrowserMode) infoLines(inner, ph int) []string {
 	var lines []string
 	muted := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Muted).Render(t) }
 	subtle := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Subtle).Render(t) }
-	accent := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Accent).Render(t) }
+	accent := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Accent).Bold(true).Render(t) }
+	good := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.StatusReady).Render(t) }
 	warn := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.StatusStart).Render(t) }
-	sep := subtle(strings.Repeat("─", max(10, inner)))
+	sep := muted(strings.Repeat("─", max(10, inner)))
 
 	if s.selected == nil {
 		lines = append(lines, muted("select a repo…"))
 	} else {
 		m := s.selected
 		lines = append(lines, accent(m.ID))
-		if bm := baseModelOf(*m); bm != "" {
-			lines = append(lines, subtle("from "+bm))
+		// params (name-derived) left of the from-line, different color.
+		if p, ok := paramCountOf(*m); ok {
+			line := good(humanB(p) + " params")
+			if bm := baseModelOf(*m); bm != "" {
+				line += " · " + muted("from ") + subtle(bm)
+			}
+			lines = append(lines, line)
+		} else if bm := baseModelOf(*m); bm != "" {
+			lines = append(lines, muted("from ")+subtle(bm))
 		}
 		lines = append(lines, sep)
-		lines = append(lines, "⬇ "+humanCount(m.Downloads)+" downloads")
-		lines = append(lines, "♥ "+strconv.FormatInt(m.Likes, 10)+" likes")
-		lines = append(lines, subtle("license: "+licenseOf(*m)))
+		lines = append(lines, good("⬇ "+humanCount(m.Downloads))+" "+muted("downloads"))
+		lines = append(lines, accent("♥ "+strconv.FormatInt(m.Likes, 10))+" "+muted("likes"))
+		lines = append(lines, muted("⚖ license: ")+subtle(licenseOf(*m)))
 		if m.PipelineTag != "" {
-			lines = append(lines, subtle("task: "+m.PipelineTag))
+			lines = append(lines, muted("▷ task: ")+subtle(m.PipelineTag))
 		}
 		if w := nonCommercialLicense(*m); w != "" {
 			lines = append(lines, warn("⚠ "+w))
@@ -932,7 +1095,9 @@ func (s *BrowserMode) infoLines(inner, ph int) []string {
 		case len(s.quants) > 0:
 			lines = append(lines, accent(fmt.Sprintf("quants (%d)", len(s.quants))))
 			for i, q := range s.quants {
-				row := quantRowLabel(q, false)
+				// tag in the row color, size in Muted like the result
+				// descriptions (owner round), then the ● cached badge.
+				row := q.Tag + " — " + muted(hf.HumanSize(q.Size))
 				if s.cached[q.Tag] {
 					row += "  " + cachedBadge(s.theme)
 				}
@@ -962,6 +1127,12 @@ func (s *BrowserMode) infoLines(inner, ph int) []string {
 	return lines
 }
 
+// humanB renders a param count: 8 → "8B", 2.6 → "2.6B".
+func humanB(n float64) string {
+	s := strconv.FormatFloat(n, 'f', -1, 64)
+	return s + "B"
+}
+
 // cachedBadge renders the fancy "already on disk" marker — a green
 // dot + label instead of the plain "(cached)" suffix (owner).
 func cachedBadge(theme Theme) string {
@@ -983,7 +1154,7 @@ func (s *BrowserMode) renderFooter() string {
 		keys = []string{
 			shortcut("↑/↓", "navigate", s.theme),
 			shortcut("tab", "quants", s.theme),
-			shortcut("l/L", "filter", s.theme),
+			shortcut("l/L/k/m", "filter", s.theme),
 			shortcut("t", "sort", s.theme),
 			shortcut("esc", "search", s.theme),
 		}

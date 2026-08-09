@@ -9,12 +9,14 @@ import (
 
 // SearchOpts configures a model-search request (DESIGN §16.7).
 type SearchOpts struct {
-	Query     string   // "" = browse: top GGUF repos by Sort
-	Limit     int      // 0 → 50
-	Sort      string   // "downloads" | "likes" | "lastModified"; "" → downloads
+	Query string // "" = browse: top GGUF repos by Sort
+	Limit int    // 0 → 50
+	Sort  string // "downloads" | "likes" | "trendingScore" |
+	// "createdAt" | "lastModified"; "" → downloads
 	Direction int      // -1 desc (default), 1 asc
 	Filter    []string // extra tags beyond the fixed "gguf", in order
 	// (e.g. "ja", "license:apache-2.0") — language and license filters
+	PipelineTag string // server-side task filter (e.g. "text-generation")
 }
 
 // SearchResult is one hit of the model search endpoint. The search
@@ -70,6 +72,9 @@ func searchQuery(opts SearchOpts) string {
 	}
 	if opts.Sort != "" {
 		q.Set("sort", opts.Sort)
+	}
+	if opts.PipelineTag != "" {
+		q.Set("pipeline_tag", opts.PipelineTag)
 	}
 	dir := opts.Direction
 	if dir != 1 && dir != -1 {

@@ -80,7 +80,7 @@ func TestBrowserOpensFromMain(t *testing.T) {
 		"browse — Hugging Face",
 		"search:",
 		"sort:",
-		"enter a query and press enter",
+		"search, or press enter to browse",
 		"enter search", // the search-zone footer
 	} {
 		if !strings.Contains(out, want) {
@@ -144,11 +144,11 @@ func TestBrowserMetadataPane(t *testing.T) {
 	out := stripANSI(b.View())
 	for _, want := range []string{
 		"org/one",
-		"from meta-llama/Llama-3.1-8B-Instruct",
+		"8B params · from meta-llama/Llama-3.1-8B-Instruct",
 		"⬇ 743.5k downloads",
 		"♥ 17 likes",
-		"license: llama3.1",
-		"task: text-generation",
+		"⚖ license: llama3.1",
+		"▷ task: text-generation",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("info pane missing %q\nout:\n%s", want, out)
@@ -363,11 +363,99 @@ func TestBrowserSortCycle(t *testing.T) {
 	if out := stripANSI(b.View()); !strings.Contains(out, "sort: likes") {
 		t.Errorf("header missing sort\nout:\n%s", out)
 	}
+	// The cycle mirrors the HF site's Models ranking: downloads →
+	// likes → trending → newest → updated.
+	driveRoot(t, r, keyMsg("t"))
+	if b.sort != "trendingScore" || stub.searchCalls[2].Sort != "trendingScore" {
+		t.Errorf("sort = %q, want trendingScore", b.sort)
+	}
+	if out := stripANSI(b.View()); !strings.Contains(out, "sort: trending") {
+		t.Errorf("header missing friendly sort label\nout:\n%s", out)
+	}
+	driveRoot(t, r, keyMsg("t"))
+	if b.sort != "createdAt" {
+		t.Errorf("sort = %q, want createdAt", b.sort)
+	}
 	driveRoot(t, r, keyMsg("t"))
 	if b.sort != "lastModified" {
 		t.Errorf("sort = %q, want lastModified", b.sort)
 	}
 }
+
+// TestBrowserBrowseNoQuery: an empty query browses the top repos by
+// the current sort (the HF Models ranking, no search term needed).
+func TestBrowserBrowseNoQuery(t *testing.T) {
+	stub := &stubBrowserRunner{results: browserTestResults()}
+	r, b := openBrowserRoot(t, stub)
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // empty query = browse
+	if len(stub.searchCalls) != 1 {
+		t.Fatalf("search calls = %d, want 1", len(stub.searchCalls))
+	}
+	if stub.searchCalls[0].Query != "" {
+		t.Errorf("query = %q, want empty (browse)", stub.searchCalls[0].Query)
+	}
+	if b.zone != zoneResults || len(b.results.Items()) != 2 {
+		t.Errorf("zone = %v items = %d, want results with the page", b.zone, len(b.results.Items()))
+	}
+}
+
+// TestBrowserTaskFilter: k opens the task picker; picking one re-runs
+// the search with the server-side pipeline_tag param.
+func TestBrowserTaskFilter(t *testing.T) {
+	stub := &stubBrowserRunner{results: browserTestResults()}
+	r, b := openBrowserRoot(t, stub)
+	searchDrive(t, r, "q")
+	driveRoot(t, r, keyMsg("k")) // task filter
+	// options: any task(""), text-generation, translation, …
+	driveRoot(t, r,
+		tea.KeyMsg{Type: tea.KeyDown}, // text-generation
+		tea.KeyMsg{Type: tea.KeyEnter},
+	)
+	if b.filterTask != "text-generation" {
+		t.Fatalf("filterTask = %q, want text-generation", b.filterTask)
+	}
+	if len(stub.searchCalls) != 2 || stub.searchCalls[1].PipelineTag != "text-generation" {
+		t.Fatalf("search calls = %+v", stub.searchCalls)
+	}
+	if out := stripANSI(b.View()); !strings.Contains(out, "filter: text-generation") {
+		t.Errorf("filter line missing task\nout:\n%s", out)
+	}
+}
+
+// TestBrowserParamsFilter: m opens the min/max params form; the
+// client-side filter (name-derived) prunes the current page.
+func TestBrowserParamsFilter(t *testing.T) {
+	stub := &stubBrowserRunner{results: []hf.SearchResult{
+		{ID: "org/big", Tags: []string{"gguf", "base_model:org/Llama-70B"}},
+		{ID: "org/small", Tags: []string{"gguf", "base_model:org/Mistral-7B"}},
+	}}
+	r, b := openBrowserRoot(t, stub)
+	searchDrive(t, r, "q")
+	if len(b.results.Items()) != 2 {
+		t.Fatalf("items = %d, want 2 before filtering", len(b.results.Items()))
+	}
+	driveRoot(t, r, keyMsg("m")) // params form
+	driveRoot(t, r,
+		keyRunes("7"), tea.KeyMsg{Type: tea.KeyEnter}, // min
+		keyRunes("10"), tea.KeyMsg{Type: tea.KeyEnter}, // max
+	)
+	if b.paramMin != 7 || b.paramMax != 10 {
+		t.Fatalf("paramMin/Max = %v/%v, want 7/10", b.paramMin, b.paramMax)
+	}
+	if len(b.results.Items()) != 1 {
+		t.Fatalf("items = %d, want 1 after 7B-10B filter", len(b.results.Items()))
+	}
+	item, ok := b.results.SelectedItem().(resultItem)
+	if !ok || item.res.ID != "org/small" {
+		t.Errorf("first hit = %v, want org/small (70B excluded)", item)
+	}
+	if out := stripANSI(b.View()); !strings.Contains(out, "filter: 7B-10B") {
+		t.Errorf("filter line missing params\nout:\n%s", out)
+	}
+}
+
+// TestBrowserTabCyclesZones: tab cycles search → results → quants →
+// search (the search bar is part of the cycle); shift+tab reverses.
 
 // TestBrowserSearchError: a failed search flashes its distinct message
 // and stays in the search zone.
@@ -498,29 +586,3 @@ func TestBrowserTagFilterEscDismisses(t *testing.T) {
 
 // TestBrowserTabCyclesZones: tab toggles the results/quants pair;
 // from the search box either direction lands on the results.
-func TestBrowserTabCyclesZones(t *testing.T) {
-	_, b := openBrowserRoot(t, &stubBrowserRunner{})
-	if b.zone != zoneSearch {
-		t.Fatalf("initial zone = %v", b.zone)
-	}
-	next, _ := b.Update(tea.KeyMsg{Type: tea.KeyTab})
-	b = next
-	if b.zone != zoneResults {
-		t.Errorf("tab (search) → zone = %v, want zoneResults", b.zone)
-	}
-	next, _ = b.Update(tea.KeyMsg{Type: tea.KeyTab})
-	b = next
-	if b.zone != zoneQuants {
-		t.Errorf("tab (results) → zone = %v, want zoneQuants", b.zone)
-	}
-	next, _ = b.Update(tea.KeyMsg{Type: tea.KeyTab})
-	b = next
-	if b.zone != zoneResults {
-		t.Errorf("tab (quants) → zone = %v, want zoneResults", b.zone)
-	}
-	next, _ = b.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
-	b = next
-	if b.zone != zoneSearch {
-		t.Errorf("shift+tab (results) → zone = %v, want zoneSearch", b.zone)
-	}
-}
