@@ -1153,6 +1153,7 @@ func titledBoxLines(content []string, title string, w, h int, theme Theme, focus
 	top := bs.Render("╭─ ") +
 		lipgloss.NewStyle().Foreground(theme.Accent).Bold(true).Render(title) +
 		bs.Render(" "+strings.Repeat("─", dashes)+"╮")
+	side := bs.Render("│")
 	out := make([]string, 0, h)
 	out = append(out, padLinesTo(top, w))
 	maxLines := max(0, h-2)
@@ -1160,10 +1161,10 @@ func titledBoxLines(content []string, title string, w, h int, theme Theme, focus
 		content = content[:maxLines]
 	}
 	for _, ln := range content {
-		out = append(out, truncatePad(ln, inner))
+		out = append(out, side+truncatePad(ln, inner)+side)
 	}
 	for len(out) < h-1 {
-		out = append(out, strings.Repeat(" ", inner))
+		out = append(out, side+strings.Repeat(" ", inner)+side)
 	}
 	out = append(out, bs.Render("╰"+strings.Repeat("─", inner)+"╯"))
 	return out

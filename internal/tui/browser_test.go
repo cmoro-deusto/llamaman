@@ -730,5 +730,11 @@ func TestBrowserFitsWidth(t *testing.T) {
 				t.Errorf("width %d: line %d is %d runes wide — overflow\n%q", w, i, l, ln)
 			}
 		}
+		// Regression: every panel content line must carry its │ side
+		// borders (the manual box builder used to omit them — the
+		// round-4 border bug).
+		if out := stripANSI(r.browser.View()); !strings.Contains(out, "│search: q") {
+			t.Errorf("width %d: search content line missing its left border", w)
+		}
 	}
 }
