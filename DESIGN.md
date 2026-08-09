@@ -585,7 +585,7 @@ Three-pane master-detail:
 `Tab` / `Shift+Tab` cycle focus across panes. `Right` / `Left` (and `l` / `h`) do the same — the user can navigate to any pane with arrow keys without lifting from the navigation cluster.
 
 **Models pane**:
-- `e` rename alias / change source (modal form: alias, source select [`local` | `huggingface`], then either a path input or a `org/repo[:quant]` input depending on the selection). Both value inputs stay free-type and are picker-assisted (§16.5): `ctrl+o` in the path input opens a `.gguf` filepicker (starting in `preferences.models-dir` → the current value's dir → the first local model's dir → `~`), and `ctrl+o` in the HF input opens a cached-repo list (one row per cached repo with quants + sizes, plus "type a new repo…"; a single cached quant pre-fills `org/repo:QUANT`, several pre-fill bare `org/repo`; an empty cache skips the list).
+- `e` rename alias / change source (modal form: alias, source select [`local` | `huggingface`], then either a path input or a `org/repo[:quant]` input depending on the selection). Both value inputs stay free-type and are picker-assisted (§16.5): `ctrl+o` in the path input opens a `.gguf` filepicker (starting in `preferences.models-dir` → the current value's dir → the first local model's dir → `~`), and `ctrl+o` in the HF input opens a cached-repo list (one row per cached repo with quants + sizes, plus "type a new repo…"; a single cached quant pre-fills `org/repo:QUANT`, several pre-fill bare `org/repo`; an empty cache skips the list). Confirming a *typed* bare `org/repo` in the HF field runs one async `tree/main` check offering the shared quant chooser with real sizes; failures are non-blocking distinct flashes and the id is still saved (§16.6).
 - `n` new model (same modal as edit).
 - `c` duplicate, prompt for new alias (presets and params copied; source kind and value preserved).
 - `d` delete (confirm with preset count).
@@ -2328,3 +2328,175 @@ slot, `SetSize`/`View` propagate it, `handleModelPickerDone` rebuilds
 the form's cached view after a pre-fill. `DESIGN.md` §16.5 + the §7.5 Models
 pane bullet (same change, P5). No changes to `internal/storage`,
 `internal/hf`, the config schema, or ROADMAP.
+
+### 16.6 Typed-repo check + quant offer — config editor, §3.8 step B
+
+**Scope.** Sixth item of Release 2 (ROADMAP §3.7 item 6, §3.8 **step
+B**), delivered after the Storage & Downloads manager and the config-
+editor pickers per the owner's order. When the user confirms a **typed,
+bare** `org/repo` id in the model form's HF field, one async `tree/main`
+call (via the §16.2 client) checks existence and fetches the quant list
+with real sizes; on success the shared quant chooser (§16.3 data, §16.4
+UI shape) offers the quants, and the picked quant is written back as the
+`:quant` suffix. **Non-goals:** no VRAM math (the §14.3 estimator is a
+render-time hook, sizes-only until it ships), no existence validation
+for ids that already carry a `:quant` (that is R3's pre-spawn "HF repo
+existence validation", §14.3 — a quanted id is an explicit choice and
+llama-server surfaces problems at launch), no mmproj handling (llama.cpp
+auto-downloads it; presets already set `no-mmproj`), no config schema
+change (P8), no new dependency, no `internal/hf` change (the check
+composes the existing exported `Tree` + `hf.Quants` + `hf.HasMMProj`).
+
+**Trigger — what counts as "a typed repo id".** The check fires only
+when the user **confirms the HF field with enter** (the "explicit user
+action" P7 requires) and all of these hold:
+
+- the id is **valid** (`hfFormValidator`, the same check the form runs
+  today — otherwise the key is delegated so huh shows its inline error),
+- the id is **bare** — no `:quant` suffix (the check's point is the
+  quant *offer*; a suffix means the quant is already decided),
+- the id was **typed in this form session** — tracked by a new `edited`
+  flag on `pickerInput`, set whenever the field's `Update` sees any key
+  other than `ctrl+o`/enter. A pre-fill from the cached-repo picker
+  (§16.5) goes through `RefreshValue()` *outside* `Update`, so `edited`
+  stays false for picked ids; an unchanged id in edit mode likewise
+  skips the check. Typing anything (even a single backspace fix) flips
+  the flag — the check is advisory, so over-eagerness is acceptable.
+
+The cache list is the offline path (no network), and an unchanged
+existing entry was never "typed" — both skip. When the check is
+skipped, enter behaves exactly as today (delegate to the embedded
+input; the form advances normally). When the runner is unavailable
+(see below), the same.
+
+**Mechanism.** `pickerInput.Update` (modelpicker.go:94) gains, after the
+`ctrl+o` arm and before delegating: when `kind == sourceHF` and the key
+is enter and `edited && hfFormValidator(*p.value) == nil && bare` —
+return the wrapper unchanged plus a cmd emitting a new
+`hfCheckRequestedMsg{id: strings.TrimSpace(*p.value)}`, **without**
+forwarding the key. Swallowing the enter means the form does not
+advance; the user stays on the HF field while the check runs. The
+validator gate keeps huh's inline error display intact for invalid ids.
+
+**The async check.** ConfigMode gains:
+
+- `hfRunner hfCheckRunner` — `CheckHF(ctx, repo) ([]hf.QuantOption,
+  bool /*mmproj*/, error)`, nil = check disabled (P3: the form just
+  advances). The production adapter `hfCheckClient{c *hf.Client}`
+  composes one `Tree(repo, "main")` round trip into `hf.Quants` +
+  `hf.HasMMProj` — the ROADMAP's "existence + quant list + sizes + LFS
+  sha256 in a single round-trip". Wired via a new `SetHFCheckRunner`
+  setter, mirroring `StorageMode.SetEngine` (storage.go:183); root
+  builds a lazy `hf.New()` at the two ConfigMode creation sites
+  (root.go:272, 457) and a nil-safe adapter (client error → runner nil
+  → check disabled, never a crash).
+- `hfCheck *hfCheckState{repo, cancel}` — the in-flight state. On
+  `hfCheckRequestedMsg`: guard `formKind` is new/edit model, split the
+  id (`splitRepoQuant`, storage.go:748 — bare, so repo = trimmed id),
+  create a cancellable ctx, set the slot, and return the check cmd
+  (`func() tea.Msg { opts, mmproj, err := runner.CheckHF(ctx, repo);
+  return hfCheckDoneMsg{id, opts, mmproj, err} }` — the same cmd-returns-
+  a-msg shape as `fetchPropsCmd`, fetcher.go:230). The request is
+  bounded by the §16.2 client's 30s `requestTimeout`; esc cancels the
+  ctx (P10).
+- **Shield:** while `hfCheck != nil`, every key is swallowed except
+  `esc` (cancel the ctx, clear the slot, stay on the HF field) and the
+  `hfCheckDoneMsg` itself. `View` renders a small centered box
+  (`overlayCenter`, `pickerSize`) — static text
+  `checking org/repo…` + `esc: cancel` (static, no spinner — the check
+  is one bounded call and static text keeps snapshot tests
+  deterministic).
+
+**On `hfCheckDoneMsg`** (handled on every message, before the errorModal
+arm, alongside the other overlay-done messages — the §16.4 discipline):
+
+- `ctx.Canceled` → no flash, no chooser; clear the slot, stay on the
+  HF field (the user aborted).
+- success, `len(opts) > 0` → open the **quant chooser** (below).
+- success, no quants → flash `org/repo: no GGUF files found` (append
+  ` (mmproj only)` when `HasMMProj`) and advance.
+- `hf.IsNotFound` → flash `org/repo: not found on Hugging Face`.
+- `hf.IsGated` → flash `org/repo: gated — requires HF_TOKEN`.
+- other error (network/HTTP) → flash `org/repo: could not reach
+  Hugging Face` (network) or `org/repo: HTTP <code>`.
+
+Every failure/empty path then **advances the form**: `c.form.NextField()`
+(huh v1.0.0 exports it, form.go:488 — `f.Update(NextField())`, and the
+gotcha's "forms complete on a follow-up nextFieldMsg" chain drives
+completion; the HF field is the last visible field, so the form
+completes and `applyForm` saves the model with the typed id as-is).
+Non-blocking per ROADMAP §3.8: "the id can still be saved (llama-server
+surfaces it at launch)". The flash persists (config-mode flashes only
+auto-clear for the "saved" indicator) so the user sees why nothing
+happened before the form closed.
+
+**The quant chooser.** Reuses the §16.4 label shape exactly — the same
+`Tag — hf.HumanSize(Size)` rows plus ` (cached)` markers from
+`storage.Lookup(root, repo)` when the cache root resolves (P3: lookup
+failure → empty marker set), and a trailing
+`keep org/repo (no quant)` option. Extracted into a shared
+`quantChooserForm(repo string, opts []hf.QuantOption, cached
+map[string]bool, note string) *huh.Form` helper (new `hfcheck.go`);
+`StorageMode.openQuantPicker` (storage.go:756) switches to it so both
+hosts always agree (the same "same helpers" rule item 5 applied to the
+repo list). The mmproj note (`mmproj present — llama.cpp auto-downloads
+it`) rides the form's `Description` as an informational line only.
+**VRAM hint:** sizes-only; per §16.3 the hint is a render-time addition
+hosts attach when the §14.3 estimator ships — no coupling here. The
+chooser is a dedicated ConfigMode slot `hfQuant *huh.Form`, rendered
+via `overlayCenter` ahead of the form, sized like §16.4's form
+(`formWidth()`).
+
+Chooser exits: picking a quant writes `repo + ":" + tag` into the
+staging `hf` pointer, calls `hfField.RefreshValue()` (the item-5 gotcha:
+the input's internal text must be re-synced or the form's `GetValue` at
+completion saves the stale bare id), then `NextField()` — the form
+completes and `applyForm` persists `org/repo:QUANT`. The "keep bare id"
+option → `NextField()` with no write. `esc` aborts the chooser (huh
+`StateAborted`) → clear the slot, stay on the HF field, nothing
+committed. The chooser's completion msgs are routed on every message
+while `hfQuant` is set, same discipline as the other overlays.
+
+**Routing and state.** `Update` order (config.go:168): `savedExpiredMsg`
+→ `hfCheckDoneMsg` → errorModal → `hfCheckRequestedMsg` → `hfCheck`
+shield → `hfQuant` routing → the existing picker/modelPicker/form arms.
+The new slots are mutually exclusive with the existing overlays, so the
+relative order within the overlay block is immaterial; `dismissForm`
+clears `hfCheck`/`hfQuant` defensively. `SetSize` propagates to the new
+overlays like it does for `modelPicker` (config.go:151).
+
+**Determinism and tests (P9).**
+
+- `pickerInput` unit: enter on the HF field with a typed bare id emits
+  `hfCheckRequestedMsg` and does **not** advance; quanted id → delegates
+  (no msg); invalid id → delegates (huh shows the error); `edited ==
+  false` (fresh edit-form, or after a picker pre-fill) → delegates;
+  local field → delegates; `ctrl+o` still wins (checked first).
+- ConfigMode flow (the modelpicker_test harness + `drainCmds`): drive
+  the model form to the HF field, type a bare id, enter → checking
+  overlay renders; esc → canceled, no flash, still on the field; stub
+  runner (synchronous, `SetHFCheckRunner`) → success+quants → chooser
+  renders sizes + mmproj note + keep-bare row; pick → staging
+  `org/repo:QUANT`, form completes, model applied with the suffix;
+  keep-bare → bare id saved; `ErrNotFound` / `ErrGated` / network →
+  the distinct flash **and** the form completes with the bare id saved;
+  no-quants → flash + completes; runner nil → enter completes the form
+  with no check.
+- `hfCheckClient` adapter: `httptest.Server` tree fixture → quants +
+  mmproj derived from one response; the §16.2 typed errors map through
+  unchanged.
+- Existing snapshots are unaffected: the model form's `View` is
+  byte-identical (the enter intercept changes no rendering, and the
+  help row gains no binding).
+
+**File map.** New `internal/tui/hfcheck.go` + `hfcheck_test.go` (the two
+messages, `hfCheckRunner` + `hfCheckClient` adapter, the check cmd, the
+checking overlay, `quantChooserForm`). `internal/tui/modelpicker.go` —
+`pickerInput` gains `edited` + the enter-intercept. `internal/tui/config.go`
+— `SetHFCheckRunner`, the `hfCheck`/`hfQuant` slots, the Update arms +
+ordering, `View`/`SetSize` propagation, `handleHFCheckDone`,
+`handleQuantChooserDone`. `internal/tui/storage.go` — `openQuantPicker`
+switches to the shared `quantChooserForm`. `internal/tui/root.go` — wire
+the lazy real runner at the two ConfigMode creation sites.
+`DESIGN.md` §16.6 + the §7.5 Models pane bullet (same change, P5). No
+changes to `internal/hf`, the config schema, or ROADMAP.
