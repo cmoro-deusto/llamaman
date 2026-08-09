@@ -162,10 +162,10 @@ type BrowserMode struct {
 	quantIdx      int
 	quantOffset   int // first visible quant (windowed list, scrolls with the cursor)
 
-	card        string // model card text (frontmatter trimmed)
-	cardErr     string // friendly non-blocking note when the card is unavailable
+	cardLines   []string // model card rendered to styled lines (markdown)
+	cardErr     string   // friendly non-blocking note when the card is unavailable
 	cardLoading bool
-	cardOffset  int // first visible card line (pgup/pgdn scroll)
+	cardOffset  int // first visible card line (pgup/pgdown scroll)
 
 	searchGen   int
 	quantGen    int
@@ -192,10 +192,9 @@ type BrowserMode struct {
 // results). root is the resolved cache root for (cached) markers.
 func NewBrowserMode(theme Theme, root string) BrowserMode {
 	in := textinput.New()
-	in.Prompt = "search: "
+	in.Prompt = "" // the panel's "search" title makes a prompt redundant
 	in.Placeholder = "search Hugging Face… (empty = browse)"
 	in.CharLimit = 256
-	in.PromptStyle = lipgloss.NewStyle().Foreground(theme.Accent).Bold(true)
 	in.Focus()
 	return BrowserMode{
 		runner:  nil,
@@ -440,7 +439,7 @@ func (s *BrowserMode) runQuantFetch(res hf.SearchResult) (*BrowserMode, tea.Cmd)
 	s.quantGen++
 	qgen := s.quantGen
 	// The model card fetches alongside the quants, same discipline.
-	s.card = ""
+	s.cardLines = nil
 	s.cardErr = ""
 	s.cardLoading = true
 	s.cardOffset = 0
@@ -513,10 +512,10 @@ func (s *BrowserMode) handleCardDone(msg browserCardDoneMsg) (*BrowserMode, tea.
 		} else {
 			s.cardErr = "could not load model card"
 		}
-		s.card = ""
+		s.cardLines = nil
 		return s, nil
 	}
-	s.card = trimCardFrontmatter(msg.text)
+	s.cardLines = renderCardMarkdown(s.theme, []byte(trimCardFrontmatter(msg.text)))
 	s.cardErr = ""
 	s.cardOffset = 0
 	return s, nil
@@ -1061,10 +1060,10 @@ func (s *BrowserMode) renderSearchBox(cw int, focused bool) string {
 	label := lipgloss.NewStyle().Foreground(s.theme.Subtle).Render("sort: ")
 	value := lipgloss.NewStyle().Foreground(s.theme.Accent).Bold(true).Render(effSort(s.sort))
 	sortLen := len("sort: ") + len(effSort(s.sort))
-	// 11 = prompt ("search: ") + cursor + the "  " gap + margin.
-	// The input pads to Width+1 (cursor), so the line must fit inner
-	// exactly or the sort value wraps onto its own line.
-	s.input.Width = max(10, inner-11-sortLen)
+	// 3 = cursor + the "  " gap + margin. The input pads to Width+1
+	// (cursor) with no prompt, so the line must fit inner exactly or
+	// the sort value wraps onto its own line.
+	s.input.Width = max(10, inner-3-sortLen)
 	line := s.input.View() + "  " + label + value
 	return strings.Join(titledBoxLines([]string{line}, "search", cw, 3, s.theme, focused), "\n")
 }
@@ -1125,7 +1124,7 @@ func (s *BrowserMode) renderPanes(cw int) []string {
 	cardH := max(0, rem-quantsH)
 	ib := titledBoxLines(info, "model info", rw, infoH, s.theme, false)
 	qb := titledBoxLines(s.quantsLines(rw-2, max(0, quantsH-2)), fmt.Sprintf("quants (%d)", len(s.quants)), rw, quantsH, s.theme, s.zone == zoneQuants)
-	cb := titledBoxLines(s.cardLines(rw-2, max(0, cardH-2)), "model card", rw, cardH, s.theme, false)
+	cb := titledBoxLines(s.cardPanelLines(rw-2, max(0, cardH-2)), "model card", rw, cardH, s.theme, false)
 
 	return joinPanes(lb, joinLines(ib, qb, cb))
 }
@@ -1216,8 +1215,6 @@ func (s *BrowserMode) infoLines(inner int) []string {
 	accent := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Accent).Bold(true).Render(t) }
 	good := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.StatusReady).Render(t) }
 	warn := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.StatusStart).Render(t) }
-	sep := muted(strings.Repeat("─", max(10, inner)))
-
 	if s.selected == nil {
 		lines = append(lines, muted("select a repo…"))
 		return lines
@@ -1233,7 +1230,7 @@ func (s *BrowserMode) infoLines(inner int) []string {
 	} else if bm := baseModelOf(*m); bm != "" {
 		lines = append(lines, muted("from ")+subtle(bm))
 	}
-	lines = append(lines, sep)
+	lines = append(lines, "")
 	lines = append(lines, good("⬇ "+humanCount(m.Downloads))+" "+muted("downloads"))
 	lines = append(lines, accent("♥ "+strconv.FormatInt(m.Likes, 10))+" "+muted("likes"))
 	lines = append(lines, muted("⚖ license: ")+subtle(licenseOf(*m)))
@@ -1323,44 +1320,47 @@ func cachedBadge(theme Theme) string {
 
 // renderFooter shows the shortcuts relevant to the focused zone — the
 // quants zone advertises enter as "hand off" (owner).
-// cardLines renders the model card panel content: the README text
-// windowed to the panel height, scrollable with pgup/pgdn in the
-// quants zone (quants ↑/↓ select; pgup/pgdn scroll the card). Loading
-// and absence states are friendly and non-blocking.
-func (s *BrowserMode) cardLines(inner, maxLines int) []string {
+// cardLines renders the model card panel content: the README rendered
+// to styled markdown lines (renderCardMarkdown), windowed to the panel
+// height, scrollable with pgup/pgdown in the quants zone (quants ↑/↓
+// select; pgup/pgdown scroll the card). A scroll indicator — percent
+// plus a 10-dot bar — replaces the old ▴/▾ text markers when the card
+// overflows (owner round). Loading and absence states are friendly and
+// non-blocking.
+func (s *BrowserMode) cardPanelLines(inner, maxLines int) []string {
 	var lines []string
 	muted := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Muted).Render(t) }
 	subtle := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Subtle).Render(t) }
 
-	cardLines := strings.Split(s.card, "\n")
 	switch {
 	case s.cardLoading:
 		lines = append(lines, subtle("loading card…"))
 	case s.cardErr != "":
 		lines = append(lines, muted(s.cardErr))
-	case len(cardLines) == 0 || (len(cardLines) == 1 && cardLines[0] == ""):
+	case len(s.cardLines) == 0:
 		lines = append(lines, muted("no model card"))
 	default:
-		visible := maxLines - 1 // reserve the ▾/▴ indicator slot
+		total := len(s.cardLines)
+		visible := maxLines - 1 // reserve the scroll-indicator slot
 		if visible < 1 {
 			visible = 1
 		}
-		maxOff := max(0, len(cardLines)-visible)
+		maxOff := max(0, total-visible)
 		if s.cardOffset > maxOff {
 			s.cardOffset = maxOff
 		}
-		end := min(len(cardLines), s.cardOffset+visible)
-		for _, ln := range cardLines[s.cardOffset:end] {
-			if ln == "" {
-				ln = " "
-			}
+		end := min(total, s.cardOffset+visible)
+		for _, ln := range s.cardLines[s.cardOffset:end] {
 			lines = append(lines, subtle(ln))
 		}
-		if s.cardOffset > 0 {
-			lines = append(lines, subtle("▴ more (pgup)"))
-		}
-		if end < len(cardLines) {
-			lines = append(lines, subtle("▾ more (pgdn)"))
+		if total > visible {
+			pct := 0
+			if maxOff > 0 {
+				pct = s.cardOffset * 100 / maxOff
+			}
+			filled := (pct + 5) / 10
+			dots := strings.Repeat("▰", filled) + strings.Repeat("▱", 10-filled)
+			lines = append(lines, subtle(fmt.Sprintf("%3d%% %s", pct, dots)))
 		}
 	}
 	return lines

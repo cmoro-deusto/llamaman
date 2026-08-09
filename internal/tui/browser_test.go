@@ -87,7 +87,7 @@ func TestBrowserOpensFromMain(t *testing.T) {
 	out := stripANSI(b.View())
 	for _, want := range []string{
 		"browse — Hugging Face",
-		"search:",
+		"search Hugging Face", // the placeholder (no redundant prompt)
 		"sort:",
 		"search, or press enter to browse",
 		"enter search", // the search-zone footer
@@ -620,7 +620,7 @@ func TestBrowserCardFlow(t *testing.T) {
 	stub := &stubBrowserRunner{
 		results: []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
 		opts:    []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}},
-		card:    "---\nlicense: llama3.1\n---\n# Model Name\n\nCard body line.",
+		card:    "---\nlicense: llama3.1\n---\n# Model Name\n\nCard body line with **bold** and `code`.",
 	}
 	r, b := openBrowserRoot(t, stub)
 	searchDrive(t, r, "q")
@@ -628,13 +628,20 @@ func TestBrowserCardFlow(t *testing.T) {
 		t.Fatalf("card calls = %v", stub.cardCalls)
 	}
 	out := stripANSI(b.View())
-	for _, want := range []string{"model card", "# Model Name", "Card body line."} {
+	for _, want := range []string{
+		"model card",
+		"Model Name",                         // the heading renders styled, no '#' prefix
+		"Card body line with bold and code.", // markdown markers rendered away
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("card panel missing %q\nout:\n%s", want, out)
 		}
 	}
 	if strings.Contains(out, "license: llama3.1") {
 		t.Error("frontmatter must be trimmed from the card")
+	}
+	if strings.Contains(out, "# Model Name") || strings.Contains(out, "**bold**") || strings.Contains(out, "`code`") {
+		t.Error("raw markdown markers must not leak into the card panel")
 	}
 
 	// Missing card → friendly note.
@@ -650,10 +657,11 @@ func TestBrowserCardFlow(t *testing.T) {
 // TestBrowserCardScroll: pgup/pgdn scroll the card text in the quants
 // zone; truncation is marked with ▴/▾ indicators.
 func TestBrowserCardScroll(t *testing.T) {
-	long := ""
+	long := "```\n"
 	for i := 1; i <= 30; i++ {
 		long += strings.Repeat("x", 20) + " " + strconv.Itoa(i) + "\n"
 	}
+	long += "```"
 	stub := &stubBrowserRunner{
 		results: []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
 		opts:    []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}},
@@ -663,8 +671,8 @@ func TestBrowserCardScroll(t *testing.T) {
 	driveRoot(t, r, tea.WindowSizeMsg{Width: 160, Height: 40})
 	searchDrive(t, r, "q")
 	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyTab}) // quants zone (pgup/pgdn live here)
-	if out := stripANSI(b.View()); !strings.Contains(out, "▾ more (pgdn)") {
-		t.Errorf("card truncation indicator missing\nout:\n%s", out)
+	if out := stripANSI(b.View()); !strings.Contains(out, "%") || !strings.Contains(out, "▱") {
+		t.Errorf("card scroll indicator (percent + dots) missing\nout:\n%s", out)
 	}
 	before := b.cardOffset
 	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyPgDown})
@@ -732,8 +740,9 @@ func TestBrowserFitsWidth(t *testing.T) {
 		}
 		// Regression: every panel content line must carry its │ side
 		// borders (the manual box builder used to omit them — the
-		// round-4 border bug).
-		if out := stripANSI(r.browser.View()); !strings.Contains(out, "│search: q") {
+		// round-4 border bug). No "search: " prompt anymore, so the
+		// typed value sits right after the border.
+		if out := stripANSI(r.browser.View()); !strings.Contains(out, "│q") {
 			t.Errorf("width %d: search content line missing its left border", w)
 		}
 	}
