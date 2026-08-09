@@ -1117,10 +1117,10 @@ func (s *BrowserMode) renderPanes(cw int) []string {
 	info := s.infoLines(rw - 2)
 	infoH := len(info) + 2
 	rem := max(0, ph-infoH)
-	quantsH := max(2, rem*3/5)
-	if rem-quantsH < 1 && rem >= 3 {
-		quantsH = rem - 1
-	}
+	// The quants panel shows a fixed 5-quant window (title border + 5
+	// rows + bottom border = 7 lines, owner round); the model card
+	// panel takes every freed line.
+	quantsH := min(7, rem)
 	cardH := max(0, rem-quantsH)
 	ib := titledBoxLines(info, "model info", rw, infoH, s.theme, false)
 	qb := titledBoxLines(s.quantsLines(rw-2, max(0, quantsH-2)), fmt.Sprintf("quants (%d)", len(s.quants)), rw, quantsH, s.theme, s.zone == zoneQuants)
@@ -1240,6 +1240,9 @@ func (s *BrowserMode) infoLines(inner int) []string {
 	if w := nonCommercialLicense(*m); w != "" {
 		lines = append(lines, warn("⚠ "+w))
 	}
+	if s.mmproj {
+		lines = append(lines, subtle("mmproj present — llama.cpp auto-downloads it"))
+	}
 	return lines
 }
 
@@ -1248,9 +1251,12 @@ func humanB(n float64) string {
 	return strconv.FormatFloat(n, 'f', -1, 64) + "B"
 }
 
-// quantsLines renders the quants panel content — a windowed list
-// (standard list behavior): the cursor stays visible, ▴/▾ mark
-// overflow. The panel scrolls, so any number of quants fit.
+// quantsLines renders the quants panel content — a fixed 5-row window
+// (standard list behavior: the cursor stays visible, the window
+// follows it). The panel is shorter by design (owner round: 5 quants
+// visible) so the model card panel gets the room; the "quants (N)"
+// title carries the total count, and scrolling is visible as the
+// window moves.
 func (s *BrowserMode) quantsLines(inner, maxLines int) []string {
 	var lines []string
 	muted := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Muted).Render(t) }
@@ -1264,10 +1270,7 @@ func (s *BrowserMode) quantsLines(inner, maxLines int) []string {
 	case !s.quantsLoaded:
 		lines = append(lines, subtle("loading quants…"))
 	case len(s.quants) > 0:
-		visible := maxLines - 1 // reserve the ▾/▴ indicator slot
-		if visible < 1 {
-			visible = 1
-		}
+		visible := min(5, max(1, maxLines))
 		// Keep the cursor inside the window (standard list behavior).
 		if s.quantIdx < s.quantOffset {
 			s.quantOffset = s.quantIdx
@@ -1289,14 +1292,6 @@ func (s *BrowserMode) quantsLines(inner, maxLines int) []string {
 			}
 			lines = append(lines, row)
 		}
-		if end < len(s.quants) {
-			lines = append(lines, subtle("▾ more"))
-		} else if s.quantOffset > 0 {
-			lines = append(lines, subtle("▴ more"))
-		}
-		if s.mmproj {
-			lines = append(lines, subtle("mmproj present — llama.cpp auto-downloads it"))
-		}
 	default: // loaded, no GGUF quants (or fetch failed): the bare row
 		row := "use " + s.selected.ID + " without a quant"
 		if s.zone == zoneQuants && s.quantIdx == 0 {
@@ -1305,9 +1300,6 @@ func (s *BrowserMode) quantsLines(inner, maxLines int) []string {
 			row = "  " + row
 		}
 		lines = append(lines, row)
-		if s.mmproj {
-			lines = append(lines, subtle("mmproj present — llama.cpp auto-downloads it"))
-		}
 	}
 	return lines
 }

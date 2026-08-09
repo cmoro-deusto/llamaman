@@ -685,36 +685,41 @@ func TestBrowserCardScroll(t *testing.T) {
 	}
 }
 
-// TestBrowserQuantsWindow: the quants panel windows its rows (standard
-// list behavior) — only the visible ones render with a ▾ more marker,
-// and the window follows the cursor.
+// TestBrowserQuantsWindow: the quants panel shows a fixed 5-row window
+// (owner round: the panel is short so the model card gets the room) —
+// the window follows the cursor as you scroll through more quants, and
+// the title carries the total count.
 func TestBrowserQuantsWindow(t *testing.T) {
 	opts := []hf.QuantOption{
 		{Tag: "Q2_K", Size: 100}, {Tag: "Q4_K_M", Size: 200}, {Tag: "Q5_K_M", Size: 300},
-		{Tag: "Q6_K", Size: 400}, {Tag: "Q8_0", Size: 500},
+		{Tag: "Q6_K", Size: 400}, {Tag: "Q8_0", Size: 500}, {Tag: "F16", Size: 600},
+		{Tag: "BF16", Size: 700}, {Tag: "IQ3", Size: 800},
 	}
 	stub := &stubBrowserRunner{
 		results: []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
 		opts:    opts,
 	}
 	r, b := openBrowserRoot(t, stub)
-	// Short window: the quants panel gets only a couple of rows.
-	driveRoot(t, r, tea.WindowSizeMsg{Width: 160, Height: 30})
+	// Tall enough that the quants panel hits its 7-line cap (5 rows).
+	driveRoot(t, r, tea.WindowSizeMsg{Width: 160, Height: 52})
 	searchDrive(t, r, "q")
-	if out := stripANSI(b.View()); !strings.Contains(out, "quants (5)") {
+	if out := stripANSI(b.View()); !strings.Contains(out, "quants (8)") {
 		t.Errorf("quants title with count missing\nout:\n%s", out)
 	}
-	if !strings.Contains(stripANSI(b.View()), "▾ more") {
-		t.Errorf("▾ more indicator missing for a windowed list")
-	}
-	// Tab into quants and move down: the window follows the cursor.
+	// Tab into quants and scroll past the window edge: the fixed 5-row
+	// window follows the cursor.
 	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyTab})
-	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyDown})
-	if b.quantIdx != 1 {
-		t.Fatalf("quantIdx = %d, want 1", b.quantIdx)
+	for i := 0; i < 5; i++ {
+		driveRoot(t, r, tea.KeyMsg{Type: tea.KeyDown})
+	}
+	if b.quantIdx != 5 {
+		t.Fatalf("quantIdx = %d, want 5", b.quantIdx)
 	}
 	if b.quantOffset != 1 {
-		t.Errorf("quantOffset = %d, want 1 (window follows the cursor)", b.quantOffset)
+		t.Errorf("quantOffset = %d, want 1 (5-row window follows the cursor)", b.quantOffset)
+	}
+	if out := stripANSI(b.View()); strings.Contains(out, "IQ3") || strings.Contains(out, "Q2_K") {
+		t.Errorf("window should show rows 1-5, not row 0 or 7\nout:\n%s", out)
 	}
 }
 

@@ -2754,14 +2754,17 @@ lists the top GGUF repos by the current sort (the placeholder reads
      `▷ task: <pipeline_tag>` (label Muted, value Subtle); a
      **⚠ non-commercial license — check terms** warning for `cc-by-nc*`
      (P3: display only).
-  2. **quants (N)** — the quant list, **windowed and scrollable**
-     (standard list behavior: the cursor stays visible, `▴`/`▾ more`
-     mark overflow, so any number of quants fit); rows
-     `Tag — hf.HumanSize(Size)` with the size in Muted plus the green
-     `● cached` badge when `storage.Lookup(root, repo)` marks it (the
-     storage.go:764–769 logic) and the mmproj informational line. This
-     panel is the tab focus target of the quants zone: ↑/↓ select a
-     quant, enter opens the hand-off dialog.
+  2. **quants (N)** — a **fixed 5-row window** (owner round: the panel
+     is a short 7-line box — title border + 5 rows + bottom border —
+     so the model card panel below gets every freed line); the window
+     follows the cursor (standard list behavior) and the `quants (N)`
+     title carries the total count. Rows `Tag — hf.HumanSize(Size)`
+     with the size in Muted plus the green `● cached` badge when
+     `storage.Lookup(root, repo)` marks it (the storage.go:764–769
+     logic); the mmproj note lives in the model info panel now (repo
+     level, and the quants box has no spare slot). This panel is the
+     tab focus target of the quants zone: ↑/↓ select a quant, enter
+     opens the hand-off dialog.
   3. **model card** — the README text, fetched alongside the quants
      (new `hf.Client.Card` — `GET {endpoint}/{repo}/raw/main/README.md`,
      the §16.6 async discipline with its own gen/cancel; YAML
@@ -2776,7 +2779,10 @@ lists the top GGUF repos by the current sort (the placeholder reads
      **scroll indicator** — `NN% ▰▱▱▱▱▱▱▱▱▱`, a 10-dot bar filling as
      you scroll (owner round; replaces the earlier ▴/▾ text markers).
      Friendly non-blocking states: `loading card…`, `no model card`
-     (404), `could not load model card` (other).
+     (404), `could not load model card` (other). The panel takes the
+     column's remaining height — `quantsH = min(7, rem)`,
+     `cardH = rem - quantsH` — so the card grows as much as the
+     terminal allows.
 - **focusQuants** — the quant list with its own cursor (↑/↓); `enter`
   on a quant opens the **hand-off dialog** (below); a repo with no
   GGUF quants shows a `use org/repo without a quant` row that hands
