@@ -2768,19 +2768,29 @@ lists the top GGUF repos by the current sort (the placeholder reads
   3. **model card** — the README text, fetched alongside the quants
      (new `hf.Client.Card` — `GET {endpoint}/{repo}/raw/main/README.md`,
      the §16.6 async discipline with its own gen/cancel; YAML
-     frontmatter trimmed), then **rendered from markdown to styled
-     lines** (owner round: `internal/tui/markdown.go` — goldmark
-     v1.7.11 + GFM, a custom `cardRenderer` emits lipgloss-styled text
-     instead of HTML: headings accent-bold, strong bold, emphasis
-     italic, code Muted, links accent-underline, list items bulleted,
-     blockquotes quoted, code blocks Muted, tables cell-separated; raw
-     HTML skipped; blank lines dropped for panel density). Windowed and
-     scrollable (`pgup`/`pgdown` in the quants zone) with a
-     **scroll indicator** — `NN% ▰▱▱▱▱▱▱▱▱▱`, a 10-dot bar filling as
-     you scroll (owner round; replaces the earlier ▴/▾ text markers).
-     Friendly non-blocking states: `loading card…`, `no model card`
-     (404), `could not load model card` (other). The panel takes the
-     column's remaining height — `quantsH = min(7, rem)`,
+     frontmatter trimmed — **robustly**: some cards put HTML comments
+     before the frontmatter, so the first `---` line is found anywhere
+     in the card head, owner round), then **rendered from markdown to
+     styled lines** (`internal/tui/markdown.go` — goldmark v1.7.11 +
+     GFM, a custom `cardRenderer` emits lipgloss-styled text instead
+     of HTML). Renderer notes (round 7): the custom renderer registers
+     at **priority 100** — `extension.GFM` adds its own HTML table
+     renderer at 500 and goldmark lets the LAST registered func win,
+     so without the lower priority raw `<table>`/`<th>` HTML leaked
+     into cards (owner report: unsloth cards); **blocks are separated
+     by blank lines** (headings/paragraphs/blockquotes end with
+     `\n\n`, collapsed to one in post-processing); **links and
+     autolinks are OSC 8 terminal hyperlinks** — `ESC]8;;URL ESC\
+     … ESC]8;; ESC\\` — so ctrl/cmd-click opens the URL in the
+     user's browser (owner round); raw HTML skipped; tables render
+     cell-separated (`a │ b`). Windowed and scrollable — **`pgup`/
+     `pgdown` scroll the card from ANY zone** (owner round: moved out
+     of the quants-zone key handler into the browser-wide routing; the
+     footer advertises `pgup/pgdn` in every zone, compactly) — with a
+     **scroll indicator** `NN% ▰▱▱▱▱▱▱▱▱▱` (10-dot bar filling as you
+     scroll). Friendly non-blocking states: `loading card…`, `no model
+     card` (404), `could not load model card` (other). The panel takes
+     the column's remaining height — `quantsH = min(7, rem)`,
      `cardH = rem - quantsH` — so the card grows as much as the
      terminal allows.
 - **focusQuants** — the quant list with its own cursor (↑/↓); `enter`

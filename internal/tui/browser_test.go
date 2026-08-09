@@ -752,3 +752,33 @@ func TestBrowserFitsWidth(t *testing.T) {
 		}
 	}
 }
+
+// TestBrowserCardScrollFromAnyZone: pgup/pgdown scroll the model card
+// from any zone (owner round), not just the quants zone; the footer
+// advertises the shortcut in every zone.
+func TestBrowserCardScrollFromAnyZone(t *testing.T) {
+	long := "```\n"
+	for i := 1; i <= 30; i++ {
+		long += strings.Repeat("x", 20) + " " + strconv.Itoa(i) + "\n"
+	}
+	long += "```"
+	stub := &stubBrowserRunner{
+		results: []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
+		opts:    []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}},
+		card:    long,
+	}
+	r, b := openBrowserRoot(t, stub)
+	searchDrive(t, r, "q") // zone = results (not quants)
+	if out := stripANSI(b.View()); !strings.Contains(out, "pgup/pgdn") {
+		t.Errorf("footer must advertise the card scroll\nto:\n%s", out)
+	}
+	before := b.cardOffset
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyPgDown}) // still in the results zone
+	if b.cardOffset <= before {
+		t.Errorf("pgdown must scroll the card from the results zone: %d → %d", before, b.cardOffset)
+	}
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyPgUp})
+	if b.cardOffset != before {
+		t.Errorf("pgup must scroll back: %d → %d", b.cardOffset, before)
+	}
+}

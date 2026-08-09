@@ -42,7 +42,7 @@ func (r *cardRenderer) RegisterFuncs(reg renderer.NodeRendererFuncRegisterer) {
 	reg.Register(ast.KindLink, r.renderLink)
 	reg.Register(ast.KindImage, r.renderImage)
 	reg.Register(ast.KindAutoLink, r.renderAutoLink)
-	reg.Register(ast.KindList, r.renderChildren)
+	reg.Register(ast.KindList, r.renderList)
 	reg.Register(ast.KindListItem, r.renderListItem)
 	reg.Register(ast.KindBlockquote, r.renderBlockquote)
 	reg.Register(ast.KindThematicBreak, r.renderThematicBreak)
@@ -62,9 +62,16 @@ func (r *cardRenderer) renderChildren(_ util.BufWriter, _ []byte, _ ast.Node, _ 
 	return ast.WalkContinue, nil
 }
 
+func (r *cardRenderer) renderList(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
+	if !entering {
+		r.buf.WriteString("\n") // blank line after a list
+	}
+	return ast.WalkContinue, nil
+}
+
 func (r *cardRenderer) renderParagraph(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
 	if !entering {
-		r.buf.WriteString("\n")
+		r.buf.WriteString("\n\n") // blank line between blocks (owner round)
 	}
 	return ast.WalkContinue, nil
 }
@@ -74,7 +81,7 @@ func (r *cardRenderer) renderHeading(_ util.BufWriter, _ []byte, _ ast.Node, ent
 		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true).Render(s) })
 	} else {
 		r.pop()
-		r.buf.WriteString("\n")
+		r.buf.WriteString("\n\n") // blank line after a heading
 	}
 	return ast.WalkContinue, nil
 }
@@ -124,9 +131,13 @@ func (r *cardRenderer) renderEmphasis(_ util.BufWriter, _ []byte, n ast.Node, en
 	return ast.WalkContinue, nil
 }
 
-func (r *cardRenderer) renderLink(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
+func (r *cardRenderer) renderLink(_ util.BufWriter, source []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
-		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Accent).Underline(true).Render(s) })
+		dest := string(n.(*ast.Link).Destination)
+		r.push(func(s string) string {
+			styled := lipgloss.NewStyle().Foreground(r.theme.Accent).Underline(true).Render(s)
+			return osc8(dest, styled)
+		})
 	} else {
 		r.pop()
 	}
@@ -145,9 +156,19 @@ func (r *cardRenderer) renderImage(_ util.BufWriter, _ []byte, _ ast.Node, enter
 
 func (r *cardRenderer) renderAutoLink(w util.BufWriter, source []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
-		r.write(lipgloss.NewStyle().Foreground(r.theme.Accent).Underline(true).Render(string(n.(*ast.AutoLink).URL(source))))
+		url := string(n.(*ast.AutoLink).URL(source))
+		styled := lipgloss.NewStyle().Foreground(r.theme.Accent).Underline(true).Render(url)
+		r.write(osc8(url, styled))
 	}
 	return ast.WalkSkipChildren, nil
+}
+
+// osc8 wraps text in an OSC 8 terminal hyperlink (ESC]8;;URL ESC\ …
+// ESC]8;; ESC\\) — terminals that support it (kitty, wezterm, iTerm2,
+// Windows Terminal, foot, …) make the text ctrl/cmd-clickable and open
+// the URL in the user's browser (owner round).
+func osc8(url, text string) string {
+	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
 }
 
 func (r *cardRenderer) renderListItem(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
@@ -165,7 +186,7 @@ func (r *cardRenderer) renderBlockquote(_ util.BufWriter, _ []byte, _ ast.Node, 
 		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Muted).Render(s) })
 	} else {
 		r.pop()
-		r.buf.WriteString("\n")
+		r.buf.WriteString("\n\n") // blank line after a blockquote
 	}
 	return ast.WalkContinue, nil
 }
@@ -230,7 +251,11 @@ func renderCardMarkdown(theme Theme, src []byte) []string {
 	md := goldmark.New(
 		goldmark.WithExtensions(extension.GFM),
 		goldmark.WithRenderer(renderer.NewRenderer(
-			renderer.WithNodeRenderers(util.Prioritized(cr, 1000)),
+			// Priority 100: extension.GFM registers its own HTML table
+			// renderer at 500, and goldmark's renderer lets the LAST
+			// registered func win — so ours must sort below it or raw
+			// <table>/<th> HTML leaks into the card (owner report).
+			renderer.WithNodeRenderers(util.Prioritized(cr, 100)),
 		)),
 	)
 	if err := md.Convert(src, &cr.buf); err != nil {
@@ -242,14 +267,23 @@ func renderCardMarkdown(theme Theme, src []byte) []string {
 	}
 	lines := strings.Split(text, "\n")
 	out := make([]string, 0, len(lines))
+	blank := false
 	for _, ln := range lines {
-		// Drop pure-whitespace lines (paragraph spacing) — the card
-		// panel is dense; blank lines eat its scarce height.
-		// lipgloss.Width is ANSI-aware, so styled-empty lines count 0.
+		// lipgloss.Width is ANSI-aware: styled-empty lines count 0.
 		if lipgloss.Width(ln) == 0 {
+			// Keep one blank line between blocks (section spacing,
+			// owner round); collapse runs and drop leading/trailing.
+			if len(out) > 0 && !blank {
+				out = append(out, "")
+			}
+			blank = true
 			continue
 		}
 		out = append(out, ln)
+		blank = false
+	}
+	if n := len(out); n > 0 && out[n-1] == "" {
+		out = out[:n-1]
 	}
 	return out
 }

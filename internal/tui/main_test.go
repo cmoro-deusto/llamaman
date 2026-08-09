@@ -38,16 +38,30 @@ func TestMainViewRendersWordmarkAndShortcuts(t *testing.T) {
 func stripANSI(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
-		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
-			j := i + 2
-			for j < len(s) && (s[j] < 0x40 || s[j] > 0x7e) {
-				j++
+		if s[i] == 0x1b && i+1 < len(s) {
+			switch s[i+1] {
+			case '[': // CSI ... final byte
+				j := i + 2
+				for j < len(s) && (s[j] < 0x40 || s[j] > 0x7e) {
+					j++
+				}
+				if j < len(s) {
+					j++
+				}
+				i = j - 1
+				continue
+			case ']': // OSC (e.g. OSC 8 hyperlinks) ... ESC \
+				j := i + 2
+				for j < len(s) {
+					if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
+						j += 2
+						break
+					}
+					j++
+				}
+				i = j - 1
+				continue
 			}
-			if j < len(s) {
-				j++
-			}
-			i = j - 1
-			continue
 		}
 		b.WriteByte(s[i])
 	}

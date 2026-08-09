@@ -266,6 +266,14 @@ func (s *BrowserMode) Update(msg tea.Msg) (*BrowserMode, tea.Cmd) {
 		case "shift+tab":
 			s.cycleZone(true)
 			return s, nil
+		case "pgup":
+			// The model card scrolls from anywhere in the browse view
+			// (owner round), not just the quants zone.
+			s.cardOffset = max(0, s.cardOffset-5)
+			return s, nil
+		case "pgdown":
+			s.cardOffset += 5
+			return s, nil
 		case "esc":
 			switch s.zone {
 			case zoneSearch:
@@ -521,16 +529,21 @@ func (s *BrowserMode) handleCardDone(msg browserCardDoneMsg) (*BrowserMode, tea.
 	return s, nil
 }
 
-// trimCardFrontmatter drops the README's leading YAML frontmatter
-// (--- … ---), leaving the card text proper.
+// trimCardFrontmatter drops the README's YAML frontmatter (--- … ---),
+// wherever it sits — some cards put HTML comments (markdownlint
+// pragmas, badges) before the frontmatter, so the first "---" line is
+// found anywhere in the card head rather than only at position 0
+// (owner report: unsloth cards rendered "license: mit" etc.).
 func trimCardFrontmatter(text string) string {
-	if !strings.HasPrefix(text, "---") {
-		return text
-	}
 	lines := strings.Split(text, "\n")
-	for i := 1; i < len(lines); i++ {
-		if strings.HasPrefix(lines[i], "---") {
-			return strings.Join(lines[i+1:], "\n")
+	for i, ln := range lines {
+		if strings.TrimSpace(ln) == "---" {
+			for j := i + 1; j < len(lines); j++ {
+				if strings.TrimSpace(lines[j]) == "---" {
+					return strings.Join(lines[j+1:], "\n")
+				}
+			}
+			return text // unterminated fence: leave as-is
 		}
 	}
 	return text
@@ -563,12 +576,6 @@ func (s *BrowserMode) updateQuants(msg tea.Msg) (*BrowserMode, tea.Cmd) {
 			if len(s.quants) > 0 && s.quantIdx < len(s.quants)-1 {
 				s.quantIdx++
 			}
-			return s, nil
-		case "pgup":
-			s.cardOffset = max(0, s.cardOffset-5)
-			return s, nil
-		case "pgdown":
-			s.cardOffset += 5
 			return s, nil
 		}
 	}
@@ -1365,14 +1372,16 @@ func (s *BrowserMode) renderFooter() string {
 		keys = []string{
 			shortcut("enter", "search", s.theme),
 			shortcut("tab", "results", s.theme),
+			shortcut("pgup/pgdn", "", s.theme),
 			shortcut("esc", "back", s.theme),
 		}
 	case zoneResults:
 		keys = []string{
-			shortcut("↑/↓", "navigate", s.theme),
+			shortcut("↑/↓", "move", s.theme),
 			shortcut("tab", "quants", s.theme),
-			shortcut("l/L/k/m", "filter", s.theme),
+			shortcut("l/L/k/m", "filt", s.theme),
 			shortcut("s", "sort", s.theme),
+			shortcut("pgup/pgdn", "", s.theme),
 			shortcut("esc", "search", s.theme),
 		}
 	case zoneQuants:
@@ -1380,10 +1389,13 @@ func (s *BrowserMode) renderFooter() string {
 			shortcut("↑/↓", "quant", s.theme),
 			shortcut("enter", "hand off", s.theme),
 			shortcut("tab", "results", s.theme),
+			shortcut("pgup/pgdn", "", s.theme),
 			shortcut("esc", "back", s.theme),
 		}
 	}
-	return strings.Join(keys, "  ·  ")
+	// Compact separators: the footer must fit the outer box's inner
+	// width (s.width-6) or it inflates the whole view (owner report).
+	return strings.Join(keys, " · ")
 }
 
 // shieldView renders the static in-flight search popup (no spinner —
