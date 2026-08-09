@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/storage"
@@ -224,7 +225,7 @@ func TestModelFormLocalPickerFlow(t *testing.T) {
 	if c.modelPicker.kind != sourceLocal {
 		t.Fatalf("picker kind = %q, want %q", c.modelPicker.kind, sourceLocal)
 	}
-	if got := c.modelPicker.browser.dir; got != home {
+	if got := c.modelPicker.fp.CurrentDirectory; got != home {
 		t.Errorf("start dir = %q, want %q", got, home)
 	}
 	if !strings.Contains(c.View(), "model.gguf") {
@@ -288,7 +289,7 @@ func TestModelFormPickerDisabledFile(t *testing.T) {
 	if c.modelPicker == nil {
 		t.Fatal("overlay closed on a disabled file")
 	}
-	if c.modelPicker.browser.errLine == "" {
+	if c.modelPicker.errLine == "" {
 		t.Error("no error line after selecting a non-.gguf file")
 	}
 	if !strings.Contains(c.View(), ".gguf files only") {
@@ -426,8 +427,8 @@ func TestModelFormPickerDirNavigation(t *testing.T) {
 	if got := deref(c.formStaging.location); got != "" {
 		t.Errorf("staged location = %q after dir enter, want empty", got)
 	}
-	if c.modelPicker.browser.dir != filepath.Join(home, "sub") {
-		t.Errorf("dir = %q, want %q", c.modelPicker.browser.dir, filepath.Join(home, "sub"))
+	if c.modelPicker.fp.CurrentDirectory != filepath.Join(home, "sub") {
+		t.Errorf("CurrentDirectory = %q, want %q", c.modelPicker.fp.CurrentDirectory, filepath.Join(home, "sub"))
 	}
 	if !strings.Contains(c.View(), "inner.gguf") {
 		t.Error("picker did not list the file inside the directory")
@@ -502,19 +503,19 @@ func TestModelFormPickerHiddenFiles(t *testing.T) {
 	if c.modelPicker == nil {
 		t.Fatal("local picker did not open")
 	}
-	if !c.modelPicker.browser.showHidden {
+	if !c.modelPicker.fp.ShowHidden {
 		t.Error("hidden files should be shown by default")
 	}
 	if !strings.Contains(c.View(), ".hidden.gguf") {
 		t.Error("hidden file not listed while hidden shown")
 	}
 
-	// tab toggles hidden off.
-	c = drive(t, c, tea.KeyMsg{Type: tea.KeyTab})
+	// "." toggles hidden off.
+	c = drive(t, c, keyRunes("."))
 	if c.modelPicker == nil {
 		t.Fatal("overlay closed on the toggle key")
 	}
-	if c.modelPicker.browser.showHidden {
+	if c.modelPicker.fp.ShowHidden {
 		t.Error("toggle did not switch hidden off")
 	}
 	if strings.Contains(c.View(), ".hidden.gguf") {
@@ -524,9 +525,9 @@ func TestModelFormPickerHiddenFiles(t *testing.T) {
 		t.Error("hint does not show hidden off state")
 	}
 
-	// tab again restores them.
-	c = drive(t, c, tea.KeyMsg{Type: tea.KeyTab})
-	if !c.modelPicker.browser.showHidden {
+	// "." again restores them.
+	c = drive(t, c, keyRunes("."))
+	if !c.modelPicker.fp.ShowHidden {
 		t.Error("toggle did not switch hidden back on")
 	}
 	if !strings.Contains(c.View(), ".hidden.gguf") {
@@ -566,84 +567,41 @@ func TestModelFormHFWideList(t *testing.T) {
 	}
 }
 
-// TestModelFormPickerFilter checks the type-to-filter behavior of the
-// local browser: typing narrows the listing live, a no-match query
-// shows the empty state, esc clears the filter, and enter picks the
-// filtered file.
-func TestModelFormPickerFilter(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	for _, f := range []string{"model.gguf", "notes.txt"} {
-		if err := os.WriteFile(filepath.Join(home, f), []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
+// TestModelFormHFFixedBoxWidth checks the owner round-3 feedback: the
+// enclosing selector rectangle spans the full screen width and its
+// size does not change when the selection moves (the selected row used
+// to render 2 cells narrower, shifting the box).
+func TestModelFormHFFixedBoxWidth(t *testing.T) {
+	root := t.TempDir()
+	mkHubRepo(t, root, "Alpha/First", "model-Q4_K_M.gguf")
+	mkHubRepo(t, root, "Beta/Second", "model-Q4_K_M.gguf")
+	cfg := &config.Config{
+		Version:     1,
+		Globals:     config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Preferences: &config.Preferences{ModelsDir: root},
+	}
+	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceHF)
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyCtrlO})
+	if c.modelPicker == nil {
+		t.Fatal("repo picker did not open")
+	}
+	boxWidth := func() int {
+		for _, l := range strings.Split(c.View(), "\n") {
+			if strings.Contains(l, "╭") { // the box's top border spans its width
+				return lipgloss.Width(l)
+			}
 		}
+		t.Fatal("no box border found in view")
+		return 0
 	}
-	cfg := &config.Config{Version: 1, Globals: config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
-	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceLocal)
-	c = drive(t, c, tea.KeyMsg{Type: tea.KeyCtrlO})
-	if c.modelPicker == nil {
-		t.Fatal("local picker did not open")
+	w1 := boxWidth()
+	if w1 != c.width {
+		t.Errorf("box width = %d, want full screen %d", w1, c.width)
 	}
-
-	// Typing filters live: "model" leaves only model.gguf.
-	for _, r := range "model" {
-		c = drive(t, c, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
-	}
-	if c.modelPicker.browser.filter != "model" {
-		t.Fatalf("filter = %q, want model", c.modelPicker.browser.filter)
-	}
-	if strings.Contains(c.View(), "notes.txt") {
-		t.Error("notes.txt still listed after filtering")
-	}
-	if !strings.Contains(c.View(), "model.gguf") {
-		t.Error("model.gguf missing from the filtered listing")
-	}
-	if !strings.Contains(c.View(), "filter: model") {
-		t.Error("filter line not rendered")
-	}
-
-	// Enter picks the filtered file.
-	c = drive(t, c, tea.KeyMsg{Type: tea.KeyEnter})
-	if c.modelPicker != nil {
-		t.Fatal("overlay did not close after picking the filtered file")
-	}
-	if got := deref(c.formStaging.location); got != filepath.Join(home, "model.gguf") {
-		t.Errorf("staged location = %q", got)
-	}
-}
-
-// TestModelFormPickerFilterClear checks the empty-filter state and the
-// esc-clears-filter path.
-func TestModelFormPickerFilterClear(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	if err := os.WriteFile(filepath.Join(home, "model.gguf"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cfg := &config.Config{Version: 1, Globals: config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
-	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceLocal)
-	c = drive(t, c, tea.KeyMsg{Type: tea.KeyCtrlO})
-	if c.modelPicker == nil {
-		t.Fatal("local picker did not open")
-	}
-
-	// A no-match query shows the empty state and does not crash.
-	for _, r := range "zzz" {
-		c = drive(t, c, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
-	}
-	if !strings.Contains(c.View(), "no matching files") {
-		t.Error("empty state not rendered")
-	}
-	// esc clears the filter, restoring the listing.
-	c = drive(t, c, tea.KeyMsg{Type: tea.KeyEsc})
-	if c.modelPicker == nil {
-		t.Fatal("esc with a filter closed the overlay instead of clearing it")
-	}
-	if c.modelPicker.browser.filter != "" {
-		t.Errorf("filter = %q after esc, want empty", c.modelPicker.browser.filter)
-	}
-	if !strings.Contains(c.View(), "model.gguf") {
-		t.Error("listing not restored after clearing the filter")
+	// Moving the selection must not change the box width.
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyDown})
+	if w2 := boxWidth(); w2 != w1 {
+		t.Errorf("box width changed on selection move: %d → %d", w1, w2)
 	}
 }
 

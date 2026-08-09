@@ -249,7 +249,7 @@ func (c *ConfigMode) openModelPicker(kind string) (*ConfigMode, tea.Cmd) {
 		if c.formStaging.location != nil {
 			cur = *c.formStaging.location
 		}
-		mp = &modelPicker{kind: sourceLocal, browser: newFileBrowser(pickerStartDir(c.work.Prefs().ModelsDir, cur, c.work.Models))}
+		mp = newLocalPicker(pickerStartDir(c.work.Prefs().ModelsDir, cur, c.work.Models))
 	} else {
 		root, err := storage.CacheRoot(c.work.Prefs().ModelsDir)
 		if err != nil {
@@ -262,7 +262,7 @@ func (c *ConfigMode) openModelPicker(kind string) (*ConfigMode, tea.Cmd) {
 	}
 	// The HF repo list gets essentially the full screen width — long
 	// org/repo ids and their quant lists need room to stay on one line
-	// (owner feedback). The local browser only uses the height.
+	// (owner feedback). The local filepicker only uses the height.
 	pw, ph := c.pickerSize()
 	if kind == sourceHF {
 		pw = c.width - 6
@@ -272,7 +272,7 @@ func (c *ConfigMode) openModelPicker(kind string) (*ConfigMode, tea.Cmd) {
 	}
 	mp.SetSize(pw, ph)
 	c.modelPicker = mp
-	return c, nil
+	return c, mp.Init()
 }
 
 // handleModelPickerDone consumes the model-form picker's result:
