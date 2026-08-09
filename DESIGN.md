@@ -2653,11 +2653,14 @@ for the `(cached)` markers — and injects the runner.
 ```go
 type browserRunner interface {
     Search(ctx context.Context, opts hf.SearchOpts) ([]hf.SearchResult, error)
-    Choose(ctx context.Context, repo string) ([]hf.QuantOption, error) // tree → quants
+    // CheckHF is the §16.6 tree/main check — one round trip yields the
+    // quant list, sizes, and mmproj presence for the quant pane.
+    CheckHF(ctx context.Context, repo string) ([]hf.QuantOption, bool, error)
 }
 ```
 
-`SetBrowserRunner` setter; `r.browserRunner()` builds a lazy `hf.New()`;
+`SetBrowserRunner` setter; `r.browserRunner()` builds a lazy `hf.New()`
+(the production adapter reuses the §16.6 `hfCheckClient` for the check);
 client error → nil runner → search disabled (P3: the mode renders and
 Esc works; search shows a "search unavailable" flash, never a crash).
 
@@ -2682,12 +2685,13 @@ popup):
 
 - **focusSearch** — a `bubbles/textinput` line. Typing goes to it;
   `enter` runs the search (gen-guarded async, shield + `esc: cancel`
-  like §16.6); `t` cycles sort downloads → likes → lastModified (re-runs
-  the same query, same gen guard); `l` / `L` open the tag filters
-  (below); `esc` returns to Main. The input is
-  re-shown pre-filled with the last query so edits re-search.
+  like §16.6); `esc` returns to Main. The input is
+  re-shown pre-filled with the last query so edits re-search. (Sort
+  cycling and the tag filters live in the results zone — every
+  printable key must type, the §16.5 modifier precedent.)
 - **focusResults** — a `bubbles/list` (the §16.5 repoPicker delegate
-  shape: arrows-only keymap, no chrome) over the results; row =
+  shape: **arrows-only** keymap — page jumps, help, and quit unbound —
+  no chrome) over the results; row =
   `org/repo`, description = `Nk downloads · N likes · <languages> ·
   license: <id>` (languages = the bare tag codes, space-joined;
   license pulled from `tags`). `enter` on a result **explicitly
@@ -2716,23 +2720,29 @@ popup):
   **hand-off dialog** (below); a repo with no GGUF quants shows a
   `use org/repo without a quant` row that hands off the **bare** id
   (same semantics as the chooser's esc-saves-bare and §16.6's Save
-  path). `esc` returns to focusResults.
+  path). `esc` returns to focusResults. In this zone **`t` cycles sort
+  downloads → likes → lastModified** (re-runs the same query, same gen
+  guard) and `l`/`L` open the tag filters (below).
 
 Tab / Shift+Tab cycle the three zones; each zone's key handling is
 exclusive (the same "overlay handlers run on EVERY message" discipline —
 zone messages are consumed in `Update` before anything else).
 
-**Tag filters (`l` / `L`, focusSearch).** Two curated overlays — the
+**Tag filters (`l` / `L`, results zone).** Two curated overlays — the
 §16.6 dialog pattern (boxed, height-capped huh select, dedicated slot
-`tagFilter *huh.Form` + `tagFilterVal`):
+`tagFilter *huh.Form` + `tagFilterVal`). The keys live in **focusResults**,
+not focusSearch: the search box must own every printable key (typing
+`llama` starts with `l`), the same reason §16.5's picker hotkey is a
+modifier (`ctrl+o`) — the owner's `l`/`L` keys are preserved, just
+where no text entry happens:
 
 - `l` — **language**: `all languages`, en, es, de, fr, it, pt, ja, zh,
   ko, ru, ar, hi, th, multilingual. Picking one sets
   `browser.filterLang` and re-runs the search with it; `all languages`
-  (or esc) clears it.
+  clears it; esc **dismisses without changing the filter**.
 - `L` — **license**: `any license`, apache-2.0, mit, llama3.1, llama3.2,
   llama3.3, gemma, openrail, cc-by-nc-4.0, other. Sets
-  `browser.filterLic`; `any license`/esc clears.
+  `browser.filterLic`; `any license` clears; esc dismisses.
 
 Both filters combine into the search request as extra `Filter` tags
 (`filter=gguf,ja,license:apache-2.0` — verified server-side), re-run
