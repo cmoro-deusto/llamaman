@@ -2777,9 +2777,12 @@ lists the top GGUF repos by the current sort (the placeholder reads
      at **priority 100** — `extension.GFM` adds its own HTML table
      renderer at 500 and goldmark lets the LAST registered func win,
      so without the lower priority raw `<table>`/`<th>` HTML leaked
-     into cards (owner report: unsloth cards); **blocks are separated
-     by blank lines** (headings/paragraphs/blockquotes end with
-     `\n\n`, collapsed to one in post-processing); **links and
+     into cards (owner report: unsloth cards); **blank lines follow a
+     sections-only policy** (owner round): headings, thematic breaks,
+     code blocks, tables and lists get one blank line before AND after
+     them, while consecutive paragraphs flow together (thematic breaks
+     and tables used to drop their after-blank entirely — fixed);
+     **links and
      autolinks are OSC 8 terminal hyperlinks** — `ESC]8;;URL ESC\
      … ESC]8;; ESC\\` — so ctrl/cmd-click opens the URL in the
      user's browser (owner round); raw HTML skipped; tables render

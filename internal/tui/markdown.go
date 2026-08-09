@@ -49,7 +49,7 @@ func (r *cardRenderer) RegisterFuncs(reg renderer.NodeRendererFuncRegisterer) {
 	reg.Register(ast.KindHTMLBlock, r.renderSkip)
 	reg.Register(ast.KindRawHTML, r.renderSkip)
 	// GFM (table + task-list kinds live in extension/ast)
-	reg.Register(extast.KindTable, r.renderChildren)
+	reg.Register(extast.KindTable, r.renderTable)
 	reg.Register(extast.KindTableHeader, r.renderTableRow)
 	reg.Register(extast.KindTableRow, r.renderTableRow)
 	reg.Register(extast.KindTableCell, r.renderTableCell)
@@ -63,25 +63,28 @@ func (r *cardRenderer) renderChildren(_ util.BufWriter, _ []byte, _ ast.Node, _ 
 }
 
 func (r *cardRenderer) renderList(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
-	if !entering {
-		r.buf.WriteString("\n") // blank line after a list
+	if entering {
+		r.buf.WriteString("\n") // blank before a list
+	} else {
+		r.buf.WriteString("\n") // blank after a list
 	}
 	return ast.WalkContinue, nil
 }
 
 func (r *cardRenderer) renderParagraph(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
 	if !entering {
-		r.buf.WriteString("\n\n") // blank line between blocks (owner round)
+		r.buf.WriteString("\n") // paragraphs flow together (sections-only policy)
 	}
 	return ast.WalkContinue, nil
 }
 
 func (r *cardRenderer) renderHeading(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
+		r.buf.WriteString("\n") // blank before a heading (sections-only)
 		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true).Render(s) })
 	} else {
 		r.pop()
-		r.buf.WriteString("\n\n") // blank line after a heading
+		r.buf.WriteString("\n\n") // blank after a heading
 	}
 	return ast.WalkContinue, nil
 }
@@ -107,6 +110,7 @@ func (r *cardRenderer) renderCodeSpan(_ util.BufWriter, _ []byte, _ ast.Node, en
 
 func (r *cardRenderer) renderCodeBlock(_ util.BufWriter, source []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
+		r.buf.WriteString("\n") // blank before a code block
 		style := lipgloss.NewStyle().Foreground(r.theme.Muted)
 		lines := n.Lines()
 		for i := 0; i < lines.Len(); i++ {
@@ -186,20 +190,31 @@ func (r *cardRenderer) renderBlockquote(_ util.BufWriter, _ []byte, _ ast.Node, 
 		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Muted).Render(s) })
 	} else {
 		r.pop()
-		r.buf.WriteString("\n\n") // blank line after a blockquote
+		r.buf.WriteString("\n") // blockquote flows like a paragraph
 	}
 	return ast.WalkContinue, nil
 }
 
 func (r *cardRenderer) renderThematicBreak(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
-		r.buf.WriteString(lipgloss.NewStyle().Foreground(r.theme.Muted).Render("────") + "\n")
+		// Blank before AND after (the next block may be a paragraph,
+		// which emits no enter blank of its own).
+		r.buf.WriteString("\n" + lipgloss.NewStyle().Foreground(r.theme.Muted).Render("────") + "\n\n")
 	}
 	return ast.WalkSkipChildren, nil
 }
 
 func (r *cardRenderer) renderSkip(_ util.BufWriter, _ []byte, _ ast.Node, _ bool) (ast.WalkStatus, error) {
 	return ast.WalkSkipChildren, nil
+}
+
+func (r *cardRenderer) renderTable(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
+	if entering {
+		r.buf.WriteString("\n") // blank before a table
+	} else {
+		r.buf.WriteString("\n") // blank after a table
+	}
+	return ast.WalkContinue, nil
 }
 
 func (r *cardRenderer) renderTableRow(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {

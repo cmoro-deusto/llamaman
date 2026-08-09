@@ -28,13 +28,41 @@ func TestCardMarkdownTable(t *testing.T) {
 	}
 }
 
+// TestCardMarkdownBlockSpacing: sections-only policy (owner round) —
+// blank lines around headings, breaks, code, tables and lists, but not
+// between consecutive paragraphs.
 func TestCardMarkdownBlockSpacing(t *testing.T) {
-	lines := renderCardMarkdown(DefaultTheme(), []byte("# H1\n\npara one\n\n## H2\n\npara two"))
-	if len(lines) != 7 {
-		t.Fatalf("lines = %d, want 7 (blocks separated by blanks)\n%q", len(lines), lines)
+	// Heading → paragraph → paragraph → heading: blanks around the
+	// headings only.
+	lines := renderCardMarkdown(DefaultTheme(), []byte("# H1\n\npara one\n\npara two\n\n## H2"))
+	if len(lines) != 6 {
+		t.Fatalf("lines = %d, want 6\n%q", len(lines), lines)
 	}
-	if lines[0] != "H1" || lines[1] != "" || lines[2] != "para one" || lines[4] != "H2" {
-		t.Errorf("spacing wrong: %q", lines)
+	want := []string{"H1", "", "para one", "para two", "", "H2"}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Errorf("line %d = %q, want %q (all: %q)", i, lines[i], want[i], lines)
+		}
+	}
+}
+
+// TestCardMarkdownSectionBlanks: breaks, code blocks, tables and lists
+// are section blocks — blanks around them, not between paragraphs.
+func TestCardMarkdownSectionBlanks(t *testing.T) {
+	md := "intro\n\n---\n\ncode below\n\n```\nline1\nline2\n```\n\n- a\n- b\n\n| x | y |\n|---|---|\n| 1 | 2 |\n\noutro"
+	lines := renderCardMarkdown(DefaultTheme(), []byte(md))
+	// intro | ──── | code below | line1 line2 | • a • b | x │ y 1 │ 2 | outro
+	// with blanks around ────, the code block, the list, and the table.
+	want := []string{
+		"intro", "", "────", "", "code below", "", "line1", "line2", "", "• a", "• b", "", "x │ y │ ", "1 │ 2 │ ", "", "outro",
+	}
+	if len(lines) != len(want) {
+		t.Fatalf("lines = %d, want %d\n%q", len(lines), len(want), lines)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Errorf("line %d = %q, want %q (all: %q)", i, lines[i], want[i], lines)
+		}
 	}
 }
 
