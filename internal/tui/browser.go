@@ -215,11 +215,18 @@ func (s *BrowserMode) SetBrowserRunner(r browserRunner) { s.runner = r }
 // user-selected theme into every live mode — the browser may have been
 // created before the change (owner round: the Preferences theme must
 // reach the browse view). The rendered card is re-rendered so its
-// embedded colors follow the theme.
+// embedded colors follow the theme, and the results list is rebuilt —
+// its delegate captures palette colors at creation, so it would
+// otherwise stay on the stale palette.
 func (s *BrowserMode) SetTheme(t Theme) {
 	s.theme = t
 	if s.cardRaw != "" {
 		s.cardLines = renderCardMarkdown(t, []byte(s.cardRaw))
+	}
+	if items := s.results.Items(); len(items) > 0 {
+		idx := s.results.Index()
+		s.results = newResultList(items, t)
+		s.results.Select(idx)
 	}
 }
 

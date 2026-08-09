@@ -786,15 +786,17 @@ func TestBrowserCardScrollFromAnyZone(t *testing.T) {
 
 // TestBrowserSetTheme: a theme change (Settings save / t cycle) must
 // reach a browser that was created earlier — applyTheme pushes into
-// live modes and the rendered card follows (owner round).
+// live modes; the rendered card and the results list follow (owner
+// round: the browse view was left on the stale palette).
 func TestBrowserSetTheme(t *testing.T) {
 	stub := &stubBrowserRunner{
-		results: []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
+		results: browserTestResults(), // two results to test cursor preservation
 		opts:    []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}},
 		card:    "# Model\n\nCard body.",
 	}
 	r, b := openBrowserRoot(t, stub)
-	searchDrive(t, r, "q") // card loads
+	searchDrive(t, r, "q")                         // card loads
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyDown}) // cursor on org/nc
 	if b.cardRaw == "" || len(b.cardLines) == 0 {
 		t.Fatal("card must be loaded before the theme change")
 	}
@@ -813,5 +815,15 @@ func TestBrowserSetTheme(t *testing.T) {
 	// The card was re-rendered under the new theme (lines still present).
 	if len(b.cardLines) == 0 || !strings.Contains(stripANSI(strings.Join(b.cardLines, "\n")), "Model") {
 		t.Error("card must be re-rendered after the theme change")
+	}
+	// The results list delegate captures colors at creation — SetTheme
+	// rebuilds it onto the new palette; the cursor survives the
+	// rebuild (lipgloss renders no ANSI in tests, so the palette itself
+	// is asserted via the theme struct above).
+	if b.results.Index() != 1 {
+		t.Errorf("list cursor lost on theme change: index = %d, want 1", b.results.Index())
+	}
+	if n := len(b.results.Items()); n != 2 {
+		t.Errorf("list items lost on theme change: %d, want 2", n)
 	}
 }

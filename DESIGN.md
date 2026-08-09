@@ -2810,7 +2810,10 @@ lists the top GGUF repos by the current sort (the placeholder reads
      palette into every live mode — the browser (and the Storage
      manager) are lazily created once and reused, so a theme changed
      after their creation must still apply (`SetTheme`; the rendered
-     card is re-rendered under the new theme).
+     card is re-rendered under the new theme, and the results list is
+     rebuilt — its delegate captures palette colors at creation, so it
+     would otherwise stay on the stale palette, the owner's remaining
+     report after the first push; the cursor survives the rebuild).
 - **focusQuants** — the quant list with its own cursor (↑/↓); `enter`
   on a quant opens the **hand-off dialog** (below); a repo with no
   GGUF quants shows a `use org/repo without a quant` row that hands
