@@ -2706,9 +2706,10 @@ panel with the input width reserved so it never overlaps the border,
 and the value is accent-bold with a friendly label. **The default sort
 is `trendingScore`** (owner round — browse *and* search start at
 "trending", HF-site parity); the **`s` key** (owner round: renamed from
-`t`) cycles trending → downloads → likes → newest → updated. The
-`search: ` prompt is accent-bold. **The search bar is part of the tab
-cycle**: tab cycles search → results → quants → search; esc still backs
+`t`) cycles trending → downloads → likes → newest → updated. There is
+**no `search: ` prompt** — the panel's `search` title makes it
+redundant (owner round); the placeholder reads `search Hugging Face…
+(empty = browse)`. **The search bar is part of the tab cycle**: tab cycles search → results → quants → search; esc still backs
 out one step. **The focused panel's border lights up** (`BorderFocus`,
 the router-mode pattern) — search / results / quants panels; the info
 and card panels are display-only. Result rows are colored (titles
@@ -2747,7 +2748,8 @@ lists the top GGUF repos by the current sort (the placeholder reads
      StatusReady-green, "from" Muted, base Subtle; **name-derived** —
      the search API has no params field, so `paramCountOf` regexes the
      `8B`-style suffix out of the base-model/repo id, a flagged display
-     heuristic); a separator; `⬇ N downloads` (count green) and
+     heuristic); a blank line (owner round: the `─` separator is an
+     empty line now); `⬇ N downloads` (count green) and
      `♥ N likes` (count accent); `⚖ license: <id>` and
      `▷ task: <pipeline_tag>` (label Muted, value Subtle); a
      **⚠ non-commercial license — check terms** warning for `cc-by-nc*`
@@ -2763,9 +2765,18 @@ lists the top GGUF repos by the current sort (the placeholder reads
   3. **model card** — the README text, fetched alongside the quants
      (new `hf.Client.Card` — `GET {endpoint}/{repo}/raw/main/README.md`,
      the §16.6 async discipline with its own gen/cancel; YAML
-     frontmatter trimmed), windowed and scrollable (`pgup`/`pgdown` in
-     the quants zone). Friendly non-blocking states: `loading card…`,
-     `no model card` (404), `could not load model card` (other).
+     frontmatter trimmed), then **rendered from markdown to styled
+     lines** (owner round: `internal/tui/markdown.go` — goldmark
+     v1.7.11 + GFM, a custom `cardRenderer` emits lipgloss-styled text
+     instead of HTML: headings accent-bold, strong bold, emphasis
+     italic, code Muted, links accent-underline, list items bulleted,
+     blockquotes quoted, code blocks Muted, tables cell-separated; raw
+     HTML skipped; blank lines dropped for panel density). Windowed and
+     scrollable (`pgup`/`pgdown` in the quants zone) with a
+     **scroll indicator** — `NN% ▰▱▱▱▱▱▱▱▱▱`, a 10-dot bar filling as
+     you scroll (owner round; replaces the earlier ▴/▾ text markers).
+     Friendly non-blocking states: `loading card…`, `no model card`
+     (404), `could not load model card` (other).
 - **focusQuants** — the quant list with its own cursor (↑/↓); `enter`
   on a quant opens the **hand-off dialog** (below); a repo with no
   GGUF quants shows a `use org/repo without a quant` row that hands
