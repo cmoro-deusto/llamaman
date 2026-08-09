@@ -2690,26 +2690,32 @@ popup):
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Layout — three zones; the pane follows the cursor.** The model-info
-+ quants pane **auto-updates as the results are navigated** (owner
-flow): moving in the results list re-renders the right pane instantly
-from the search response and fires one gen-guarded `tree/main` fetch
-for the quants — no enter needed on a result, so enter is free for
-selecting a quant. The search box, the results, and the model info each
-live in their own thin rounded rectangle; the sort indicator sits at
-the top right of the search box with the input width reserved so it
-never overlaps the border, and the value is accent-bold with a friendly
-label (owner round: the sort cycle mirrors the HF site's Models
-ranking — **downloads → likes → trending → newest → updated**, i.e.
-`downloads`, `likes`, `trendingScore`, `createdAt`, `lastModified`, all
-verified server-side). The `search: ` prompt is accent-bold. **The
-search bar is part of the tab cycle** (owner round): tab cycles search
-→ results → quants → search; esc still backs out one step. Result rows
-are colored (titles Subtle, descriptions Muted, selection accent-bold
-on reversed background); the quant rows show the size in Muted and a
-green `● cached` badge. **Browsing without a search term works** — an
-empty query lists the top GGUF repos by the current sort (the
-placeholder reads `search Hugging Face… (empty = browse)`).
+**Layout — three zones; the panes follow the cursor.** The model-info
++ quants + card panes **auto-update as the results are navigated**
+(owner flow): moving in the results list re-renders the right column
+instantly from the search response and fires one gen-guarded
+`tree/main` fetch (quants) plus a `raw/main/README.md` fetch (card) in
+the background — no enter needed on a result, so enter is free for
+selecting a quant. **All panels carry their title embedded in the top
+border line** (`╭─ search ─…`, `╭─ results (N) ─…`, `╭─ model info ─…`,
+`╭─ quants (N) ─…`, `╭─ model card ─…`), drawn manually (`titledBoxLines`
+— lipgloss `Width()` wraps long lines instead of truncating, which
+previously pushed boxes past their allocation; `truncatePad` clamps
+content). The sort indicator sits at the top right of the search
+panel with the input width reserved so it never overlaps the border,
+and the value is accent-bold with a friendly label. **The default sort
+is `trendingScore`** (owner round — browse *and* search start at
+"trending", HF-site parity); the **`s` key** (owner round: renamed from
+`t`) cycles trending → downloads → likes → newest → updated. The
+`search: ` prompt is accent-bold. **The search bar is part of the tab
+cycle**: tab cycles search → results → quants → search; esc still backs
+out one step. **The focused panel's border lights up** (`BorderFocus`,
+the router-mode pattern) — search / results / quants panels; the info
+and card panels are display-only. Result rows are colored (titles
+Subtle, descriptions Muted, selection accent-bold on reversed
+background). **Browsing without a search term works** — an empty query
+lists the top GGUF repos by the current sort (the placeholder reads
+`search Hugging Face… (empty = browse)`).
 
 - **focusSearch** — a `bubbles/textinput` line inside its thin box
   (accent-bold `search: ` prompt). Typing goes to it; `enter` runs the
@@ -2731,26 +2737,35 @@ placeholder reads `search Hugging Face… (empty = browse)`).
   **background** — no full-screen shield (that would flicker during
   fast navigation): the pane shows an inline `loading quants…` line and
   a superseded fetch is cancelled and gen-dropped. `esc` returns to
-  focusSearch. In this zone **`t` cycles sort downloads → likes →
-  trending → newest → updated** (re-runs the same query, same gen
-  guard) and `l`/`L`/`k`/`m` open the filters (below).
-- **Model info + quants pane** (right box, follows the results
-  cursor), colored throughout (owner round): repo name (accent bold);
-  a **params line** — `8B params · from <base_model>` (the param count
-  in StatusReady-green, "from" Muted, base Subtle) when a
-  `base_model:quantized:<id>` tag is present (answers "what is this
-  repo actually?"; the count is **name-derived** — the search API has
-  no params field, so `paramCountOf` regexes the `8B`-style suffix out
-  of the base-model id / repo id, a flagged display heuristic); a
-  separator; `⬇ N downloads` (count green) and `♥ N likes` (count
-  accent); `⚖ license: <id>` and `▷ task: <pipeline_tag>` (label
-  Muted, value Subtle — icons match the ⬇/♥ style, owner round); a
-  **⚠ non-commercial license — check terms** warning for `cc-by-nc*`
-  (P3: display only); another separator; then the quant list — rows
-  `Tag — hf.HumanSize(Size)` with the size in Muted (owner round, like
-  the result descriptions) plus the green `● cached` badge when
-  `storage.Lookup(root, repo)` marks it (the storage.go:764–769 logic)
-  and the mmproj informational line (`hf.HasMMProj`).
+  focusSearch. In this zone **`s` cycles sort trending → downloads →
+  likes → newest → updated** (re-runs the same query, same gen guard)
+  and `l`/`L`/`k`/`m` open the filters (below).
+- **Right column — three titled panels** (owner round), stacking to the
+  results height so the column bottom-aligns:
+  1. **model info** (content-sized) — repo name (accent bold); the
+     **params line** `8B params · from <base_model>` (count
+     StatusReady-green, "from" Muted, base Subtle; **name-derived** —
+     the search API has no params field, so `paramCountOf` regexes the
+     `8B`-style suffix out of the base-model/repo id, a flagged display
+     heuristic); a separator; `⬇ N downloads` (count green) and
+     `♥ N likes` (count accent); `⚖ license: <id>` and
+     `▷ task: <pipeline_tag>` (label Muted, value Subtle); a
+     **⚠ non-commercial license — check terms** warning for `cc-by-nc*`
+     (P3: display only).
+  2. **quants (N)** — the quant list, **windowed and scrollable**
+     (standard list behavior: the cursor stays visible, `▴`/`▾ more`
+     mark overflow, so any number of quants fit); rows
+     `Tag — hf.HumanSize(Size)` with the size in Muted plus the green
+     `● cached` badge when `storage.Lookup(root, repo)` marks it (the
+     storage.go:764–769 logic) and the mmproj informational line. This
+     panel is the tab focus target of the quants zone: ↑/↓ select a
+     quant, enter opens the hand-off dialog.
+  3. **model card** — the README text, fetched alongside the quants
+     (new `hf.Client.Card` — `GET {endpoint}/{repo}/raw/main/README.md`,
+     the §16.6 async discipline with its own gen/cancel; YAML
+     frontmatter trimmed), windowed and scrollable (`pgup`/`pgdown` in
+     the quants zone). Friendly non-blocking states: `loading card…`,
+     `no model card` (404), `could not load model card` (other).
 - **focusQuants** — the quant list with its own cursor (↑/↓); `enter`
   on a quant opens the **hand-off dialog** (below); a repo with no
   GGUF quants shows a `use org/repo without a quant` row that hands
@@ -2865,13 +2880,13 @@ cancel is dropped (cancel-then-complete race).
   list; malformed JSON → error.
 - Browser flow tests with a **stub runner** (the stubSpawner pattern,
   `SetBrowserRunner`): type query → enter → results render and the
-  **pane auto-follows the first hit** (no enter on a result);
-  navigating with ↓ auto-updates the pane (metadata instantly, quants
-  async, superseded fetches cancelled/gen-dropped) with `(cached)`
-  markers (fake hub cache trees via `storage.Lookup`, the scan_test
-  fixture style) + mmproj note + the `● cached` badge; tab → quants →
-  enter on a quant → hand-off dialog → **add to config** yields
-  `browserConfigHandoffMsg{org/repo:QUANT}` and Root's arm opens
+  **panes auto-follow the first hit** (no enter on a result);
+  navigating with ↓ auto-updates the right column (metadata instantly,
+  quants + card async, superseded fetches cancelled/gen-dropped) with
+  `(cached)` markers (fake hub cache trees via `storage.Lookup`, the
+  scan_test fixture style) + mmproj note + the `● cached` badge; tab →
+  quants → enter on a quant → hand-off dialog → **add to config**
+  yields `browserConfigHandoffMsg{org/repo:QUANT}` and Root's arm opens
   ConfigMode with the new-model form pre-filled source=hf,
   hf=`org/repo:QUANT` (assert the form's staging, and that no
   `hfCheckRequestedMsg` fires — pre-filled, not typed); **download
@@ -2879,16 +2894,21 @@ cancel is dropped (cancel-then-complete race).
   Storage manager with a running download row for the split repo/quant
   (stub engine); esc paths at every zone and the dialog; the search
   shield renders static text and its esc bumps the gen (cancel-then-
-  complete race); gen-mismatch drop (stale search and stale quant
-  msgs); the no-quant bare hand-off row; sort cycle re-runs the search
-  with the new sort; **per-rune typing regression** (keystrokes arrive
-  one rune at a time — "mistral" must type, t/l/L must not hijack the
-  input); **`l`/`L` tag filters** — the picker opens, picking
-  `ja` re-runs the search with `Filter: ["ja"]`, picking a license
-  appends `license:<id>`, both combine in one request, `all languages`/
-  `any license` clear, esc dismisses without changing, header shows the
-  active filters; **metadata pane** — stub results with
-  `base_model:quantized:<id>` render the
+  complete race); gen-mismatch drop (stale search, quant, and card
+  msgs); the no-quant bare hand-off row; the sort cycle (s key,
+  trending default) re-runs the search; **card panel** — README text
+  rendered frontmatter-trimmed, 404 → `no model card`, pgup/pgdown
+  scroll with ▴/▾ indicators; **quants window** — the panel windows
+  its rows with a `▾ more` marker and the window follows the cursor;
+  **width-fit regression** — no rendered line may exceed the terminal
+  width (the lipgloss Width-wrap bug); **per-rune typing regression**
+  (keystrokes arrive one rune at a time — "mistral" must type, s/l/L
+  must not hijack the input); **`l`/`L` tag filters** — the picker
+  opens, picking `ja` re-runs the search with `Filter: ["ja"]`,
+  picking a license appends `license:<id>`, both combine in one
+  request, `all languages`/`any license` clear, esc dismisses without
+  changing, header shows the active filters; **metadata pane** — stub
+  results with `base_model:quantized:<id>` render the
   `quantized from` line, `license:cc-by-nc-4.0` renders the
   non-commercial warning, language codes render in the pane and the
   result row; runner nil → search flash, no crash.
