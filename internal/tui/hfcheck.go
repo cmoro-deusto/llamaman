@@ -127,6 +127,19 @@ func formWidthFor(width int) int {
 	return max(60, min(width-12, 160))
 }
 
+// quantRowLabel renders one quant row exactly as the shared chooser
+// shows it — Tag — human size, plus " (cached)" when the quant is
+// already on disk. It is the single label source for the quant chooser
+// and the HF browser's quant pane, so both surfaces always agree (the
+// "same helpers" rule).
+func quantRowLabel(q hf.QuantOption, cached bool) string {
+	label := fmt.Sprintf("%s — %s", q.Tag, hf.HumanSize(q.Size))
+	if cached {
+		label += " (cached)"
+	}
+	return label
+}
+
 // quantChooserForm builds the shared quant chooser (DESIGN §16.3 data,
 // §16.4 UI shape): one row per quant — Tag — human size, with a
 // (cached) marker for quants already on disk. note is an extra
@@ -140,11 +153,7 @@ func formWidthFor(width int) int {
 func quantChooserForm(repo string, opts []hf.QuantOption, cached map[string]bool, note string, value *string, maxRows int) *huh.Form {
 	choices := make([]huh.Option[string], 0, len(opts))
 	for _, q := range opts {
-		label := fmt.Sprintf("%s — %s", q.Tag, hf.HumanSize(q.Size))
-		if cached[q.Tag] {
-			label += " (cached)"
-		}
-		choices = append(choices, huh.NewOption(label, q.Tag))
+		choices = append(choices, huh.NewOption(quantRowLabel(q, cached[q.Tag]), q.Tag))
 	}
 	desc := repo
 	if note != "" {

@@ -25,6 +25,7 @@ const (
 	ViewFirstRun
 	ViewSettings
 	ViewStorage
+	ViewBrowser
 )
 
 // SpawnRequestMsg asks the root to spawn llama-server for (Model, Preset)
@@ -87,6 +88,7 @@ type Root struct {
 	settings  *SettingsMode
 	storage   *StorageMode
 	dlEngine  downloadEngine
+	browser   *BrowserMode
 
 	// initialRun, if non-nil, makes the program jump straight to run mode
 	// on Init() (used both for `llamaman <alias>` and for reattach).
@@ -181,6 +183,9 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if r.storage != nil {
 			r.storage.SetSize(msg.Width, msg.Height)
 		}
+		if r.browser != nil {
+			r.browser.SetSize(msg.Width, msg.Height)
+		}
 		return r, nil
 
 	case FirstRunCompletedMsg:
@@ -252,6 +257,17 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		r.refreshDlStatusLine()
 		return r, r.armDlMainTick()
 
+	case returnFromBrowserMsg:
+		r.view = ViewMain
+		r.refreshDlStatusLine() // a download may be running while browsing
+		return r, nil
+
+	case browserConfigHandoffMsg:
+		return r.openConfig(configEntry{openNewModel: true, prefillHF: msg.id})
+
+	case browserDownloadHandoffMsg:
+		return r.handleBrowserDownloadHandoff(msg)
+
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" && r.view != ViewRun && r.view != ViewConfig {
 			r.quitting = true
@@ -290,6 +306,8 @@ func (r *Root) routeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return r.openConfig(configEntry{focus: FocusModels})
 		case "s":
 			return r.openStorage()
+		case "b":
+			return r.openBrowser()
 		case "p":
 			return r.openSettings()
 		case "t":
@@ -338,6 +356,13 @@ func (r *Root) routeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		next, cmd := r.storage.Update(msg)
 		r.storage = next
 		return r, cmd
+	case ViewBrowser:
+		if r.browser == nil {
+			return r, nil
+		}
+		next, cmd := r.browser.Update(msg)
+		r.browser = next
+		return r, cmd
 	case ViewFirstRun:
 		if r.firstRun == nil {
 			return r, nil
@@ -378,6 +403,13 @@ func (r *Root) forward(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		next, cmd := r.storage.Update(msg)
 		r.storage = next
+		return r, cmd
+	case ViewBrowser:
+		if r.browser == nil {
+			return r, nil
+		}
+		next, cmd := r.browser.Update(msg)
+		r.browser = next
 		return r, cmd
 	case ViewFirstRun:
 		if r.firstRun == nil {
@@ -452,12 +484,14 @@ type configEntry struct {
 	focusPreset  string
 	focus        ConfigFocus
 	openNewModel bool
+	prefillHF    string // §16.7 browser hand-off: seeds the new-model form's HF id
 }
 
 func (r *Root) openConfig(entry configEntry) (tea.Model, tea.Cmd) {
 	cm := NewConfigMode(r.cfgPath, r.cfg, r.theme)
 	cm.SetRegistry(r.registry)
 	cm.SetHFCheckRunner(r.hfCheckRunner())
+	cm.prefillHF = entry.prefillHF
 	cm.SetSize(r.width, r.height)
 	if entry.focusAlias != "" {
 		for i, m := range r.cfg.Models {
@@ -555,6 +589,61 @@ func (r *Root) hfCheckRunner() hfCheckRunner {
 		return hfCheckClient{c}
 	}
 	return nil
+}
+
+// browserRunner returns the §16.7 browser runner (search + repo check):
+// the same lazy, nil-safe pattern as hfCheckRunner.
+func (r *Root) browserRunner() browserRunner {
+	if c, err := hf.New(); err == nil {
+		return browserClient{c}
+	}
+	return nil
+}
+
+// openBrowser switches to the HF browser. A live browser is reused —
+// leaving with Esc keeps the query, results, and loaded quants, and
+// re-entering shows them again (the §16.4 re-entry discipline).
+func (r *Root) openBrowser() (tea.Model, tea.Cmd) {
+	if r.cfg == nil {
+		return r, nil
+	}
+	if r.browser == nil {
+		root, err := storage.CacheRoot(r.cfg.Prefs().ModelsDir)
+		if err != nil {
+			root = "" // (cached) markers disabled (P3 — never a block)
+		}
+		b := NewBrowserMode(r.theme, root)
+		b.SetBrowserRunner(r.browserRunner())
+		r.browser = &b
+	}
+	r.browser.SetSize(r.width, r.height)
+	r.browser.flash = "" // no stale announcements on re-entry
+	r.mainMode.SetStatusLine("")
+	r.view = ViewBrowser
+	return r, nil
+}
+
+// handleBrowserDownloadHandoff lands a browser hand-off in the Storage
+// manager: downloads stay in the manager — the single place downloads
+// are managed (§16.4) — so Root reopens it and starts the download
+// there (a quant is always present: bare ids never offer download).
+func (r *Root) handleBrowserDownloadHandoff(msg browserDownloadHandoffMsg) (tea.Model, tea.Cmd) {
+	if r.cfg == nil {
+		return r, nil
+	}
+	if _, _ = r.openStorage(); r.storage == nil {
+		return r, nil
+	}
+	repo, quant := splitRepoQuant(msg.id)
+	if quant == "" {
+		r.storage.flash = "download needs a quant — pick one in the browser"
+		return r, r.storage.tickCmd()
+	}
+	r.storage.flash = ""
+	r.storage.startDownload(repo, quant)
+	r.storage.rebuild()
+	r.storage.focusDownloadRow()
+	return r, r.storage.tickCmd()
 }
 
 // openStorage switches to the Storage & Downloads manager. A live
@@ -753,6 +842,11 @@ func (r *Root) View() string {
 			return ""
 		}
 		return r.storage.View()
+	case ViewBrowser:
+		if r.browser == nil {
+			return ""
+		}
+		return r.browser.View()
 	case ViewFirstRun:
 		if r.firstRun == nil {
 			return ""

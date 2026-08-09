@@ -550,6 +550,7 @@ func (m MainMode) renderShortcuts() string {
 			shortcut("a", "attach", m.theme),
 			shortcut("c", "configure", m.theme),
 			shortcut("s", "storage", m.theme),
+			shortcut("b", "browse", m.theme),
 			shortcut("p", "preferences", m.theme),
 			shortcut("?", "help", m.theme),
 			shortcut("q", "quit", m.theme),
@@ -569,6 +570,7 @@ func (m MainMode) renderShortcuts() string {
 	parts = append(parts, shortcut("tab", modeLabel, m.theme))
 	parts = append(parts, shortcut("c", "configure", m.theme))
 	parts = append(parts, shortcut("s", "storage", m.theme))
+	parts = append(parts, shortcut("b", "browse", m.theme))
 	parts = append(parts, shortcut("p", "preferences", m.theme))
 	parts = append(parts, shortcut("t", "theme", m.theme))
 	parts = append(parts, shortcut("?", "help", m.theme))
@@ -658,6 +660,7 @@ func (m MainMode) renderHelp() string {
 		"Esc         back out of preset pivot",
 		"c           open configuration mode",
 		"s           open storage manager (cache, downloads)",
+		"b           open Hugging Face browser (search, filters)",
 		"p           open preferences (theme, animations, models-dir)",
 		"t / Shift+t cycle theme (forward / backward)",
 		"a           attach to running session (only when one exists)",

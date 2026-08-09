@@ -108,6 +108,7 @@ type ConfigMode struct {
 	modelPicker *modelPicker // picker overlay for the model form's location/hf inputs
 	locField    *pickerInput // picker-assisted location input, for post-pick refresh
 	hfField     *pickerInput // picker-assisted HF input, for post-pick refresh
+	prefillHF   string       // §16.7 browser hand-off: consumed by openNewModelForm
 
 	// §16.6 typed-repo check + quant offer (ROADMAP §3.8 step B).
 	hfRunner   hfCheckRunner // nil disables the check (P3: the form advances as before)
@@ -844,6 +845,14 @@ func (c *ConfigMode) openExportIniForm() tea.Cmd {
 func (c *ConfigMode) openNewModelForm() tea.Cmd {
 	alias, location, hf := "", "", ""
 	source := sourceLocal
+	if c.prefillHF != "" {
+		// Browser hand-off (§16.7): open on the HF branch with the id
+		// pre-filled. The pre-fill is staging, not a typed edit, so the
+		// §16.6 check correctly does not fire (edited stays false).
+		source = sourceHF
+		hf = c.prefillHF
+		c.prefillHF = "" // consumed
+	}
 	// A fresh form action supersedes any stale flash; the only flash
 	// that may be pending at submit is the §16.6 check's (applyForm
 	// preserves exactly that one).
