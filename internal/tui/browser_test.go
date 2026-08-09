@@ -79,9 +79,9 @@ func TestBrowserOpensFromMain(t *testing.T) {
 	for _, want := range []string{
 		"browse — Hugging Face",
 		"search:",
-		"sort: downloads",
+		"sort:",
 		"enter a query and press enter",
-		"l/L filter",
+		"enter search", // the search-zone footer
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("browser view missing %q\nout:\n%s", want, out)
@@ -95,7 +95,7 @@ func TestBrowserOpensFromMain(t *testing.T) {
 
 // TestBrowserSearchFlow: typing reaches the input (every printable
 // key), enter runs the search, results render with metadata, and the
-// zone lands on the results.
+// pane auto-follows the first hit (no enter needed).
 func TestBrowserSearchFlow(t *testing.T) {
 	stub := &stubBrowserRunner{results: browserTestResults()}
 	r, b := openBrowserRoot(t, stub)
@@ -113,6 +113,10 @@ func TestBrowserSearchFlow(t *testing.T) {
 	if stub.searchCalls[0].Filter != nil {
 		t.Errorf("filter = %v, want none", stub.searchCalls[0].Filter)
 	}
+	// The pane follows the first hit automatically.
+	if len(stub.checkCalls) != 1 || stub.checkCalls[0] != "org/one" {
+		t.Errorf("auto-fetch calls = %v, want [org/one]", stub.checkCalls)
+	}
 	out := stripANSI(b.View())
 	for _, want := range []string{
 		"org/one",
@@ -121,6 +125,7 @@ func TestBrowserSearchFlow(t *testing.T) {
 		"17 likes",
 		"license: llama3.1",
 		"en ja",
+		"results (2)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("results view missing %q\nout:\n%s", want, out)
@@ -128,38 +133,41 @@ func TestBrowserSearchFlow(t *testing.T) {
 	}
 }
 
-// TestBrowserMetadataPane: the pane shows license, task, languages,
-// "quantized from <base_model>", and the non-commercial warning.
+// TestBrowserMetadataPane: navigating the results auto-updates the
+// info pane — repo name, from <base_model>, downloads, likes, license,
+// task, and the non-commercial warning for cc-by-nc repos.
 func TestBrowserMetadataPane(t *testing.T) {
 	stub := &stubBrowserRunner{results: browserTestResults()}
 	r, b := openBrowserRoot(t, stub)
-	searchDrive(t, r, "q")
-	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // select org/one
+	searchDrive(t, r, "q") // auto-selects org/one
 
 	out := stripANSI(b.View())
 	for _, want := range []string{
 		"org/one",
-		"license: llama3.1 · task: text-generation",
-		"languages: en ja",
 		"from meta-llama/Llama-3.1-8B-Instruct",
+		"⬇ 743.5k downloads",
+		"♥ 17 likes",
+		"license: llama3.1",
+		"task: text-generation",
 	} {
 		if !strings.Contains(out, want) {
-			t.Errorf("metadata pane missing %q\nout:\n%s", want, out)
+			t.Errorf("info pane missing %q\nout:\n%s", want, out)
 		}
 	}
 	if strings.Contains(out, "non-commercial license") {
 		t.Error("org/one is llama3.1-licensed; no non-commercial warning expected")
 	}
 
-	// org/nc: cc-by-nc-4.0 → the warning, and no base_model line.
-	// Back to the results list first (enter lands in the quants zone).
-	driveRoot(t, r, keyMsg("esc"), // zoneQuants → zoneResults
-		tea.KeyMsg{Type: tea.KeyDown}, // → org/nc
-		tea.KeyMsg{Type: tea.KeyEnter})
+	// ↓ → org/nc: the pane follows; cc-by-nc-4.0 → the warning, and no
+	// base_model line.
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyDown})
+	if b.selected == nil || b.selected.ID != "org/nc" {
+		t.Fatalf("selected = %v, want org/nc", b.selected)
+	}
 	out2 := stripANSI(b.View())
 	for _, want := range []string{"org/nc", "⚠ non-commercial license — check terms"} {
 		if !strings.Contains(out2, want) {
-			t.Errorf("metadata pane missing %q\nout:\n%s", want, out2)
+			t.Errorf("info pane missing %q\nout:\n%s", want, out2)
 		}
 	}
 	if strings.Contains(out2, "from ") {
@@ -167,8 +175,9 @@ func TestBrowserMetadataPane(t *testing.T) {
 	}
 }
 
-// TestBrowserQuantPane: selecting a repo fetches quants with real
-// sizes, (cached) markers from the cache reader, and the mmproj note.
+// TestBrowserQuantPane: selecting a repo (auto-fetch) shows quants
+// with real sizes, the ● cached badge from the cache reader, and the
+// mmproj note.
 func TestBrowserQuantPane(t *testing.T) {
 	stub := &stubBrowserRunner{
 		results: []hf.SearchResult{{ID: "org/cachedrepo", Tags: []string{"gguf", "en"}}},
@@ -176,11 +185,10 @@ func TestBrowserQuantPane(t *testing.T) {
 		mmproj:  true,
 	}
 	r, b := openBrowserRoot(t, stub)
-	searchDrive(t, r, "q")
-	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // select org/cachedrepo
+	searchDrive(t, r, "q") // auto-selects org/cachedrepo
 
-	if b.zone != zoneQuants {
-		t.Errorf("zone = %v, want zoneQuants", b.zone)
+	if !b.quantsLoaded || len(b.quants) != 2 {
+		t.Fatalf("quantsLoaded = %v quants = %v", b.quantsLoaded, b.quants)
 	}
 	if len(stub.checkCalls) != 1 || stub.checkCalls[0] != "org/cachedrepo" {
 		t.Fatalf("check calls = %v", stub.checkCalls)
@@ -188,7 +196,8 @@ func TestBrowserQuantPane(t *testing.T) {
 	out := stripANSI(b.View())
 	for _, want := range []string{
 		"org/cachedrepo",
-		"Q4_K_M — 5 GiB (cached)", // the storageTestConfig fixture
+		"Q4_K_M — 5 GiB",
+		"● cached", // the fancy badge (storageTestConfig fixture)
 		"Q8_0 — 10 GiB",
 		"mmproj present — llama.cpp auto-downloads it",
 	} {
@@ -198,17 +207,18 @@ func TestBrowserQuantPane(t *testing.T) {
 	}
 }
 
-// TestBrowserHandoffToConfig: enter on a quant → dialog → "add to
-// config" opens the new-model form pre-filled source=hf with
-// org/repo:QUANT (staging, so the §16.6 check must not fire).
+// TestBrowserHandoffToConfig: tab into the quants pane, enter on a
+// quant → dialog → "add to config" opens the new-model form
+// pre-filled source=hf with org/repo:QUANT (staging, so the §16.6
+// check must not fire).
 func TestBrowserHandoffToConfig(t *testing.T) {
 	stub := &stubBrowserRunner{
 		results: []hf.SearchResult{{ID: "org/cachedrepo", Tags: []string{"gguf"}}},
 		opts:    []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}},
 	}
 	r, _ := openBrowserRoot(t, stub)
-	searchDrive(t, r, "q")
-	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // select → quants
+	searchDrive(t, r, "q")                          // auto-selects org/cachedrepo
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyTab})   // → quants pane
 	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // Q4_K_M → hand-off dialog
 	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // "add to config" (first option)
 
@@ -235,7 +245,7 @@ func TestBrowserHandoffToDownload(t *testing.T) {
 	r, _ := openBrowserRoot(t, stub)
 	r.SetDownloadEngine(eng)
 	searchDrive(t, r, "q")
-	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // select → quants
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyTab})   // → quants pane
 	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // quant → dialog
 	driveRoot(t, r,
 		tea.KeyMsg{Type: tea.KeyDown}, // "download now"
@@ -264,8 +274,7 @@ func TestBrowserHandoffToDownload(t *testing.T) {
 func TestBrowserNoQuantRow(t *testing.T) {
 	stub := &stubBrowserRunner{results: []hf.SearchResult{{ID: "org/empty", Tags: []string{"gguf"}}}}
 	r, b := openBrowserRoot(t, stub)
-	searchDrive(t, r, "q")
-	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // select → quants (empty)
+	searchDrive(t, r, "q") // auto-selects org/empty → empty quants
 
 	if !b.quantsLoaded || len(b.quants) != 0 {
 		t.Fatalf("quantsLoaded = %v quants = %v, want loaded with none", b.quantsLoaded, b.quants)
@@ -273,6 +282,7 @@ func TestBrowserNoQuantRow(t *testing.T) {
 	if out := stripANSI(b.View()); !strings.Contains(out, "use org/empty without a quant") {
 		t.Errorf("bare row missing\nout:\n%s", out)
 	}
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyTab})   // → quants pane
 	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // bare row → dialog
 	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // "add to config"
 
@@ -375,16 +385,19 @@ func TestBrowserSearchError(t *testing.T) {
 }
 
 // TestBrowserQuantError: a failed quant fetch flashes the distinct
-// message and still offers the bare-id hand-off.
+// message and still offers the bare-id hand-off; the zone stays on the
+// results (the pane follows the cursor in the background).
 func TestBrowserQuantError(t *testing.T) {
 	stub := &stubBrowserRunner{
 		results:  []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
 		checkErr: &hf.Error{Kind: hf.ErrNotFound},
 	}
 	r, b := openBrowserRoot(t, stub)
-	searchDrive(t, r, "q")
-	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // select → quants (failed)
+	searchDrive(t, r, "q") // auto-selects org/one → fetch fails
 
+	if b.zone != zoneResults {
+		t.Errorf("zone = %v, want zoneResults (auto-fetch is background)", b.zone)
+	}
 	out := stripANSI(b.View())
 	if !strings.Contains(out, "org/one: not found on Hugging Face") {
 		t.Errorf("missing failure message\nout:\n%s", out)
@@ -483,8 +496,8 @@ func TestBrowserTagFilterEscDismisses(t *testing.T) {
 	}
 }
 
-// TestBrowserTabCyclesZones: tab cycles search → results → quants and
-// back; shift+tab reverses.
+// TestBrowserTabCyclesZones: tab toggles the results/quants pair;
+// from the search box either direction lands on the results.
 func TestBrowserTabCyclesZones(t *testing.T) {
 	_, b := openBrowserRoot(t, &stubBrowserRunner{})
 	if b.zone != zoneSearch {
@@ -493,16 +506,21 @@ func TestBrowserTabCyclesZones(t *testing.T) {
 	next, _ := b.Update(tea.KeyMsg{Type: tea.KeyTab})
 	b = next
 	if b.zone != zoneResults {
-		t.Errorf("tab → zone = %v, want zoneResults", b.zone)
+		t.Errorf("tab (search) → zone = %v, want zoneResults", b.zone)
 	}
 	next, _ = b.Update(tea.KeyMsg{Type: tea.KeyTab})
 	b = next
 	if b.zone != zoneQuants {
-		t.Errorf("tab → zone = %v, want zoneQuants", b.zone)
+		t.Errorf("tab (results) → zone = %v, want zoneQuants", b.zone)
+	}
+	next, _ = b.Update(tea.KeyMsg{Type: tea.KeyTab})
+	b = next
+	if b.zone != zoneResults {
+		t.Errorf("tab (quants) → zone = %v, want zoneResults", b.zone)
 	}
 	next, _ = b.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
 	b = next
-	if b.zone != zoneResults {
-		t.Errorf("shift+tab → zone = %v, want zoneResults", b.zone)
+	if b.zone != zoneSearch {
+		t.Errorf("shift+tab (results) → zone = %v, want zoneSearch", b.zone)
 	}
 }

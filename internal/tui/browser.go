@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -106,7 +107,11 @@ func (a browserClient) CheckHF(ctx context.Context, repo string) ([]hf.QuantOpti
 	return hfCheckClient{a.c}.CheckHF(ctx, repo)
 }
 
-// BrowserMode is the search/browse screen.
+// BrowserMode is the search/browse screen. The model-info + quant
+// pane follows the results cursor automatically (owner flow):
+// navigating the results list updates the right pane, so enter on a
+// result is not needed — tab moves into the quants pane where enter
+// hands the picked quant off.
 type BrowserMode struct {
 	runner browserRunner
 	root   string // cache root for (cached) markers; "" disables them
@@ -125,16 +130,18 @@ type BrowserMode struct {
 	results list.Model // zone results
 	zone    browserZone
 
-	selected     *hf.SearchResult // repo whose quants are shown
-	quants       []hf.QuantOption
-	cached       map[string]bool
-	mmproj       bool
-	quantsLoaded bool
-	quantIdx     int
+	selected      *hf.SearchResult // repo whose quants are shown
+	quants        []hf.QuantOption
+	cached        map[string]bool
+	mmproj        bool
+	quantsLoaded  bool
+	quantsLoading bool // a fetch is in flight (inline "loading quants…")
+	quantIdx      int
 
-	searchGen int
-	quantGen  int
-	shield    *browserShield
+	searchGen   int
+	quantGen    int
+	quantCancel context.CancelFunc // superseded/cancelled on navigation
+	shield      *browserShield     // search only — the full-screen popup
 
 	handoff    *huh.Form
 	handoffID  string
@@ -160,7 +167,7 @@ func NewBrowserMode(theme Theme, root string) BrowserMode {
 		root:    root,
 		theme:   theme,
 		input:   in,
-		results: newResultList(nil),
+		results: newResultList(nil, theme),
 		zone:    zoneSearch,
 	}
 }
@@ -303,14 +310,19 @@ func (s *BrowserMode) handleSearchDone(msg browserSearchDoneMsg) (*BrowserMode, 
 		s.flash = browserFlash(msg.err)
 		return s, nil
 	}
-	s.results = newResultList(resultItems(msg.results))
+	s.results = newResultList(resultItems(msg.results), s.theme)
 	s.selected = nil
 	s.quants = nil
 	s.cached = nil
 	s.mmproj = false
 	s.quantsLoaded = false
+	s.quantsLoading = false
 	s.quantIdx = 0
 	s.zone = zoneResults
+	if len(msg.results) > 0 {
+		// The pane follows the first hit immediately — no enter needed.
+		return s.runQuantFetch(msg.results[0])
+	}
 	return s, nil
 }
 
@@ -319,30 +331,35 @@ func (s *BrowserMode) handleSearchDone(msg browserSearchDoneMsg) (*BrowserMode, 
 func (s *BrowserMode) updateResults(msg tea.Msg) (*BrowserMode, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok {
 		switch k.String() {
-		case "enter":
-			item, ok := s.results.SelectedItem().(resultItem)
-			if !ok {
-				return s, nil
-			}
-			return s.runQuantFetch(item.res)
 		case "l":
 			return s.openTagFilter("lang")
 		case "L":
 			return s.openTagFilter("lic")
 		case "t":
-			// The footer's "t sort" also works from the results zone —
-			// the search box owns typing only while it is focused.
+			// The footer's "t sort" works from the results zone — the
+			// search box owns typing only while it is focused.
 			s.sort = nextSort(s.sort)
 			return s.runSearch()
 		}
 	}
+	before := s.results.Index()
 	var cmd tea.Cmd
 	s.results, cmd = s.results.Update(msg)
+	if s.results.Index() != before {
+		// Seamless: navigating updates the right pane (metadata from
+		// the search response, quants async). Stale fetches are
+		// cancelled and gen-dropped, so fast navigation is safe.
+		if item, ok := s.results.SelectedItem().(resultItem); ok {
+			return s.runQuantFetch(item.res)
+		}
+	}
 	return s, cmd
 }
 
 // runQuantFetch loads the quants for the selected repo: one tree/main
-// round trip, gen-guarded, shield + esc-cancel (the §16.6 discipline).
+// round trip, gen-guarded and cancellable. Background by design — the
+// pane follows the results cursor, so there is no full-screen shield;
+// a superseded fetch is cancelled and its done msg gen-dropped.
 func (s *BrowserMode) runQuantFetch(res hf.SearchResult) (*BrowserMode, tea.Cmd) {
 	if s.runner == nil {
 		s.flash = "search unavailable"
@@ -353,11 +370,14 @@ func (s *BrowserMode) runQuantFetch(res hf.SearchResult) (*BrowserMode, tea.Cmd)
 	s.cached = nil
 	s.mmproj = false
 	s.quantsLoaded = false
-	s.quantIdx = 0
+	s.quantsLoading = true
+	if s.quantCancel != nil {
+		s.quantCancel() // superseded by the new selection
+	}
 	ctx, cancel := context.WithCancel(context.Background())
+	s.quantCancel = cancel
 	s.quantGen++
 	gen := s.quantGen
-	s.shield = &browserShield{kind: "quants", repo: res.ID, cancel: cancel}
 	return s, func() tea.Msg {
 		opts, mmproj, err := s.runner.CheckHF(ctx, res.ID)
 		return browserQuantsDoneMsg{repo: res.ID, gen: gen, opts: opts, mmproj: mmproj, err: err}
@@ -366,12 +386,13 @@ func (s *BrowserMode) runQuantFetch(res hf.SearchResult) (*BrowserMode, tea.Cmd)
 
 func (s *BrowserMode) handleQuantsDone(msg browserQuantsDoneMsg) (*BrowserMode, tea.Cmd) {
 	if msg.gen != s.quantGen {
-		return s, nil // stale — the user moved on
+		return s, nil // stale — a newer selection owns the pane
 	}
-	s.shield = nil
+	s.quantCancel = nil
+	s.quantsLoading = false
 	if msg.err != nil {
 		if errors.Is(msg.err, context.Canceled) {
-			return s, nil // esc — stay on the results
+			return s, nil // superseded/cancelled — pane keeps prior state
 		}
 		s.flash = hfCheckFlash(msg.repo, msg.err)
 		// Metadata-only state: the pane still offers the bare-id
@@ -379,7 +400,6 @@ func (s *BrowserMode) handleQuantsDone(msg browserQuantsDoneMsg) (*BrowserMode, 
 		s.quantsLoaded = true
 		s.quants = nil
 		s.mmproj = false
-		s.zone = zoneQuants
 		return s, nil
 	}
 	s.quants = msg.opts
@@ -394,7 +414,6 @@ func (s *BrowserMode) handleQuantsDone(msg browserQuantsDoneMsg) (*BrowserMode, 
 			s.cached[q.Tag] = true
 		}
 	}
-	s.zone = zoneQuants
 	return s, nil
 }
 
@@ -404,11 +423,8 @@ func (s *BrowserMode) updateQuants(msg tea.Msg) (*BrowserMode, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok {
 		switch k.String() {
 		case "enter":
-			if s.selected == nil {
-				return s, nil
-			}
-			if !s.quantsLoaded {
-				return s.runQuantFetch(*s.selected) // tabbed here pre-load
+			if s.selected == nil || !s.quantsLoaded {
+				return s, nil // still loading — nothing to hand off yet
 			}
 			if len(s.quants) > 0 {
 				q := s.quants[s.quantIdx]
@@ -540,11 +556,23 @@ func (s *BrowserMode) updateTagFilter(msg tea.Msg) (*BrowserMode, tea.Cmd) {
 
 // ---- misc helpers ----
 
+// cycleZone moves the focus. Tab toggles the results/quants pair (the
+// pane follows the cursor, so tab just picks which side you act on);
+// from the search box either direction lands on the results.
 func (s *BrowserMode) cycleZone(back bool) {
-	if back {
-		s.zone = (s.zone + 2) % 3
-	} else {
-		s.zone = (s.zone + 1) % 3
+	switch {
+	case !back && s.zone == zoneSearch:
+		s.zone = zoneResults
+	case !back && s.zone == zoneResults:
+		s.zone = zoneQuants
+	case !back: // zoneQuants
+		s.zone = zoneResults
+	case back && s.zone == zoneQuants:
+		s.zone = zoneResults
+	case back && s.zone == zoneResults:
+		s.zone = zoneSearch
+	default: // back && zoneSearch
+		s.zone = zoneResults
 	}
 }
 
@@ -609,15 +637,16 @@ func resultItems(results []hf.SearchResult) []list.Item {
 // newResultList builds the results list with the repoPicker chrome
 // (reverse-video selection, no title/filter/help chrome, arrows-only
 // keymap) — filtering stays in the search box, so list filtering is
-// disabled.
-func newResultList(items []list.Item) list.Model {
+// disabled. Colors (owner): titles in Subtle, descriptions in Muted,
+// the selected row accent-bold on the reversed background.
+func newResultList(items []list.Item, theme Theme) list.Model {
 	delegate := list.NewDefaultDelegate()
 	delegate.SetSpacing(0)
-	row := lipgloss.NewStyle().Padding(0, 0, 0, 2)
-	delegate.Styles.NormalTitle = row
-	delegate.Styles.NormalDesc = row
-	delegate.Styles.SelectedTitle = row.Reverse(true)
-	delegate.Styles.SelectedDesc = row.Reverse(true)
+	pad := lipgloss.NewStyle().Padding(0, 0, 0, 2)
+	delegate.Styles.NormalTitle = pad.Foreground(theme.Subtle)
+	delegate.Styles.NormalDesc = pad.Foreground(theme.Muted)
+	delegate.Styles.SelectedTitle = pad.Reverse(true).Foreground(theme.Accent).Bold(true)
+	delegate.Styles.SelectedDesc = pad.Reverse(true).Foreground(theme.Subtle)
 	l := list.New(items, delegate, 0, 0)
 	l.SetShowTitle(false)
 	l.SetShowFilter(false)
@@ -736,16 +765,17 @@ func (s *BrowserMode) View() string {
 	if s.height == 0 {
 		s.height = 24
 	}
+	cw := max(40, s.width-8)
 	body := []string{
 		lipgloss.NewStyle().Foreground(s.theme.Accent).Bold(true).Render("browse — Hugging Face (gguf)"),
 		"",
-		s.renderSearchLine(),
+		s.renderSearchBox(cw),
 	}
 	if f := s.renderFilterLine(); f != "" {
 		body = append(body, f)
 	}
 	body = append(body, "")
-	body = append(body, s.renderPanes()...)
+	body = append(body, s.renderPanes(cw)...)
 	if s.flash != "" {
 		body = append(body, "", lipgloss.NewStyle().Foreground(s.theme.StatusStart).Render("⚠ "+s.flash))
 	}
@@ -765,10 +795,24 @@ func (s *BrowserMode) View() string {
 	return bg
 }
 
-func (s *BrowserMode) renderSearchLine() string {
-	sort := lipgloss.NewStyle().Foreground(s.theme.Subtle).Render(
-		"  sort: " + effSort(s.sort) + " (t)")
-	return s.input.View() + sort
+// renderSearchBox draws the search line + the sort indicator inside a
+// thin rectangle. The input width is reserved so the indicator never
+// overflows the box's right border (owner report: long sort values
+// used to overlap the border). The sort value is accent-bold — the
+// active sort is evident at a glance (owner).
+func (s *BrowserMode) renderSearchBox(cw int) string {
+	inner := cw - 2
+	label := lipgloss.NewStyle().Foreground(s.theme.Subtle).Render("sort: ")
+	value := lipgloss.NewStyle().Foreground(s.theme.Accent).Bold(true).Render(effSort(s.sort))
+	sortLen := len("sort: ") + len(effSort(s.sort))
+	// 10 = prompt ("search: ") + the "  " gap + margin
+	s.input.Width = max(10, inner-10-sortLen)
+	line := s.input.View() + "  " + label + value
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(s.theme.Border).
+		Width(cw).
+		Render(line)
 }
 
 func (s *BrowserMode) renderFilterLine() string {
@@ -786,78 +830,112 @@ func (s *BrowserMode) renderFilterLine() string {
 		"filter: " + strings.Join(active, " · ") + "  (l/L)")
 }
 
-// renderPanes lays out the results list (left) and the metadata +
-// quant pane (right) side by side, each line padded to its pane width.
-func (s *BrowserMode) renderPanes() []string {
-	cw := max(40, s.width-8)
+// renderPanes lays out the results box (left) and the model-info +
+// quants box (right) side by side inside their own thin rectangles.
+func (s *BrowserMode) renderPanes(cw int) []string {
 	lw := cw * 2 / 5
-	rw := cw - lw - 2 // "  " separator between the panes
-	ph := max(6, s.height-13)
+	rw := cw - lw - 1 // " " separator
+	ph := max(6, s.height-15)
 
 	var left []string
-	if len(s.results.Items()) == 0 && s.selected == nil {
+	if len(s.results.Items()) == 0 {
 		hint := "enter a query and press enter"
 		if s.query != "" {
 			hint = "no results for " + s.query
 		}
 		left = []string{lipgloss.NewStyle().Foreground(s.theme.Muted).Render(hint)}
 	} else {
-		s.results.SetSize(lw, ph)
-		left = strings.Split(s.results.View(), "\n")
+		left = append(left, lipgloss.NewStyle().Foreground(s.theme.Accent).Bold(true).Render(
+			fmt.Sprintf("results (%d)", len(s.results.Items()))))
+		s.results.SetSize(lw-2, ph-1)
+		left = append(left, strings.Split(s.results.View(), "\n")...)
 	}
-	right := s.metaLines(rw, ph)
+	right := s.infoLines(rw-2, ph)
 
-	out := make([]string, 0, max(len(left), len(right)))
-	for i := 0; i < max(len(left), len(right)); i++ {
+	lb := boxLines(left, lw, ph+2, s.theme)
+	rb := boxLines(right, rw, ph+2, s.theme)
+	return joinPanes(lb, rb)
+}
+
+// boxLines renders content inside a fixed-width rounded box of exactly
+// h lines (content padded/truncated to h-2 inner lines) — the results
+// and model-info panes share the height so both sides align.
+func boxLines(content []string, w, h int, theme Theme) []string {
+	inner := w - 2
+	maxLines := h - 2
+	if len(content) > maxLines {
+		content = content[:maxLines]
+	}
+	for i := range content {
+		content[i] = padLinesTo(content[i], inner)
+	}
+	for len(content) < maxLines {
+		content = append(content, strings.Repeat(" ", inner))
+	}
+	b := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(theme.Border).
+		Width(w)
+	return strings.Split(b.Render(strings.Join(content, "\n")), "\n")
+}
+
+func joinPanes(left, right []string) []string {
+	h := max(len(left), len(right))
+	out := make([]string, 0, h)
+	for i := 0; i < h; i++ {
 		l, r := "", ""
 		if i < len(left) {
-			l = padLinesTo(left[i], lw)
-		} else {
-			l = strings.Repeat(" ", lw)
+			l = left[i]
 		}
 		if i < len(right) {
-			r = padLinesTo(right[i], rw)
+			r = right[i]
 		}
-		out = append(out, l+"  "+r)
+		out = append(out, l+" "+r)
 	}
 	return out
 }
 
-// metaLines renders the metadata + quant pane for the selected repo.
-func (s *BrowserMode) metaLines(rw, ph int) []string {
+// infoLines renders the model-info + quants pane for the selected repo
+// (owner layout): repo name, "from <base_model>", separator, downloads
+// and likes, license, task, the non-commercial warning, separator, and
+// the quant rows (with the ● cached badge).
+func (s *BrowserMode) infoLines(inner, ph int) []string {
 	var lines []string
 	muted := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Muted).Render(t) }
 	subtle := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Subtle).Render(t) }
 	accent := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Accent).Render(t) }
 	warn := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.StatusStart).Render(t) }
+	sep := subtle(strings.Repeat("─", max(10, inner)))
 
 	if s.selected == nil {
 		lines = append(lines, muted("select a repo…"))
 	} else {
 		m := s.selected
 		lines = append(lines, accent(m.ID))
-		meta := "license: " + licenseOf(*m)
-		if m.PipelineTag != "" {
-			meta += " · task: " + m.PipelineTag
-		}
-		lines = append(lines, subtle(meta))
-		if langs := languagesOf(*m); len(langs) > 0 {
-			lines = append(lines, subtle("languages: "+strings.Join(langs, " ")))
-		}
 		if bm := baseModelOf(*m); bm != "" {
 			lines = append(lines, subtle("from "+bm))
+		}
+		lines = append(lines, sep)
+		lines = append(lines, "⬇ "+humanCount(m.Downloads)+" downloads")
+		lines = append(lines, "♥ "+strconv.FormatInt(m.Likes, 10)+" likes")
+		lines = append(lines, subtle("license: "+licenseOf(*m)))
+		if m.PipelineTag != "" {
+			lines = append(lines, subtle("task: "+m.PipelineTag))
 		}
 		if w := nonCommercialLicense(*m); w != "" {
 			lines = append(lines, warn("⚠ "+w))
 		}
-		lines = append(lines, "")
+		lines = append(lines, sep)
 		switch {
 		case !s.quantsLoaded:
-			lines = append(lines, subtle("enter to load quants…"))
+			lines = append(lines, subtle("loading quants…"))
 		case len(s.quants) > 0:
 			lines = append(lines, accent(fmt.Sprintf("quants (%d)", len(s.quants))))
 			for i, q := range s.quants {
-				row := quantRowLabel(q, s.cached[q.Tag])
+				row := quantRowLabel(q, false)
+				if s.cached[q.Tag] {
+					row += "  " + cachedBadge(s.theme)
+				}
 				if s.zone == zoneQuants && i == s.quantIdx {
 					row = "▶ " + row
 				} else {
@@ -881,38 +959,53 @@ func (s *BrowserMode) metaLines(rw, ph int) []string {
 			}
 		}
 	}
-	for len(lines) < ph {
-		lines = append(lines, "")
-	}
 	return lines
 }
 
+// cachedBadge renders the fancy "already on disk" marker — a green
+// dot + label instead of the plain "(cached)" suffix (owner).
+func cachedBadge(theme Theme) string {
+	return lipgloss.NewStyle().Foreground(theme.StatusReady).Bold(true).Render("● cached")
+}
+
+// renderFooter shows the shortcuts relevant to the focused zone — the
+// quants zone advertises enter as "hand off" (owner).
 func (s *BrowserMode) renderFooter() string {
-	keys := []string{
-		shortcut("↑/↓", "move", s.theme),
-		shortcut("enter", "open", s.theme),
-		shortcut("tab", "zone", s.theme),
-		shortcut("l/L", "filter", s.theme),
-		shortcut("t", "sort", s.theme),
-		shortcut("esc", "back", s.theme),
+	var keys []string
+	switch s.zone {
+	case zoneSearch:
+		keys = []string{
+			shortcut("enter", "search", s.theme),
+			shortcut("tab", "results", s.theme),
+			shortcut("esc", "back", s.theme),
+		}
+	case zoneResults:
+		keys = []string{
+			shortcut("↑/↓", "navigate", s.theme),
+			shortcut("tab", "quants", s.theme),
+			shortcut("l/L", "filter", s.theme),
+			shortcut("t", "sort", s.theme),
+			shortcut("esc", "search", s.theme),
+		}
+	case zoneQuants:
+		keys = []string{
+			shortcut("↑/↓", "quant", s.theme),
+			shortcut("enter", "hand off", s.theme),
+			shortcut("tab", "results", s.theme),
+			shortcut("esc", "back", s.theme),
+		}
 	}
 	return strings.Join(keys, "  ·  ")
 }
 
-// shieldView renders the static in-flight popup (no spinner — one
-// bounded call; static text keeps snapshot tests deterministic).
+// shieldView renders the static in-flight search popup (no spinner —
+// one bounded call; static text keeps snapshot tests deterministic).
+// The quants fetch is background by design (it follows the cursor), so
+// only the search gets a shield.
 func (s *BrowserMode) shieldView() string {
-	var lines []string
-	if s.shield.kind == "quants" {
-		lines = []string{
-			lipgloss.NewStyle().Bold(true).Render("loading quants for " + s.shield.repo + "…"),
-			lipgloss.NewStyle().Foreground(s.theme.Subtle).Render("esc: cancel"),
-		}
-	} else {
-		lines = []string{
-			lipgloss.NewStyle().Bold(true).Render("searching Hugging Face…"),
-			lipgloss.NewStyle().Foreground(s.theme.Subtle).Render("esc: cancel"),
-		}
+	lines := []string{
+		lipgloss.NewStyle().Bold(true).Render("searching Hugging Face…"),
+		lipgloss.NewStyle().Foreground(s.theme.Subtle).Render("esc: cancel"),
 	}
 	return overlayBox(s.theme, strings.Join(lines, "\n"))
 }
