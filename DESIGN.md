@@ -2785,7 +2785,13 @@ lists the top GGUF repos by the current sort (the placeholder reads
      **consecutive quoted lines flow together** — goldmark parses
      `> a` blank-separated lines as separate Blockquote nodes, and the
      inner paragraph's newline already separates them, so only the
-     last line of a quoted run adds the trailing blank);
+     last line of a quoted run adds the trailing blank;
+     **list items add their newline only when the content didn't end
+     with one** — blank-separated `*`/`-` items are Paragraph-wrapped
+     (their paragraph newline already separates them; without the
+     guard every bullet got a blank after it, owner report:
+     RichardErkhov/microsoft_-_phi-1-gguf), while simple items are
+     TextBlocks that need the item's own newline);
      **links and
      autolinks are OSC 8 terminal hyperlinks** — `ESC]8;;URL ESC\
      … ESC]8;; ESC\\` — so ctrl/cmd-click opens the URL in the

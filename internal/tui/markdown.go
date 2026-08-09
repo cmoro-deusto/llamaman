@@ -179,7 +179,15 @@ func (r *cardRenderer) renderListItem(_ util.BufWriter, _ []byte, _ ast.Node, en
 	if entering {
 		r.write("• ")
 	} else {
-		r.buf.WriteString("\n")
+		// Simple items (no blank between them in the source) are
+		// TextBlocks with no trailing newline — add one here.
+		// Blank-separated items are Paragraph-wrapped and already end
+		// with the paragraph's newline — adding another would stack
+		// into a blank between every bullet (owner report:
+		// RichardErkhov/microsoft_-_phi-1-gguf).
+		if !strings.HasSuffix(r.buf.String(), "\n") {
+			r.buf.WriteString("\n")
+		}
 	}
 	return ast.WalkContinue, nil
 }

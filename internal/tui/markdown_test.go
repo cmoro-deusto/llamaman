@@ -133,3 +133,27 @@ func TestCardMarkdownBlockquoteRun(t *testing.T) {
 		}
 	}
 }
+
+// TestCardMarkdownListBlankSeparated: list items separated by blank
+// lines in the source are paragraph-wrapped; the paragraph's newline
+// already separates them, so no blank appears between bullets (owner
+// report: RichardErkhov/microsoft_-_phi-1-gguf). Simple items still
+// get their separator from the item handler.
+func TestCardMarkdownListBlankSeparated(t *testing.T) {
+	md := "- a\n\n- b\n\n- c\n\npara"
+	lines := renderCardMarkdown(DefaultTheme(), []byte(md))
+	want := []string{"• a", "• b", "• c", "", "para"}
+	if len(lines) != len(want) {
+		t.Fatalf("lines = %d, want %d\n%q", len(lines), len(want), lines)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Errorf("line %d = %q, want %q (all: %q)", i, lines[i], want[i], lines)
+		}
+	}
+	// Simple (single-newline) items also stay tight.
+	simple := renderCardMarkdown(DefaultTheme(), []byte("- x\n- y"))
+	if len(simple) != 2 || simple[0] != "• x" || simple[1] != "• y" {
+		t.Errorf("simple list = %q, want [• x • y]", simple)
+	}
+}
