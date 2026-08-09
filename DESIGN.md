@@ -2670,63 +2670,87 @@ popup):
 
 ```
 ┌ browse — Hugging Face (gguf) ────────────────────────────────┐
-│ search: [llama 3          ]  sort: downloads (t)            │
-│ filter: en · apache-2.0   (l/L)                             │
-│ ┌─ results (50) ──────────────┐ ┌─ metadata + quants ──────┐ │
-│ │ ▶ lm-anon/vntl-llama3…      │ │ org/repo                 │ │
-│ │   743k dl · 17 likes ·      │ │ license: llama3.1 · task…│ │
-│ │   en ja · lic: llama3       │ │ languages: en de fr it   │ │
-│ │   bartowski/Meta-Llama-3…   │ │ from meta-llama/Llama-3… │ │
-│ │   …                         │ │ ⚠ non-commercial license │ │
-│ └─────────────────────────────┘ └──────────────────────────┘ │
-│ ↑/↓ move · enter open · l/L filter · t sort · esc back      │
-└───────────────────────────────────────────────────────────────┘
+│ ╭ search ──────────────────────────────────────────────────╮ │
+│ │ search: [llama 3          ]  sort: downloads            │ │
+│ ╰─────────────────────────────────────────────────────────╯ │
+│ ╭─ results (2) ───────────╮ ╭─ model info ────────────────╮ │
+│ │ ▶ lm-anon/vntl-llama3…  │ │ org/repo                   │ │
+│ │   743k dl · 17 likes …  │ │ from meta-llama/Llama-3…   │ │
+│ │   bartowski/Meta-Llama… │ │ ────────────────────────   │ │
+│ │   …                     │ │ ⬇ 743.5k downloads        │ │
+│ └─────────────────────────┘ │ ♥ 17 likes                 │ │
+│                             │ license: llama3.1          │ │
+│                             │ task: text-generation      │ │
+│                             │ ⚠ non-commercial license   │ │
+│                             │ ────────────────────────   │ │
+│                             │ quants (2)                 │ │
+│                             │ ▶ Q4_K_M — 5 GiB ●cached   │ │
+│ ─────────────────────────   │   Q8_0 — 10 GiB            │ │
+│ ↑/↓ navigate · tab quants · l/L filter · t sort · esc    │ │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-- **focusSearch** — a `bubbles/textinput` line. Typing goes to it;
-  `enter` runs the search (gen-guarded async, shield + `esc: cancel`
-  like §16.6); `esc` returns to Main. The input is
-  re-shown pre-filled with the last query so edits re-search. (Sort
-  cycling and the tag filters live in the results zone — every
+**Layout — three zones; the pane follows the cursor.** The model-info
++ quants pane **auto-updates as the results are navigated** (owner
+flow): moving in the results list re-renders the right pane instantly
+from the search response (name, `from <base_model>`, downloads, likes,
+license, task) and fires one gen-guarded `tree/main` fetch for the
+quants — no enter needed on a result, so enter is free for selecting a
+quant. The search box, the results, and the model info each live in
+their own thin rounded rectangle; the sort indicator sits at the top
+right of the search box with the input width reserved so it never
+overlaps the border, and the value is accent-bold (the active sort is
+evident at a glance). Result rows are colored (titles Subtle,
+descriptions Muted, selection accent-bold on reversed background); the
+quant rows show a green `● cached` badge instead of plain `(cached)`.
+
+- **focusSearch** — a `bubbles/textinput` line inside its thin box.
+  Typing goes to it; `enter` runs the search (gen-guarded async,
+  shield + `esc: cancel` like §16.6); `esc` returns to Main. The
+  input is re-shown pre-filled with the last query so edits re-search.
+  (Sort cycling and the tag filters live in the results zone — every
   printable key must type, the §16.5 modifier precedent.)
 - **focusResults** — a `bubbles/list` (the §16.5 repoPicker delegate
   shape: **arrows-only** keymap — page jumps, help, and quit unbound —
-  no chrome) over the results; row =
-  `org/repo`, description = `Nk downloads · N likes · <languages> ·
-  license: <id>` (languages = the bare tag codes, space-joined;
-  license pulled from `tags`). `enter` on a result **explicitly
-  fetches** its quants (P7 — one `tree/main` via the runner's `Choose`,
-  the §16.6 async discipline: cancellable ctx, per-request gen counter,
-  `ctx.Canceled` re-raised by the adapter because the §16.2 client
-  swallows it — the item-6 gotcha, hfcheck.go:64–77) and fills the
-  metadata + quant pane; the pane header shows a static
-  `loading quants for org/repo… · esc: cancel` shield until done.
-  `esc` returns to focusSearch.
-- **Metadata pane** (right zone header, filled on enter; the data is
-  already in the search result): `license:<id>`, `pipeline_tag`,
-  **languages** (`en · de · fr`), and — when a
-  `base_model:quantized:<id>` tag is present — a `quantized from <id>`
-  line (answers "what is this repo actually?"). A license starting
-  `cc-by-nc` (the non-commercial family) renders a
-  **⚠ non-commercial license — check terms** warning line (P3: display
-  only, never blocks a hand-off).
-- **focusQuants** — the quant list for the selected repo: rows reuse
-  the §16.3 label exactly — `Tag — hf.HumanSize(Size)` + ` (cached)`
-  when `storage.Lookup(root, repo)` marks it (the storage.go:764–769
-  logic, extracted into a shared `quantRowLabel(q hf.QuantOption, cached
-  bool) string` in hfcheck.go — the "same helpers" rule, so the chooser,
-  the config editor, and the browser always agree), plus the mmproj
-  informational line (`hf.HasMMProj`). `enter` on a quant opens the
-  **hand-off dialog** (below); a repo with no GGUF quants shows a
-  `use org/repo without a quant` row that hands off the **bare** id
-  (same semantics as the chooser's esc-saves-bare and §16.6's Save
-  path). `esc` returns to focusResults. In this zone **`t` cycles sort
-  downloads → likes → lastModified** (re-runs the same query, same gen
-  guard) and `l`/`L` open the tag filters (below).
+  no chrome, colored rows) over the results; row = `org/repo`,
+  description = `Nk downloads · N likes · <languages> · license: <id>`
+  (languages = the bare tag codes, space-joined; license pulled from
+  `tags`). Moving the cursor (or a fresh search's first hit) runs the
+  auto-fetch: the §16.6 async discipline (cancellable ctx, per-request
+  gen counter, `ctx.Canceled` re-raised by the adapter because the
+  §16.2 client swallows it — the item-6 gotcha, hfcheck.go:64–77), but
+  **background** — no full-screen shield (that would flicker during
+  fast navigation): the pane shows an inline `loading quants…` line and
+  a superseded fetch is cancelled and gen-dropped. `esc` returns to
+  focusSearch. In this zone **`t` cycles sort downloads → likes →
+  lastModified** (re-runs the same query, same gen guard) and `l`/`L`
+  open the tag filters (below).
+- **Model info + quants pane** (right box, follows the results
+  cursor): repo name (accent), `from <base_model>` when a
+  `base_model:quantized:<id>` tag is present (answers "what is this
+  repo actually?"), a separator, `⬇ N downloads` and `♥ N likes`,
+  `license: <id>`, `task: <pipeline_tag>`, a
+  **⚠ non-commercial license — check terms** warning for `cc-by-nc*`
+  (P3: display only), another separator, then the quant list — rows
+  reuse the §16.3 label (`Tag — hf.HumanSize(Size)` via the shared
+  `quantRowLabel` from hfcheck.go) with the green `● cached` badge when
+  `storage.Lookup(root, repo)` marks it (the storage.go:764–769 logic)
+  and the mmproj informational line (`hf.HasMMProj`).
+- **focusQuants** — the quant list with its own cursor (↑/↓); `enter`
+  on a quant opens the **hand-off dialog** (below); a repo with no
+  GGUF quants shows a `use org/repo without a quant` row that hands
+  off the **bare** id (same semantics as the chooser's esc-saves-bare
+  and §16.6's Save path); while a fetch is in flight `enter` is a
+  no-op. `esc` returns to focusResults.
 
-Tab / Shift+Tab cycle the three zones; each zone's key handling is
-exclusive (the same "overlay handlers run on EVERY message" discipline —
-zone messages are consumed in `Update` before anything else).
+Tab / Shift+Tab **toggle the results/quants pair** (the pane follows
+the cursor, so tab just picks which side you act on); from the search
+box either direction lands on the results. The footer is **zone-
+aware** (owner): the quants zone advertises `↑/↓ quant · enter hand off
+· tab results · esc back`, the results zone `↑/↓ navigate · tab quants
+· l/L filter · t sort · esc search`. Each zone's key handling is
+exclusive (the same "overlay handlers run on EVERY message" discipline
+— zone messages are consumed in `Update` before anything else).
 
 **Tag filters (`l` / `L`, results zone).** Two curated overlays — the
 §16.6 dialog pattern (boxed, height-capped huh select, dedicated slot
@@ -2785,17 +2809,19 @@ runner-nil case (search disabled) also disables hand-off (flash only).
 
 **Routing and state.** `BrowserMode` fields: `query string`, `input
 textinput.Model`, `sort string`, `filterLang, filterLic string`,
-`results []hf.SearchResult`, `cursor`
-(zone enum + list state), `selected hf.SearchResult`, `quants
-[]hf.QuantOption`, `cached map[string]bool`, `mmproj bool`,
-`shield *browserShield{zone, repo, cancel}`, `gen` counters
-for search and quant fetches, `handoff *huh.Form` + `handoffVal`,
-`tagFilter *huh.Form` + `tagFilterVal`, `flash
+`results list.Model` + `zone browserZone`, `selected *hf.SearchResult`,
+`quants []hf.QuantOption`, `cached map[string]bool`, `mmproj bool`,
+`quantsLoaded/quantsLoading bool`, `quantIdx int`, `searchGen/quantGen`
+counters + `quantCancel context.CancelFunc` (the pane's fetch is
+cancelled on navigation; the search keeps the `shield` popup), `handoff
+*huh.Form` + `handoffVal`, `tagFilter *huh.Form` + `tagFilterVal`, `flash
 string`. `SetSize` propagates to the textinput/list/dialogs like
 `StorageMode`'s. Stale-result discipline (the item-6 gotcha): a done msg
 whose gen mismatches the current request is dropped — a stale search may
 never overwrite a newer query's results, and a stale quant fetch (user
-selected another repo meanwhile) may never fill the pane.
+selected another repo meanwhile) may never fill the pane. The search
+shield's esc also bumps the gen, so a done msg landing just after a
+cancel is dropped (cancel-then-complete race).
 
 **Determinism and tests (P9).**
 
@@ -2810,24 +2836,31 @@ selected another repo meanwhile) may never fill the pane.
   `full=true` not requested; 404/401/transport → typed kinds; empty
   list; malformed JSON → error.
 - Browser flow tests with a **stub runner** (the stubSpawner pattern,
-  `SetBrowserRunner`): type query → enter → results render; select →
-  enter → quants + sizes + `(cached)` markers (fake hub cache trees via
-  `storage.Lookup`, the scan_test fixture style) + mmproj note; pick a
-  quant → hand-off dialog → **add to config** yields
+  `SetBrowserRunner`): type query → enter → results render and the
+  **pane auto-follows the first hit** (no enter on a result);
+  navigating with ↓ auto-updates the pane (metadata instantly, quants
+  async, superseded fetches cancelled/gen-dropped) with `(cached)`
+  markers (fake hub cache trees via `storage.Lookup`, the scan_test
+  fixture style) + mmproj note + the `● cached` badge; tab → quants →
+  enter on a quant → hand-off dialog → **add to config** yields
   `browserConfigHandoffMsg{org/repo:QUANT}` and Root's arm opens
   ConfigMode with the new-model form pre-filled source=hf,
   hf=`org/repo:QUANT` (assert the form's staging, and that no
   `hfCheckRequestedMsg` fires — pre-filled, not typed); **download
   now** yields `browserDownloadHandoffMsg` and Root's arm opens the
   Storage manager with a running download row for the split repo/quant
-  (stub engine); esc paths at every zone and the dialog; shield renders
-  static text; gen-mismatch drop (stale search and stale quant msgs);
-  the no-quant bare hand-off row; sort cycle re-runs the search with
-  the new sort; **`l`/`L` tag filters** — the picker opens, picking
+  (stub engine); esc paths at every zone and the dialog; the search
+  shield renders static text and its esc bumps the gen (cancel-then-
+  complete race); gen-mismatch drop (stale search and stale quant
+  msgs); the no-quant bare hand-off row; sort cycle re-runs the search
+  with the new sort; **per-rune typing regression** (keystrokes arrive
+  one rune at a time — "mistral" must type, t/l/L must not hijack the
+  input); **`l`/`L` tag filters** — the picker opens, picking
   `ja` re-runs the search with `Filter: ["ja"]`, picking a license
   appends `license:<id>`, both combine in one request, `all languages`/
-  `any license`/esc clear, header shows the active filters; **metadata
-  pane** — stub results with `base_model:quantized:<id>` render the
+  `any license` clear, esc dismisses without changing, header shows the
+  active filters; **metadata pane** — stub results with
+  `base_model:quantized:<id>` render the
   `quantized from` line, `license:cc-by-nc-4.0` renders the
   non-commercial warning, language codes render in the pane and the
   result row; runner nil → search flash, no crash.
