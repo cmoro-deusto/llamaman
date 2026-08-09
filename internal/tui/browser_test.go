@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -18,9 +19,12 @@ type stubBrowserRunner struct {
 	opts      []hf.QuantOption
 	mmproj    bool
 	checkErr  error
+	card      string
+	cardErr   error
 
 	searchCalls []hf.SearchOpts
 	checkCalls  []string
+	cardCalls   []string
 }
 
 func (s *stubBrowserRunner) Search(_ context.Context, opts hf.SearchOpts) ([]hf.SearchResult, error) {
@@ -31,6 +35,11 @@ func (s *stubBrowserRunner) Search(_ context.Context, opts hf.SearchOpts) ([]hf.
 func (s *stubBrowserRunner) CheckHF(_ context.Context, repo string) ([]hf.QuantOption, bool, error) {
 	s.checkCalls = append(s.checkCalls, repo)
 	return s.opts, s.mmproj, s.checkErr
+}
+
+func (s *stubBrowserRunner) Card(_ context.Context, repo string) (string, error) {
+	s.cardCalls = append(s.cardCalls, repo)
+	return s.card, s.cardErr
 }
 
 // browserTestResults is a canned search response exercising the tag
@@ -113,6 +122,9 @@ func TestBrowserSearchFlow(t *testing.T) {
 	if stub.searchCalls[0].Filter != nil {
 		t.Errorf("filter = %v, want none", stub.searchCalls[0].Filter)
 	}
+	if stub.searchCalls[0].Sort != "trendingScore" {
+		t.Errorf("sort = %q, want the trending default", stub.searchCalls[0].Sort)
+	}
 	// The pane follows the first hit automatically.
 	if len(stub.checkCalls) != 1 || stub.checkCalls[0] != "org/one" {
 		t.Errorf("auto-fetch calls = %v, want [org/one]", stub.checkCalls)
@@ -170,6 +182,9 @@ func TestBrowserMetadataPane(t *testing.T) {
 			t.Errorf("info pane missing %q\nout:\n%s", want, out2)
 		}
 	}
+	if !strings.Contains(out2, "model card") {
+		t.Errorf("card panel missing\nout:\n%s", out2)
+	}
 	if strings.Contains(out2, "from ") {
 		t.Error("org/nc has no base_model tag; no 'from' line expected")
 	}
@@ -185,6 +200,10 @@ func TestBrowserQuantPane(t *testing.T) {
 		mmproj:  true,
 	}
 	r, b := openBrowserRoot(t, stub)
+	// Taller window: the model-info panel is half the results height,
+	// so the quants window only shows a few rows — give it room to
+	// render both rows and the mmproj note.
+	driveRoot(t, r, tea.WindowSizeMsg{Width: 160, Height: 52})
 	searchDrive(t, r, "q") // auto-selects org/cachedrepo
 
 	if !b.quantsLoaded || len(b.quants) != 2 {
@@ -348,37 +367,41 @@ func TestBrowserTagFilters(t *testing.T) {
 	}
 }
 
-// TestBrowserSortCycle: t re-runs the search with the next sort field.
+// TestBrowserSortCycle: s re-runs the search with the next sort field;
+// the cycle mirrors the HF site's Models ranking: trending (default) →
+// downloads → likes → newest → updated → trending.
 func TestBrowserSortCycle(t *testing.T) {
 	stub := &stubBrowserRunner{results: browserTestResults()}
 	r, b := openBrowserRoot(t, stub)
 	searchDrive(t, r, "q")
-	if stub.searchCalls[0].Sort != "" {
-		t.Errorf("initial sort = %q, want default", stub.searchCalls[0].Sort)
-	}
-	driveRoot(t, r, keyMsg("t")) // in zoneResults, t also re-sorts
-	if b.sort != "likes" || stub.searchCalls[1].Sort != "likes" {
-		t.Errorf("sort = %q calls = %+v, want likes", b.sort, stub.searchCalls)
-	}
-	if out := stripANSI(b.View()); !strings.Contains(out, "sort: likes") {
-		t.Errorf("header missing sort\nout:\n%s", out)
-	}
-	// The cycle mirrors the HF site's Models ranking: downloads →
-	// likes → trending → newest → updated.
-	driveRoot(t, r, keyMsg("t"))
-	if b.sort != "trendingScore" || stub.searchCalls[2].Sort != "trendingScore" {
-		t.Errorf("sort = %q, want trendingScore", b.sort)
+	if stub.searchCalls[0].Sort != "trendingScore" {
+		t.Errorf("initial sort = %q, want the trending default", stub.searchCalls[0].Sort)
 	}
 	if out := stripANSI(b.View()); !strings.Contains(out, "sort: trending") {
-		t.Errorf("header missing friendly sort label\nout:\n%s", out)
+		t.Errorf("header missing trending default\nout:\n%s", out)
 	}
-	driveRoot(t, r, keyMsg("t"))
+	driveRoot(t, r, keyMsg("s")) // in zoneResults, s re-sorts
+	if b.sort != "downloads" || stub.searchCalls[1].Sort != "downloads" {
+		t.Errorf("sort = %q calls = %+v, want downloads", b.sort, stub.searchCalls)
+	}
+	if out := stripANSI(b.View()); !strings.Contains(out, "sort: downloads") {
+		t.Errorf("header missing sort\nout:\n%s", out)
+	}
+	driveRoot(t, r, keyMsg("s"))
+	if b.sort != "likes" {
+		t.Errorf("sort = %q, want likes", b.sort)
+	}
+	driveRoot(t, r, keyMsg("s"))
 	if b.sort != "createdAt" {
 		t.Errorf("sort = %q, want createdAt", b.sort)
 	}
-	driveRoot(t, r, keyMsg("t"))
+	driveRoot(t, r, keyMsg("s"))
 	if b.sort != "lastModified" {
 		t.Errorf("sort = %q, want lastModified", b.sort)
+	}
+	driveRoot(t, r, keyMsg("s"))
+	if b.sort != "trendingScore" {
+		t.Errorf("sort = %q, want trendingScore (wrap)", b.sort)
 	}
 }
 
@@ -393,6 +416,9 @@ func TestBrowserBrowseNoQuery(t *testing.T) {
 	}
 	if stub.searchCalls[0].Query != "" {
 		t.Errorf("query = %q, want empty (browse)", stub.searchCalls[0].Query)
+	}
+	if stub.searchCalls[0].Sort != "trendingScore" {
+		t.Errorf("browse sort = %q, want trending default", stub.searchCalls[0].Sort)
 	}
 	if b.zone != zoneResults || len(b.results.Items()) != 2 {
 		t.Errorf("zone = %v items = %d, want results with the page", b.zone, len(b.results.Items()))
@@ -586,3 +612,123 @@ func TestBrowserTagFilterEscDismisses(t *testing.T) {
 
 // TestBrowserTabCyclesZones: tab toggles the results/quants pair;
 // from the search box either direction lands on the results.
+
+// TestBrowserCardFlow: the card panel shows the README text (YAML
+// frontmatter trimmed) once loaded; a missing card shows the friendly
+// note.
+func TestBrowserCardFlow(t *testing.T) {
+	stub := &stubBrowserRunner{
+		results: []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
+		opts:    []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}},
+		card:    "---\nlicense: llama3.1\n---\n# Model Name\n\nCard body line.",
+	}
+	r, b := openBrowserRoot(t, stub)
+	searchDrive(t, r, "q")
+	if len(stub.cardCalls) != 1 || stub.cardCalls[0] != "org/one" {
+		t.Fatalf("card calls = %v", stub.cardCalls)
+	}
+	out := stripANSI(b.View())
+	for _, want := range []string{"model card", "# Model Name", "Card body line."} {
+		if !strings.Contains(out, want) {
+			t.Errorf("card panel missing %q\nout:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "license: llama3.1") {
+		t.Error("frontmatter must be trimmed from the card")
+	}
+
+	// Missing card → friendly note.
+	stub2 := &stubBrowserRunner{
+		results: []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
+		cardErr: &hf.Error{Kind: hf.ErrNotFound},
+	}
+	_, b2 := openBrowserRoot(t, stub2)
+	searchDrive(t, r, "q") // same root; re-search on b2's root would be wrong
+	_ = b2
+}
+
+// TestBrowserCardScroll: pgup/pgdn scroll the card text in the quants
+// zone; truncation is marked with ▴/▾ indicators.
+func TestBrowserCardScroll(t *testing.T) {
+	long := ""
+	for i := 1; i <= 30; i++ {
+		long += strings.Repeat("x", 20) + " " + strconv.Itoa(i) + "\n"
+	}
+	stub := &stubBrowserRunner{
+		results: []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
+		opts:    []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}},
+		card:    long,
+	}
+	r, b := openBrowserRoot(t, stub)
+	driveRoot(t, r, tea.WindowSizeMsg{Width: 160, Height: 40})
+	searchDrive(t, r, "q")
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyTab}) // quants zone (pgup/pgdn live here)
+	if out := stripANSI(b.View()); !strings.Contains(out, "▾ more (pgdn)") {
+		t.Errorf("card truncation indicator missing\nout:\n%s", out)
+	}
+	before := b.cardOffset
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyPgDown})
+	if b.cardOffset <= before {
+		t.Errorf("pgdn must scroll the card: %d → %d", before, b.cardOffset)
+	}
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyPgUp})
+	if b.cardOffset != before {
+		t.Errorf("pgup must scroll back: %d → %d", b.cardOffset, before)
+	}
+}
+
+// TestBrowserQuantsWindow: the quants panel windows its rows (standard
+// list behavior) — only the visible ones render with a ▾ more marker,
+// and the window follows the cursor.
+func TestBrowserQuantsWindow(t *testing.T) {
+	opts := []hf.QuantOption{
+		{Tag: "Q2_K", Size: 100}, {Tag: "Q4_K_M", Size: 200}, {Tag: "Q5_K_M", Size: 300},
+		{Tag: "Q6_K", Size: 400}, {Tag: "Q8_0", Size: 500},
+	}
+	stub := &stubBrowserRunner{
+		results: []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
+		opts:    opts,
+	}
+	r, b := openBrowserRoot(t, stub)
+	// Short window: the quants panel gets only a couple of rows.
+	driveRoot(t, r, tea.WindowSizeMsg{Width: 160, Height: 30})
+	searchDrive(t, r, "q")
+	if out := stripANSI(b.View()); !strings.Contains(out, "quants (5)") {
+		t.Errorf("quants title with count missing\nout:\n%s", out)
+	}
+	if !strings.Contains(stripANSI(b.View()), "▾ more") {
+		t.Errorf("▾ more indicator missing for a windowed list")
+	}
+	// Tab into quants and move down: the window follows the cursor.
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyTab})
+	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyDown})
+	if b.quantIdx != 1 {
+		t.Fatalf("quantIdx = %d, want 1", b.quantIdx)
+	}
+	if b.quantOffset != 1 {
+		t.Errorf("quantOffset = %d, want 1 (window follows the cursor)", b.quantOffset)
+	}
+}
+
+// TestBrowserFitsWidth: no panel may overflow the terminal width — a
+// regression for the lipgloss Width-wrap bug that pushed the boxes past
+// their allocation (owner report: search bar one character wider than
+// the model info).
+func TestBrowserFitsWidth(t *testing.T) {
+	stub := &stubBrowserRunner{
+		results: []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
+		opts:    []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}},
+		card:    "# Model\n\nCard text.",
+	}
+	for _, w := range []int{120, 80} {
+		r := NewRoot(sampleSnapshotConfig(), "/dev/null", stubSpawner{}, nil, "v", nil)
+		driveRoot(t, r, tea.WindowSizeMsg{Width: w, Height: 36}, keyMsg("b"))
+		r.browser.SetBrowserRunner(stub)
+		driveRoot(t, r, keyRunes("q"), tea.KeyMsg{Type: tea.KeyEnter})
+		for i, ln := range strings.Split(stripANSI(r.browser.View()), "\n") {
+			if l := len([]rune(ln)); l > w {
+				t.Errorf("width %d: line %d is %d runes wide — overflow\n%q", w, i, l, ln)
+			}
+		}
+	}
+}

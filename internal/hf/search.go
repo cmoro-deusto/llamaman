@@ -104,3 +104,16 @@ func joinFilters(extra []string) string {
 	}
 	return strings.Join(parts, ",")
 }
+
+// Card fetches a repo's model card (README.md) as text — the browser's
+// card panel (DESIGN §16.7). 404 → ErrNotFound (no card); missing repos
+// surface as 401 (ErrGated) — callers treat any non-404 as "could not
+// load the card" (non-blocking, P3).
+func (c *Client) Card(ctx context.Context, repo string) (string, error) {
+	u := c.endpoint + "/" + escapeRepo(repo) + "/raw/main/README.md"
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}

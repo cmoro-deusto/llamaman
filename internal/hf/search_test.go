@@ -215,3 +215,36 @@ func TestSearchEmptyAndMalformed(t *testing.T) {
 		t.Error("malformed JSON must error")
 	}
 }
+
+func TestCardFetchesReadme(t *testing.T) {
+	body := "# My Model\n\nCool card text.\n"
+	srv, getReq := searchHandler(t, body, http.StatusOK)
+	c := clientAt(t, srv, "")
+	card, err := c.Card(context.Background(), "org/repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if card != body {
+		t.Errorf("card = %q, want %q", card, body)
+	}
+	if r := getReq(); r == nil || r.URL.Path != "/org/repo/raw/main/README.md" {
+		t.Errorf("URL = %v", r.URL)
+	}
+}
+
+func TestCardNotFound(t *testing.T) {
+	srv, _ := searchHandler(t, ``, http.StatusNotFound)
+	c := clientAt(t, srv, "")
+	if _, err := c.Card(context.Background(), "org/repo"); !IsNotFound(err) {
+		t.Errorf("error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestCardNetworkError(t *testing.T) {
+	srv, _ := searchHandler(t, `[]`, http.StatusOK)
+	c := clientAt(t, srv, "")
+	srv.Close()
+	if _, err := c.Card(context.Background(), "org/repo"); err == nil || kindOf(err) != ErrNetwork {
+		t.Errorf("kind = %v, want ErrNetwork", kindOf(err))
+	}
+}

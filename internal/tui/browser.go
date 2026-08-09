@@ -65,6 +65,15 @@ type browserQuantsDoneMsg struct {
 	err    error
 }
 
+// browserCardDoneMsg carries the async model-card (README) fetch.
+// gen ties it to the selection that produced it.
+type browserCardDoneMsg struct {
+	repo string
+	gen  int
+	text string
+	err  error
+}
+
 // browserConfigHandoffMsg asks Root to open the config editor's
 // new-model form pre-filled with the picked HF id.
 type browserConfigHandoffMsg struct {
@@ -88,6 +97,8 @@ type browserRunner interface {
 	// CheckHF is the §16.6 tree/main check — one round trip yields the
 	// quant list, sizes, and mmproj presence for the quant pane.
 	CheckHF(ctx context.Context, repo string) ([]hf.QuantOption, bool, error)
+	// Card fetches the repo's model card (README.md) text.
+	Card(ctx context.Context, repo string) (string, error)
 }
 
 // browserClient is the production runner; CheckHF reuses the §16.6
@@ -106,6 +117,14 @@ func (a browserClient) Search(ctx context.Context, opts hf.SearchOpts) ([]hf.Sea
 
 func (a browserClient) CheckHF(ctx context.Context, repo string) ([]hf.QuantOption, bool, error) {
 	return hfCheckClient{a.c}.CheckHF(ctx, repo)
+}
+
+func (a browserClient) Card(ctx context.Context, repo string) (string, error) {
+	text, err := a.c.Card(ctx, repo)
+	if err != nil && ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	return text, err
 }
 
 // BrowserMode is the search/browse screen. The model-info + quant
@@ -141,11 +160,19 @@ type BrowserMode struct {
 	quantsLoaded  bool
 	quantsLoading bool // a fetch is in flight (inline "loading quants…")
 	quantIdx      int
+	quantOffset   int // first visible quant (windowed list, scrolls with the cursor)
+
+	card        string // model card text (frontmatter trimmed)
+	cardErr     string // friendly non-blocking note when the card is unavailable
+	cardLoading bool
+	cardOffset  int // first visible card line (pgup/pgdn scroll)
 
 	searchGen   int
 	quantGen    int
+	cardGen     int
 	quantCancel context.CancelFunc // superseded/cancelled on navigation
-	shield      *browserShield     // search only — the full-screen popup
+	cardCancel  context.CancelFunc
+	shield      *browserShield // search only — the full-screen popup
 
 	handoff    *huh.Form
 	handoffID  string
@@ -203,6 +230,8 @@ func (s *BrowserMode) Update(msg tea.Msg) (*BrowserMode, tea.Cmd) {
 		return s.handleSearchDone(msg)
 	case browserQuantsDoneMsg:
 		return s.handleQuantsDone(msg)
+	case browserCardDoneMsg:
+		return s.handleCardDone(msg)
 	}
 	if s.tagFilter != nil {
 		return s.updateTagFilter(msg)
@@ -287,9 +316,13 @@ func (s *BrowserMode) runSearch() (*BrowserMode, tea.Cmd) {
 		return s, nil
 	}
 	s.query = s.input.Value()
+	sort := s.sort
+	if sort == "" {
+		sort = browserSorts[0] // the trending default
+	}
 	opts := hf.SearchOpts{
 		Query:       s.query,
-		Sort:        s.sort,
+		Sort:        sort,
 		Filter:      s.activeFilters(),
 		PipelineTag: s.filterTask,
 	}
@@ -361,8 +394,8 @@ func (s *BrowserMode) updateResults(msg tea.Msg) (*BrowserMode, tea.Cmd) {
 			return s.openTagFilter("task")
 		case "m":
 			return s.openParamsForm()
-		case "t":
-			// The footer's "t sort" works from the results zone — the
+		case "s":
+			// The footer's "s sort" works from the results zone — the
 			// search box owns typing only while it is focused.
 			s.sort = nextSort(s.sort)
 			return s.runSearch()
@@ -397,17 +430,37 @@ func (s *BrowserMode) runQuantFetch(res hf.SearchResult) (*BrowserMode, tea.Cmd)
 	s.mmproj = false
 	s.quantsLoaded = false
 	s.quantsLoading = true
+	s.quantIdx = 0
+	s.quantOffset = 0
 	if s.quantCancel != nil {
 		s.quantCancel() // superseded by the new selection
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	s.quantCancel = cancel
+	qctx, qcancel := context.WithCancel(context.Background())
+	s.quantCancel = qcancel
 	s.quantGen++
-	gen := s.quantGen
-	return s, func() tea.Msg {
-		opts, mmproj, err := s.runner.CheckHF(ctx, res.ID)
-		return browserQuantsDoneMsg{repo: res.ID, gen: gen, opts: opts, mmproj: mmproj, err: err}
+	qgen := s.quantGen
+	// The model card fetches alongside the quants, same discipline.
+	s.card = ""
+	s.cardErr = ""
+	s.cardLoading = true
+	s.cardOffset = 0
+	if s.cardCancel != nil {
+		s.cardCancel()
 	}
+	cctx, ccancel := context.WithCancel(context.Background())
+	s.cardCancel = ccancel
+	s.cardGen++
+	cgen := s.cardGen
+	return s, tea.Batch(
+		func() tea.Msg {
+			opts, mmproj, err := s.runner.CheckHF(qctx, res.ID)
+			return browserQuantsDoneMsg{repo: res.ID, gen: qgen, opts: opts, mmproj: mmproj, err: err}
+		},
+		func() tea.Msg {
+			text, err := s.runner.Card(cctx, res.ID)
+			return browserCardDoneMsg{repo: res.ID, gen: cgen, text: text, err: err}
+		},
+	)
 }
 
 func (s *BrowserMode) handleQuantsDone(msg browserQuantsDoneMsg) (*BrowserMode, tea.Cmd) {
@@ -443,6 +496,47 @@ func (s *BrowserMode) handleQuantsDone(msg browserQuantsDoneMsg) (*BrowserMode, 
 	return s, nil
 }
 
+// handleCardDone lands the model card text (or its friendly absence
+// note) on the pane; stale gens are dropped.
+func (s *BrowserMode) handleCardDone(msg browserCardDoneMsg) (*BrowserMode, tea.Cmd) {
+	if msg.gen != s.cardGen {
+		return s, nil
+	}
+	s.cardCancel = nil
+	s.cardLoading = false
+	if msg.err != nil {
+		if errors.Is(msg.err, context.Canceled) {
+			return s, nil
+		}
+		if hf.IsNotFound(msg.err) {
+			s.cardErr = "no model card"
+		} else {
+			s.cardErr = "could not load model card"
+		}
+		s.card = ""
+		return s, nil
+	}
+	s.card = trimCardFrontmatter(msg.text)
+	s.cardErr = ""
+	s.cardOffset = 0
+	return s, nil
+}
+
+// trimCardFrontmatter drops the README's leading YAML frontmatter
+// (--- … ---), leaving the card text proper.
+func trimCardFrontmatter(text string) string {
+	if !strings.HasPrefix(text, "---") {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	for i := 1; i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], "---") {
+			return strings.Join(lines[i+1:], "\n")
+		}
+	}
+	return text
+}
+
 // ---- quants zone ----
 
 func (s *BrowserMode) updateQuants(msg tea.Msg) (*BrowserMode, tea.Cmd) {
@@ -460,12 +554,22 @@ func (s *BrowserMode) updateQuants(msg tea.Msg) (*BrowserMode, tea.Cmd) {
 		case "up":
 			if len(s.quants) > 0 && s.quantIdx > 0 {
 				s.quantIdx--
+				// keep the cursor inside the window
+				if s.quantIdx < s.quantOffset {
+					s.quantOffset = s.quantIdx
+				}
 			}
 			return s, nil
 		case "down":
 			if len(s.quants) > 0 && s.quantIdx < len(s.quants)-1 {
 				s.quantIdx++
 			}
+			return s, nil
+		case "pgup":
+			s.cardOffset = max(0, s.cardOffset-5)
+			return s, nil
+		case "pgdown":
+			s.cardOffset += 5
 			return s, nil
 		}
 	}
@@ -711,23 +815,24 @@ func (s *BrowserMode) cycleZone(back bool) {
 	}
 }
 
-// browserSorts is the t-key cycle — the search endpoint's sort fields,
-// mirroring the HF site's Models ranking (most downloads, most likes,
-// trending, recently created, recently updated; verified live).
-var browserSorts = []string{"downloads", "likes", "trendingScore", "createdAt", "lastModified"}
+// browserSorts is the s-key cycle — the search endpoint's sort fields,
+// mirroring the HF site's Models ranking (verified live). The DEFAULT
+// sort is trendingScore (owner round): both browse and search start at
+// "trending", matching huggingface.co/models.
+var browserSorts = []string{"trendingScore", "downloads", "likes", "createdAt", "lastModified"}
 
 // sortLabels are the friendly names shown in the sort indicator.
 var sortLabels = map[string]string{
+	"trendingScore": "trending",
 	"downloads":     "downloads",
 	"likes":         "likes",
-	"trendingScore": "trending",
 	"createdAt":     "newest",
 	"lastModified":  "updated",
 }
 
 func nextSort(cur string) string {
 	if cur == "" {
-		return "likes"
+		return browserSorts[1] // first press leaves the trending default
 	}
 	for i, s := range browserSorts {
 		if s == cur {
@@ -739,7 +844,7 @@ func nextSort(cur string) string {
 
 func effSort(cur string) string {
 	if cur == "" {
-		cur = browserSorts[0]
+		cur = browserSorts[0] // the trending default
 	}
 	if l, ok := sortLabels[cur]; ok {
 		return l
@@ -918,7 +1023,7 @@ func (s *BrowserMode) View() string {
 	body := []string{
 		lipgloss.NewStyle().Foreground(s.theme.Accent).Bold(true).Render("browse — Hugging Face (gguf)"),
 		"",
-		s.renderSearchBox(cw),
+		s.renderSearchBox(cw, s.zone == zoneSearch),
 	}
 	if f := s.renderFilterLine(); f != "" {
 		body = append(body, f)
@@ -944,24 +1049,24 @@ func (s *BrowserMode) View() string {
 	return bg
 }
 
-// renderSearchBox draws the search line + the sort indicator inside a
-// thin rectangle. The input width is reserved so the indicator never
-// overflows the box's right border (owner report: long sort values
-// used to overlap the border). The sort value is accent-bold — the
-// active sort is evident at a glance (owner).
-func (s *BrowserMode) renderSearchBox(cw int) string {
+// renderSearchBox draws the search panel: the accent-bold `search: `
+// prompt + input on the content line, the sort indicator right-aligned
+// on the same line, the panel title ("search") embedded in the top
+// border. The input width is reserved so the indicator never overflows
+// the box's right border; the value is accent-bold with a friendly
+// label. The border lights up (BorderFocus) when the search zone is
+// focused (owner round, router-mode pattern).
+func (s *BrowserMode) renderSearchBox(cw int, focused bool) string {
 	inner := cw - 2
 	label := lipgloss.NewStyle().Foreground(s.theme.Subtle).Render("sort: ")
 	value := lipgloss.NewStyle().Foreground(s.theme.Accent).Bold(true).Render(effSort(s.sort))
 	sortLen := len("sort: ") + len(effSort(s.sort))
-	// 10 = prompt ("search: ") + the "  " gap + margin
-	s.input.Width = max(10, inner-10-sortLen)
+	// 11 = prompt ("search: ") + cursor + the "  " gap + margin.
+	// The input pads to Width+1 (cursor), so the line must fit inner
+	// exactly or the sort value wraps onto its own line.
+	s.input.Width = max(10, inner-11-sortLen)
 	line := s.input.View() + "  " + label + value
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(s.theme.Border).
-		Width(cw).
-		Render(line)
+	return strings.Join(titledBoxLines([]string{line}, "search", cw, 3, s.theme, focused), "\n")
 }
 
 func (s *BrowserMode) renderFilterLine() string {
@@ -985,8 +1090,13 @@ func (s *BrowserMode) renderFilterLine() string {
 		"filter: " + strings.Join(active, " · ") + "  (l/L/k/m)")
 }
 
-// renderPanes lays out the results box (left) and the model-info +
-// quants box (right) side by side inside their own thin rectangles.
+// renderPanes lays out the results panel (left, full height) and the
+// right column of three titled panels — model info (content-sized:
+// name, params·from, downloads, likes, license, task), the quants
+// panel (scrollable list, in the tab focus flow), and the model card
+// (scrollable) — stacking to the results height so the column
+// bottom-aligns (owner round). The focused panel's border lights up
+// (BorderFocus).
 func (s *BrowserMode) renderPanes(cw int) []string {
 	lw := cw * 2 / 5
 	rw := cw - lw - 1 // " " separator
@@ -1000,40 +1110,75 @@ func (s *BrowserMode) renderPanes(cw int) []string {
 		}
 		left = []string{lipgloss.NewStyle().Foreground(s.theme.Muted).Render(hint)}
 	} else {
-		left = append(left, lipgloss.NewStyle().Foreground(s.theme.Accent).Bold(true).Render(
-			fmt.Sprintf("results (%d)", len(s.results.Items()))))
-		s.results.SetSize(lw-2, ph-1)
-		left = append(left, strings.Split(s.results.View(), "\n")...)
+		s.results.SetSize(lw-2, ph-2)
+		left = strings.Split(s.results.View(), "\n")
 	}
-	right := s.infoLines(rw-2, ph)
+	lb := titledBoxLines(left, fmt.Sprintf("results (%d)", len(s.results.Items())), lw, ph, s.theme, s.zone == zoneResults)
 
-	lb := boxLines(left, lw, ph+2, s.theme)
-	rb := boxLines(right, rw, ph+2, s.theme)
-	return joinPanes(lb, rb)
+	info := s.infoLines(rw - 2)
+	infoH := len(info) + 2
+	rem := max(0, ph-infoH)
+	quantsH := max(2, rem*3/5)
+	if rem-quantsH < 1 && rem >= 3 {
+		quantsH = rem - 1
+	}
+	cardH := max(0, rem-quantsH)
+	ib := titledBoxLines(info, "model info", rw, infoH, s.theme, false)
+	qb := titledBoxLines(s.quantsLines(rw-2, max(0, quantsH-2)), fmt.Sprintf("quants (%d)", len(s.quants)), rw, quantsH, s.theme, s.zone == zoneQuants)
+	cb := titledBoxLines(s.cardLines(rw-2, max(0, cardH-2)), "model card", rw, cardH, s.theme, false)
+
+	return joinPanes(lb, joinLines(ib, qb, cb))
 }
 
-// boxLines renders content inside a fixed-width rounded box of exactly
-// h lines (content padded/truncated to h-2 inner lines) — the results
-// and model-info panes share the height so both sides align.
-func boxLines(content []string, w, h int, theme Theme) []string {
+// titledBoxLines renders content inside a fixed-width rounded box of
+// exactly h lines with the panel title embedded in the top border line
+// (owner round: "all panels should have their title enclosed in the
+// top line"). Drawn manually — lipgloss Width() wraps long lines
+// instead of truncating, which previously pushed boxes past their
+// allocation (owner report: the search bar rendered one character
+// wider than the model info and long lines wrapped onto new rows).
+// focused lights the border up (BorderFocus, the router-mode pattern).
+func titledBoxLines(content []string, title string, w, h int, theme Theme, focused bool) []string {
+	if h < 2 {
+		return nil // no room for a box (tiny terminals): the caller skips it
+	}
 	inner := w - 2
-	maxLines := h - 2
+	border := theme.Border
+	if focused {
+		border = theme.BorderFocus
+	}
+	bs := lipgloss.NewStyle().Foreground(border)
+	// ╭─ title ──────────╮  (width w exactly)
+	dashes := max(0, inner-len(title)-3)
+	top := bs.Render("╭─ ") +
+		lipgloss.NewStyle().Foreground(theme.Accent).Bold(true).Render(title) +
+		bs.Render(" "+strings.Repeat("─", dashes)+"╮")
+	out := make([]string, 0, h)
+	out = append(out, padLinesTo(top, w))
+	maxLines := max(0, h-2)
 	if len(content) > maxLines {
 		content = content[:maxLines]
 	}
-	for i := range content {
-		content[i] = padLinesTo(content[i], inner)
+	for _, ln := range content {
+		out = append(out, truncatePad(ln, inner))
 	}
-	for len(content) < maxLines {
-		content = append(content, strings.Repeat(" ", inner))
+	for len(out) < h-1 {
+		out = append(out, strings.Repeat(" ", inner))
 	}
-	b := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(theme.Border).
-		Width(w)
-	return strings.Split(b.Render(strings.Join(content, "\n")), "\n")
+	out = append(out, bs.Render("╰"+strings.Repeat("─", inner)+"╯"))
+	return out
 }
 
+// truncatePad truncates and pads a line to exactly width — box content
+// must fit or the box grows (lipgloss Width wraps; MaxWidth truncates
+// explicitly).
+func truncatePad(s string, width int) string {
+	s = lipgloss.NewStyle().MaxWidth(width).Render(s)
+	return padLinesTo(s, width)
+}
+
+// joinPanes lays two same-height panel line-sets side by side with a
+// one-space gutter (the results panel and the right column).
 func joinPanes(left, right []string) []string {
 	h := max(len(left), len(right))
 	out := make([]string, 0, h)
@@ -1050,11 +1195,20 @@ func joinPanes(left, right []string) []string {
 	return out
 }
 
-// infoLines renders the model-info + quants pane for the selected repo
-// (owner layout): repo name, "from <base_model>", separator, downloads
-// and likes, license, task, the non-commercial warning, separator, and
-// the quant rows (with the ● cached badge).
-func (s *BrowserMode) infoLines(inner, ph int) []string {
+// joinLines stacks panel line-sets vertically (the right column).
+func joinLines(parts ...[]string) []string {
+	var out []string
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	return out
+}
+
+// infoLines renders the model-info panel content (the panel is
+// content-sized; its title lives in the border): repo name (accent
+// bold), params·from line, separator, downloads and likes, license and
+// task, and the non-commercial warning.
+func (s *BrowserMode) infoLines(inner int) []string {
 	var lines []string
 	muted := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Muted).Render(t) }
 	subtle := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Subtle).Render(t) }
@@ -1065,72 +1219,99 @@ func (s *BrowserMode) infoLines(inner, ph int) []string {
 
 	if s.selected == nil {
 		lines = append(lines, muted("select a repo…"))
-	} else {
-		m := s.selected
-		lines = append(lines, accent(m.ID))
-		// params (name-derived) left of the from-line, different color.
-		if p, ok := paramCountOf(*m); ok {
-			line := good(humanB(p) + " params")
-			if bm := baseModelOf(*m); bm != "" {
-				line += " · " + muted("from ") + subtle(bm)
-			}
-			lines = append(lines, line)
-		} else if bm := baseModelOf(*m); bm != "" {
-			lines = append(lines, muted("from ")+subtle(bm))
+		return lines
+	}
+	m := s.selected
+	lines = append(lines, accent(m.ID))
+	if p, ok := paramCountOf(*m); ok {
+		line := good(humanB(p) + " params")
+		if bm := baseModelOf(*m); bm != "" {
+			line += " · " + muted("from ") + subtle(bm)
 		}
-		lines = append(lines, sep)
-		lines = append(lines, good("⬇ "+humanCount(m.Downloads))+" "+muted("downloads"))
-		lines = append(lines, accent("♥ "+strconv.FormatInt(m.Likes, 10))+" "+muted("likes"))
-		lines = append(lines, muted("⚖ license: ")+subtle(licenseOf(*m)))
-		if m.PipelineTag != "" {
-			lines = append(lines, muted("▷ task: ")+subtle(m.PipelineTag))
-		}
-		if w := nonCommercialLicense(*m); w != "" {
-			lines = append(lines, warn("⚠ "+w))
-		}
-		lines = append(lines, sep)
-		switch {
-		case !s.quantsLoaded:
-			lines = append(lines, subtle("loading quants…"))
-		case len(s.quants) > 0:
-			lines = append(lines, accent(fmt.Sprintf("quants (%d)", len(s.quants))))
-			for i, q := range s.quants {
-				// tag in the row color, size in Muted like the result
-				// descriptions (owner round), then the ● cached badge.
-				row := q.Tag + " — " + muted(hf.HumanSize(q.Size))
-				if s.cached[q.Tag] {
-					row += "  " + cachedBadge(s.theme)
-				}
-				if s.zone == zoneQuants && i == s.quantIdx {
-					row = "▶ " + row
-				} else {
-					row = "  " + row
-				}
-				lines = append(lines, row)
-			}
-			if s.mmproj {
-				lines = append(lines, subtle("mmproj present — llama.cpp auto-downloads it"))
-			}
-		default: // loaded, no GGUF quants (or fetch failed): the bare row
-			row := "use " + m.ID + " without a quant"
-			if s.zone == zoneQuants && s.quantIdx == 0 {
-				row = "▶ " + row
-			} else {
-				row = "  " + row
-			}
-			lines = append(lines, row)
-			if s.mmproj {
-				lines = append(lines, subtle("mmproj present — llama.cpp auto-downloads it"))
-			}
-		}
+		lines = append(lines, line)
+	} else if bm := baseModelOf(*m); bm != "" {
+		lines = append(lines, muted("from ")+subtle(bm))
+	}
+	lines = append(lines, sep)
+	lines = append(lines, good("⬇ "+humanCount(m.Downloads))+" "+muted("downloads"))
+	lines = append(lines, accent("♥ "+strconv.FormatInt(m.Likes, 10))+" "+muted("likes"))
+	lines = append(lines, muted("⚖ license: ")+subtle(licenseOf(*m)))
+	if m.PipelineTag != "" {
+		lines = append(lines, muted("▷ task: ")+subtle(m.PipelineTag))
+	}
+	if w := nonCommercialLicense(*m); w != "" {
+		lines = append(lines, warn("⚠ "+w))
 	}
 	return lines
 }
 
 // humanB renders a param count: 8 → "8B", 2.6 → "2.6B".
 func humanB(n float64) string {
-	s := strconv.FormatFloat(n, 'f', -1, 64)
-	return s + "B"
+	return strconv.FormatFloat(n, 'f', -1, 64) + "B"
+}
+
+// quantsLines renders the quants panel content — a windowed list
+// (standard list behavior): the cursor stays visible, ▴/▾ mark
+// overflow. The panel scrolls, so any number of quants fit.
+func (s *BrowserMode) quantsLines(inner, maxLines int) []string {
+	var lines []string
+	muted := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Muted).Render(t) }
+	subtle := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Subtle).Render(t) }
+
+	if s.selected == nil {
+		lines = append(lines, muted("select a repo…"))
+		return lines
+	}
+	switch {
+	case !s.quantsLoaded:
+		lines = append(lines, subtle("loading quants…"))
+	case len(s.quants) > 0:
+		visible := maxLines - 1 // reserve the ▾/▴ indicator slot
+		if visible < 1 {
+			visible = 1
+		}
+		// Keep the cursor inside the window (standard list behavior).
+		if s.quantIdx < s.quantOffset {
+			s.quantOffset = s.quantIdx
+		}
+		if s.quantIdx >= s.quantOffset+visible {
+			s.quantOffset = s.quantIdx - visible + 1
+		}
+		end := min(len(s.quants), s.quantOffset+visible)
+		for i := s.quantOffset; i < end; i++ {
+			q := s.quants[i]
+			row := q.Tag + " — " + muted(hf.HumanSize(q.Size))
+			if s.cached[q.Tag] {
+				row += "  " + cachedBadge(s.theme)
+			}
+			if s.zone == zoneQuants && i == s.quantIdx {
+				row = "▶ " + row
+			} else {
+				row = "  " + row
+			}
+			lines = append(lines, row)
+		}
+		if end < len(s.quants) {
+			lines = append(lines, subtle("▾ more"))
+		} else if s.quantOffset > 0 {
+			lines = append(lines, subtle("▴ more"))
+		}
+		if s.mmproj {
+			lines = append(lines, subtle("mmproj present — llama.cpp auto-downloads it"))
+		}
+	default: // loaded, no GGUF quants (or fetch failed): the bare row
+		row := "use " + s.selected.ID + " without a quant"
+		if s.zone == zoneQuants && s.quantIdx == 0 {
+			row = "▶ " + row
+		} else {
+			row = "  " + row
+		}
+		lines = append(lines, row)
+		if s.mmproj {
+			lines = append(lines, subtle("mmproj present — llama.cpp auto-downloads it"))
+		}
+	}
+	return lines
 }
 
 // cachedBadge renders the fancy "already on disk" marker — a green
@@ -1141,6 +1322,49 @@ func cachedBadge(theme Theme) string {
 
 // renderFooter shows the shortcuts relevant to the focused zone — the
 // quants zone advertises enter as "hand off" (owner).
+// cardLines renders the model card panel content: the README text
+// windowed to the panel height, scrollable with pgup/pgdn in the
+// quants zone (quants ↑/↓ select; pgup/pgdn scroll the card). Loading
+// and absence states are friendly and non-blocking.
+func (s *BrowserMode) cardLines(inner, maxLines int) []string {
+	var lines []string
+	muted := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Muted).Render(t) }
+	subtle := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Subtle).Render(t) }
+
+	cardLines := strings.Split(s.card, "\n")
+	switch {
+	case s.cardLoading:
+		lines = append(lines, subtle("loading card…"))
+	case s.cardErr != "":
+		lines = append(lines, muted(s.cardErr))
+	case len(cardLines) == 0 || (len(cardLines) == 1 && cardLines[0] == ""):
+		lines = append(lines, muted("no model card"))
+	default:
+		visible := maxLines - 1 // reserve the ▾/▴ indicator slot
+		if visible < 1 {
+			visible = 1
+		}
+		maxOff := max(0, len(cardLines)-visible)
+		if s.cardOffset > maxOff {
+			s.cardOffset = maxOff
+		}
+		end := min(len(cardLines), s.cardOffset+visible)
+		for _, ln := range cardLines[s.cardOffset:end] {
+			if ln == "" {
+				ln = " "
+			}
+			lines = append(lines, subtle(ln))
+		}
+		if s.cardOffset > 0 {
+			lines = append(lines, subtle("▴ more (pgup)"))
+		}
+		if end < len(cardLines) {
+			lines = append(lines, subtle("▾ more (pgdn)"))
+		}
+	}
+	return lines
+}
+
 func (s *BrowserMode) renderFooter() string {
 	var keys []string
 	switch s.zone {
@@ -1155,7 +1379,7 @@ func (s *BrowserMode) renderFooter() string {
 			shortcut("↑/↓", "navigate", s.theme),
 			shortcut("tab", "quants", s.theme),
 			shortcut("l/L/k/m", "filter", s.theme),
-			shortcut("t", "sort", s.theme),
+			shortcut("s", "sort", s.theme),
 			shortcut("esc", "search", s.theme),
 		}
 	case zoneQuants:
