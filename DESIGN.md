@@ -2523,3 +2523,323 @@ switches to the shared `quantChooserForm`. `internal/tui/root.go` — wire
 the lazy real runner at the two ConfigMode creation sites.
 `DESIGN.md` §16.6 + the §7.5 Models pane bullet (same change, P5). No
 changes to `internal/hf`, the config schema, or ROADMAP.
+
+### 16.7 HF model browser — search/browse Hugging Face from the TUI
+
+**Scope.** Final item of Release 2 (ROADMAP §3.5, §3.7 item 7), delivered
+after the Storage & Downloads manager, the config-editor pickers, and the
+typed-repo check per the owner's order. A new **Browse** mode from Main
+searches/browses Hugging Face inside the TUI: a search box with
+server-side tag filters (language, license) — the HF search endpoint
+with the `gguf` library filter — a result list (downloads / likes /
+license / languages / task), a metadata + quant pane for the selected
+repo (real sizes
+from one `tree/main` round trip, `(cached)` markers), and a **hand-off** of
+the picked `org/repo:QUANT` straight into either the config editor's new-
+model form or the Storage manager's download action. **Non-goals:** no
+download loop here (the manager owns downloads — §16.4), no model-card
+parsing for params/context (see scope cut below), no write path of its own
+(hand-offs go through the existing editor save flow and the existing
+download engine), no config schema change (P8), no pagination beyond one
+page (see scope cut below), no VRAM math (R3).
+
+**API reality check (verified against the live API at the time of
+writing).** The search endpoint is
+
+```
+GET {endpoint}/api/models?search=<q>&filter=gguf&sort=<field>&direction=<±1>&limit=<N>
+```
+
+and returns a **plain JSON array** of repo objects with `id` (+ `modelId`
+alias), `downloads`, `likes`, `tags` (carries `license:<id>`,
+`base_model:<id>`, and language-code entries), `pipeline_tag`,
+`createdAt`, `private`. Three facts shape the design:
+
+1. **No file sizes in the search response — not even with `full=true`**
+   (verified: `full=true` adds `sha`, `lastModified`, `siblings` whose
+   entries carry only `rfilename`, `library_name`, `gated` — no size, no
+   LFS info). Per-repo sizes therefore require the existing `tree/main`
+   round trip; the design fetches it once, per selected repo, on the
+   user's explicit enter (§16.6's P7 discipline), and reuses the existing
+   §16.3/§16.6 machinery for quants + sizes + `(cached)`.
+2. **No server-side quant or size filter.** `filter=gguf` is the only
+   library filter; quant tags and file sizes are not queryable. "Filter
+   by quant/size" (§3.5) is therefore client-side: the search query
+   itself, plus the per-repo quant pane that lists every quant with its
+   real size (a GiB-budget filter over that pane was proposed and **cut
+   by owner decision** — see scope cuts). Quant *names* are served by
+   the search box (repo-level) and the quant pane (file-level).
+3. **Tags are a server-side browse axis.** Every search hit carries
+   `license:<id>`, bare language codes (`en`, `ja`, …), task tags, and
+   `base_model:<id>` / `base_model:quantized:<id>`. The `filter` param
+   is comma-joined and accepts **any** tag — `filter=gguf,ja` and
+   `filter=gguf,license:cc-by-nc-4.0` both verified live — so language
+   and license filters are one query param, zero client-side logic
+   (owner decision: included; §3.5's "filter by quant/size" reading).
+
+**Scope cut — params/context metadata (owner decision).** ROADMAP §3.5
+lists "params, context, license" as metadata. `license` comes free from
+`tags`; **params (parameter count) and context length are not fields of
+the search or repo APIs** — they live in model cards / `config.json`,
+which would mean fetching and parsing card text per repo (heavy, brittle,
+and only present on a subset of GGUF repos). This note cuts them: the
+metadata pane shows downloads, likes, license, task, base model, and
+repo-commit recency where cheap, and the quant pane carries the size
+story. Params/context are a deferred extension ("read the
+model card" button) — the owner confirms the cut or the note grows a card
+parser. This is the §14.2 "largest item" pressure valve.
+
+**Scope cut — size filter (owner decision).** A client-side GiB-budget
+filter hiding over-budget quant rows was proposed as the "filter by
+size" reading of §3.5; the owner cut it — the quant pane is sizes-only.
+The R3 VRAM estimator (§14.3) is the natural future home of a
+budget/fits-VRAM filter.
+
+**Scope cut — pagination.** One request of `limit=50` (verified
+accepted; the API returns up to at least 110 in practice) ranked by
+downloads; a "load more" / cursor loop is deferred. Search is
+stateless and re-runnable, so the browse loop stays useful without it.
+
+#### The client (`internal/hf/search.go`)
+
+The §16.2 client gains one method (its "browser extends later" hook from
+§16.2). No changes to existing methods or types:
+
+```go
+type SearchOpts struct {
+    Query     string // "" = browse: top GGUF repos by sort
+    Limit     int    // 0 → 50
+    Sort      string // "downloads" | "likes" | "lastModified"; "" → downloads
+    Direction int    // -1 desc (default), 1 asc
+    Filter    []string // extra tags beyond the fixed "gguf", in order
+                       // (e.g. "ja", "license:apache-2.0")
+}
+
+type SearchResult struct {
+    ID          string
+    Downloads   int64
+    Likes       int64
+    Tags        []string // raw: "license:*", "base_model:*", language codes
+    PipelineTag string
+}
+
+func (c *Client) Search(ctx context.Context, opts SearchOpts) ([]SearchResult, error)
+```
+
+- `filter=gguf` always, then `opts.Filter` tags appended in order
+  (`filter=gguf,ja,license:apache-2.0`); `search` omitted when empty;
+  query and each filter tag are URL-escaped per segment (same escaping
+  rule as §16.2). Errors map
+  through the existing typed `hf.Error` kinds (404 → `ErrNotFound`,
+  401/403 → `ErrGated`, transport → `ErrNetwork`, other → `ErrHTTP`)
+  and the Bearer-token rule (HF_TOKEN) applies unchanged.
+- Decode only the fields above; unknown fields ignored (forward
+  compatibility). Malformed JSON → error.
+
+#### Browser mode (`internal/tui/browser.go`)
+
+New `ViewBrowser` under Root; entry key **`b`** in Main
+(`b browse` — free in the current shortcut row; the reattach row gains
+it too), shortcut text and help line updated (main.go:544–580,
+654–666). Mirror of the `ViewStorage` wiring: a Root-owned
+`browser *BrowserMode` reused across entries (its search state and
+loaded quants survive Esc), `openBrowser()` builds it lazily like
+`openStorage` (root.go:563) — `storage.CacheRoot(r.cfg.Prefs().ModelsDir)`
+for the `(cached)` markers — and injects the runner.
+
+**Runner injection.** Same lazy, nil-safe pattern as §16.6's
+`hfCheckRunner` (root.go:549–557):
+
+```go
+type browserRunner interface {
+    Search(ctx context.Context, opts hf.SearchOpts) ([]hf.SearchResult, error)
+    Choose(ctx context.Context, repo string) ([]hf.QuantOption, error) // tree → quants
+}
+```
+
+`SetBrowserRunner` setter; `r.browserRunner()` builds a lazy `hf.New()`;
+client error → nil runner → search disabled (P3: the mode renders and
+Esc works; search shows a "search unavailable" flash, never a crash).
+
+**Layout — three zones, Tab cycles.** The mode is a static layout, not
+an overlay (this is a full screen like the Storage manager, not a form
+popup):
+
+```
+┌ browse — Hugging Face (gguf) ────────────────────────────────┐
+│ search: [llama 3          ]  sort: downloads (t)            │
+│ filter: en · apache-2.0   (l/L)                             │
+│ ┌─ results (50) ──────────────┐ ┌─ metadata + quants ──────┐ │
+│ │ ▶ lm-anon/vntl-llama3…      │ │ org/repo                 │ │
+│ │   743k dl · 17 likes ·      │ │ license: llama3.1 · task…│ │
+│ │   en ja · lic: llama3       │ │ languages: en de fr it   │ │
+│ │   bartowski/Meta-Llama-3…   │ │ from meta-llama/Llama-3… │ │
+│ │   …                         │ │ ⚠ non-commercial license │ │
+│ └─────────────────────────────┘ └──────────────────────────┘ │
+│ ↑/↓ move · enter open · l/L filter · t sort · esc back      │
+└───────────────────────────────────────────────────────────────┘
+```
+
+- **focusSearch** — a `bubbles/textinput` line. Typing goes to it;
+  `enter` runs the search (gen-guarded async, shield + `esc: cancel`
+  like §16.6); `t` cycles sort downloads → likes → lastModified (re-runs
+  the same query, same gen guard); `l` / `L` open the tag filters
+  (below); `esc` returns to Main. The input is
+  re-shown pre-filled with the last query so edits re-search.
+- **focusResults** — a `bubbles/list` (the §16.5 repoPicker delegate
+  shape: arrows-only keymap, no chrome) over the results; row =
+  `org/repo`, description = `Nk downloads · N likes · <languages> ·
+  license: <id>` (languages = the bare tag codes, space-joined;
+  license pulled from `tags`). `enter` on a result **explicitly
+  fetches** its quants (P7 — one `tree/main` via the runner's `Choose`,
+  the §16.6 async discipline: cancellable ctx, per-request gen counter,
+  `ctx.Canceled` re-raised by the adapter because the §16.2 client
+  swallows it — the item-6 gotcha, hfcheck.go:64–77) and fills the
+  metadata + quant pane; the pane header shows a static
+  `loading quants for org/repo… · esc: cancel` shield until done.
+  `esc` returns to focusSearch.
+- **Metadata pane** (right zone header, filled on enter; the data is
+  already in the search result): `license:<id>`, `pipeline_tag`,
+  **languages** (`en · de · fr`), and — when a
+  `base_model:quantized:<id>` tag is present — a `quantized from <id>`
+  line (answers "what is this repo actually?"). A license starting
+  `cc-by-nc` (the non-commercial family) renders a
+  **⚠ non-commercial license — check terms** warning line (P3: display
+  only, never blocks a hand-off).
+- **focusQuants** — the quant list for the selected repo: rows reuse
+  the §16.3 label exactly — `Tag — hf.HumanSize(Size)` + ` (cached)`
+  when `storage.Lookup(root, repo)` marks it (the storage.go:764–769
+  logic, extracted into a shared `quantRowLabel(q hf.QuantOption, cached
+  bool) string` in hfcheck.go — the "same helpers" rule, so the chooser,
+  the config editor, and the browser always agree), plus the mmproj
+  informational line (`hf.HasMMProj`). `enter` on a quant opens the
+  **hand-off dialog** (below); a repo with no GGUF quants shows a
+  `use org/repo without a quant` row that hands off the **bare** id
+  (same semantics as the chooser's esc-saves-bare and §16.6's Save
+  path). `esc` returns to focusResults.
+
+Tab / Shift+Tab cycle the three zones; each zone's key handling is
+exclusive (the same "overlay handlers run on EVERY message" discipline —
+zone messages are consumed in `Update` before anything else).
+
+**Tag filters (`l` / `L`, focusSearch).** Two curated overlays — the
+§16.6 dialog pattern (boxed, height-capped huh select, dedicated slot
+`tagFilter *huh.Form` + `tagFilterVal`):
+
+- `l` — **language**: `all languages`, en, es, de, fr, it, pt, ja, zh,
+  ko, ru, ar, hi, th, multilingual. Picking one sets
+  `browser.filterLang` and re-runs the search with it; `all languages`
+  (or esc) clears it.
+- `L` — **license**: `any license`, apache-2.0, mit, llama3.1, llama3.2,
+  llama3.3, gemma, openrail, cc-by-nc-4.0, other. Sets
+  `browser.filterLic`; `any license`/esc clears.
+
+Both filters combine into the search request as extra `Filter` tags
+(`filter=gguf,ja,license:apache-2.0` — verified server-side), re-run
+with the same gen guard as sort changes. The header renders the active
+filters (`filter: en · apache-2.0`, key hint `(l/L)`); `l`/`L` re-open
+the pickers to change or clear. Escaping a tag uses the same per-segment
+rule as the query. The curated lists are package-level constants (the
+"same helpers" rule — the picker options and the request assembly both
+read from them), so the two surfaces can never disagree.
+
+**Hand-off dialog.** `enter` on a quant (or the no-quant row) opens a
+boxed, height-capped huh select — the §16.6 dialog pattern
+(hfFail/hfQuant: dedicated slot, `overlayBox`, `maxRows` = height −
+overhead):
+
+- **`add to config`** → emits `browserConfigHandoffMsg{id}`. Root opens
+  the config editor's **new-model form pre-filled**: `configEntry`
+  (root.go:450) gains `prefillHF string`; `openConfig` sets a new
+  `ConfigMode.prefillHF` and `openNewModelForm` (config.go:844) seeds
+  the staging `source = sourceHF` and `hf = prefillHF` instead of `""`
+  (cleared after use). The pre-fill goes through the staging-pointer +
+  `RefreshValue()` path, so `edited` stays false and the §16.6 check
+  does **not** fire on the pre-filled id (correct: it was never typed).
+  The form opens on the alias field; the user names the model and saves
+  normally (the existing save flow, P8).
+- **`download now`** → emits `browserDownloadHandoffMsg{id}`. Root opens
+  the Storage manager (`openStorage()`, reusing the live instance so
+  existing downloads survive) and starts the download directly:
+  `splitRepoQuant(id)` → `r.storage.startDownload(repo, quant)` +
+  `rebuild()` + `focusDownloadRow()` (the openStorage pattern,
+  root.go:573–593). Downloads stay in the manager — the single place
+  downloads are managed (§16.4); the browser never spawns its own rows.
+- **`cancel`** → closes the dialog, stays on the quant pane.
+
+`esc` in the dialog = cancel. Errors during the quant fetch (not-found /
+gated / network / HTTP — the §16.2 kinds) flash the distinct message in
+the browser footer and leave the pane on the metadata-only state, so the
+user can still hand off the bare id (mirrors §16.6's Save path). The
+runner-nil case (search disabled) also disables hand-off (flash only).
+
+**Routing and state.** `BrowserMode` fields: `query string`, `input
+textinput.Model`, `sort string`, `filterLang, filterLic string`,
+`results []hf.SearchResult`, `cursor`
+(zone enum + list state), `selected hf.SearchResult`, `quants
+[]hf.QuantOption`, `cached map[string]bool`, `mmproj bool`,
+`shield *browserShield{zone, repo, cancel}`, `gen` counters
+for search and quant fetches, `handoff *huh.Form` + `handoffVal`,
+`tagFilter *huh.Form` + `tagFilterVal`, `flash
+string`. `SetSize` propagates to the textinput/list/dialogs like
+`StorageMode`'s. Stale-result discipline (the item-6 gotcha): a done msg
+whose gen mismatches the current request is dropped — a stale search may
+never overwrite a newer query's results, and a stale quant fetch (user
+selected another repo meanwhile) may never fill the pane.
+
+**Determinism and tests (P9).**
+
+- `hf/search_test.go` against `httptest.Server` (the §16.2 style): URL
+  path + query assembly (`filter=gguf` always; `search` absent when
+  empty; **filter-tag assembly** — `Filter: []string{"ja"}` →
+  `filter=gguf,ja`, `["ja","license:apache-2.0"]` →
+  `filter=gguf,ja,license:apache-2.0`, order preserved, escaping;
+  limit/sort/direction; query escaping incl. `+`/spaces);
+  Bearer header with and without `HF_TOKEN`; response parse (id,
+  downloads, likes, tags, pipeline_tag; absent fields → zero values);
+  `full=true` not requested; 404/401/transport → typed kinds; empty
+  list; malformed JSON → error.
+- Browser flow tests with a **stub runner** (the stubSpawner pattern,
+  `SetBrowserRunner`): type query → enter → results render; select →
+  enter → quants + sizes + `(cached)` markers (fake hub cache trees via
+  `storage.Lookup`, the scan_test fixture style) + mmproj note; pick a
+  quant → hand-off dialog → **add to config** yields
+  `browserConfigHandoffMsg{org/repo:QUANT}` and Root's arm opens
+  ConfigMode with the new-model form pre-filled source=hf,
+  hf=`org/repo:QUANT` (assert the form's staging, and that no
+  `hfCheckRequestedMsg` fires — pre-filled, not typed); **download
+  now** yields `browserDownloadHandoffMsg` and Root's arm opens the
+  Storage manager with a running download row for the split repo/quant
+  (stub engine); esc paths at every zone and the dialog; shield renders
+  static text; gen-mismatch drop (stale search and stale quant msgs);
+  the no-quant bare hand-off row; sort cycle re-runs the search with
+  the new sort; **`l`/`L` tag filters** — the picker opens, picking
+  `ja` re-runs the search with `Filter: ["ja"]`, picking a license
+  appends `license:<id>`, both combine in one request, `all languages`/
+  `any license`/esc clear, header shows the active filters; **metadata
+  pane** — stub results with `base_model:quantized:<id>` render the
+  `quantized from` line, `license:cc-by-nc-4.0` renders the
+  non-commercial warning, language codes render in the pane and the
+  result row; runner nil → search flash, no crash.
+- Root dispatch: `b` opens ViewBrowser from both Main states (idle +
+  reattach); shortcut-row and help text updated; size propagation and
+  `forward`/`View` wiring (the §16.4 checklist).
+- Snapshot tests render the browser in-process with the stub runner:
+  empty search, results + metadata pane, quant pane with a cached
+  marker, hand-off dialog — deterministic (no network, no timing).
+
+**File map.** New `internal/hf/search.go` + `search_test.go`.
+New `internal/tui/browser.go` + `browser_test.go` (BrowserMode, the zone
+state, search/quant-fetch cmds + gen counters, shield, tag-filter
+overlays (`l`/`L`) + the curated constants, hand-off dialog,
+the two hand-off messages, runner interface).
+`internal/tui/hfcheck.go` — extract `quantRowLabel` (chooser + browser
+share it). `internal/tui/root.go` — `ViewBrowser`, `b` key + dispatch,
+`openBrowser` + lazy `browserRunner`, size/forward/View wiring, the two
+hand-off msg arms (`browserConfigHandoffMsg` → openConfig prefill;
+`browserDownloadHandoffMsg` → openStorage + startDownload +
+focusDownloadRow). `internal/tui/config.go` — `prefillHF` field + the
+`openNewModelForm` seeding branch; `configEntry` gains `prefillHF`.
+`internal/tui/main.go` — `b browse` shortcut + help line. `DESIGN.md`
+§16.7 + §7.5 mode list + §14.2 browser bullet (same change, P5). No
+changes to the config schema, `internal/storage`, or ROADMAP.
