@@ -2781,7 +2781,11 @@ lists the top GGUF repos by the current sort (the placeholder reads
      sections-only policy** (owner round): headings, thematic breaks,
      code blocks, tables and lists get one blank line before AND after
      them, while consecutive paragraphs flow together (thematic breaks
-     and tables used to drop their after-blank entirely — fixed);
+     and tables used to drop their after-blank entirely — fixed;
+     **consecutive quoted lines flow together** — goldmark parses
+     `> a` blank-separated lines as separate Blockquote nodes, and the
+     inner paragraph's newline already separates them, so only the
+     last line of a quoted run adds the trailing blank);
      **links and
      autolinks are OSC 8 terminal hyperlinks** — `ESC]8;;URL ESC\
      … ESC]8;; ESC\\` — so ctrl/cmd-click opens the URL in the

@@ -116,3 +116,20 @@ func TestCardMarkdownHTMLSkipped(t *testing.T) {
 		t.Fatalf("HTML block must be skipped: %q", lines)
 	}
 }
+
+// TestCardMarkdownBlockquoteRun: consecutive quoted lines (separate
+// Blockquote nodes in goldmark) flow with a single newline; only the
+// last line of the run adds the trailing blank (owner round).
+func TestCardMarkdownBlockquoteRun(t *testing.T) {
+	md := "> line one\n\n> line two\n\n> line three\n\npara"
+	lines := renderCardMarkdown(DefaultTheme(), []byte(md))
+	want := []string{"▍ line one", "▍ line two", "▍ line three", "", "para"}
+	if len(lines) != len(want) {
+		t.Fatalf("lines = %d, want %d\n%q", len(lines), len(want), lines)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Errorf("line %d = %q, want %q (all: %q)", i, lines[i], want[i], lines)
+		}
+	}
+}

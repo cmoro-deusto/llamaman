@@ -184,13 +184,22 @@ func (r *cardRenderer) renderListItem(_ util.BufWriter, _ []byte, _ ast.Node, en
 	return ast.WalkContinue, nil
 }
 
-func (r *cardRenderer) renderBlockquote(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
+func (r *cardRenderer) renderBlockquote(_ util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
 		r.write("▍ ") // prefix once; the muted style covers the chunks
 		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Muted).Render(s) })
 	} else {
 		r.pop()
-		r.buf.WriteString("\n") // blockquote flows like a paragraph
+		// Consecutive quoted lines are separate Blockquote nodes in
+		// goldmark (the card author blanks them); the inner paragraph's
+		// newline already separates them — only the LAST line of a
+		// quoted run adds the trailing blank (owner round). Without
+		// this, each quoted line ended with \n\n (paragraph \n +
+		// blockquote \n stacking).
+		if sib := n.NextSibling(); sib != nil && sib.Kind() == ast.KindBlockquote {
+			return ast.WalkContinue, nil
+		}
+		r.buf.WriteString("\n")
 	}
 	return ast.WalkContinue, nil
 }
