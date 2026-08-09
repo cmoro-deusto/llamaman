@@ -260,15 +260,13 @@ func (c *ConfigMode) openModelPicker(kind string) (*ConfigMode, tea.Cmd) {
 			return c, nil
 		}
 	}
-	// The HF repo list gets essentially the full screen width — long
-	// org/repo ids and their quant lists need room to stay on one line
-	// (owner feedback). The local filepicker only uses the height.
+	// The HF repo list is sized to half the screen (owner round-4: no
+	// need for full width); the box is padded to exactly half the
+	// screen so the rectangle never jitters with the selection. The
+	// local filepicker only uses the height.
 	pw, ph := c.pickerSize()
 	if kind == sourceHF {
-		pw = c.width - 6
-		if pw < 40 {
-			pw = 40
-		}
+		pw = max(24, c.width/2-6)
 	}
 	mp.SetSize(pw, ph)
 	c.modelPicker = mp

@@ -434,7 +434,24 @@ func TestModelFormPickerDirNavigation(t *testing.T) {
 		t.Error("picker did not list the file inside the directory")
 	}
 
-	// Enter again picks the file inside it.
+	// Backspace goes up one level even from inside a subdirectory
+	// (owner round-4: navigation up must always work).
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyBackspace})
+	if c.modelPicker == nil {
+		t.Fatal("overlay closed on backspace")
+	}
+	if c.modelPicker.fp.CurrentDirectory != home {
+		t.Errorf("CurrentDirectory = %q after backspace, want %q", c.modelPicker.fp.CurrentDirectory, home)
+	}
+	if !strings.Contains(c.View(), "sub") {
+		t.Error("picker did not list the directory after going up")
+	}
+
+	// Enter again descends and picks the file inside it.
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyEnter})
+	if c.modelPicker == nil {
+		t.Fatal("overlay closed when re-entering the directory")
+	}
 	c = drive(t, c, tea.KeyMsg{Type: tea.KeyEnter})
 	if c.modelPicker != nil {
 		t.Fatal("overlay did not close after picking inside the directory")
@@ -536,8 +553,8 @@ func TestModelFormPickerHiddenFiles(t *testing.T) {
 }
 
 // TestModelFormHFWideList checks the owner feedback: the HF repo list
-// is sized to nearly the full screen width so long org/repo ids and
-// their quant lists stay on one line.
+// is half the screen width; long org/repo ids ellipsize (never wrap)
+// inside the fixed rectangle.
 func TestModelFormHFWideList(t *testing.T) {
 	root := t.TempDir()
 	mkHubRepo(t, root, "DavidAU/Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF",
@@ -552,25 +569,28 @@ func TestModelFormHFWideList(t *testing.T) {
 	if c.modelPicker == nil {
 		t.Fatal("repo picker did not open")
 	}
-	if got := c.modelPicker.repos.list.Width(); got != c.width-6 {
-		t.Errorf("repo list width = %d, want %d (screen width - 6)", got, c.width-6)
+	if got := c.modelPicker.repos.list.Width(); got != max(24, c.width/2-6) {
+		t.Errorf("repo list width = %d, want %d (half screen - 6)", got, max(24, c.width/2-6))
 	}
-	// The long id and both quants render on a single line each.
 	view := c.View()
-	for _, want := range []string{
-		"DavidAU/Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF",
-		"Q4_K_S", "Q4_K_M",
-	} {
+	// Quants render; the long id is ellipsized (single line, no wrap).
+	for _, want := range []string{"Q4_K_S", "Q4_K_M"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("repo picker view missing %q", want)
 		}
 	}
+	if strings.Contains(view, "DavidAU/Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF") {
+		t.Error("long id unexpectedly fit in half width (should ellipsize)")
+	}
+	if !strings.Contains(view, "…") {
+		t.Error("long id should be ellipsized, not wrapped")
+	}
 }
 
 // TestModelFormHFFixedBoxWidth checks the owner round-3 feedback: the
-// enclosing selector rectangle spans the full screen width and its
-// size does not change when the selection moves (the selected row used
-// to render 2 cells narrower, shifting the box).
+// enclosing selector rectangle spans half the screen and its size does
+// not change when the selection moves (the selected row used to render
+// 2 cells narrower, shifting the box).
 func TestModelFormHFFixedBoxWidth(t *testing.T) {
 	root := t.TempDir()
 	mkHubRepo(t, root, "Alpha/First", "model-Q4_K_M.gguf")
@@ -586,17 +606,20 @@ func TestModelFormHFFixedBoxWidth(t *testing.T) {
 		t.Fatal("repo picker did not open")
 	}
 	boxWidth := func() int {
-		for _, l := range strings.Split(c.View(), "\n") {
-			if strings.Contains(l, "╭") { // the box's top border spans its width
+		// Render the popup alone (no background overlay) — the border
+		// line's width is exactly the enclosing rectangle's width.
+		for _, l := range strings.Split(c.modelPicker.View(DefaultTheme()), "\n") {
+			if strings.Contains(l, "╭") {
 				return lipgloss.Width(l)
 			}
 		}
 		t.Fatal("no box border found in view")
 		return 0
 	}
+	want := max(24, c.width/2-6) + 6
 	w1 := boxWidth()
-	if w1 != c.width {
-		t.Errorf("box width = %d, want full screen %d", w1, c.width)
+	if w1 != want {
+		t.Errorf("box width = %d, want half screen %d", w1, want)
 	}
 	// Moving the selection must not change the box width.
 	c = drive(t, c, tea.KeyMsg{Type: tea.KeyDown})

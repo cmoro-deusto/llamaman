@@ -24,6 +24,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/hf"
@@ -132,7 +133,6 @@ type modelPicker struct {
 	kind         string // sourceLocal | sourceHF
 	fp           filepicker.Model
 	repos        *repoPicker
-	startDir     string // the filepicker's opening directory (the esc-cancel boundary)
 	toggleHidden key.Binding // "." — show/hide hidden files in the local picker
 	errLine      string // transient overlay error (e.g. selecting a disabled file)
 	boxWidth     int    // HF only: fixed popup width (0 = auto-sized)
@@ -174,7 +174,6 @@ func newLocalPicker(dir string) *modelPicker {
 	return &modelPicker{
 		kind:         sourceLocal,
 		fp:           fp,
-		startDir:     dir,
 		toggleHidden: key.NewBinding(key.WithKeys("."), key.WithHelp(".", "toggle hidden")),
 	}
 }
@@ -261,11 +260,14 @@ func (p *modelPicker) Update(msg tea.Msg) (*modelPicker, tea.Cmd) {
 			// visibility (readDirMsg flows back through the loop).
 			return p, p.fp.Init()
 		}
-		if key.Matches(k, p.fp.KeyMap.Back) && p.fp.CurrentDirectory == p.startDir {
-			// esc back at the opening directory cancels instead of
-			// leaving it: the picker is closed, nothing changes.
+		if key.Matches(k, p.fp.KeyMap.Back) && k.String() == "esc" {
+			// esc always cancels (config-mode convention); the widget
+			// must not see it, or it would navigate up instead.
 			return p, func() tea.Msg { return modelPickerDoneMsg{kind: sourceLocal, cancelled: true} }
 		}
+		// backspace / ← fall through to the widget, which always goes
+		// up one level — navigating up from the start dir works too
+		// (owner round-4).
 	}
 	var cmd tea.Cmd
 	p.fp, cmd = p.fp.Update(msg)
@@ -297,7 +299,7 @@ func (p *modelPicker) View(theme Theme) string {
 			hidden = "on"
 		}
 		parts = append(parts, lipgloss.NewStyle().Foreground(theme.Subtle).Render(
-			"↑↓: move · enter: open/select · esc: back, cancel at start · .: hidden "+hidden))
+			"↑↓: move · enter: open/select · ←/backspace: up · esc: cancel · .: hidden "+hidden))
 		return box.Render(strings.Join(parts, "\n"))
 	}
 	out := box.Render(p.repos.View(theme))
@@ -463,14 +465,21 @@ func (p *repoPicker) View(theme Theme) string {
 	}
 	parts = append(parts, lipgloss.NewStyle().Foreground(theme.Subtle).Render(hint))
 	// Pad every line to the list width so the fixed-width box has no
-	// ragged right edge (and the rectangle never jitters).
+	// ragged right edge (and the rectangle never jitters); lines wider
+	// than the list (e.g. a long hint on a narrow terminal) are
+	// truncated so the box can never grow. Each line is handled
+	// individually — parts elements can be multi-line.
 	inner := max(20, p.list.Width())
-	out := make([]string, 0, len(parts))
-	for _, l := range parts {
-		if w := lipgloss.Width(l); w < inner {
-			l += strings.Repeat(" ", inner-w)
+	out := make([]string, 0, len(parts)+4)
+	for _, part := range parts {
+		for _, l := range strings.Split(part, "\n") {
+			if w := lipgloss.Width(l); w > inner {
+				l = ansi.Truncate(l, inner, "…")
+			} else if w < inner {
+				l += strings.Repeat(" ", inner-w)
+			}
+			out = append(out, l)
 		}
-		out = append(out, l)
 	}
 	return strings.Join(out, "\n")
 }

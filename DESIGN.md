@@ -2200,8 +2200,9 @@ filtering in the local picker):
   (huh keeps it false for the same reason).
 - Keymap trimmed to the config-mode arrow convention (same rationale as
   `paramPicker` dropping j/k): `↑`/`↓` move, `enter` opens a directory
-  or selects a file, `esc`/`backspace`/`←` go up one level, `esc` at
-  the start dir cancels the overlay. `g`/`G`/`j`/`k`/`h`/`l` removed.
+  or selects a file, `←`/`backspace` **always go up one level — even
+  from the opening directory** (owner round-4), `esc` always cancels
+  the picker. `g`/`G`/`j`/`k`/`h`/`l` removed.
 - Sized via the existing `pickerSize()` height + `overlayCenter` (the
   same box treatment `paramPicker.View` uses), height through
   `picker.SetHeight`.
@@ -2223,8 +2224,8 @@ filtering in the local picker):
 4. `~`.
 
 If every candidate is unset or nonexistent, `~` is used. The resolved
-dir is the browser's start dir (the esc-cancel boundary); the browser
-reads the directory synchronously at construction.
+dir is the filepicker's opening directory (where `←`/`backspace` can
+still go up — only `esc` cancels); the picker reads it at construction.
 
 #### HF branch — the cached-repo list
 
@@ -2239,13 +2240,15 @@ via `hf.Quants(repoFiles(fs))` + `hf.HumanSize` — both package-level in
 
 The overlay is a `bubbles/list` picker in the `paramPicker` shape
 (arrows-only keymap, reverse-video selection, no
-chrome). The repo list is sized to **essentially the full screen width**
-(`width - 6` inner, vs the standard `pickerSize` width), and the popup
-box is padded to exactly `width` cells — the enclosing rectangle spans
-the whole screen and **never changes size when the selection moves**
-(owner round-3: all four row styles share the same 2-cell left padding
-and the box is right-padded via `padLinesTo`; the delegate ellipsizes
-anything longer than the screen, it never wraps). ROADMAP §3.8 names
+chrome). The repo list is sized to **half the screen width**
+(`width/2 - 6` inner), and the popup box is padded to exactly
+`width/2` cells (owner round-4: no full width) — the enclosing
+rectangle never changes size when the selection moves (owner round-3:
+all four row styles share the same 2-cell left padding, every line is
+padded — and truncated if longer than the list — via the
+`repoPicker.View` pass, and the box is right-padded via `padLinesTo`).
+The delegate ellipsizes anything longer than the screen, it never
+wraps. ROADMAP §3.8 names
 `huh.Select`, but per-option descriptions
 (quants + sizes) are exactly what `huh.Select` cannot render — the same
 reason `paramPicker` exists — so the custom list picker is used
