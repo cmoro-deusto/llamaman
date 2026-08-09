@@ -2805,7 +2805,12 @@ lists the top GGUF repos by the current sort (the placeholder reads
      card` (404), `could not load model card` (other). The panel takes
      the column's remaining height — `quantsH = min(7, rem)`,
      `cardH = rem - quantsH` — so the card grows as much as the
-     terminal allows.
+     terminal allows. **The Preferences theme reaches the browser**:
+     Root.applyTheme (Settings save / `t` cycle) pushes the resolved
+     palette into every live mode — the browser (and the Storage
+     manager) are lazily created once and reused, so a theme changed
+     after their creation must still apply (`SetTheme`; the rendered
+     card is re-rendered under the new theme).
 - **focusQuants** — the quant list with its own cursor (↑/↓); `enter`
   on a quant opens the **hand-off dialog** (below); a repo with no
   GGUF quants shows a `use org/repo without a quant` row that hands

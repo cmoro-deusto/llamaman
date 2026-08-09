@@ -20,8 +20,8 @@ import (
 	"syscall"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/bubbles/spinner"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 
@@ -83,11 +83,11 @@ type downloadState struct {
 	prog         *progressSlot
 	finish       chan error // the download goroutine reports completion
 	spinner      spinner.Model
-	err       error
-	cancel    context.CancelFunc
-	paused    bool // user pressed pause
-	discard   bool // user pressed cancel (remove partials)
-	doneAt    time.Time // when the download finished (auto-dismiss clock)
+	err          error
+	cancel       context.CancelFunc
+	paused       bool      // user pressed pause
+	discard      bool      // user pressed cancel (remove partials)
+	doneAt       time.Time // when the download finished (auto-dismiss clock)
 }
 
 type dlTickMsg struct{}
@@ -143,26 +143,26 @@ type StorageMode struct {
 	cursor  int
 	spinner spinner.Model
 
-	form      *huh.Form // download-now repo input
-	repoVal   string
-	quantForm *huh.Form // quant picker
-	quantVal  string
-	pendingRepo string
-	menu      *huh.Form // per-row action menu
-	menuAction string
-	menuStage  int // 0 = row action menu, 1 = delete-scope menu
-	quantDel  *huh.Form // per-quant delete multi-select
-	quantDelVal []string
-	confirm      *huh.Form // delete confirmation
-	confirmYes   bool
-	confirmEntry int
+	form          *huh.Form // download-now repo input
+	repoVal       string
+	quantForm     *huh.Form // quant picker
+	quantVal      string
+	pendingRepo   string
+	menu          *huh.Form // per-row action menu
+	menuAction    string
+	menuStage     int       // 0 = row action menu, 1 = delete-scope menu
+	quantDel      *huh.Form // per-quant delete multi-select
+	quantDelVal   []string
+	confirm       *huh.Form // delete confirmation
+	confirmYes    bool
+	confirmEntry  int
 	confirmAction string // "deletecache" | "deleteconfig" | "deletequants"
 	confirmQuants []string
 
 	downloads []*downloadState
 
-	flash   string
-	flashAt time.Time // flash auto-expiry clock
+	flash         string
+	flashAt       time.Time // flash auto-expiry clock
 	width, height int
 }
 
@@ -171,9 +171,9 @@ type StorageMode struct {
 // stub; the root wires a real *hf.Client).
 func NewStorageMode(cfg *config.Config, theme Theme, root string) *StorageMode {
 	return &StorageMode{
-		cfg:     cfg,
-		theme:   theme,
-		root:    root,
+		cfg:   cfg,
+		theme: theme,
+		root:  root,
 		spinner: spinner.New(spinner.WithSpinner(spinner.Dot),
 			spinner.WithStyle(lipgloss.NewStyle().Foreground(theme.Accent))),
 	}
@@ -181,6 +181,11 @@ func NewStorageMode(cfg *config.Config, theme Theme, root string) *StorageMode {
 
 // SetEngine attaches the download engine.
 func (s *StorageMode) SetEngine(e downloadEngine) { s.engine = e }
+
+// SetTheme swaps the manager's palette (Root.applyTheme pushes the
+// user-selected theme into every live mode — the manager may have been
+// created before the change, same pattern as the browser).
+func (s *StorageMode) SetTheme(t Theme) { s.theme = t }
 
 // SetSize tracks terminal dimensions.
 func (s *StorageMode) SetSize(w, h int) { s.width, s.height = w, h }

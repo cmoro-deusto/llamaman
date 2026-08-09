@@ -163,6 +163,7 @@ type BrowserMode struct {
 	quantOffset   int // first visible quant (windowed list, scrolls with the cursor)
 
 	cardLines   []string // model card rendered to styled lines (markdown)
+	cardRaw     string   // frontmatter-trimmed markdown, for theme re-renders
 	cardErr     string   // friendly non-blocking note when the card is unavailable
 	cardLoading bool
 	cardOffset  int // first visible card line (pgup/pgdown scroll)
@@ -209,6 +210,18 @@ func NewBrowserMode(theme Theme, root string) BrowserMode {
 // SetBrowserRunner injects the network runner (nil disables search,
 // P3 — the mode still renders and esc works).
 func (s *BrowserMode) SetBrowserRunner(r browserRunner) { s.runner = r }
+
+// SetTheme swaps the browser's palette. Root.applyTheme pushes the
+// user-selected theme into every live mode — the browser may have been
+// created before the change (owner round: the Preferences theme must
+// reach the browse view). The rendered card is re-rendered so its
+// embedded colors follow the theme.
+func (s *BrowserMode) SetTheme(t Theme) {
+	s.theme = t
+	if s.cardRaw != "" {
+		s.cardLines = renderCardMarkdown(t, []byte(s.cardRaw))
+	}
+}
 
 // SetSize propagates the window size into the search input; the list
 // and panes are sized at render time from s.width/s.height.
@@ -523,7 +536,8 @@ func (s *BrowserMode) handleCardDone(msg browserCardDoneMsg) (*BrowserMode, tea.
 		s.cardLines = nil
 		return s, nil
 	}
-	s.cardLines = renderCardMarkdown(s.theme, []byte(trimCardFrontmatter(msg.text)))
+	s.cardRaw = trimCardFrontmatter(msg.text)
+	s.cardLines = renderCardMarkdown(s.theme, []byte(s.cardRaw))
 	s.cardErr = ""
 	s.cardOffset = 0
 	return s, nil

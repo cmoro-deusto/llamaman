@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/hf"
 )
 
@@ -780,5 +781,37 @@ func TestBrowserCardScrollFromAnyZone(t *testing.T) {
 	driveRoot(t, r, tea.KeyMsg{Type: tea.KeyPgUp})
 	if b.cardOffset != before {
 		t.Errorf("pgup must scroll back: %d → %d", b.cardOffset, before)
+	}
+}
+
+// TestBrowserSetTheme: a theme change (Settings save / t cycle) must
+// reach a browser that was created earlier — applyTheme pushes into
+// live modes and the rendered card follows (owner round).
+func TestBrowserSetTheme(t *testing.T) {
+	stub := &stubBrowserRunner{
+		results: []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
+		opts:    []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}},
+		card:    "# Model\n\nCard body.",
+	}
+	r, b := openBrowserRoot(t, stub)
+	searchDrive(t, r, "q") // card loads
+	if b.cardRaw == "" || len(b.cardLines) == 0 {
+		t.Fatal("card must be loaded before the theme change")
+	}
+	before := b.theme
+	if r.cfg.Preferences == nil {
+		r.cfg.Preferences = &config.Preferences{}
+	}
+	r.cfg.Preferences.Theme = "dracula"
+	r.applyTheme()
+	if b.theme == before {
+		t.Fatal("browser theme must be updated by applyTheme")
+	}
+	if b.theme != r.theme {
+		t.Errorf("browser theme diverged from root: %v vs %v", b.theme, r.theme)
+	}
+	// The card was re-rendered under the new theme (lines still present).
+	if len(b.cardLines) == 0 || !strings.Contains(stripANSI(strings.Join(b.cardLines, "\n")), "Model") {
+		t.Error("card must be re-rendered after the theme change")
 	}
 }

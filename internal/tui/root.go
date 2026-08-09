@@ -810,6 +810,16 @@ func (r *Root) applyTheme() {
 	}
 	r.theme = theme
 	r.mainMode.SetTheme(theme)
+	// Push into every live mode: storage and the browser are lazily
+	// created once and reused, so a theme changed after their creation
+	// must still reach them (owner round: the Preferences theme must
+	// apply to the browse view).
+	if r.storage != nil {
+		r.storage.SetTheme(theme)
+	}
+	if r.browser != nil {
+		r.browser.SetTheme(theme)
+	}
 	if w := mismatchWarning(r.cfg.Prefs().Theme, lipgloss.HasDarkBackground()); w != "" {
 		r.mainMode.SetFlash("⚠ " + w)
 	}
