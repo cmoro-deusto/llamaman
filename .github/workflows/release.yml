@@ -66,23 +66,30 @@ jobs:
         if: always()
         run: |
           TAG="${{ github.ref_name }}"
-          # GoReleaser writes AUR files to dist/aur/
           AURDIR="dist/aur"
           if [ ! -d "$AURDIR" ]; then
             echo "::warning::No AUR directory found in dist, skipping AUR tarball"
             exit 0
           fi
           mkdir -p aur-pkg
-          # GoReleaser names files with .pkgbuild / .srcinfo extensions
-          cp "$AURDIR"/*.pkgbuild "$AURDIR"/*.srcinfo aur-pkg/ 2>/dev/null || true
-          # Also include any generated PKGBUILD without extension if present
-          cp "$AURDIR"/PKGBUILD "$AURDIR"/.SRCINFO aur-pkg/ 2>/dev/null || true
-          if [ -z "$(ls -A aur-pkg 2>/dev/null)" ]; then
-            echo "::warning::No AUR files found to package, skipping"
+          # GoReleaser creates files like llamaman-bin.pkgbuild and llamaman-bin.srcinfo
+          # makepkg expects PKGBUILD and .SRCINFO in the working directory
+          shopt -s nullglob
+          PKGFILES=("$AURDIR"/*.pkgbuild "$AURDIR"/PKGBUILD)
+          SRCFILES=("$AURDIR"/*.srcinfo "$AURDIR"/.SRCINFO)
+          if [ ${#PKGFILES[@]} -gt 0 ]; then
+            cp "${PKGFILES[0]}" aur-pkg/PKGBUILD
+          fi
+          if [ ${#SRCFILES[@]} -gt 0 ]; then
+            cp "${SRCFILES[0]}" aur-pkg/.SRCINFO
+          fi
+          if [ ! -f aur-pkg/PKGBUILD ]; then
+            echo "::warning::No PKGBUILD found to package, skipping"
             exit 0
           fi
           tar -czf "llamaman-bin-${TAG}-aur.tar.gz" -C aur-pkg .
           echo "Uploading AUR tarball to release $TAG"
           gh release upload "$TAG" "llamaman-bin-${TAG}-aur.tar.gz" --clobber
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
