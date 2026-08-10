@@ -77,7 +77,7 @@ aurs:
     license: "MIT"
     private_key: "{{ .Env.AUR_KEY }}"
     git_url: "ssh://aur@aur.archlinux.org/llamaman-bin.git"
-    skip_upload: auto
+    skip_upload: true
     provides: ["llamaman"]
     conflicts: ["llamaman"]
     optdepends:

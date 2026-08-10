@@ -45,6 +45,7 @@ jobs:
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
+        continue-on-error: true
         with:
           version: "~> v2"
           args: release --clean
@@ -52,3 +53,30 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AUR_STAGING_KEY: ${{ secrets.AUR_STAGING_KEY }}
           AUR_KEY: ${{ secrets.AUR_KEY }}
+      - name: Upload PKGBUILD and dist artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llamaman-dist-${{ github.ref_name }}
+          path: |
+            dist/**
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Create and upload AUR tarball to GitHub release
+        if: always()
+        run: |
+          TAG="${{ github.ref_name }}"
+          # Find the directory goreleaser created for the AUR package
+          PKGDIR=$(find dist -type d -name "*llamaman-bin*" -print -quit || true)
+          if [ -z "$PKGDIR" ]; then
+            echo "::warning::No AUR directory found in dist, skipping AUR tarball"
+            exit 0
+          fi
+          mkdir -p aur-pkg
+          cp "$PKGDIR"/PKGBUILD "$PKGDIR"/.SRCINFO aur-pkg/ 2>/dev/null || true
+          # Include the PKGBUILD build script and any .SRCINFO; users can makepkg from here
+          tar -czf "llamaman-bin-${TAG}-aur.tar.gz" -C aur-pkg .
+          echo "Uploading AUR tarball to release $TAG"
+          gh release upload "$TAG" "llamaman-bin-${TAG}-aur.tar.gz" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
