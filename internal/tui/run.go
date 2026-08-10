@@ -84,9 +84,13 @@ type RunMode struct {
 	genFrac     smoothVal
 	procFrac    smoothVal
 	routerFlash map[string]time.Time
-	argv        []string
-	routerFile  string // my-models.ini path for router-mode runs; "" otherwise
-	warnings    []string
+	// wordmarkStart anchors the §15.5a run-header highlight sweep
+	// (zero = never started, static wordmark); NewRunMode anchors it at
+	// construction.
+	wordmarkStart time.Time
+	argv          []string
+	routerFile    string // my-models.ini path for router-mode runs; "" otherwise
+	warnings      []string
 
 	// Router-mode live state (only populated when routerFile != ""):
 	// the model list from GET /models and the loaded-model ids from
@@ -295,6 +299,9 @@ func NewRunMode(opts RunModeOpts, theme Theme) (*RunMode, tea.Cmd, error) {
 		tokensHistory:          newRingBuffer(sparkBufferSamples),
 		promptHistory:          newRingBuffer(sparkBufferSamples),
 		utilHistory:            map[string]*ringBuffer{},
+		// §15.5a: anchor the run-header highlight sweep so it runs from
+		// the moment the run screen opens (launch, router, reattach).
+		wordmarkStart: clock(),
 	}
 	r.fetchCtx, r.fetchCancel = context.WithCancel(context.Background())
 	titleState := "STARTING"
@@ -2007,9 +2014,7 @@ func (r *RunMode) renderTopStrip() string {
 	}
 
 	// Wide mode: wordmark + 3-cells-per-2-rows identity.
-	wordmark := lipgloss.NewStyle().
-		Foreground(r.theme.Subtle).
-		Render(strings.TrimRight(Wordmark, "\n"))
+	wordmark := r.renderRunWordmark()
 	wordmarkWidth := lipgloss.Width(wordmark)
 
 	// Reserve: borders (2) + padding (2) + 2-col gap between columns

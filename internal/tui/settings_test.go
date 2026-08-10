@@ -172,9 +172,10 @@ func TestSettingsSubmitNoChangePersistsNothing(t *testing.T) {
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
 		keyMsg("p"),
-		keyMsg("enter"),
-		keyMsg("enter"),
-		keyMsg("enter"),
+		keyMsg("enter"),                // theme → animations
+		keyMsg("enter"),                // animations → wordmark highlight
+		keyMsg("enter"),                // wordmark highlight → log colors
+		keyMsg("enter"),                // log colors → models dir
 		tea.KeyMsg{Type: tea.KeyEnter}, // complete on the input field
 	)
 	if root.view != ViewMain {
@@ -202,10 +203,11 @@ func TestSettingsSubmitPersistsThemeChange(t *testing.T) {
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
 		keyMsg("p"),
-		tea.KeyMsg{Type: tea.KeyDown}, // select llamaman (first option after auto)
-		keyMsg("enter"),
-		keyMsg("enter"),
-		keyMsg("enter"),
+		tea.KeyMsg{Type: tea.KeyDown},  // select llamaman (first option after auto)
+		keyMsg("enter"),                // theme → animations
+		keyMsg("enter"),                // animations → wordmark highlight
+		keyMsg("enter"),                // wordmark highlight → log colors
+		keyMsg("enter"),                // log colors → models dir
 		tea.KeyMsg{Type: tea.KeyEnter}, // complete on the input field
 	)
 
@@ -233,10 +235,11 @@ func TestSettingsSubmitAnimationsOff(t *testing.T) {
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
 		keyMsg("p"),
-		keyMsg("enter"),               // select → confirm
-		tea.KeyMsg{Type: tea.KeyLeft}, // toggle confirm to "no"
-		keyMsg("enter"),               // confirm → log colors
-		keyMsg("enter"),               // log colors → models dir
+		keyMsg("enter"),                // select → confirm
+		tea.KeyMsg{Type: tea.KeyLeft},  // toggle confirm to "no"
+		keyMsg("enter"),                // confirm → wordmark highlight
+		keyMsg("enter"),                // wordmark highlight (default once) → log colors
+		keyMsg("enter"),                // log colors → models dir
 		tea.KeyMsg{Type: tea.KeyEnter}, // complete form on the input field
 	)
 	if root.view != ViewMain {
@@ -248,6 +251,60 @@ func TestSettingsSubmitAnimationsOff(t *testing.T) {
 	data, _ := os.ReadFile(path)
 	if !strings.Contains(string(data), `"animations": false`) {
 		t.Errorf("animations=false not persisted:\n%s", data)
+	}
+}
+
+// TestSettingsSubmitLogoEffectLoop: picking "loop" on the wordmark
+// highlight select persists `"logo-effect": "loop"` through the form →
+// snapshot → atomic-save path.
+func TestSettingsSubmitLogoEffectLoop(t *testing.T) {
+	path, cfg := writeSnapshotConfig(t)
+	root := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		keyMsg("p"),
+		keyMsg("enter"),                // theme select → animations
+		keyMsg("enter"),                // animations confirm → wordmark highlight
+		tea.KeyMsg{Type: tea.KeyDown},  // once → loop
+		keyMsg("enter"),                // wordmark highlight → log colors
+		keyMsg("enter"),                // log colors → models dir
+		tea.KeyMsg{Type: tea.KeyEnter}, // complete form
+	)
+	if root.view != ViewMain {
+		t.Fatalf("after submit: view = %d, want ViewMain", root.view)
+	}
+	if got := root.cfg.Prefs().LogoEffectMode(); got != config.LogoEffectLoop {
+		t.Fatalf("logo-effect = %q, want %q", got, config.LogoEffectLoop)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), `"logo-effect": "loop"`) {
+		t.Errorf("logo-effect not persisted:\n%s", data)
+	}
+}
+
+// TestSettingsSnapshotLogoEffect pins the minimal-object contract for
+// the wordmark-highlight preference: no change → nil snapshot; switching
+// to loop sets the field; reverting to once clears it (absent == once).
+func TestSettingsSnapshotLogoEffect(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40}, keyMsg("p"))
+
+	if got := root.settings.snapshot(); got != nil {
+		t.Fatalf("no edits → snapshot = %+v, want nil", got)
+	}
+	root.settings.logoEffect = config.LogoEffectLoop
+	if got := root.settings.snapshot(); got == nil || got.LogoEffect != config.LogoEffectLoop {
+		t.Fatalf("loop edit → snapshot = %+v, want LogoEffect=loop", got)
+	}
+
+	cfg.Preferences = &config.Preferences{LogoEffect: config.LogoEffectLoop}
+	root = NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40}, keyMsg("p"))
+	root.settings.logoEffect = config.LogoEffectOnce
+	got := root.settings.snapshot()
+	if got == nil || got.LogoEffect != "" {
+		t.Fatalf("revert to once → snapshot = %+v, want LogoEffect cleared to \"\"", got)
 	}
 }
 
@@ -335,7 +392,7 @@ func TestSettingsMismatchedThemeAppliesWithWarning(t *testing.T) {
 	}
 
 	// Submit with a change (animations off): the mismatch applies, not auto.
-	driveRoot(t, root, keyMsg("enter"), tea.KeyMsg{Type: tea.KeyLeft}, keyMsg("enter"), keyMsg("enter"), tea.KeyMsg{Type: tea.KeyEnter})
+	driveRoot(t, root, keyMsg("enter"), tea.KeyMsg{Type: tea.KeyLeft}, keyMsg("enter"), keyMsg("enter"), keyMsg("enter"), tea.KeyMsg{Type: tea.KeyEnter})
 	if got := root.cfg.Prefs().Theme; got != "solarized-light" {
 		t.Fatalf("after submit: theme = %q, want solarized-light", got)
 	}
@@ -423,7 +480,8 @@ func TestSettingsSubmitModelsDir(t *testing.T) {
 		tea.WindowSizeMsg{Width: 120, Height: 40},
 		keyMsg("p"),
 		keyMsg("enter"), // theme → animations
-		keyMsg("enter"), // animations → log colors
+		keyMsg("enter"), // animations → wordmark highlight
+		keyMsg("enter"), // wordmark highlight → log colors
 		keyMsg("enter"), // log colors → models dir
 		keyMsg("/opt/llama-models"),
 		tea.KeyMsg{Type: tea.KeyEnter}, // complete form
@@ -444,9 +502,10 @@ func TestSettingsSubmitModelsDir(t *testing.T) {
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
 		keyMsg("p"),
-		keyMsg("enter"),
-		keyMsg("enter"),
-		keyMsg("enter"),
+		keyMsg("enter"),                // theme → animations
+		keyMsg("enter"),                // animations → wordmark highlight
+		keyMsg("enter"),                // wordmark highlight → log colors
+		keyMsg("enter"),                // log colors → models dir
 		tea.KeyMsg{Type: tea.KeyCtrlA}, // line start
 		tea.KeyMsg{Type: tea.KeyCtrlK}, // delete after cursor → empty input
 		tea.KeyMsg{Type: tea.KeyEnter}, // complete form

@@ -133,11 +133,20 @@ func Validate(cfg *Config) Issues {
 // import tui, and duplicating the palette-name list would break P8).
 // models-dir has one rule: when set and the path exists but is not a
 // directory, warn (P3) — the directory itself may not exist yet (the
-// Storage Manager's download action creates it).
+// Storage Manager's download action creates it). logo-effect is
+// enumerated ("once"/"loop", §15.5a): an unknown value warns (P3) and
+// the TUI falls back to the default.
 func validatePreferences(p Preferences) Issues {
 	var out Issues
+	switch p.LogoEffect {
+	case "", LogoEffectOnce, LogoEffectLoop:
+	default:
+		out = append(out, Issue{Severity: Warning, Path: "preferences.logo-effect",
+			Message: fmt.Sprintf("unknown logo-effect %q (want %q or %q), using %q",
+				p.LogoEffect, LogoEffectOnce, LogoEffectLoop, LogoEffectOnce)})
+	}
 	if p.ModelsDir == "" {
-		return nil
+		return out
 	}
 	if info, err := os.Stat(p.ModelsDir); err == nil && !info.IsDir() {
 		out = append(out, Issue{Severity: Warning, Path: "preferences.models-dir",

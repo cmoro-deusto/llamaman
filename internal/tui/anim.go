@@ -45,6 +45,13 @@ func animFrameInterval() time.Duration {
 // animTickMsg triggers a re-render so animated elements move.
 type animTickMsg struct{}
 
+// animFrameTick returns one animation frame tick (the period from
+// animFrameInterval, LLAMAMAN_ANIM_FPS override included). The single
+// place a frame tick is built — run mode, the wordmark sweep, ...
+func animFrameTick() tea.Cmd {
+	return tea.Tick(animFrameInterval(), func(time.Time) tea.Msg { return animTickMsg{} })
+}
+
 // animationsEnabled reports the effective preferences.animations value
 // (nil-safe — no config means the default, on).
 func animationsEnabled(cfg *config.Config) bool {
@@ -161,14 +168,20 @@ func (s *smoothVal) set(target float64) {
 // animCmd returns the frame tick when animations are enabled AND
 // something animated is visible; nil otherwise — steady state stays
 // static (§2.4 cost note).
+// animCmd returns the run-mode frame tick, or nil in steady state:
+// nothing animated is visible and no wordmark sweep is due (§2.4 cost
+// note). While anything is animated the frame tick re-renders every
+// frame, and the clock-derived wordmark sweep (§15.5a) animates along
+// for free; in steady state only the sweep can need a tick (once-mode
+// active window, or loop mode with its hold-end wake).
 func (r *RunMode) animCmd() tea.Cmd {
 	if !animationsEnabled(r.cfg) {
 		return nil
 	}
-	if !r.anythingAnimated() {
-		return nil
+	if r.anythingAnimated() {
+		return animFrameTick()
 	}
-	return tea.Tick(animFrameInterval(), func(time.Time) tea.Msg { return animTickMsg{} })
+	return wordmarkSweepTick(r.cfg, r.wordmarkStart)
 }
 
 // anythingAnimated reports whether any §15.5 element is currently

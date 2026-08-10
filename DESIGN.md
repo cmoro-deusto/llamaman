@@ -930,13 +930,17 @@ not relitigated. Three releases, in priority order 4 → 2 → (3 + 1).
   (model load → layer offload → HF download % → listening). **Hard
   constraint:** separate from the `[STARTING]` badge — nothing replaces it.
   Tolerant classifiers; unknown phase degrades to today's static UI.
-- **Subtle color animation.** `tea.Tick` 60 fps (owner decision;
+- **Subtle color animation + wordmark highlight.** `tea.Tick` 60 fps
+  (owner decision;
   overridable via `LLAMAMAN_ANIM_FPS`);
   true-color lerp with a
   6-step discrete fallback on 256-color (P1, owner-amended from 2–3
   steps for less jerky breathing). Scoped to: load-progress
-  fill, `[STARTING]` badge breathing, status-dot pulse while generating. No
-  wordmark animation; steady state stays static; snapshot tests freeze a
+  fill, `[STARTING]` badge breathing, status-dot pulse while generating.
+  Main mode adds the §15.5a wordmark highlight sweep (a specular band
+  traveling the logo once per visit or looping, per
+  `preferences.logo-effect`). Steady state stays static once a one-shot
+  completes; snapshot tests freeze a
   fake clock. No desktop notifications. **User control (P10):** gated by
   `preferences.animations`, default **on**; toggled in Settings mode.
 - **Main-mode layout rework.** Implement §12.2 as designed.
@@ -1070,7 +1074,8 @@ Additive `version: 1`, per P2:
   "preferences": {            // optional object; absent == all defaults
     "theme": "auto",        // string, default "auto"
     "animations": true,      // bool, default true
-    "log-colors": true       // bool, default true (§15.3)
+    "log-colors": true,      // bool, default true (§15.3)
+    "logo-effect": "once"   // string, default "once" (§15.5a)
   },
   "models": [ ... ]
 }
@@ -1090,6 +1095,12 @@ Additive `version: 1`, per P2:
     save).
   - `log-colors` follows the same `*bool` contract (default `true`,
     §15.3) — the run-mode log-coloring toggle.
+  - `logo-effect` is a plain string, default `"once"` (absent == the
+    default; only the non-default `"loop"` is ever written). It picks
+    between a one-shot wordmark highlight sweep per Main-screen visit
+    and a continuous loop (§15.5a); `preferences.animations` off
+    disables the sweep entirely. Unknown values warn (P3) and fall back
+    to `"once"`.
 - Nil-safe accessor `Config.Prefs() Preferences` (returns the zero
   value when the pointer is nil) is the only way the TUI reads
   preferences; callers never dereference the pointer directly.
@@ -1361,15 +1372,101 @@ instants; the STARTING badge color differs between phase 0 and 0.5
 distinct colors across a full period; no tick cmd is scheduled when
 animations are off or nothing animated is visible.
 
-**Non-goals.** No wordmark animation; no steady-state READY idle
-animation; no desktop notifications; no fabricated progress percentages
+**Non-goals.** No steady-state READY idle
+animation — except the loop-mode wordmark highlight sweep (§15.5a), an
+owner-approved exception on both the Main and run screens; no desktop
+notifications; no fabricated progress percentages
 (item 4 stays honest — the indeterminate bar is position motion only).
+The wordmark highlight sweep is the one deliberate persistent animation.
 
 **File map.** `internal/tui/anim.go` (new) — `clock`, `animPhase`,
 `lerpColor`, `animTickMsg` + scheduling helper. `internal/tui/run.go`
 — badge/dot/bar animation hooks (renderTopStrip + loadRows), `a` quick
 key. Tests in `anim_test.go` / `run_test.go`. DESIGN §7.4 and §15.1
 (animations field description) updated in the same change (P5).
+
+### 15.5a Wordmark highlight sweep (Main + run screens)
+
+**Goal.** Bring the ascii-art logo to life on the Main landing screen
+and the run-mode wide header with the
+*Highlight* effect from the Python library **terminaltexteffects**
+(`effects/effect_highlight.py`, MIT) — a specular band that travels the
+logo once, briefly brightening each character before it settles back to
+its base color. Ported into llamaman because no Go library implements
+it (§15.5a research: no Go port exists; the closest building blocks —
+pterm's `Area`, harmonica easing — duplicate infrastructure `anim.go`
+already provides).
+
+**Algorithm (Python defaults; owner-tuned values in bold).** The base
+color is the settled screen color — the theme accent on Main, the theme
+subtle on the run header
+(single-color final state — Python's documented mode for a flat final
+color). The specular is the base color with HSL lightness ×1.75
+(`brightenColor`, clamped at white). Each character's scene is a
+`base → bright → bright → base` ramp of 3+**1**+3 = **7** colors held 2
+frames each (Python's default width is 8; the owner narrowed the bright
+core to a thin line). Characters are grouped into diagonal bands ordered from
+the bottom-left corner to the top-right (band key = col − row,
+ascending), and a `SequenceEaser` with `ease-in-out-circ` walks the
+bands; a band's characters start their scene when the eased progress
+reaches the band's index. The effect ends with every character settled
+in the base color.
+
+**Timing.** Time-based, not frame-based, so speed is independent of the
+effective frame rate: the band travels in 400 ms (owner-tuned down
+from 1500), each ramp color is
+held `2 × 1/60 s`, and the scene tail adds 200 ms. Loop mode rests 4 s
+(owner-tuned up from 2) between sweeps. `LLAMAMAN_ANIM_FPS` changes
+smoothness only.
+
+**Rendering.** `MainMode.View()` and the run-mode wide header render
+the wordmark per glyph cell
+(space cells stay uncolored), each with its ramp color for the current
+frame. When no sweep is running — animations off, sweep never started,
+loop hold, or a finished one-shot — the output is the plain flat render
+(accent on Main, subtle on the run header), byte-identical in visible
+output to the pre-animation screen
+(snapshot tests strip ANSI and stay green).
+
+**Lifecycle.** `Root` calls `MainMode.RestartWordmark()` every time the
+main screen becomes visible (construction and every return-to-main
+transition), anchoring the sweep at `clock()`. `NewRunMode` anchors the
+run-header sweep at construction, so it runs once per session (launch,
+router, reattach). Both screens
+re-arm the tick when each `animTickMsg` lands — the runtime's pending
+timer already covers any intervening messages — so the sweep animates
+while the screen is visible and stops once a one-shot completes or the
+view changes (loop mode holds, then wakes once at the hold end). In run
+mode, frame ticks already re-render while anything is animated, so the
+clock-derived sweep animates along for free; the sweep's own tick only
+kicks in at steady state. A zero
+`wordmarkStart` (never restarted) renders static — the state
+`NewMainMode`/direct construction leaves, which keeps snapshot tests
+and the Settings preview deterministic.
+
+**Preferences.** `preferences.logo-effect`: `"once"` (default; sweep on
+each Main-screen visit and once per run session, then static) or
+`"loop"` (continuous, on both screens). In loop mode the run header
+keeps sweeping while a session runs — a deliberate, owner-approved
+exception to the §15.5 "no steady-state READY idle animation" non-goal.
+The existing `preferences.animations` toggle is the master switch — off
+disables the sweep entirely; there is no separate "off" value.
+Unknown values warn (P3) and fall back to `"once"`. Edited in the
+Settings mode form.
+
+**Determinism (P9).** The sweep is derived entirely from the injectable
+`clock()` and `wordmarkStart`; frozen-clock tests render the wordmark at
+exact instants (start = flat accent, mid-sweep = specular band present,
+after completion = flat accent again) and assert the tick lifecycle.
+
+**File map.** `internal/tui/highlight.go` (new) — `wordmarkRamp`,
+`brightenColor` (HSL), `easeInOutCirc`/`invEaseInOutCirc`, the
+precomputed `wordmarkGrid` (band geometry of `wordmark.txt`),
+`RestartWordmark`, `wordmarkTickCmd`, `renderWordmark`. `main.go` —
+`wordmarkStart` field + Update wrapper re-arming the tick. `root.go` —
+`showMain()` (restart + tick on every return to Main) and
+`forward()` routing `animTickMsg` to `MainMode`. `settings.go` —
+once/loop select. Tests in `highlight_test.go`.
 
 ### 15.4 Load-progress indicator (§2.3)
 

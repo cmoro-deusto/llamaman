@@ -22,11 +22,12 @@ type SettingsMode struct {
 	darkBg  bool
 	version string
 
-	form      *huh.Form
-	themeVal  string
-	anim      bool
-	logColors bool
-	modelsDir string
+	form       *huh.Form
+	themeVal   string
+	anim       bool
+	logColors  bool
+	modelsDir  string
+	logoEffect string
 
 	// lastThemeVal tracks the select's live value so Update can detect
 	// arrow-key changes and re-theme the chrome + preview immediately
@@ -75,6 +76,7 @@ func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg boo
 		anim:         prefs.AnimationsEnabled(),
 		logColors:    prefs.LogColorsEnabled(),
 		modelsDir:    prefs.ModelsDir,
+		logoEffect:   prefs.LogoEffectMode(),
 		lastThemeVal: themeVal,
 		warn:         warn,
 	}
@@ -101,8 +103,16 @@ func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg boo
 			Value(&sm.themeVal),
 		huh.NewConfirm().
 			Title("animations").
-			Description("subtle transitional animations (dot pulse, badge breathing); off in Preferences too").
+			Description("subtle animations (dot pulse, badge breathing, wordmark highlight); off in Preferences too").
 			Value(&sm.anim),
+		huh.NewSelect[string]().
+			Title("wordmark highlight").
+			Description("specular highlight sweeping the llamaman logo on the main screen (needs animations on)").
+			Options(
+				huh.NewOption("once — sweep each time the main screen opens", config.LogoEffectOnce),
+				huh.NewOption("loop — keep sweeping while the main screen is open", config.LogoEffectLoop),
+			).
+			Value(&sm.logoEffect),
 		huh.NewConfirm().
 			Title("log colors").
 			Description("render-time line-kind coloring of the run-mode log (also toggled with `o` in run mode)").
@@ -217,6 +227,14 @@ func (s *SettingsMode) snapshot() *config.Preferences {
 	if s.logColors != prefs.LogColorsEnabled() {
 		logColors := s.logColors
 		prefs.LogColors = &logColors
+		changed = true
+	}
+
+	if s.logoEffect != prefs.LogoEffectMode() {
+		prefs.LogoEffect = s.logoEffect
+		if s.logoEffect == config.LogoEffectOnce {
+			prefs.LogoEffect = "" // reverting to the default removes the field
+		}
 		changed = true
 	}
 

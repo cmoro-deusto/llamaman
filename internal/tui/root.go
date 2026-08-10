@@ -131,6 +131,10 @@ func NewRoot(cfg *config.Config, cfgPath string, spawner Spawner, registry flags
 		initialRun: initialRun,
 	}
 	r.mainMode.SetCfgPath(cfgPath)
+	// Anchor the wordmark highlight sweep so it runs from the first
+	// moment the main screen is visible (§15.5a); Root restarts it on
+	// every later return to Main.
+	r.mainMode.RestartWordmark()
 	if initialRun != nil {
 		r.view = ViewRun
 	}
@@ -154,13 +158,13 @@ func (r *Root) Init() tea.Cmd {
 		if err != nil {
 			r.startErr = err
 			r.view = ViewMain
-			return nil
+			return r.mainMode.wordmarkTickCmd()
 		}
 		r.run = run
 		return cmd
 	}
 	r.refreshSessionState()
-	return tickSession()
+	return tea.Batch(tickSession(), r.mainMode.wordmarkTickCmd())
 }
 
 func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -233,34 +237,31 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		r.run = nil
-		r.view = ViewMain
 		r.refreshSessionState()
-		return r, nil
+		return r.showMain()
 
 	case returnFromConfigMsg:
 		r.applyConfigChanges()
 		r.configMod = nil
-		r.view = ViewMain
-		return r, nil
+		return r.showMain()
 
 	case returnFromSettingsMsg:
 		if r.settings != nil && r.settings.Applied() != nil {
 			r.applyPreferences(r.settings.Applied())
 		}
 		r.settings = nil
-		r.view = ViewMain
-		return r, nil
+		return r.showMain()
 
 	case returnFromStorageMsg:
 		// the download (if any) keeps running; Main surfaces its status
 		r.view = ViewMain
 		r.refreshDlStatusLine()
-		return r, r.armDlMainTick()
+		return r.showMain(r.armDlMainTick())
 
 	case returnFromBrowserMsg:
 		r.view = ViewMain
 		r.refreshDlStatusLine() // a download may be running while browsing
-		return r, nil
+		return r.showMain()
 
 	case browserConfigHandoffMsg:
 		return r.openConfig(configEntry{openNewModel: true, prefillHF: msg.id})
@@ -376,6 +377,12 @@ func (r *Root) routeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (r *Root) forward(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch r.view {
+	case ViewMain:
+		// animTickMsg (and any other unhandled msg) reaches the main
+		// mode here, which re-arms the wordmark sweep tick (§15.5a).
+		next, cmd := r.mainMode.Update(msg)
+		r.mainMode = next
+		return r, cmd
 	case ViewRun:
 		if r.run == nil {
 			return r, nil
@@ -551,6 +558,16 @@ func (r *Root) refreshSessionState() {
 	}
 	alias, preset, port := r.spawner.RunningAlias()
 	r.mainMode.SetRunning(alias, preset, port)
+}
+
+// showMain flips to the main view, (re)starts the wordmark highlight
+// sweep so a one-shot runs once per visit (§15.5a), and returns the
+// sweep's frame tick alongside any extra cmds. Callers replace every
+// `r.view = ViewMain; return r, cmd` transition with this.
+func (r *Root) showMain(extra ...tea.Cmd) (tea.Model, tea.Cmd) {
+	r.view = ViewMain
+	r.mainMode.RestartWordmark()
+	return r, tea.Batch(append(extra, r.mainMode.wordmarkTickCmd())...)
 }
 
 // applyConfigChanges replaces the in-memory config with the saved

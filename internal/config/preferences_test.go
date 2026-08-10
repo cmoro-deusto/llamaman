@@ -46,6 +46,9 @@ func TestPreferencesAbsentMeansDefaults(t *testing.T) {
 	if !p.LogColorsEnabled() {
 		t.Error("default log colors should be enabled")
 	}
+	if p.LogoEffectMode() != LogoEffectOnce {
+		t.Errorf("default logo-effect = %q, want %q", p.LogoEffectMode(), LogoEffectOnce)
+	}
 }
 
 // TestPreferencesRoundTrip pins the full field-arrival contract: an
@@ -64,6 +67,7 @@ func TestPreferencesRoundTrip(t *testing.T) {
 			Theme:      "nord",
 			Animations: &animOff,
 			LogColors:  &logOff,
+			LogoEffect: LogoEffectLoop,
 		},
 	}
 	if err := Save(path, cfg); err != nil {
@@ -86,6 +90,67 @@ func TestPreferencesRoundTrip(t *testing.T) {
 	}
 	if loaded.Preferences == nil || loaded.Preferences.Animations == nil || *loaded.Preferences.Animations {
 		t.Fatalf("Animations pointer must be non-nil and false, got %+v", loaded.Preferences)
+	}
+	if p.LogoEffectMode() != LogoEffectLoop {
+		t.Errorf("logo-effect = %q after round trip, want %q", p.LogoEffectMode(), LogoEffectLoop)
+	}
+}
+
+// TestLogoEffectRoundTrip pins the field-arrival contract for
+// preferences.logo-effect (§15.5a): an explicit "loop" survives a
+// round trip, and the default "once" stays omitted from the file.
+func TestLogoEffectRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg := &Config{
+		Version: 1,
+		Globals: Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Preferences: &Preferences{
+			Theme:      "nord", // set another pref so the object exists
+			LogoEffect: LogoEffectLoop,
+		},
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsSubstring(string(data), `"logo-effect": "loop"`) {
+		t.Errorf("logo-effect should be written verbatim:\n%s", data)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := loaded.Prefs(); p.LogoEffectMode() != LogoEffectLoop {
+		t.Errorf("logo-effect = %q after round trip, want loop", p.LogoEffectMode())
+	}
+}
+
+// TestLogoEffectUnknownWarns verifies an unknown logo-effect value
+// surfaces as a non-blocking Warning (P3) that the TUI falls back from.
+func TestLogoEffectUnknownWarns(t *testing.T) {
+	cfg := &Config{
+		Version: 1,
+		Globals: Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Preferences: &Preferences{
+			LogoEffect: "sideways",
+		},
+	}
+	issues := Validate(cfg)
+	if issues.HasErrors() {
+		t.Fatalf("unknown logo-effect must never Block, got %+v", issues)
+	}
+	var saw bool
+	for _, it := range issues {
+		if it.Path == "preferences.logo-effect" && it.Severity == Warning {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Errorf("expected a Warning on preferences.logo-effect, got %+v", issues)
 	}
 }
 
