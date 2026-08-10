@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +11,7 @@ import (
 	"github.com/muesli/termenv"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
+	"github.com/cmoro-deusto/llamaman/internal/server"
 )
 
 // forceTrueColor renders hex colors verbatim (38;2;r;g;b) so sweep tests
@@ -290,6 +293,157 @@ func TestWordmarkRestartReanchors(t *testing.T) {
 	}
 	if !hasTrueColor(out, accent) {
 		t.Errorf("after restart: settled cells stay accent")
+	}
+}
+
+// runSweepWordmark renders the run-header wordmark at the frozen instant
+// `at`, a sweep anchored at a fixed base instant (P9 determinism), with
+// the run mode in steady state (StatusReady).
+func runSweepWordmark(t *testing.T, cfg *config.Config, at time.Time) string {
+	t.Helper()
+	forceTrueColor(t)
+	base := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	freezeClock(t, base)
+	r := &RunMode{cfg: cfg, theme: DefaultTheme(), status: StatusReady}
+	r.RestartWordmark() // anchors at the fixed base instant
+	freezeClock(t, at)
+	return r.renderRunWordmark()
+}
+
+// TestRunWordmarkSweepOneShot pins the run-header sweep with a frozen
+// clock: flat subtle at start and after completion, a specular band
+// mid-sweep. The llamaman subtle #9A9A9A ×1.75 clamps to white.
+func TestRunWordmarkSweepOneShot(t *testing.T) {
+	base := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	cfg := sampleSnapshotConfig()
+	subtle := "#9a9a9a"
+
+	at := runSweepWordmark(t, cfg, base)
+	if !hasTrueColor(at, subtle) {
+		t.Errorf("start frame: wordmark should be all subtle %s", subtle)
+	}
+	if hasTrueColor(at, "#ffffff") {
+		t.Errorf("start frame: no specular yet")
+	}
+
+	mid := runSweepWordmark(t, cfg, base.Add(wordmarkSweepDur/2))
+	if !hasTrueColor(mid, "#ffffff") {
+		t.Errorf("mid sweep: expected a specular white band\n%.200s", mid)
+	}
+	if !hasTrueColor(mid, subtle) {
+		t.Errorf("mid sweep: settled cells should stay subtle %s", subtle)
+	}
+
+	done := runSweepWordmark(t, cfg, base.Add(wordmarkSweepDur+wordmarkSceneDur+time.Millisecond))
+	if !hasTrueColor(done, subtle) {
+		t.Errorf("after completion: wordmark should be all subtle %s", subtle)
+	}
+	if hasTrueColor(done, "#ffffff") {
+		t.Errorf("after completion: no specular left")
+	}
+}
+
+// TestRunWordmarkSweepLoopHonored verifies the run header honors the
+// logo-effect preference: in loop mode it rests in the hold window and
+// re-animates on the next cycle.
+func TestRunWordmarkSweepLoopHonored(t *testing.T) {
+	base := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	cfg := sampleSnapshotConfig()
+	cfg.Preferences = &config.Preferences{LogoEffect: config.LogoEffectLoop}
+
+	hold := runSweepWordmark(t, cfg, base.Add(wordmarkSweepDur+wordmarkSceneDur+time.Millisecond))
+	if hasTrueColor(hold, "#ffffff") {
+		t.Errorf("hold window: no specular expected")
+	}
+	cycle := wordmarkSweepDur + wordmarkSceneDur + wordmarkLoopHold
+	mid2 := runSweepWordmark(t, cfg, base.Add(cycle+wordmarkSweepDur/2))
+	if !hasTrueColor(mid2, "#ffffff") {
+		t.Errorf("second cycle mid-sweep: expected a specular band")
+	}
+}
+
+// TestRunWordmarkSweepGates pins the run-header off switches:
+// animations disabled or a never-started sweep both render the flat
+// subtle wordmark.
+func TestRunWordmarkSweepGates(t *testing.T) {
+	base := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	subtle := "#9a9a9a"
+
+	off := false
+	cfgOff := sampleSnapshotConfig()
+	cfgOff.Preferences = &config.Preferences{Animations: &off}
+	at := runSweepWordmark(t, cfgOff, base.Add(wordmarkSweepDur/2))
+	if hasTrueColor(at, "#ffffff") {
+		t.Errorf("animations off: wordmark must stay flat subtle")
+	}
+
+	never := &RunMode{cfg: sampleSnapshotConfig(), theme: DefaultTheme(), status: StatusReady}
+	out := never.renderRunWordmark()
+	if !hasTrueColor(out, subtle) {
+		t.Errorf("never-started sweep: wordmark should be static subtle")
+	}
+}
+
+// TestRunWordmarkSweepTickGating pins the run-mode tick lifecycle in
+// steady state (StatusReady, nothing else animated): no tick before the
+// sweep starts, frame ticks while a one-shot is active, nil once it
+// completes, and loop mode keeps a (hold-end wake) tick armed forever.
+func TestRunWordmarkSweepTickGating(t *testing.T) {
+	base := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	cfg := sampleSnapshotConfig()
+
+	freezeClock(t, base)
+	r := &RunMode{cfg: cfg, theme: DefaultTheme(), status: StatusReady}
+	if cmd := r.animCmd(); cmd != nil {
+		t.Error("never-started sweep: no tick in steady state")
+	}
+	r.RestartWordmark()
+	freezeClock(t, base.Add(time.Millisecond))
+	if cmd := r.animCmd(); cmd == nil {
+		t.Error("active sweep in steady state must arm a tick")
+	}
+	freezeClock(t, base.Add(wordmarkSweepDur+wordmarkSceneDur+time.Millisecond))
+	if cmd := r.animCmd(); cmd != nil {
+		t.Error("finished one-shot: no tick")
+	}
+
+	cfgLoop := sampleSnapshotConfig()
+	cfgLoop.Preferences = &config.Preferences{LogoEffect: config.LogoEffectLoop}
+	freezeClock(t, base)
+	r2 := &RunMode{cfg: cfgLoop, theme: DefaultTheme(), status: StatusReady}
+	r2.RestartWordmark()
+	freezeClock(t, base.Add(wordmarkSweepDur+wordmarkSceneDur+time.Millisecond)) // hold
+	if cmd := r2.animCmd(); cmd == nil {
+		t.Error("loop hold must keep a wake tick armed")
+	}
+}
+
+// TestRunModeAnchorsWordmarkSweep verifies NewRunMode anchors the sweep
+// at construction, so a fresh run session (launch, router, reattach)
+// always gets a sweep on open.
+func TestRunModeAnchorsWordmarkSweep(t *testing.T) {
+	bin := filepath.Join(repoRoot(t), "bin", "llamaman-fakeserver")
+	if _, err := os.Stat(bin); err != nil {
+		t.Skipf("fakeserver not built: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "llama.log")
+	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { proc.Stop(2 * time.Second) })
+
+	cfg := sampleSnapshotConfig()
+	opts := RunModeOpts{
+		Cfg: cfg, Model: cfg.Models[0], Preset: cfg.Models[0].Presets[0],
+		Argv: proc.Argv, Process: proc,
+	}
+	run, _, err := NewRunMode(opts, DefaultTheme())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.wordmarkStart.IsZero() {
+		t.Error("NewRunMode must anchor the wordmark sweep")
 	}
 }
 

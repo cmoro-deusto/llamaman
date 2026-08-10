@@ -236,27 +236,21 @@ func hslToRGB(h, s, l float64) (r, g, b int) {
 		int(math.Round(hue(p, q, h-1.0/3) * 255))
 }
 
-// RestartWordmark (re)starts the wordmark highlight sweep (§15.5a).
-// Root calls it every time the main screen becomes visible, so a
-// one-shot sweep runs once per visit (and a loop restarts its cycle).
-// A zero wordmarkStart means the sweep has never been started — the
-// wordmark renders static, which is also what snapshot tests rely on.
-func (m *MainMode) RestartWordmark() { m.wordmarkStart = clock() }
-
-// wordmarkTickCmd returns the animation tick that drives the wordmark
-// sweep, or nil when nothing should animate: animations off, sweep never
-// started, or a finished one-shot. In loop mode it ticks at frame rate
-// mid-sweep and once at the hold-end to wake the next sweep (the hold
-// itself renders static — no 60 fps burn, §2.4 cost note). MainMode.Update
-// re-arms it when an animTickMsg lands (the pending timer covers any
-// intervening messages), so the sweep runs while the main screen is
-// visible and stops (in once mode) once it completes.
-func (m MainMode) wordmarkTickCmd() tea.Cmd {
-	if m.cfg == nil || !animationsEnabled(m.cfg) || m.wordmarkStart.IsZero() {
+// wordmarkSweepTick returns the animation tick that drives the wordmark
+// highlight sweep anchored at start under the given config, or nil when
+// nothing should animate: animations off, sweep never started, or a
+// finished one-shot. In loop mode it ticks at frame rate mid-sweep and
+// once at the hold-end to wake the next sweep (the hold itself renders
+// static — no 60 fps burn, §2.4 cost note). Callers re-arm it when an
+// animTickMsg lands (the pending timer covers any intervening
+// messages), so the sweep runs while the screen is visible and stops
+// (in once mode) once it completes.
+func wordmarkSweepTick(cfg *config.Config, start time.Time) tea.Cmd {
+	if cfg == nil || !animationsEnabled(cfg) || start.IsZero() {
 		return nil
 	}
-	el := clock().Sub(m.wordmarkStart)
-	if m.cfg.Prefs().LogoEffectMode() == config.LogoEffectLoop {
+	el := clock().Sub(start)
+	if cfg.Prefs().LogoEffectMode() == config.LogoEffectLoop {
 		cycle := wordmarkSweepDur + wordmarkSceneDur + wordmarkLoopHold
 		phase := el % cycle
 		if phase < 0 {
@@ -275,19 +269,32 @@ func (m MainMode) wordmarkTickCmd() tea.Cmd {
 	return nil
 }
 
-// renderWordmark renders the wordmark with the §15.5a highlight sweep
-// applied, or the plain accent render when the sweep is off (animations
-// disabled, never started, loop hold, or a completed one-shot). The
-// sweep is entirely clock-derived and gated by wordmarkStart, so a
-// frozen clock keeps frames deterministic (P9).
-func (m MainMode) renderWordmark() string {
-	base := m.theme.Accent
+// RestartWordmark (re)starts the wordmark highlight sweep (§15.5a).
+// Root calls it every time the main screen becomes visible, so a
+// one-shot sweep runs once per visit (and a loop restarts its cycle).
+// A zero wordmarkStart means the sweep has never been started — the
+// wordmark renders static, which is also what snapshot tests rely on.
+func (m *MainMode) RestartWordmark() { m.wordmarkStart = clock() }
+
+// wordmarkTickCmd returns the Main-mode sweep tick (§15.5a).
+func (m MainMode) wordmarkTickCmd() tea.Cmd {
+	return wordmarkSweepTick(m.cfg, m.wordmarkStart)
+}
+
+// renderWordmarkSweep renders the wordmark with the §15.5a highlight
+// sweep applied, or the flat base render when the sweep is off (never
+// started, loop hold, or a completed one-shot). base is the settled
+// color — the theme accent on Main, the theme subtle on the run header;
+// start anchors the sweep; mode is the logo-effect preference. The
+// sweep is entirely clock-derived, so a frozen clock keeps frames
+// deterministic (P9).
+func renderWordmarkSweep(base lipgloss.Color, start time.Time, mode string) string {
 	static := lipgloss.NewStyle().Foreground(base).Render(strings.TrimRight(Wordmark, "\n"))
-	if m.cfg == nil || !animationsEnabled(m.cfg) || m.wordmarkStart.IsZero() {
+	if start.IsZero() {
 		return static
 	}
-	el := clock().Sub(m.wordmarkStart)
-	if m.cfg.Prefs().LogoEffectMode() == config.LogoEffectLoop {
+	el := clock().Sub(start)
+	if mode == config.LogoEffectLoop {
 		el %= wordmarkSweepDur + wordmarkSceneDur + wordmarkLoopHold
 	}
 	if el < 0 || el >= wordmarkSweepDur+wordmarkSceneDur {
@@ -314,4 +321,32 @@ func (m MainMode) renderWordmark() string {
 		out[r] = sb.String()
 	}
 	return strings.Join(out, "\n")
+}
+
+// renderWordmark renders the Main-screen wordmark: the §15.5a sweep
+// over the theme accent, or the flat accent render when the sweep is
+// off (animations disabled, never started, loop hold, or a completed
+// one-shot).
+func (m MainMode) renderWordmark() string {
+	if m.cfg == nil || !animationsEnabled(m.cfg) || m.wordmarkStart.IsZero() {
+		return lipgloss.NewStyle().Foreground(m.theme.Accent).Render(strings.TrimRight(Wordmark, "\n"))
+	}
+	return renderWordmarkSweep(m.theme.Accent, m.wordmarkStart, m.cfg.Prefs().LogoEffectMode())
+}
+
+// RestartWordmark (re)starts the run-header wordmark highlight sweep
+// (§15.5a). NewRunMode anchors it at construction, so a one-shot sweep
+// runs once per session (launch, router, reattach) — or continuously
+// when preferences.logo-effect is "loop".
+func (r *RunMode) RestartWordmark() { r.wordmarkStart = clock() }
+
+// renderRunWordmark renders the run-header wordmark: the §15.5a sweep
+// over the theme subtle, or the flat subtle render when the sweep is
+// off (animations disabled, never started, loop hold, or a completed
+// one-shot).
+func (r *RunMode) renderRunWordmark() string {
+	if r.cfg == nil || !animationsEnabled(r.cfg) || r.wordmarkStart.IsZero() {
+		return lipgloss.NewStyle().Foreground(r.theme.Subtle).Render(strings.TrimRight(Wordmark, "\n"))
+	}
+	return renderWordmarkSweep(r.theme.Subtle, r.wordmarkStart, r.cfg.Prefs().LogoEffectMode())
 }

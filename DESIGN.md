@@ -1373,10 +1373,11 @@ distinct colors across a full period; no tick cmd is scheduled when
 animations are off or nothing animated is visible.
 
 **Non-goals.** No steady-state READY idle
-animation; no desktop notifications; no fabricated progress percentages
+animation — except the loop-mode wordmark highlight sweep (§15.5a), an
+owner-approved exception on both the Main and run screens; no desktop
+notifications; no fabricated progress percentages
 (item 4 stays honest — the indeterminate bar is position motion only).
-The wordmark highlight sweep (§15.5a) is the one deliberate Main-mode
-animation.
+The wordmark highlight sweep is the one deliberate persistent animation.
 
 **File map.** `internal/tui/anim.go` (new) — `clock`, `animPhase`,
 `lerpColor`, `animTickMsg` + scheduling helper. `internal/tui/run.go`
@@ -1384,9 +1385,10 @@ animation.
 key. Tests in `anim_test.go` / `run_test.go`. DESIGN §7.4 and §15.1
 (animations field description) updated in the same change (P5).
 
-### 15.5a Wordmark highlight sweep (Main mode)
+### 15.5a Wordmark highlight sweep (Main + run screens)
 
-**Goal.** Bring the landing screen's ascii-art logo to life with the
+**Goal.** Bring the ascii-art logo to life on the Main landing screen
+and the run-mode wide header with the
 *Highlight* effect from the Python library **terminaltexteffects**
 (`effects/effect_highlight.py`, MIT) — a specular band that travels the
 logo once, briefly brightening each character before it settles back to
@@ -1396,7 +1398,8 @@ pterm's `Area`, harmonica easing — duplicate infrastructure `anim.go`
 already provides).
 
 **Algorithm (Python defaults; owner-tuned values in bold).** The base
-color is the theme accent
+color is the settled screen color — the theme accent on Main, the theme
+subtle on the run header
 (single-color final state — Python's documented mode for a flat final
 color). The specular is the base color with HSL lightness ×1.75
 (`brightenColor`, clamped at white). Each character's scene is a
@@ -1416,27 +1419,37 @@ held `2 × 1/60 s`, and the scene tail adds 200 ms. Loop mode rests 4 s
 (owner-tuned up from 2) between sweeps. `LLAMAMAN_ANIM_FPS` changes
 smoothness only.
 
-**Rendering.** `MainMode.View()` renders the wordmark per glyph cell
+**Rendering.** `MainMode.View()` and the run-mode wide header render
+the wordmark per glyph cell
 (space cells stay uncolored), each with its ramp color for the current
 frame. When no sweep is running — animations off, sweep never started,
-loop hold, or a finished one-shot — the output is the plain flat-accent
-render, byte-identical in visible output to the pre-animation screen
+loop hold, or a finished one-shot — the output is the plain flat render
+(accent on Main, subtle on the run header), byte-identical in visible
+output to the pre-animation screen
 (snapshot tests strip ANSI and stay green).
 
 **Lifecycle.** `Root` calls `MainMode.RestartWordmark()` every time the
 main screen becomes visible (construction and every return-to-main
-transition), anchoring the sweep at `clock()`. `MainMode.Update`
-re-arms the tick when each `animTickMsg` lands — the runtime's pending
+transition), anchoring the sweep at `clock()`. `NewRunMode` anchors the
+run-header sweep at construction, so it runs once per session (launch,
+router, reattach). Both screens
+re-arm the tick when each `animTickMsg` lands — the runtime's pending
 timer already covers any intervening messages — so the sweep animates
-while Main is visible and stops once a one-shot completes or the view
-changes (loop mode holds, then wakes once at the hold end). A zero
+while the screen is visible and stops once a one-shot completes or the
+view changes (loop mode holds, then wakes once at the hold end). In run
+mode, frame ticks already re-render while anything is animated, so the
+clock-derived sweep animates along for free; the sweep's own tick only
+kicks in at steady state. A zero
 `wordmarkStart` (never restarted) renders static — the state
-`NewMainMode` leaves, which keeps snapshot tests and the Settings
-preview deterministic.
+`NewMainMode`/direct construction leaves, which keeps snapshot tests
+and the Settings preview deterministic.
 
 **Preferences.** `preferences.logo-effect`: `"once"` (default; sweep on
-each Main-screen visit, then static) or `"loop"` (continuous). The
-existing `preferences.animations` toggle is the master switch — off
+each Main-screen visit and once per run session, then static) or
+`"loop"` (continuous, on both screens). In loop mode the run header
+keeps sweeping while a session runs — a deliberate, owner-approved
+exception to the §15.5 "no steady-state READY idle animation" non-goal.
+The existing `preferences.animations` toggle is the master switch — off
 disables the sweep entirely; there is no separate "off" value.
 Unknown values warn (P3) and fall back to `"once"`. Edited in the
 Settings mode form.
