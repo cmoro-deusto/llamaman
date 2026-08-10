@@ -862,3 +862,30 @@ func TestBrowserCardLinksSurviveRendering(t *testing.T) {
 		t.Error("unterminated OSC 8 sequences in the view — this would garble the terminal")
 	}
 }
+
+// TestBrowserInfoHeightStable: the model info panel keeps its height
+// whether or not the repo has params/base-model info — otherwise the
+// quants/card panels below shift up a row (owner round).
+func TestBrowserInfoHeightStable(t *testing.T) {
+	h1 := infoPanelHeight(t, []hf.SearchResult{{
+		ID: "org/one", Downloads: 10, Likes: 1,
+		Tags: []string{"gguf", "base_model:org/Llama-70B"},
+	}})
+	h2 := infoPanelHeight(t, []hf.SearchResult{{
+		ID: "org/none", Downloads: 10, Likes: 1,
+		Tags: []string{"gguf"},
+	}})
+	if h1 != h2 {
+		t.Errorf("info panel height varies: %d (params) vs %d (none)", h1, h2)
+	}
+}
+
+func infoPanelHeight(t *testing.T, results []hf.SearchResult) int {
+	t.Helper()
+	stub := &stubBrowserRunner{results: results}
+	r := NewRoot(sampleSnapshotConfig(), "/dev/null", stubSpawner{}, nil, "v", nil)
+	driveRoot(t, r, tea.WindowSizeMsg{Width: 120, Height: 36}, keyMsg("b"))
+	r.browser.SetBrowserRunner(stub)
+	searchDrive(t, r, "q")
+	return len(r.browser.infoLines(40))
+}

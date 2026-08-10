@@ -1257,14 +1257,22 @@ func (s *BrowserMode) infoLines(inner int) []string {
 	}
 	m := s.selected
 	lines = append(lines, accent(m.ID))
-	if p, ok := paramCountOf(*m); ok {
+	p, hasP := paramCountOf(*m)
+	bm := baseModelOf(*m)
+	switch {
+	case hasP:
 		line := good(humanB(p) + " params")
-		if bm := baseModelOf(*m); bm != "" {
+		if bm != "" {
 			line += " · " + muted("from ") + subtle(bm)
 		}
 		lines = append(lines, line)
-	} else if bm := baseModelOf(*m); bm != "" {
+	case bm != "":
 		lines = append(lines, muted("from ")+subtle(bm))
+	default:
+		// No params and no base model: emit a blank line so the info
+		// panel keeps its height — otherwise the quants/card panels
+		// below shift up a row (owner round).
+		lines = append(lines, "")
 	}
 	lines = append(lines, "")
 	lines = append(lines, good("↓ "+humanCount(m.Downloads))+" "+muted("downloads"))

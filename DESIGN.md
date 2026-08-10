@@ -2748,8 +2748,10 @@ lists the top GGUF repos by the current sort (the placeholder reads
      StatusReady-green, "from" Muted, base Subtle; **name-derived** —
      the search API has no params field, so `paramCountOf` regexes the
      `8B`-style suffix out of the base-model/repo id, a flagged display
-     heuristic); a blank line (owner round: the `─` separator is an
-     empty line now); `⬇ N downloads` (count green) and
+     heuristic; a repo with neither emits a blank line so the panel
+     height never varies — otherwise the quants/card panels below shift
+     up a row, owner round); a blank line (the `─` separator is an
+     empty line); `↓ N downloads` (count green) and
      `♥ N likes` (count accent); `⚖ license: <id>` and
      `▷ task: <pipeline_tag>` (label Muted, value Subtle); a
      **⚠ non-commercial license — check terms** warning for `cc-by-nc*`
