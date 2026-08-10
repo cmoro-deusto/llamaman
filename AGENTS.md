@@ -1,186 +1,117 @@
-# llamaman — Agent Guide
+# Repository Guidelines
 
-## What it is
+## Project Overview
+`llamaman` is a single-binary Go CLI + TUI that manages `llama-server`. Users define models and launch presets in a JSON config, pick them from a Bubble Tea TUI, follow logs live, detach/reattach across terminal sessions, and edit config without memorising 60-flag command lines.
 
-`llamaman` is a single-binary Go CLI + TUI that manages `llama-server` (the HTTP server bundled with [llama.cpp](https://github.com/ggml-org/llama.cpp)). Users define models and launch presets in a JSON config, pick them from a Bubble Tea TUI, follow logs live, detach/reattach across terminal sessions, and edit config through a three-pane editor — without memorising 60-flag command lines.
+Module: `github.com/cmoro-deusto/llamaman`
+Go: 1.26.2 (CI uses `go-version: stable`)
+Platform: Linux only, amd64/arm64
+License: MIT
 
-**Repository:** `github.com/cmoro-deusto/llamaman`
-**License:** MIT
-**Platform:** Linux only (amd64, arm64)
+## Architecture & Data Flow
+CLI entry → config load/validate/save → flag registry → translate → server spawn/session → TUI
 
----
+- `main.go` boots Kong CLI parsing, decides entry mode, injects `tui.Spawner`.
+- `internal/config` loads XDG config `~/.config/llamaman/config.json`, expands `~/$VAR`, validates, saves atomically with one rolling `.bak` (`save.go`).
+- `internal/flags` parses `llama-server --help`, builds registry, caches by binary mtime, falls back to hard-coded set.
+- `internal/translate` converts Config → argv preserving param order, handles preset overrides and router mode (`--models-preset` from a `my-models.ini`).
+- `internal/server` spawns `llama-server` via `setsid(2)`, tracks PID in `session.json` protected by `flock`, tails logs via `fsnotify`, supports adopt/stop/reattach.
+- `internal/tui` Root Bubble Tea model dispatches Main/Run/Config/FirstRun/Settings/Storage/Browser modes. Async via `tea.Cmd` + goroutines for spawn wait and log tail.
+- `internal/llamaapi` fetches `/props` for live context.
+- `internal/hwinfo` provides CPU/GPU stats via gopsutil + NVML for Run hardware panel.
 
-## Architecture
-
-```
-main.go                          CLI entry — Kong parser, dispatch, TUI bootstrap
-completion.go                    Shell completion scripts (bash/zsh/fish)
-├── internal/config/             JSON config load/save/validate
-├── internal/flags/              llama-server --help parser, short/long form registry, caching
-├── internal/translate/          Config → argv translation (param ordering, overrides)
-├── internal/server/             Process spawn (setsid), session.json (flock), log management
-├── internal/tui/                Bubble Tea TUI (root, main, run, config, first-run modes)
-├── internal/llamaapi/           HTTP client for llama-server /props endpoint
-├── internal/hwinfo/             CPU + NVIDIA GPU stats (NVML) for run-mode Hardware panel
-├── internal/paths/              XDG-compliant path resolution
-├── internal/logging/            slog → file setup
-└── cmd/llamaman-fakeserver/     Fake llama-server for integration tests
-```
-
-### Key design decisions
-
-- **Single source of truth:** `~/.config/llamaman/config.json` (XDG-compliant). Edits only via TUI config mode.
-- **Detach/reattach:** `llama-server` is spawned with `setsid(2)` so it survives `llamaman` exit. Session state in `session.json` (flock-protected) lets new invocations reattach.
-- **Flag registry:** `llama-server --help` is parsed at startup and cached by binary mtime. Drives short-vs-long flag form and unknown-flag warnings. Falls back to hard-coded set if unavailable.
-- **Param order preserved:** Custom JSON unmarshaler keeps preset param key order → argv order.
-- **Non-blocking warnings:** Unknown flags, missing model files, missing binary → warnings, not errors. Forward-compatible with new llama-server versions.
-
-### TUI modes
-
-| Mode | File | Purpose |
-|---|---|---|
-| Root | `internal/tui/root.go` | Top-level Bubble Tea model — owns and dispatches to sub-modes |
-| Main | `internal/tui/main.go` | Centered launcher with embedded model list |
-| Run | `internal/tui/run.go` | Status header + log viewport with search, scrollback, hardware panel |
-| Config | `internal/tui/config.go` | Three-pane master/detail editor (models → presets → params) with `huh` forms |
-| FirstRun | `internal/tui/firstrun.go` | Guided setup when no config exists |
-
----
-
-## Code conventions
-
-### Go module
-- **Module:** `github.com/cmoro-deusto/llamaman`
-- **Go version:** 1.26.2 (use `go stable` in CI)
-- **CGO:** required for NVML GPU stats (`github.com/NVIDIA/go-nvml`). Build with `CGO_ENABLED=1`. The fakeserver test binary is pure Go (`CGO_ENABLED=0`).
-
-### Dependencies
-| Package | Role |
-|---|---|
-| `charmbracelet/bubbletea` | TUI framework |
-| `charmbracelet/bubbles` | Widgets (list, viewport, textinput) |
-| `charmbracelet/huh` | Forms (config mode) |
-| `charmbracelet/lipgloss` | Styling |
-| `alecthomas/kong` | CLI parsing |
-| `fsnotify/fsnotify` | Log file watching |
-| `NVIDIA/go-nvml` | GPU stats (CGO) |
-| `shirou/gopsutil/v3` | CPU/memory stats |
-
-### Naming and structure
-- Internal packages are flat under `internal/` — no sub-packages.
-- Each package groups related `.go` files by concern (e.g., `config/load.go`, `config/save.go`, `config/validate.go`).
-- Tests co-located: `*_test.go` alongside source.
-- TUI snapshot tests render the Bubble Tea model in-process with a stub spawner — no `teatest` dependency (`internal/tui/snapshot_test.go`); teatest is NOT in go.mod despite mentions in README/DESIGN.
-- Exit codes are documented constants in `main.go` (§4.4 of DESIGN.md): 0=OK, 1=generic, 2=config, 3=prereq, 4=port-in-use, 130=interrupted.
-
-### Config schema
-```json
-{
-  "version": 1,
-  "globals": {
-    "llama-server-bin": "/usr/local/bin/llama-server",
-    "ip_address": "127.0.0.1",
-    "port": 9080
-  },
-  "models": [
-    {
-      "alias": "my-model",
-      "location": "~/models/model.gguf",
-      "presets": [
-        {
-          "preset": "default",
-          "description": "balanced",
-          "params": { "ngl": 99, "ctx-size": 8192 }
-        }
-      ]
-    }
-  ]
-}
-```
-Each model has exactly one of `location` (local `.gguf`) or `hf` (Hugging Face ID). Never both.
-
-### CLI synopsis
-```
-llamaman [options] [<alias> [<preset>]]
-  -l, --list              List models
-  -p, --presets           Print presets for <alias>
-  -c, --config PATH       Alternate config file
-  --completion SHELL      Print completion script (bash, zsh, fish)
-  --version               Print version
-```
-
----
-
-## Development workflow
-
-### Prerequisites
-- Go 1.26+ (or `go stable`)
-- GCC (for CGO/NVML)
-- `gcc-aarch64-linux-gnu` (for cross-compile arm64)
-- `llama-server` binary (for manual testing; not required for unit tests)
-
-### Build
-```bash
-go build -o bin/llamaman .
-```
-
-### Test
-```bash
-go vet ./...
-go test ./...
-```
-The CI also builds `cmd/llamaman-fakeserver` (a fake llama-server for integration tests) and runs it alongside the test suite.
-
-### Run
-```bash
-./bin/llamaman              # TUI (first-run if no config)
-./bin/llamaman <alias>      # Start specific model
-./bin/llamaman <alias> <preset>  # Start specific preset
-./bin/llamaman -l           # List models (no TUI)
-```
-
-### Release
-Releases are automated via GoReleaser on `v*` tags pushed to `main`. See `.goreleaser.yaml` and `.github/workflows/release.yml`. Produces:
-- `linux/amd64` and `linux/arm64` tarballs with checksums
-- GitHub Release with changelog
-- AUR package (`llamaman-bin`)
-
----
-
-## Key files for changes
-
-| Task | Files |
-|---|---|
-| Add a new CLI flag | `main.go` (CLI struct) |
-| Change config schema | `internal/config/types.go`, `internal/config/validate.go`, `internal/config/save.go` |
-| Modify TUI main mode | `internal/tui/main.go` |
-| Modify TUI run mode | `internal/tui/run.go` |
-| Run-mode helpers (live log bar, /props fetch, overlay, zones) | `internal/tui/livebar.go`, `fetcher.go`, `overlay.go`, `zones.go` |
-| Modify TUI config mode | `internal/tui/config.go` |
-| Change param translation | `internal/translate/translate.go` |
-| Change flag parsing from --help | `internal/flags/parser.go`, `internal/flags/fallback.go` |
-| Change spawn/session logic | `internal/server/spawn.go`, `internal/server/session.go` |
-| Change shell completions | `completion.go` |
-| Add hardware info | `internal/hwinfo/` |
-| Update DESIGN.md first | `DESIGN.md` is the canonical design reference; code should match it |
-
----
-
-## Testing notes
-
-- Unit tests cover config load/save/validate, flag parsing, translation, paths, server session, and TUI snapshot rendering.
-- Integration tests use `cmd/llamaman-fakeserver` — a minimal HTTP server mimicking llama-server's `/props` endpoint.
-- TUI snapshot tests render models in-process (stub spawner) plus spawn-the-fakeserver integration tests for run-mode tail/reattach.
-- Run `go test ./...` to execute the full suite. Fakeserver-dependent tests `t.Skipf` when `bin/llamaman-fakeserver` is absent, so build it first for full coverage (`CGO_ENABLED=0 go build -o bin/llamaman-fakeserver ./cmd/llamaman-fakeserver`).
-
----
-
-## File paths (runtime)
-
-| File | XDG path | Purpose |
+### Runtime paths (XDG)
+| File | Path | Purpose |
 |---|---|---|
 | Config | `$XDG_CONFIG_HOME/llamaman/config.json` | Model/preset definitions |
-| Session | `$XDG_RUNTIME_DIR/llamaman/session.json` | Live PID, alias, argv |
-| Log | `$XDG_RUNTIME_DIR/llamaman/llama-server.log` | llama-server stdout+stderr |
-| Flag cache | `$XDG_CACHE_HOME/llamaman/flags-<mtime>.json` | Parsed --help output |
-| App log | `$XDG_STATE_HOME/llamaman/llamaman.log` | llamaman's own slog output |
+| Session | `$XDG_RUNTIME_DIR/llamaman/session.json` | Live PID, alias, argv; `flock`-protected |
+| Server log | `$XDG_RUNTIME_DIR/llamaman/llama-server.log` | llama-server stdout+stderr |
+| Flag cache | `$XDG_CACHE_HOME/llamaman/flags-<mtime>.json` | Parsed `--help` output |
+| App log | `$XDG_STATE_HOME/llamaman/llamaman.log` | llamaman's own slog output (rotates to `.1`) |
+
+Unset XDG vars fall back to `~/.config`, `~/.cache`, `~/.local/state`, and runtime dir `/tmp/llamaman-$UID/llamaman` (`internal/paths/paths.go`).
+
+## Key Directories
+- `internal/config/` – schema types, load/save/validate, ordered params unmarshaler
+- `internal/flags/` – `--help` parser, registry cache, fallback
+- `internal/translate/` – config→argv, router builder
+- `internal/server/` – spawn, session, log tail
+- `internal/tui/` – Bubble Tea modes: `root.go`, `main.go`, `run.go`, `config.go`, `firstrun.go`, `settings.go`, `storage.go`, `browser.go`; helpers `common.go` (Wordmark embed, Theme), `modelpicker.go`, `param_picker.go`, `hfcheck.go`, `markdown.go`, `theme.go`, `anim.go`, `highlight.go`, `livebar.go`, `fetcher.go`, `overlay.go`, `zones.go`
+- `internal/storage/` – llama.cpp HF cache layout resolution + model scan (read-only, never mutates; DESIGN §16.1)
+- `internal/hf/` – Hugging Face client: search, quant resolution, refs, model card, download with SHA-256 verification
+- `internal/modelsini/` – `my-models.ini` import/export and router-file derivation
+- `internal/paths/` – XDG resolution
+- `internal/logging/` – slog init
+- `internal/llamaapi/` – HTTP client
+- `internal/hwinfo/` – CPU/GPU stats
+- `cmd/llamaman-fakeserver/` – pure-Go fake llama-server for integration tests
+
+## Development Commands
+Build:
+```bash
+go build -o bin/llamaman .
+CGO_ENABLED=0 go build -o bin/llamaman-fakeserver ./cmd/llamaman-fakeserver
+```
+
+Lint / vet:
+```bash
+go vet ./...
+```
+
+Test:
+```bash
+go test ./...
+```
+
+CLI synopsis:
+```
+llamaman [flags] [<alias> [<preset>]]
+  -l, --list            List configured models and router sources
+  -p, --presets         Print presets for <alias>
+  -c, --config PATH     Alternate config file
+  -i, --ini PATH        Run a my-models.ini file in router mode (--models-preset)
+      --completion SH   Print completion script (bash, zsh, fish)
+      --version         Print version
+  llamaman import FILE        Import a my-models.ini file into config
+  llamaman export [PATH]      Export config as my-models.ini (default: stdout; -o PATH alternative)
+```
+
+Release: GoReleaser v2 (`~> v2`) builds `llamaman` (CGO_ENABLED=1, cross-compiles arm64 with `aarch64-linux-gnu-gcc`) and `llamaman-fakeserver` (CGO_ENABLED=0), ldflags embed version/commit/date. CI in `.github/workflows/ci.yml`, release in `.github/workflows/release.yml` (tags only, must be reachable from main).
+
+## Code Conventions & Common Patterns
+- Naming: exported `PascalCase`, unexported `camelCase`, constants `UPPER_SNAKE_CASE`. No wildcard imports.
+- DI: constructor injection via interfaces, e.g. `tui.Spawner`. No global singletons.
+- Errors: wrap with `fmt.Errorf("%w", err)`, check with `errors.Is/As`.
+- Async: Bubble Tea `tea.Cmd` for UI, goroutines for spawn wait and `fsnotify` log tailing.
+- State: Bubble Tea models hold UI state; config is single source of truth with atomic write+backup.
+- Concurrency safety: `flock` on `session.json` for exclusive start/reattach.
+- Param order preserved via custom JSON unmarshaler in `internal/config/params.go`.
+- Warnings non-blocking for unknown flags, missing model/binary.
+- Exit codes (constants in `main.go`, DESIGN §4.4): 0=OK, 1=generic, 2=config, 3=prereq, 4=port-in-use, 130=interrupted.
+
+## Important Files
+- `main.go` – CLI entry, Kong parsing, dispatch, exit codes
+- `completion.go` – bash/zsh/fish completion
+- `internal/config/types.go` – Config schema v1
+- `internal/tui/root.go` – top-level Bubble Tea model, mode routing
+- `internal/server/session.go` – flock session management
+- `internal/flags/parser.go` – `--help` parsing
+- `DESIGN.md` – canonical design reference. **Update it before code (ROADMAP §9); a PR that contradicts DESIGN.md updates the doc in the same PR.**
+- `README.md` – user docs, config schema, keybindings
+- `ROADMAP.md` – principles and sequencing
+- `.goreleaser.yaml` – release build matrix
+
+## Runtime / Tooling Preferences
+- Runtime: Go 1.26+, Linux amd64/arm64, CGO enabled for NVML, GCC required, `gcc-aarch64-linux-gnu` for cross-compile.
+- Package manager: Go modules `go.mod`/`go.sum`. No Makefile.
+- Tooling: `go build`, `go vet`, `go test`. GoReleaser for releases. GitHub Actions CI.
+- Dependencies: `charmbracelet/bubbletea`, `bubbles`, `huh`, `lipgloss`, `alecthomas/kong`, `fsnotify`, `NVIDIA/go-nvml`, `shirou/gopsutil/v3`.
+- Runtime env overrides: `LLAMAMAN_ANIM_FPS` (wordmark animation FPS), `LLAMA_CACHE` / `HF_HUB_CACHE` (HF cache root, see `internal/storage`).
+
+## Testing & QA
+- Framework: standard Go `testing` package, co-located `*_test.go`.
+- Patterns: table-driven tests, `t.TempDir`, `t.Setenv`, stub spawners, `drainCmds` harness for Bubble Tea snapshot tests.
+- Coverage: unit tests for config, flags, translate, paths, server session/spawn, llamaapi, modelsini, hf, hwinfo, storage, tui snapshots. Integration tests use `cmd/llamaman-fakeserver`; skipped via `t.Skipf` when binary absent.
+- Run order: build fakeserver first if needed, then `go vet ./...` then `go test ./...`.
+- No external test framework, no explicit coverage thresholds.
+- **Trap:** DESIGN.md still mentions `teatest`, but it is NOT in go.mod — TUI snapshot tests render in-process via a stub spawner + `drainCmds` (see `internal/tui/snapshot_test.go`). Don't add teatest.
