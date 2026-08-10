@@ -45,6 +45,7 @@ jobs:
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
+        continue-on-error: true
         with:
           version: "~> v2"
           args: release --clean
@@ -52,3 +53,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AUR_STAGING_KEY: ${{ secrets.AUR_STAGING_KEY }}
           AUR_KEY: ${{ secrets.AUR_KEY }}
+      - name: Upload PKGBUILD and dist artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llamaman-dist-${{ github.ref_name }}
+          path: |
+            dist/**
+          if-no-files-found: warn
+          retention-days: 14
