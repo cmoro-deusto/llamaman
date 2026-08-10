@@ -2799,7 +2799,17 @@ lists the top GGUF repos by the current sort (the placeholder reads
      transformation** — a style applied after it (e.g. a heading
      wrapping the link) would mangle the escape sequence and kill
      ctrl+click (owner report: the Guide! link inside the unsloth
-     card's heading). **The panel never re-styles card lines** — the
+     card's heading). **Emoji-capable runes are stripped** — READMEs
+     carry ✨/⚡/♥+VS16 etc. that render at width 2 in emoji-aware
+     terminals while runewidth counts 1; the cursor drifts, lines wrap,
+     and the whole view overlaps (owner report: the layout broke when
+     the unsloth Qwen3-Coder card loaded after 's'; tmux rendered it
+     clean because its font uses width 1). `stripWidthAmbiguous`
+     removes the emoji-capable ranges + variation selectors + format
+     controls from card text and result descriptions (width-2 CJK is
+     kept — runewidth and terminals agree there), and the browser's own
+     icons use width-safe glyphs (↓ ♥\ufe0e © ▲ instead of ⬇ ♥ ⚖ ⚠).
+     **The panel never re-styles card lines** — the
      renderer bakes a Subtle base color into plain text, and
      cardPanelLines passes the lines through untouched, because a
      lipgloss re-style strips the OSC 8 sequences (links rendered but

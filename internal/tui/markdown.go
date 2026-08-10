@@ -292,10 +292,36 @@ func (r *cardRenderer) write(s string) {
 	r.buf.WriteString(s)
 }
 
+// stripWidthAmbiguous removes runes whose display width is
+// terminal-dependent (emoji-presentation characters and format
+// controls). A README's ✨, ⚡, ♥ etc. render at width 2 in emoji-aware
+// terminals while lipgloss counts 1 — the cursor drifts, lines wrap,
+// and the whole view overlaps (owner report: the layout broke when a
+// card with emoji loaded after pressing 's'; tmux reproduced a clean
+// screen because its font renders them width 1). Width-2 CJK is kept
+// (runewidth and terminals agree on 2, so it is consistent).
+func stripWidthAmbiguous(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 0x2600 && r <= 0x27BF: // Misc Symbols, Dingbats (⚡♥⚖⚠✨…)
+		case r >= 0x2B00 && r <= 0x2BFF: // Misc Symbols and Arrows (⬇…)
+		case r >= 0x1F000 && r <= 0x1FAFF: // Emoji blocks
+		case r >= 0xFE00 && r <= 0xFE0F: // Variation Selectors (VS16 forces emoji)
+		case r == 0x200D || r == 0x200E || r == 0x200F: // ZWJ + bidi marks
+		case r >= 0x2060 && r <= 0x206F: // invisible format chars
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // renderCardMarkdown parses and renders markdown into styled card
 // lines. Returns nil on parse/render failure (the caller shows its
 // friendly absence note).
 func renderCardMarkdown(theme Theme, src []byte) []string {
+	src = []byte(stripWidthAmbiguous(string(src)))
 	cr := &cardRenderer{theme: theme}
 	md := goldmark.New(
 		goldmark.WithExtensions(extension.GFM),

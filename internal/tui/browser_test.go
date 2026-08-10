@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/hf"
@@ -158,9 +159,9 @@ func TestBrowserMetadataPane(t *testing.T) {
 	for _, want := range []string{
 		"org/one",
 		"8B params · from meta-llama/Llama-3.1-8B-Instruct",
-		"⬇ 743.5k downloads",
-		"♥ 17 likes",
-		"⚖ license: llama3.1",
+		"↓ 743.5k downloads",
+		"17 likes",
+		"© license: llama3.1",
 		"▷ task: text-generation",
 	} {
 		if !strings.Contains(out, want) {
@@ -178,7 +179,7 @@ func TestBrowserMetadataPane(t *testing.T) {
 		t.Fatalf("selected = %v, want org/nc", b.selected)
 	}
 	out2 := stripANSI(b.View())
-	for _, want := range []string{"org/nc", "⚠ non-commercial license — check terms"} {
+	for _, want := range []string{"org/nc", "▲ non-commercial license — check terms"} {
 		if !strings.Contains(out2, want) {
 			t.Errorf("info pane missing %q\nout:\n%s", want, out2)
 		}
@@ -744,8 +745,10 @@ func TestBrowserFitsWidth(t *testing.T) {
 		driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // browse
 		driveRoot(t, r, keyMsg("s"))                    // sort — the wide footer path
 		for i, ln := range strings.Split(stripANSI(r.browser.View()), "\n") {
-			if l := len([]rune(ln)); l > w {
-				t.Errorf("width %d: line %d is %d runes wide — overflow\n%q", w, i, l, ln)
+			// Visible width, not rune count: zero-width marks (e.g. the
+			// ♥\ufe0e text-presentation selector) must not trip this.
+			if l := lipgloss.Width(ln); l > w {
+				t.Errorf("width %d: line %d is %d cells wide — overflow\n%q", w, i, l, ln)
 			}
 		}
 		// Regression: every panel content line must carry its │ side

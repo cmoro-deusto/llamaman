@@ -194,3 +194,25 @@ func TestCardMarkdownLinkInBold(t *testing.T) {
 		t.Errorf("bold link text missing\n%s", stripANSI(got))
 	}
 }
+
+// TestCardMarkdownStripsEmoji: emoji-presentation runes (width-2 in
+// emoji-aware terminals, width-1 in runewidth) must not reach the
+// card — they break the terminal's column accounting and garble the
+// whole view (owner report: the unsloth Qwen3-Coder card's ✨+VS16
+// broke the layout after sorting).
+func TestCardMarkdownStripsEmoji(t *testing.T) {
+	md := "# Model ✨\n\n⚡ Bold text and [link](https://x.com) ♥\n\nCJK keeps 宽度."
+	lines := renderCardMarkdown(DefaultTheme(), []byte(md))
+	got := strings.Join(lines, "\n")
+	for _, bad := range []string{"✨", "⚡", "♥", "\ufe0f"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("emoji-capable rune %q leaked into the card\n%s", bad, got)
+		}
+	}
+	if !strings.Contains(got, "Model") || !strings.Contains(got, "Bold text") {
+		t.Errorf("card body missing\n%s", got)
+	}
+	if !strings.Contains(got, "CJK keeps ") {
+		t.Errorf("CJK content must survive (width-2 is consistent)\n%s", got)
+	}
+}

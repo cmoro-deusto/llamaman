@@ -1022,7 +1022,9 @@ func describeResult(r hf.SearchResult) string {
 	if lic := licenseOf(r); lic != "" {
 		parts = append(parts, "license: "+lic)
 	}
-	return strings.Join(parts, " · ")
+	// Tags can carry emoji-capable runes; strip them so result rows
+	// never break the terminal's width accounting either.
+	return stripWidthAmbiguous(strings.Join(parts, " · "))
 }
 
 // humanCount renders a compact count: 743450 → "743k", 1700 → "1.7k".
@@ -1058,7 +1060,7 @@ func (s *BrowserMode) View() string {
 	body = append(body, "")
 	body = append(body, s.renderPanes(cw)...)
 	if s.flash != "" {
-		body = append(body, "", truncatePad(lipgloss.NewStyle().Foreground(s.theme.StatusStart).Render("⚠ "+s.flash), cw))
+		body = append(body, "", truncatePad(lipgloss.NewStyle().Foreground(s.theme.StatusStart).Render("▲ "+s.flash), cw))
 	}
 	// Clamp the footer to the content width: the outer box sizes itself
 	// to its widest line, and Place cannot shrink it — an overly wide
@@ -1265,14 +1267,14 @@ func (s *BrowserMode) infoLines(inner int) []string {
 		lines = append(lines, muted("from ")+subtle(bm))
 	}
 	lines = append(lines, "")
-	lines = append(lines, good("⬇ "+humanCount(m.Downloads))+" "+muted("downloads"))
-	lines = append(lines, accent("♥ "+strconv.FormatInt(m.Likes, 10))+" "+muted("likes"))
-	lines = append(lines, muted("⚖ license: ")+subtle(licenseOf(*m)))
+	lines = append(lines, good("↓ "+humanCount(m.Downloads))+" "+muted("downloads"))
+	lines = append(lines, accent("♥︎ "+strconv.FormatInt(m.Likes, 10))+" "+muted("likes"))
+	lines = append(lines, muted("© license: ")+subtle(licenseOf(*m)))
 	if m.PipelineTag != "" {
 		lines = append(lines, muted("▷ task: ")+subtle(m.PipelineTag))
 	}
 	if w := nonCommercialLicense(*m); w != "" {
-		lines = append(lines, warn("⚠ "+w))
+		lines = append(lines, warn("▲ "+w))
 	}
 	if s.mmproj {
 		lines = append(lines, subtle("mmproj present — llama.cpp auto-downloads it"))
