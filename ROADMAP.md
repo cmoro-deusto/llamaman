@@ -152,8 +152,12 @@ no new llama-server interaction.
      loading).
   2. `[STARTING]` badge: slow color breathing (yellow ↔ gold). Text unchanged.
   3. Status dot in run mode: pulses while a request is generating.
-  4. **No** wordmark animation in Main mode; **no** animation in steady-state
-     READY idle; **no** desktop notifications.
+  4. Main-mode wordmark highlight sweep (§15.5a): a specular band
+     travels the llamaman logo bottom-left → top-right once per visit
+     (`preferences.logo-effect: "once"`, the default) or continuously
+     (`"loop"`); `preferences.animations` off disables it entirely.
+     **No** animation in steady-state READY idle; **no** desktop
+     notifications.
 - **Mechanics:** `tea.Tick` at 60 fps (owner decision; runtime
   override via `LLAMAMAN_ANIM_FPS`); sine-wave color interpolation between
   two colors. True-color terminals get smooth interpolation; 256-color

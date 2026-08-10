@@ -38,6 +38,13 @@ type Preferences struct {
 	// LogColors defaults to true: render-time line-kind coloring of the
 	// run-mode log (§15.3). Same pointer semantics as Animations.
 	LogColors *bool `json:"log-colors,omitempty"`
+	// LogoEffect is the wordmark highlight sweep mode on the main screen
+	// (§15.5a): "once" (the default) sweeps each time the main screen
+	// opens, "loop" keeps sweeping while it stays open. The Animations
+	// toggle is the master switch — off disables the sweep entirely, so
+	// this only picks between one-shot and looping. Empty string means
+	// the default, "once" (omitempty keeps untouched configs minimal).
+	LogoEffect string `json:"logo-effect,omitempty"`
 	// ModelsDir, when set, is the single llama.cpp HF cache root
 	// (DESIGN §16.1): it wins over every environment variable
 	// (LLAMA_CACHE, HF_HOME, …). Empty (the default) means follow
@@ -68,6 +75,22 @@ func (p Preferences) AnimationsEnabled() bool {
 // (nil) means the default, true.
 func (p Preferences) LogColorsEnabled() bool {
 	return p.LogColors == nil || *p.LogColors
+}
+
+// Logo-effect modes for the main-screen wordmark highlight sweep
+// (§15.5a). Empty LogoEffect means LogoEffectOnce (the default).
+const (
+	LogoEffectOnce = "once"
+	LogoEffectLoop = "loop"
+)
+
+// LogoEffectMode reports the effective wordmark-highlight mode: absent
+// means "once".
+func (p Preferences) LogoEffectMode() string {
+	if p.LogoEffect == "" {
+		return LogoEffectOnce
+	}
+	return p.LogoEffect
 }
 
 // Globals holds the binary path and the listen host/port. The JSON tag for

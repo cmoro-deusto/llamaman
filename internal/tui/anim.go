@@ -45,6 +45,13 @@ func animFrameInterval() time.Duration {
 // animTickMsg triggers a re-render so animated elements move.
 type animTickMsg struct{}
 
+// animFrameTick returns one animation frame tick (the period from
+// animFrameInterval, LLAMAMAN_ANIM_FPS override included). The single
+// place a frame tick is built — run mode, the wordmark sweep, ...
+func animFrameTick() tea.Cmd {
+	return tea.Tick(animFrameInterval(), func(time.Time) tea.Msg { return animTickMsg{} })
+}
+
 // animationsEnabled reports the effective preferences.animations value
 // (nil-safe — no config means the default, on).
 func animationsEnabled(cfg *config.Config) bool {
@@ -168,7 +175,7 @@ func (r *RunMode) animCmd() tea.Cmd {
 	if !r.anythingAnimated() {
 		return nil
 	}
-	return tea.Tick(animFrameInterval(), func(time.Time) tea.Msg { return animTickMsg{} })
+	return animFrameTick()
 }
 
 // anythingAnimated reports whether any §15.5 element is currently

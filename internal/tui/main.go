@@ -5,6 +5,7 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
@@ -52,6 +53,12 @@ type MainMode struct {
 
 	flash    string
 	showHelp bool
+
+	// wordmarkStart anchors the §15.5a highlight sweep: zero means the
+	// sweep has never been started (static wordmark); otherwise it is the
+	// time of the most recent RestartWordmark. Root restarts it every
+	// time the main screen becomes visible.
+	wordmarkStart time.Time
 
 	mode mainMode
 
@@ -476,9 +483,7 @@ func (m MainMode) View() string {
 		return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, m.renderHelp())
 	}
 
-	wordmark := lipgloss.NewStyle().
-		Foreground(m.theme.Accent).
-		Render(strings.TrimRight(Wordmark, "\n"))
+	wordmark := m.renderWordmark()
 
 	tagline := lipgloss.NewStyle().
 		Foreground(m.theme.Subtle).
@@ -691,7 +696,24 @@ func shortcut(key, label string, t Theme) string {
 // sub-list (2+ presets); Esc backs out of the preset pivot. The
 // help-overlay toggle is preserved. `c`, `a`, `q` continue to be
 // caught by Root before this handler runs.
+// Update dispatches messages; non-key messages flow to the embedded
+// list. The wordmark sweep tick is re-armed only when an animTickMsg
+// lands (§15.5a): the runtime already holds the next pending timer, so
+// other messages (keypresses, window sizes) must not mint new ones —
+// that keeps the sweep running while Main is visible without paying a
+// tick per message.
 func (m MainMode) Update(msg tea.Msg) (MainMode, tea.Cmd) {
+	m, cmd := m.update(msg)
+	if cmd != nil {
+		return m, cmd
+	}
+	if _, ok := msg.(animTickMsg); ok {
+		return m, m.wordmarkTickCmd()
+	}
+	return m, nil
+}
+
+func (m MainMode) update(msg tea.Msg) (MainMode, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok {
 		if m.showHelp {
 			m.showHelp = false
