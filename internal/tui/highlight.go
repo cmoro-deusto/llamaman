@@ -30,14 +30,14 @@ import (
 const (
 	// highlightWidth is the number of ramp steps the fully-bright core
 	// of the band spans (Python default: 8).
-	highlightWidth = 8
+	highlightWidth = 1
 	// highlightBrightness is the specular lightness multiplier applied
 	// to the base color (Python default: 1.75).
 	highlightBrightness = 1.75
 	// wordmarkSweepDur is the time the band takes to travel from the
 	// bottom-left corner of the logo to the top-right. Owner-tuned:
-	// started at 1500 ms, then 1200 ms; 800 ms is the final pace.
-	wordmarkSweepDur = 800 * time.Millisecond
+	// started at 1500 ms, then 1200, 800; 400 ms is the final pace.
+	wordmarkSweepDur = 400 * time.Millisecond
 	// wordmarkRampStep is how long each of a character's ramp colors is
 	// held. Python holds every frame 2 ticks at 60 fps; fixing it in
 	// time (2 * 1/60 s) keeps the speed FPS-independent.
@@ -47,7 +47,7 @@ const (
 	// itself, so 13 steps after activation.
 	wordmarkSceneDur = (3 + highlightWidth + 3 - 1) * wordmarkRampStep
 	// wordmarkLoopHold is the pause between sweeps in loop mode.
-	wordmarkLoopHold = 2000 * time.Millisecond
+	wordmarkLoopHold = 4000 * time.Millisecond
 )
 
 // wordmarkGrid is the precomputed sweep geometry of the embedded

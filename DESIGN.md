@@ -1395,12 +1395,14 @@ it (§15.5a research: no Go port exists; the closest building blocks —
 pterm's `Area`, harmonica easing — duplicate infrastructure `anim.go`
 already provides).
 
-**Algorithm (Python defaults).** The base color is the theme accent
+**Algorithm (Python defaults; owner-tuned values in bold).** The base
+color is the theme accent
 (single-color final state — Python's documented mode for a flat final
 color). The specular is the base color with HSL lightness ×1.75
 (`brightenColor`, clamped at white). Each character's scene is a
-`base → bright → bright → base` ramp of 3+8+3 = 14 colors held 2
-frames each. Characters are grouped into diagonal bands ordered from
+`base → bright → bright → base` ramp of 3+**1**+3 = **7** colors held 2
+frames each (Python's default width is 8; the owner narrowed the bright
+core to a thin line). Characters are grouped into diagonal bands ordered from
 the bottom-left corner to the top-right (band key = col − row,
 ascending), and a `SequenceEaser` with `ease-in-out-circ` walks the
 bands; a band's characters start their scene when the eased progress
@@ -1408,9 +1410,11 @@ reaches the band's index. The effect ends with every character settled
 in the base color.
 
 **Timing.** Time-based, not frame-based, so speed is independent of the
-effective frame rate: the band travels in 800 ms, each ramp color is
-held `2 × 1/60 s`, and the scene tail adds 433 ms. Loop mode rests 2 s
-between sweeps. `LLAMAMAN_ANIM_FPS` changes smoothness only.
+effective frame rate: the band travels in 400 ms (owner-tuned down
+from 1500), each ramp color is
+held `2 × 1/60 s`, and the scene tail adds 200 ms. Loop mode rests 4 s
+(owner-tuned up from 2) between sweeps. `LLAMAMAN_ANIM_FPS` changes
+smoothness only.
 
 **Rendering.** `MainMode.View()` renders the wordmark per glyph cell
 (space cells stay uncolored), each with its ramp color for the current
