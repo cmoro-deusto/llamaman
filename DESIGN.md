@@ -2795,7 +2795,11 @@ lists the top GGUF repos by the current sort (the placeholder reads
      **links and
      autolinks are OSC 8 terminal hyperlinks** — `ESC]8;;URL ESC\
      … ESC]8;; ESC\\` — so ctrl/cmd-click opens the URL in the
-     user's browser (owner round); raw HTML skipped; tables render
+     user's browser (owner round); **the OSC 8 wrap is the OUTERMOST
+     transformation** — a style applied after it (e.g. a heading
+     wrapping the link) would mangle the escape sequence and kill
+     ctrl+click (owner report: the Guide! link inside the unsloth
+     card's heading); raw HTML skipped; tables render
      cell-separated (`a │ b`). Windowed and scrollable — **`pgup`/
      `pgdown` scroll the card from ANY zone** (owner round: moved out
      of the quants-zone key handler into the browser-wide routing; the

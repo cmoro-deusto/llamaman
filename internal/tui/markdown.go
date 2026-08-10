@@ -27,6 +27,12 @@ type cardRenderer struct {
 	theme  Theme
 	buf    strings.Builder
 	styles []func(string) string
+	// linkURL is set while inside a Link/AutoLink node. The OSC 8
+	// hyperlink must wrap the FULLY styled text (outermost) — a lipgloss
+	// style applied after it (e.g. a heading wrapping the link) would
+	// mangle the escape sequence and kill ctrl+click (owner report:
+	// the Guide! link inside the unsloth card's heading).
+	linkURL string
 }
 
 func (r *cardRenderer) RegisterFuncs(reg renderer.NodeRendererFuncRegisterer) {
@@ -137,12 +143,10 @@ func (r *cardRenderer) renderEmphasis(_ util.BufWriter, _ []byte, n ast.Node, en
 
 func (r *cardRenderer) renderLink(_ util.BufWriter, source []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
-		dest := string(n.(*ast.Link).Destination)
-		r.push(func(s string) string {
-			styled := lipgloss.NewStyle().Foreground(r.theme.Accent).Underline(true).Render(s)
-			return osc8(dest, styled)
-		})
+		r.linkURL = string(n.(*ast.Link).Destination)
+		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Accent).Underline(true).Render(s) })
 	} else {
+		r.linkURL = ""
 		r.pop()
 	}
 	return ast.WalkContinue, nil
@@ -160,9 +164,9 @@ func (r *cardRenderer) renderImage(_ util.BufWriter, _ []byte, _ ast.Node, enter
 
 func (r *cardRenderer) renderAutoLink(w util.BufWriter, source []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
-		url := string(n.(*ast.AutoLink).URL(source))
-		styled := lipgloss.NewStyle().Foreground(r.theme.Accent).Underline(true).Render(url)
-		r.write(osc8(url, styled))
+		r.linkURL = string(n.(*ast.AutoLink).URL(source))
+		r.write(r.linkURL)
+		r.linkURL = ""
 	}
 	return ast.WalkSkipChildren, nil
 }
@@ -271,6 +275,10 @@ func (r *cardRenderer) pop() {
 func (r *cardRenderer) write(s string) {
 	for i := len(r.styles) - 1; i >= 0; i-- {
 		s = r.styles[i](s)
+	}
+	// Outermost: no style may wrap (and mangle) the OSC 8 sequence.
+	if r.linkURL != "" {
+		s = osc8(r.linkURL, s)
 	}
 	r.buf.WriteString(s)
 }

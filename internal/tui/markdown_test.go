@@ -157,3 +157,40 @@ func TestCardMarkdownListBlankSeparated(t *testing.T) {
 		t.Errorf("simple list = %q, want [• x • y]", simple)
 	}
 }
+
+// TestCardMarkdownLinkInHeading: a link inside a heading must keep its
+// OSC 8 hyperlink — the heading's lipgloss style used to wrap (and
+// mangle) the escape sequence, killing ctrl+click (owner report: the
+// "Run DeepSeek-V4-0731 Guide!" link in the unsloth card).
+func TestCardMarkdownLinkInHeading(t *testing.T) {
+	md := "## Read our How to [Run DeepSeek-V4-0731 Guide!](https://unsloth.ai/docs/models/deepseek-v4)"
+	lines := renderCardMarkdown(DefaultTheme(), []byte(md))
+	if len(lines) != 1 {
+		t.Fatalf("lines = %d\n%q", len(lines), lines)
+	}
+	ln := lines[0]
+	for _, want := range []string{
+		"\x1b]8;;https://unsloth.ai/docs/models/deepseek-v4\x1b\\",
+		"\x1b]8;;\x1b\\",
+	} {
+		if !strings.Contains(ln, want) {
+			t.Errorf("heading link missing %q\n%s", want, ln)
+		}
+	}
+	if !strings.Contains(stripANSI(ln), "Read our How to Run DeepSeek-V4-0731 Guide!") {
+		t.Errorf("heading text wrong\n%s", stripANSI(ln))
+	}
+}
+
+// TestCardMarkdownLinkInBold: same guarantee for a link inside strong
+// emphasis.
+func TestCardMarkdownLinkInBold(t *testing.T) {
+	lines := renderCardMarkdown(DefaultTheme(), []byte("**[bold link](https://example.com/x)** tail"))
+	got := strings.Join(lines, "\n")
+	if !strings.Contains(got, "\x1b]8;;https://example.com/x\x1b\\") {
+		t.Errorf("bold link lost its OSC 8 hyperlink\n%q", got)
+	}
+	if !strings.Contains(stripANSI(got), "bold link") {
+		t.Errorf("bold link text missing\n%s", stripANSI(got))
+	}
+}
