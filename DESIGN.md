@@ -2799,7 +2799,13 @@ lists the top GGUF repos by the current sort (the placeholder reads
      transformation** — a style applied after it (e.g. a heading
      wrapping the link) would mangle the escape sequence and kill
      ctrl+click (owner report: the Guide! link inside the unsloth
-     card's heading); raw HTML skipped; tables render
+     card's heading). **The panel never re-styles card lines** — the
+     renderer bakes a Subtle base color into plain text, and
+     cardPanelLines passes the lines through untouched, because a
+     lipgloss re-style strips the OSC 8 sequences (links rendered but
+     dead) and a corrupted one garbles the whole view (owner report:
+     's' broke the layout once a link line was on screen); raw HTML
+     skipped; tables render
      cell-separated (`a │ b`). Windowed and scrollable — **`pgup`/
      `pgdown` scroll the card from ANY zone** (owner round: moved out
      of the quants-zone key handler into the browser-wide routing; the

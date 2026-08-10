@@ -827,3 +827,32 @@ func TestBrowserSetTheme(t *testing.T) {
 		t.Errorf("list items lost on theme change: %d, want 2", n)
 	}
 }
+
+// TestBrowserCardLinksSurviveRendering: OSC 8 hyperlinks in the model
+// card must reach the terminal intact — the card panel used to
+// re-style every line with lipgloss, which stripped the sequences
+// (links rendered but never clickable), and a corrupted sequence
+// garbled the whole view (owner report: 's' broke the layout once a
+// link line was on screen).
+func TestBrowserCardLinksSurviveRendering(t *testing.T) {
+	card := "# " + strings.Repeat("[long link text](https://example.com/very/long/url/path) ", 12)
+	stub := &stubBrowserRunner{
+		results: []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
+		opts:    []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}},
+		card:    card,
+	}
+	r, _ := openBrowserRoot(t, stub)
+	// Tall enough that the card panel renders (it is skipped when the
+	// right column runs out of room).
+	driveRoot(t, r, tea.WindowSizeMsg{Width: 120, Height: 40})
+	searchDrive(t, r, "q")
+	v := r.browser.View()
+	opens := strings.Count(v, "\x1b]8;;https://")
+	closes := strings.Count(v, "\x1b]8;;\x1b\\")
+	if opens == 0 {
+		t.Error("OSC 8 links missing from the rendered view (panel re-style strips them?)")
+	}
+	if opens > closes {
+		t.Error("unterminated OSC 8 sequences in the view — this would garble the terminal")
+	}
+}

@@ -1371,7 +1371,9 @@ func (s *BrowserMode) cardPanelLines(inner, maxLines int) []string {
 		}
 		end := min(total, s.cardOffset+visible)
 		for _, ln := range s.cardLines[s.cardOffset:end] {
-			lines = append(lines, subtle(ln))
+			// Already fully styled by the markdown renderer — re-styling
+			// here (lipgloss) would strip its OSC 8 hyperlinks.
+			lines = append(lines, ln)
 		}
 		if total > visible {
 			pct := 0

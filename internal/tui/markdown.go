@@ -101,7 +101,14 @@ func (r *cardRenderer) renderText(_ util.BufWriter, source []byte, n ast.Node, e
 	}
 	text := string(n.(*ast.Text).Segment.Value(source))
 	// Soft line breaks become spaces (goldmark's default behavior).
-	r.write(strings.ReplaceAll(text, "\n", " "))
+	text = strings.ReplaceAll(text, "\n", " ")
+	if len(r.styles) == 0 {
+		// Base style for plain content: every card line is fully styled
+		// by the renderer, so the panel never re-styles (which would
+		// strip OSC 8 hyperlinks — owner report: 's' garbled the view).
+		text = lipgloss.NewStyle().Foreground(r.theme.Subtle).Render(text)
+	}
+	r.write(text)
 	return ast.WalkContinue, nil
 }
 
@@ -165,7 +172,9 @@ func (r *cardRenderer) renderImage(_ util.BufWriter, _ []byte, _ ast.Node, enter
 func (r *cardRenderer) renderAutoLink(w util.BufWriter, source []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
 		r.linkURL = string(n.(*ast.AutoLink).URL(source))
+		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Accent).Underline(true).Render(s) })
 		r.write(r.linkURL)
+		r.pop()
 		r.linkURL = ""
 	}
 	return ast.WalkSkipChildren, nil
