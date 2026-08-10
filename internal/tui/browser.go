@@ -1250,7 +1250,6 @@ func (s *BrowserMode) infoLines(inner int) []string {
 	subtle := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Subtle).Render(t) }
 	accent := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.Accent).Bold(true).Render(t) }
 	good := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.StatusReady).Render(t) }
-	warn := func(t string) string { return lipgloss.NewStyle().Foreground(s.theme.StatusStart).Render(t) }
 	if s.selected == nil {
 		lines = append(lines, muted("select a repo…"))
 		return lines
@@ -1277,15 +1276,28 @@ func (s *BrowserMode) infoLines(inner int) []string {
 	lines = append(lines, "")
 	lines = append(lines, good("↓ "+humanCount(m.Downloads))+" "+muted("downloads"))
 	lines = append(lines, accent("♥︎ "+strconv.FormatInt(m.Likes, 10))+" "+muted("likes"))
-	lines = append(lines, muted("© license: ")+subtle(licenseOf(*m)))
-	if m.PipelineTag != "" {
-		lines = append(lines, muted("▷ task: ")+subtle(m.PipelineTag))
+	// License row; the non-commercial warning folds in as a ▲ marker so
+	// the panel keeps its fixed row count.
+	lic := licenseOf(*m)
+	if nonCommercialLicense(*m) != "" {
+		lic += " ▲"
 	}
-	if w := nonCommercialLicense(*m); w != "" {
-		lines = append(lines, warn("▲ "+w))
-	}
+	lines = append(lines, muted("© license: ")+subtle(lic))
+	// Task row; the mmproj note folds in. ALWAYS present (blank when
+	// missing) — the panel is exactly 7 rows (owner round), otherwise
+	// the quants/card panels below shift when a repo lacks a task.
+	task := m.PipelineTag
 	if s.mmproj {
-		lines = append(lines, subtle("mmproj present — llama.cpp auto-downloads it"))
+		if task != "" {
+			task += " · mmproj"
+		} else {
+			task = "mmproj"
+		}
+	}
+	if task != "" {
+		lines = append(lines, muted("▷ task: ")+subtle(task))
+	} else {
+		lines = append(lines, "")
 	}
 	return lines
 }

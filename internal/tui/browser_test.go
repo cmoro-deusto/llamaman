@@ -179,7 +179,7 @@ func TestBrowserMetadataPane(t *testing.T) {
 		t.Fatalf("selected = %v, want org/nc", b.selected)
 	}
 	out2 := stripANSI(b.View())
-	for _, want := range []string{"org/nc", "▲ non-commercial license — check terms"} {
+	for _, want := range []string{"org/nc", "© license: cc-by-nc-4.0 ▲"} {
 		if !strings.Contains(out2, want) {
 			t.Errorf("info pane missing %q\nout:\n%s", want, out2)
 		}
@@ -220,7 +220,7 @@ func TestBrowserQuantPane(t *testing.T) {
 		"Q4_K_M — 5 GiB",
 		"● cached", // the fancy badge (storageTestConfig fixture)
 		"Q8_0 — 10 GiB",
-		"mmproj present — llama.cpp auto-downloads it",
+		"▷ task: mmproj", // the mmproj note folds into the task row
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("quant pane missing %q\nout:\n%s", want, out)
@@ -867,16 +867,30 @@ func TestBrowserCardLinksSurviveRendering(t *testing.T) {
 // whether or not the repo has params/base-model info — otherwise the
 // quants/card panels below shift up a row (owner round).
 func TestBrowserInfoHeightStable(t *testing.T) {
-	h1 := infoPanelHeight(t, []hf.SearchResult{{
-		ID: "org/one", Downloads: 10, Likes: 1,
-		Tags: []string{"gguf", "base_model:org/Llama-70B"},
-	}})
-	h2 := infoPanelHeight(t, []hf.SearchResult{{
-		ID: "org/none", Downloads: 10, Likes: 1,
-		Tags: []string{"gguf"},
-	}})
-	if h1 != h2 {
-		t.Errorf("info panel height varies: %d (params) vs %d (none)", h1, h2)
+	// The panel is always exactly 7 rows (name, params·from, blank,
+	// downloads, likes, license, task) — missing values render as blank
+	// rows so the quants/card panels below never shift (owner round).
+	shapes := []struct {
+		name string
+		res  hf.SearchResult
+	}{
+		{"full", hf.SearchResult{ID: "org/one", Downloads: 10, Likes: 1,
+			Tags:        []string{"gguf", "base_model:org/Llama-70B"},
+			PipelineTag: "text-generation"}},
+		{"no-params", hf.SearchResult{ID: "org/none", Downloads: 10, Likes: 1,
+			Tags:        []string{"gguf"},
+			PipelineTag: "text-generation"}},
+		{"no-task", hf.SearchResult{ID: "org/notask", Downloads: 10, Likes: 1,
+			Tags: []string{"gguf", "base_model:org/Llama-70B"}}},
+		{"bare", hf.SearchResult{ID: "org/bare", Downloads: 10, Likes: 1,
+			Tags: []string{"gguf"}}},
+	}
+	want := 7
+	for _, sh := range shapes {
+		h := infoPanelHeight(t, []hf.SearchResult{sh.res})
+		if h != want {
+			t.Errorf("%s: info panel height = %d, want %d", sh.name, h, want)
+		}
 	}
 }
 

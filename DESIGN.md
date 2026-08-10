@@ -2748,14 +2748,14 @@ lists the top GGUF repos by the current sort (the placeholder reads
      StatusReady-green, "from" Muted, base Subtle; **name-derived** —
      the search API has no params field, so `paramCountOf` regexes the
      `8B`-style suffix out of the base-model/repo id, a flagged display
-     heuristic; a repo with neither emits a blank line so the panel
-     height never varies — otherwise the quants/card panels below shift
-     up a row, owner round); a blank line (the `─` separator is an
-     empty line); `↓ N downloads` (count green) and
-     `♥ N likes` (count accent); `⚖ license: <id>` and
-     `▷ task: <pipeline_tag>` (label Muted, value Subtle); a
-     **⚠ non-commercial license — check terms** warning for `cc-by-nc*`
-     (P3: display only).
+     heuristic; missing values render as blank rows); a blank line; 
+     `↓ N downloads` (count green) and `♥ N likes` (count accent);
+     `© license: <id>` (the non-commercial `▲` marker folds into this
+     row) and `▷ task: <pipeline_tag>` (the `mmproj` note folds in).
+     **The panel is ALWAYS exactly 7 rows** (owner round: name,
+     params·from, blank, downloads, likes, license, task) — any missing
+     value keeps its row blank, so the quants/card panels below never
+     shift.
   2. **quants (N)** — a **fixed 5-row window** (owner round: the panel
      is a short 7-line box — title border + 5 rows + bottom border —
      so the model card panel below gets every freed line); the window
