@@ -38,13 +38,13 @@ type MainMode struct {
 	// statusLine is a one-line status hint rendered above the shortcuts
 	// (Root uses it to surface an in-flight download on Main).
 	statusLine string
-	cfg     *config.Config
-	cfgPath string // config file path; drives the derived models.ini default
-	keys    Keymap
-	theme   Theme
-	width   int
-	height  int
-	version string
+	cfg        *config.Config
+	cfgPath    string // config file path; drives the derived models.ini default
+	keys       Keymap
+	theme      Theme
+	width      int
+	height     int
+	version    string
 
 	runningAlias  string
 	runningPreset string
@@ -676,6 +676,10 @@ func (m MainMode) renderHelp() string {
 
 func shortcut(key, label string, t Theme) string {
 	keyStyle := lipgloss.NewStyle().Foreground(t.Accent).Bold(true)
+	if label == "" {
+		return keyStyle.Render(key) // no trailing space — it would widen
+		// the footer past the box and clip narrow terminals
+	}
 	labelStyle := lipgloss.NewStyle().Foreground(t.Subtle)
 	return keyStyle.Render(key) + " " + labelStyle.Render(label)
 }

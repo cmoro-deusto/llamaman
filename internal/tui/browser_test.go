@@ -724,21 +724,25 @@ func TestBrowserQuantsWindow(t *testing.T) {
 	}
 }
 
-// TestBrowserFitsWidth: no panel may overflow the terminal width — a
+// TestBrowserFitsWidth: no line may overflow the terminal width — a
 // regression for the lipgloss Width-wrap bug that pushed the boxes past
 // their allocation (owner report: search bar one character wider than
-// the model info).
+// the model info), and for the footer that used to blow the outer box
+// past narrow terminals (owner report: 's' broke the whole view — the
+// results-zone footer is the widest, so it clipped right on terminals
+// <= 77 cols).
 func TestBrowserFitsWidth(t *testing.T) {
 	stub := &stubBrowserRunner{
-		results: []hf.SearchResult{{ID: "org/one", Tags: []string{"gguf"}}},
+		results: browserTestResults(),
 		opts:    []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}},
 		card:    "# Model\n\nCard text.",
 	}
-	for _, w := range []int{120, 80} {
+	for _, w := range []int{160, 120, 100, 90, 80, 78, 76, 74, 72, 70, 68, 65, 60} {
 		r := NewRoot(sampleSnapshotConfig(), "/dev/null", stubSpawner{}, nil, "v", nil)
 		driveRoot(t, r, tea.WindowSizeMsg{Width: w, Height: 36}, keyMsg("b"))
 		r.browser.SetBrowserRunner(stub)
-		driveRoot(t, r, keyRunes("q"), tea.KeyMsg{Type: tea.KeyEnter})
+		driveRoot(t, r, tea.KeyMsg{Type: tea.KeyEnter}) // browse
+		driveRoot(t, r, keyMsg("s"))                    // sort — the wide footer path
 		for i, ln := range strings.Split(stripANSI(r.browser.View()), "\n") {
 			if l := len([]rune(ln)); l > w {
 				t.Errorf("width %d: line %d is %d runes wide — overflow\n%q", w, i, l, ln)
@@ -746,10 +750,9 @@ func TestBrowserFitsWidth(t *testing.T) {
 		}
 		// Regression: every panel content line must carry its │ side
 		// borders (the manual box builder used to omit them — the
-		// round-4 border bug). No "search: " prompt anymore, so the
-		// typed value sits right after the border.
-		if out := stripANSI(r.browser.View()); !strings.Contains(out, "│q") {
-			t.Errorf("width %d: search content line missing its left border", w)
+		// round-4 border bug).
+		if out := stripANSI(r.browser.View()); !strings.Contains(out, "│") {
+			t.Errorf("width %d: panel content missing its side borders", w)
 		}
 	}
 }

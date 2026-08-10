@@ -2809,7 +2809,15 @@ lists the top GGUF repos by the current sort (the placeholder reads
      cell-separated (`a │ b`). Windowed and scrollable — **`pgup`/
      `pgdown` scroll the card from ANY zone** (owner round: moved out
      of the quants-zone key handler into the browser-wide routing; the
-     footer advertises `pgup/pgdn` in every zone, compactly) — with a
+     footer advertises `pgup/pgdn` in every zone, compactly; **the
+     footer (and flash/filter lines) are clamped to the content width
+     and the empty-label shortcut emits no trailing space** — the outer
+     box sizes itself to its widest line and Place cannot shrink it, so
+     an unclamped footer pushed the box past the terminal, clipping the
+     right edge of the whole view on narrow terminals (owner report:
+     's' broke the layout — the results-zone footer is the widest, and
+     `shortcut("pgup/pgdn", "", …)` added a trailing space making it 71
+     chars, overflowing anything ≤ 77 cols)) — with a
      **scroll indicator** `NN% ▰▱▱▱▱▱▱▱▱▱` (10-dot bar filling as you
      scroll). Friendly non-blocking states: `loading card…`, `no model
      card` (404), `could not load model card` (other). The panel takes

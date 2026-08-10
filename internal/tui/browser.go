@@ -1053,14 +1053,20 @@ func (s *BrowserMode) View() string {
 		s.renderSearchBox(cw, s.zone == zoneSearch),
 	}
 	if f := s.renderFilterLine(); f != "" {
-		body = append(body, f)
+		body = append(body, truncatePad(f, cw))
 	}
 	body = append(body, "")
 	body = append(body, s.renderPanes(cw)...)
 	if s.flash != "" {
-		body = append(body, "", lipgloss.NewStyle().Foreground(s.theme.StatusStart).Render("⚠ "+s.flash))
+		body = append(body, "", truncatePad(lipgloss.NewStyle().Foreground(s.theme.StatusStart).Render("⚠ "+s.flash), cw))
 	}
-	body = append(body, "", s.renderFooter())
+	// Clamp the footer to the content width: the outer box sizes itself
+	// to its widest line, and Place cannot shrink it — an overly wide
+	// footer used to push the box past the terminal, clipping the right
+	// edge of the whole view on narrow terminals (owner report: the
+	// results-zone footer is the widest, so it broke precisely when
+	// sorting with 's').
+	body = append(body, "", truncatePad(s.renderFooter(), cw))
 	content := strings.Join(body, "\n")
 	box := lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
