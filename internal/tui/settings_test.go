@@ -38,14 +38,14 @@ func writeSnapshotConfig(t *testing.T) (string, *config.Config) {
 }
 
 // TestSnapshotMainShowsSettingsAndThemeShortcuts pins the new shortcut
-// row entries (s = settings, t = theme) in Main mode.
+// row entries (s = storage, p = preferences, t = theme) in Main mode.
 func TestSnapshotMainShowsSettingsAndThemeShortcuts(t *testing.T) {
 	cfg := sampleSnapshotConfig()
 	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
 
 	out := driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40})
 
-	for _, want := range []string{"settings", "theme"} {
+	for _, want := range []string{"storage", "preferences", "theme"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("main mode shortcut row missing %q\nout:\n%s", want, out)
 		}
@@ -128,7 +128,7 @@ func TestSettingsOpensFromMain(t *testing.T) {
 
 	out := driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 	)
 
 	if root.view != ViewSettings {
@@ -148,7 +148,7 @@ func TestSettingsEscDiscards(t *testing.T) {
 	root := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 		keyMsg("esc"),
 	)
 	if root.view != ViewMain {
@@ -171,10 +171,11 @@ func TestSettingsSubmitNoChangePersistsNothing(t *testing.T) {
 	root := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 		keyMsg("enter"),
 		keyMsg("enter"),
 		keyMsg("enter"),
+		tea.KeyMsg{Type: tea.KeyEnter}, // complete on the input field
 	)
 	if root.view != ViewMain {
 		t.Fatalf("after submit: view = %d, want ViewMain", root.view)
@@ -200,11 +201,12 @@ func TestSettingsSubmitPersistsThemeChange(t *testing.T) {
 	root := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 		tea.KeyMsg{Type: tea.KeyDown}, // select llamaman (first option after auto)
 		keyMsg("enter"),
 		keyMsg("enter"),
 		keyMsg("enter"),
+		tea.KeyMsg{Type: tea.KeyEnter}, // complete on the input field
 	)
 
 	if root.view != ViewMain {
@@ -230,11 +232,12 @@ func TestSettingsSubmitAnimationsOff(t *testing.T) {
 	root := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 		keyMsg("enter"),               // select → confirm
 		tea.KeyMsg{Type: tea.KeyLeft}, // toggle confirm to "no"
 		keyMsg("enter"),               // confirm → log colors
-		keyMsg("enter"),               // complete form
+		keyMsg("enter"),               // log colors → models dir
+		tea.KeyMsg{Type: tea.KeyEnter}, // complete form on the input field
 	)
 	if root.view != ViewMain {
 		t.Fatalf("after submit: view = %d, want ViewMain", root.view)
@@ -285,7 +288,7 @@ func TestSettingsShowsBothVariants(t *testing.T) {
 	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
 	out := driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 	)
 	for _, want := range []string{
 		"terminal background: dark",
@@ -319,7 +322,7 @@ func TestSettingsMismatchedThemeAppliesWithWarning(t *testing.T) {
 
 	out := driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 	)
 	if root.settings == nil || root.settings.warn == "" {
 		t.Fatalf("expected a mismatch warning, got warn=%q", root.settings.warn)
@@ -332,7 +335,7 @@ func TestSettingsMismatchedThemeAppliesWithWarning(t *testing.T) {
 	}
 
 	// Submit with a change (animations off): the mismatch applies, not auto.
-	driveRoot(t, root, keyMsg("enter"), tea.KeyMsg{Type: tea.KeyLeft}, keyMsg("enter"), keyMsg("enter"))
+	driveRoot(t, root, keyMsg("enter"), tea.KeyMsg{Type: tea.KeyLeft}, keyMsg("enter"), keyMsg("enter"), tea.KeyMsg{Type: tea.KeyEnter})
 	if got := root.cfg.Prefs().Theme; got != "solarized-light" {
 		t.Fatalf("after submit: theme = %q, want solarized-light", got)
 	}
@@ -359,7 +362,7 @@ func TestSettingsLivePreviewReThemes(t *testing.T) {
 	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
 	driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 	)
 	if root.settings == nil {
 		t.Fatal("settings not open")
@@ -395,7 +398,7 @@ func TestSettingsWarnsOnUnknownStoredTheme(t *testing.T) {
 
 	out := driveRoot(t, root,
 		tea.WindowSizeMsg{Width: 120, Height: 40},
-		keyMsg("s"),
+		keyMsg("p"),
 	)
 
 	if root.settings == nil || root.settings.warn == "" {
@@ -407,5 +410,75 @@ func TestSettingsWarnsOnUnknownStoredTheme(t *testing.T) {
 	// The form must have reset to auto.
 	if root.settings.themeVal != "auto" {
 		t.Errorf("form theme = %q, want auto fallback", root.settings.themeVal)
+	}
+}
+
+// TestSettingsSubmitModelsDir: entering a models directory in the new
+// form field persists preferences.models-dir; clearing it removes the
+// field (empty == absent, DESIGN §16.1 field-arrival contract).
+func TestSettingsSubmitModelsDir(t *testing.T) {
+	path, cfg := writeSnapshotConfig(t)
+	root := NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		keyMsg("p"),
+		keyMsg("enter"), // theme → animations
+		keyMsg("enter"), // animations → log colors
+		keyMsg("enter"), // log colors → models dir
+		keyMsg("/opt/llama-models"),
+		tea.KeyMsg{Type: tea.KeyEnter}, // complete form
+	)
+	if root.view != ViewMain {
+		t.Fatalf("after submit: view = %d, want ViewMain", root.view)
+	}
+	if got := root.cfg.Prefs().ModelsDir; got != "/opt/llama-models" {
+		t.Fatalf("models-dir = %q, want /opt/llama-models", got)
+	}
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), `"models-dir": "/opt/llama-models"`) {
+		t.Errorf("models-dir not persisted:\n%s", data)
+	}
+
+	// Re-open, clear the field, submit: the field must disappear.
+	root = NewRoot(cfg, path, stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		keyMsg("p"),
+		keyMsg("enter"),
+		keyMsg("enter"),
+		keyMsg("enter"),
+		tea.KeyMsg{Type: tea.KeyCtrlA}, // line start
+		tea.KeyMsg{Type: tea.KeyCtrlK}, // delete after cursor → empty input
+		tea.KeyMsg{Type: tea.KeyEnter}, // complete form
+	)
+	if got := root.cfg.Prefs().ModelsDir; got != "" {
+		t.Fatalf("cleared models-dir = %q, want empty", got)
+	}
+	data, _ = os.ReadFile(path)
+	if strings.Contains(string(data), "models-dir") {
+		t.Errorf("cleared models-dir must be omitted on save:\n%s", data)
+	}
+}
+
+// TestSettingsOpensWithModelsDirFromConfig: the settings form binds the
+// models directory input to the stored preference (DESIGN §16.1 P2
+// editor support); the end-to-end submit round trip is covered by
+// TestSettingsSubmitModelsDir.
+func TestSettingsOpensWithModelsDirFromConfig(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	cfg.Preferences = &config.Preferences{ModelsDir: "/opt/llama-models"}
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root,
+		tea.WindowSizeMsg{Width: 120, Height: 40},
+		keyMsg("p"),
+	)
+	if root.view != ViewSettings {
+		t.Fatalf("view = %d, want ViewSettings", root.view)
+	}
+	if root.settings == nil {
+		t.Fatal("settings mode not open")
+	}
+	if got := root.settings.modelsDir; got != "/opt/llama-models" {
+		t.Errorf("form models-dir = %q, want the stored value", got)
 	}
 }

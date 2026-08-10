@@ -126,15 +126,24 @@ func Validate(cfg *Config) Issues {
 }
 
 // validatePreferences holds the config-level rules for the preferences
-// object (DESIGN §15.1). Both fields are type-checked by JSON decode,
-// and the zero value equals the defaults, so there is nothing to flag
-// at config level today: an empty/absent theme means "auto", any bool
-// is valid, and the *semantic* check — is the theme a real palette —
-// deliberately lives in the TUI resolver (config cannot import tui,
-// and duplicating the palette-name list would break P8). Unknown
-// theme values degrade to "auto" with a Warning, never a Block.
-func validatePreferences(_ Preferences) Issues {
-	return nil
+// object (DESIGN §15.1, §16.1). Theme/animations/log-colors are
+// type-checked by JSON decode, and the zero value equals the defaults,
+// so there is nothing to flag at config level for them — the *semantic*
+// theme check deliberately lives in the TUI resolver (config cannot
+// import tui, and duplicating the palette-name list would break P8).
+// models-dir has one rule: when set and the path exists but is not a
+// directory, warn (P3) — the directory itself may not exist yet (the
+// Storage Manager's download action creates it).
+func validatePreferences(p Preferences) Issues {
+	var out Issues
+	if p.ModelsDir == "" {
+		return nil
+	}
+	if info, err := os.Stat(p.ModelsDir); err == nil && !info.IsDir() {
+		out = append(out, Issue{Severity: Warning, Path: "preferences.models-dir",
+			Message: fmt.Sprintf("models-dir is not a directory: %s", p.ModelsDir)})
+	}
+	return out
 }
 
 func validateGlobals(g Globals) Issues {

@@ -11,10 +11,10 @@ import (
 )
 
 // SettingsMode edits exactly the top-level `preferences` config object
-// (DESIGN §15.1): theme + animations, saved through the standard atomic
-// path on submit; Esc discards. Quick keys (`t`/`shift+t` in Main) are
-// shortcuts that write the same object — Settings is not a second
-// source of truth (P8).
+// (DESIGN §15.1, §16.1): theme, animations, log colors, and the models
+// directory, saved through the standard atomic path on submit; Esc
+// discards. Quick keys (`t`/`shift+t` in Main) are shortcuts that write
+// the same object — Settings is not a second source of truth (P8).
 type SettingsMode struct {
 	cfgPath string
 	cfg     *config.Config
@@ -26,6 +26,7 @@ type SettingsMode struct {
 	themeVal  string
 	anim      bool
 	logColors bool
+	modelsDir string
 
 	// lastThemeVal tracks the select's live value so Update can detect
 	// arrow-key changes and re-theme the chrome + preview immediately
@@ -73,6 +74,7 @@ func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg boo
 		themeVal:     themeVal,
 		anim:         prefs.AnimationsEnabled(),
 		logColors:    prefs.LogColorsEnabled(),
+		modelsDir:    prefs.ModelsDir,
 		lastThemeVal: themeVal,
 		warn:         warn,
 	}
@@ -105,6 +107,12 @@ func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg boo
 			Title("log colors").
 			Description("render-time line-kind coloring of the run-mode log (also toggled with `o` in run mode)").
 			Value(&sm.logColors),
+		huh.NewInput().
+			Title("models directory").
+			Description("llama.cpp cache root for HF models; leave empty for the default ($LLAMA_CACHE → ~/.cache/huggingface/hub), shared with llama-cli").
+			Placeholder("e.g. ~/models or /opt/llama-cache").
+			CharLimit(1024).
+			Value(&sm.modelsDir),
 	)).WithTheme(configHuhTheme(theme))
 	return sm
 }
@@ -209,6 +217,11 @@ func (s *SettingsMode) snapshot() *config.Preferences {
 	if s.logColors != prefs.LogColorsEnabled() {
 		logColors := s.logColors
 		prefs.LogColors = &logColors
+		changed = true
+	}
+
+	if s.modelsDir != prefs.ModelsDir {
+		prefs.ModelsDir = s.modelsDir // empty == absent (omitempty)
 		changed = true
 	}
 

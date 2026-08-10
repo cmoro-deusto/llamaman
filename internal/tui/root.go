@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -9,6 +11,8 @@ import (
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
+	"github.com/cmoro-deusto/llamaman/internal/hf"
+	"github.com/cmoro-deusto/llamaman/internal/storage"
 )
 
 // View enumerates the top-level TUI screens.
@@ -20,6 +24,8 @@ const (
 	ViewConfig
 	ViewFirstRun
 	ViewSettings
+	ViewStorage
+	ViewBrowser
 )
 
 // SpawnRequestMsg asks the root to spawn llama-server for (Model, Preset)
@@ -80,6 +86,9 @@ type Root struct {
 	configMod *ConfigMode
 	firstRun  *FirstRunMode
 	settings  *SettingsMode
+	storage   *StorageMode
+	dlEngine  downloadEngine
+	browser   *BrowserMode
 
 	// initialRun, if non-nil, makes the program jump straight to run mode
 	// on Init() (used both for `llamaman <alias>` and for reattach).
@@ -171,6 +180,12 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if r.settings != nil {
 			r.settings.SetSize(msg.Width, msg.Height)
 		}
+		if r.storage != nil {
+			r.storage.SetSize(msg.Width, msg.Height)
+		}
+		if r.browser != nil {
+			r.browser.SetSize(msg.Width, msg.Height)
+		}
 		return r, nil
 
 	case FirstRunCompletedMsg:
@@ -181,7 +196,21 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sessionTickMsg:
 		r.refreshSessionState()
+		r.refreshDlStatusLine()
 		return r, tickSession()
+
+	case dlMainTickMsg:
+		if r.view != ViewMain || r.storage == nil || !r.storage.hasRunning() {
+			r.refreshDlStatusLine()
+			return r, nil
+		}
+		r.storage.spinner, _ = r.storage.spinner.Update(r.storage.spinner.Tick())
+		r.refreshDlStatusLine()
+		interval := r.storage.spinner.Spinner.FPS
+		if interval <= 0 {
+			interval = 100 * time.Millisecond
+		}
+		return r, tea.Tick(interval, func(time.Time) tea.Msg { return dlMainTickMsg{} })
 
 	case SpawnRequestMsg:
 		return r.handleSpawn(msg)
@@ -222,6 +251,23 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		r.view = ViewMain
 		return r, nil
 
+	case returnFromStorageMsg:
+		// the download (if any) keeps running; Main surfaces its status
+		r.view = ViewMain
+		r.refreshDlStatusLine()
+		return r, r.armDlMainTick()
+
+	case returnFromBrowserMsg:
+		r.view = ViewMain
+		r.refreshDlStatusLine() // a download may be running while browsing
+		return r, nil
+
+	case browserConfigHandoffMsg:
+		return r.openConfig(configEntry{openNewModel: true, prefillHF: msg.id})
+
+	case browserDownloadHandoffMsg:
+		return r.handleBrowserDownloadHandoff(msg)
+
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" && r.view != ViewRun && r.view != ViewConfig {
 			r.quitting = true
@@ -241,6 +287,7 @@ func (r *Root) handleFirstRunCompleted(msg FirstRunCompletedMsg) (tea.Model, tea
 	r.mainMode.SetSize(r.width, r.height)
 	cm := NewConfigMode(msg.CfgPath, msg.Cfg, r.theme)
 	cm.SetRegistry(r.registry)
+	cm.SetHFCheckRunner(r.hfCheckRunner())
 	cm.ShowFirstRunBanner()
 	cm.SetSize(r.width, r.height)
 	r.configMod = &cm
@@ -258,6 +305,10 @@ func (r *Root) routeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "c":
 			return r.openConfig(configEntry{focus: FocusModels})
 		case "s":
+			return r.openStorage()
+		case "b":
+			return r.openBrowser()
+		case "p":
 			return r.openSettings()
 		case "t":
 			r.cycleTheme(+1)
@@ -298,6 +349,20 @@ func (r *Root) routeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		next, cmd := r.settings.Update(msg)
 		r.settings = next
 		return r, cmd
+	case ViewStorage:
+		if r.storage == nil {
+			return r, nil
+		}
+		next, cmd := r.storage.Update(msg)
+		r.storage = next
+		return r, cmd
+	case ViewBrowser:
+		if r.browser == nil {
+			return r, nil
+		}
+		next, cmd := r.browser.Update(msg)
+		r.browser = next
+		return r, cmd
 	case ViewFirstRun:
 		if r.firstRun == nil {
 			return r, nil
@@ -331,6 +396,20 @@ func (r *Root) forward(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		next, cmd := r.settings.Update(msg)
 		r.settings = next
+		return r, cmd
+	case ViewStorage:
+		if r.storage == nil {
+			return r, nil
+		}
+		next, cmd := r.storage.Update(msg)
+		r.storage = next
+		return r, cmd
+	case ViewBrowser:
+		if r.browser == nil {
+			return r, nil
+		}
+		next, cmd := r.browser.Update(msg)
+		r.browser = next
 		return r, cmd
 	case ViewFirstRun:
 		if r.firstRun == nil {
@@ -405,11 +484,14 @@ type configEntry struct {
 	focusPreset  string
 	focus        ConfigFocus
 	openNewModel bool
+	prefillHF    string // §16.7 browser hand-off: seeds the new-model form's HF id
 }
 
 func (r *Root) openConfig(entry configEntry) (tea.Model, tea.Cmd) {
 	cm := NewConfigMode(r.cfgPath, r.cfg, r.theme)
 	cm.SetRegistry(r.registry)
+	cm.SetHFCheckRunner(r.hfCheckRunner())
+	cm.prefillHF = entry.prefillHF
 	cm.SetSize(r.width, r.height)
 	if entry.focusAlias != "" {
 		for i, m := range r.cfg.Models {
@@ -493,6 +575,173 @@ type returnFromSettingsMsg struct{}
 
 // openSettings switches to the Settings mode, which edits exactly the
 // preferences object (DESIGN §15.1).
+// SetDownloadEngine attaches the download engine used by the Storage
+// manager (DESIGN §16.4). Tests inject a stub; the default is a real
+// *hf.Client built lazily in openStorage.
+func (r *Root) SetDownloadEngine(e downloadEngine) { r.dlEngine = e }
+
+// hfCheckRunner returns the §16.6 typed-repo check runner for the
+// config editor: a real *hf.Client-backed adapter when the env is
+// usable, nil otherwise (the check is then disabled, P3 — the model
+// form advances exactly as before).
+func (r *Root) hfCheckRunner() hfCheckRunner {
+	if c, err := hf.New(); err == nil {
+		return hfCheckClient{c}
+	}
+	return nil
+}
+
+// browserRunner returns the §16.7 browser runner (search + repo check):
+// the same lazy, nil-safe pattern as hfCheckRunner.
+func (r *Root) browserRunner() browserRunner {
+	if c, err := hf.New(); err == nil {
+		return browserClient{c}
+	}
+	return nil
+}
+
+// openBrowser switches to the HF browser. A live browser is reused —
+// leaving with Esc keeps the query, results, and loaded quants, and
+// re-entering shows them again (the §16.4 re-entry discipline).
+func (r *Root) openBrowser() (tea.Model, tea.Cmd) {
+	if r.cfg == nil {
+		return r, nil
+	}
+	if r.browser == nil {
+		root, err := storage.CacheRoot(r.cfg.Prefs().ModelsDir)
+		if err != nil {
+			root = "" // (cached) markers disabled (P3 — never a block)
+		}
+		b := NewBrowserMode(r.theme, root)
+		b.SetBrowserRunner(r.browserRunner())
+		r.browser = &b
+	}
+	r.browser.SetSize(r.width, r.height)
+	r.browser.flash = "" // no stale announcements on re-entry
+	r.mainMode.SetStatusLine("")
+	r.view = ViewBrowser
+	return r, nil
+}
+
+// handleBrowserDownloadHandoff lands a browser hand-off in the Storage
+// manager: downloads stay in the manager — the single place downloads
+// are managed (§16.4) — so Root reopens it and starts the download
+// there (a quant is always present: bare ids never offer download).
+func (r *Root) handleBrowserDownloadHandoff(msg browserDownloadHandoffMsg) (tea.Model, tea.Cmd) {
+	if r.cfg == nil {
+		return r, nil
+	}
+	if _, _ = r.openStorage(); r.storage == nil {
+		return r, nil
+	}
+	repo, quant := splitRepoQuant(msg.id)
+	if quant == "" {
+		r.storage.flash = "download needs a quant — pick one in the browser"
+		return r, r.storage.tickCmd()
+	}
+	r.storage.flash = ""
+	r.storage.startDownload(repo, quant)
+	r.storage.rebuild()
+	r.storage.focusDownloadRow()
+	return r, r.storage.tickCmd()
+}
+
+// openStorage switches to the Storage & Downloads manager. A live
+// manager is reused — leaving with Esc keeps any running download
+// alive, and re-entering shows it again (owner flow).
+func (r *Root) openStorage() (tea.Model, tea.Cmd) {
+	if r.cfg == nil {
+		return r, nil
+	}
+	if r.storage == nil {
+		root, err := storage.CacheRoot(r.cfg.Prefs().ModelsDir)
+		if err != nil {
+			r.mainMode.SetFlash("could not resolve cache root: " + err.Error())
+			return r, nil
+		}
+		sm := NewStorageMode(r.cfg, r.theme, root)
+		sm.cfgPath = r.cfgPath
+		if r.dlEngine != nil {
+			sm.SetEngine(r.dlEngine)
+		} else if c, err := hf.New(); err == nil {
+			sm.SetEngine(c)
+		}
+		r.storage = sm
+	}
+	r.storage.SetSize(r.width, r.height)
+	r.storage.flash = "" // no stale announcements on re-entry
+	r.storage.rebuild()
+	if len(r.storage.downloads) > 0 {
+		// re-entry mid-download: resume the progress tick and land the
+		// cursor on a download row (pause/cancel one Enter away).
+		r.storage.focusDownloadRow()
+	}
+	r.mainMode.SetStatusLine("")
+	r.view = ViewStorage
+	return r, r.storage.tickCmd()
+}
+
+// refreshDlStatusLine surfaces an in-flight download on the Main screen
+// so leaving the manager never orphans it invisibly (owner flow).
+func (r *Root) refreshDlStatusLine() {
+	if r.storage == nil || len(r.storage.downloads) == 0 {
+		r.mainMode.SetStatusLine("")
+		return
+	}
+	var running, paused, failed, done []string
+	for _, d := range r.storage.downloads {
+		// cancelled downloads are marked dlDone for auto-dismiss but
+		// must never surface as "downloaded" (owner report).
+		if d.discard {
+			continue
+		}
+		name := d.repo + ":" + d.quant
+		switch d.status {
+		case dlRunning:
+			running = append(running, name)
+		case dlPaused:
+			paused = append(paused, name)
+		case dlFailed:
+			failed = append(failed, name)
+		case dlDone:
+			done = append(done, name)
+		}
+	}
+	var label string
+	join := func(ns []string) string {
+		j := strings.Join(ns, ", ")
+		if len(j) > 48 {
+			j = j[:48] + "…"
+		}
+		return j
+	}
+	switch {
+	case len(running) == 1:
+		label = r.storage.spinner.View() + " downloading " + running[0]
+	case len(running) > 1:
+		label = fmt.Sprintf("%s %d downloads: %s", r.storage.spinner.View(), len(running), join(running))
+	case len(paused) > 0:
+		label = "⏸ download paused: " + join(paused)
+	case len(failed) > 0:
+		label = "✕ download failed: " + join(failed)
+	case len(done) > 0:
+		label = "⬇ download finished: " + join(done)
+	default:
+		r.mainMode.SetStatusLine("")
+		return
+	}
+	r.mainMode.SetStatusLine(label + " — s to view")
+}
+
+// armDlMainTick starts the Main spinner animation while a download is
+// running; call it when leaving the storage view.
+func (r *Root) armDlMainTick() tea.Cmd {
+	if r.view == ViewMain && r.storage != nil && r.storage.hasRunning() {
+		return func() tea.Msg { return dlMainTickMsg{} }
+	}
+	return nil
+}
+
 func (r *Root) openSettings() (tea.Model, tea.Cmd) {
 	r.settings = NewSettingsMode(r.cfgPath, r.cfg, r.theme, lipgloss.HasDarkBackground(), r.version)
 	r.settings.SetSize(r.width, r.height)
@@ -561,6 +810,16 @@ func (r *Root) applyTheme() {
 	}
 	r.theme = theme
 	r.mainMode.SetTheme(theme)
+	// Push into every live mode: storage and the browser are lazily
+	// created once and reused, so a theme changed after their creation
+	// must still reach them (owner round: the Preferences theme must
+	// apply to the browse view).
+	if r.storage != nil {
+		r.storage.SetTheme(theme)
+	}
+	if r.browser != nil {
+		r.browser.SetTheme(theme)
+	}
 	if w := mismatchWarning(r.cfg.Prefs().Theme, lipgloss.HasDarkBackground()); w != "" {
 		r.mainMode.SetFlash("⚠ " + w)
 	}
@@ -588,6 +847,16 @@ func (r *Root) View() string {
 			return ""
 		}
 		return r.settings.View()
+	case ViewStorage:
+		if r.storage == nil {
+			return ""
+		}
+		return r.storage.View()
+	case ViewBrowser:
+		if r.browser == nil {
+			return ""
+		}
+		return r.browser.View()
 	case ViewFirstRun:
 		if r.firstRun == nil {
 			return ""
@@ -609,6 +878,10 @@ func (spawnerMissingError) Error() string { return "TUI: Spawner not configured"
 // the (running) marker and the "▶ Detached" line if another process
 // changes the session state out-of-band.
 type sessionTickMsg struct{}
+
+// dlMainTickMsg advances the download spinner shown in Main's status
+// line while a download runs (the storage tick does not run there).
+type dlMainTickMsg struct{}
 
 func tickSession() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return sessionTickMsg{} })

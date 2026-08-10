@@ -35,13 +35,16 @@ const (
 // Router mode (globals.models-files entries — each spawns one
 // llama-server hosting every model in the file).
 type MainMode struct {
-	cfg     *config.Config
-	cfgPath string // config file path; drives the derived models.ini default
-	keys    Keymap
-	theme   Theme
-	width   int
-	height  int
-	version string
+	// statusLine is a one-line status hint rendered above the shortcuts
+	// (Root uses it to surface an in-flight download on Main).
+	statusLine string
+	cfg        *config.Config
+	cfgPath    string // config file path; drives the derived models.ini default
+	keys       Keymap
+	theme      Theme
+	width      int
+	height     int
+	version    string
 
 	runningAlias  string
 	runningPreset string
@@ -149,6 +152,9 @@ func (m MainMode) IsSessionRunning() bool { return m.runningAlias != "" }
 // SetFlash sets a short status message shown beneath the list (or
 // beneath the shortcut row when the list is hidden). Used by Root to
 // surface spawn errors.
+// SetStatusLine sets the one-line status hint shown above the shortcuts.
+func (m *MainMode) SetStatusLine(line string) { m.statusLine = line }
+
 func (m *MainMode) SetFlash(msg string) { m.flash = msg }
 
 // HasModels reports whether the inline selection list is rendered in
@@ -497,6 +503,11 @@ func (m MainMode) View() string {
 		parts = append(parts, "", m.renderFlash())
 	}
 
+	if m.statusLine != "" {
+		parts = append(parts, "",
+			lipgloss.NewStyle().Foreground(m.theme.StatusStart).Render(m.statusLine))
+	}
+
 	parts = append(parts, "", m.renderShortcuts())
 
 	if !running && !hasModels && m.flash != "" {
@@ -538,7 +549,9 @@ func (m MainMode) renderShortcuts() string {
 			shortcut("Enter", "attach", m.theme),
 			shortcut("a", "attach", m.theme),
 			shortcut("c", "configure", m.theme),
-			shortcut("s", "settings", m.theme),
+			shortcut("s", "storage", m.theme),
+			shortcut("b", "browse", m.theme),
+			shortcut("p", "preferences", m.theme),
 			shortcut("?", "help", m.theme),
 			shortcut("q", "quit", m.theme),
 		}
@@ -556,7 +569,9 @@ func (m MainMode) renderShortcuts() string {
 	}
 	parts = append(parts, shortcut("tab", modeLabel, m.theme))
 	parts = append(parts, shortcut("c", "configure", m.theme))
-	parts = append(parts, shortcut("s", "settings", m.theme))
+	parts = append(parts, shortcut("s", "storage", m.theme))
+	parts = append(parts, shortcut("b", "browse", m.theme))
+	parts = append(parts, shortcut("p", "preferences", m.theme))
 	parts = append(parts, shortcut("t", "theme", m.theme))
 	parts = append(parts, shortcut("?", "help", m.theme))
 	parts = append(parts, shortcut("q", "quit", m.theme))
@@ -626,7 +641,8 @@ func (m MainMode) renderHelp() string {
 		keys := []string{
 			"Enter / a attach to the running session",
 			"c           open configuration mode",
-			"s           open settings (theme, animations)",
+			"s           open storage manager (cache, downloads)",
+			"p           open preferences (theme, animations, models-dir)",
 			"t / Shift+t cycle theme (forward / backward)",
 			"?           toggle this help",
 			"q / Ctrl+C  quit (server keeps running)",
@@ -643,7 +659,9 @@ func (m MainMode) renderHelp() string {
 		"tab         toggle Single Model / Router mode",
 		"Esc         back out of preset pivot",
 		"c           open configuration mode",
-		"s           open settings (theme, animations)",
+		"s           open storage manager (cache, downloads)",
+		"b           open Hugging Face browser (search, filters)",
+		"p           open preferences (theme, animations, models-dir)",
 		"t / Shift+t cycle theme (forward / backward)",
 		"a           attach to running session (only when one exists)",
 		"?           toggle this help",
@@ -658,6 +676,10 @@ func (m MainMode) renderHelp() string {
 
 func shortcut(key, label string, t Theme) string {
 	keyStyle := lipgloss.NewStyle().Foreground(t.Accent).Bold(true)
+	if label == "" {
+		return keyStyle.Render(key) // no trailing space — it would widen
+		// the footer past the box and clip narrow terminals
+	}
 	labelStyle := lipgloss.NewStyle().Foreground(t.Subtle)
 	return keyStyle.Render(key) + " " + labelStyle.Render(label)
 }

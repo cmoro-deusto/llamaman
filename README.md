@@ -6,7 +6,7 @@
 [![Go version](https://img.shields.io/github/go-mod/go-version/cmoro-deusto/llamaman)](go.mod)
 [![AUR](https://img.shields.io/aur/version/llamaman-bin)](https://aur.archlinux.org/packages/llamaman-bin)
 
-A modern terminal manager for [`llama-server`](https://github.com/ggml-org/llama.cpp) (the HTTP server bundled with llama.cpp). Define your models and launch presets once in a JSON config, pick them from a Bubble Tea TUI, follow the log live, detach when you're done, and reattach later from another shell — without ever memorising a 60-flag command line.
+A modern terminal manager for [`llama-server`](https://github.com/ggml-org/llama.cpp) (the HTTP server bundled with llama.cpp). Define your models and launch presets once in a JSON config, pick them from a Bubble Tea TUI, follow the log live, detach when you're done, and reattach later from another shell — without ever memorising a 60-flag command line. The same TUI manages your storage and downloads: scan the cache, pull GGUF quants straight from Hugging Face, or search the hub and hand a model straight into your config.
 
 ## Why llamaman?
 
@@ -19,6 +19,9 @@ If you've already chosen llama.cpp, you've felt the friction: every model wants 
 - Log tailing with live forward search, mouse-wheel scrollback, and `n`/`N` / `g`/`G` navigation.
 - Type-aware parameter editor whose autocomplete and validation come straight from `llama-server --help`.
 - Local `.gguf` files or Hugging Face identifiers (`-m` vs `-hf`) on a per-model basis.
+- **Storage & Downloads manager** (`s`): scan the cache (local models + HF downloads), spot `(cached)` quants, and download GGUF files straight from the hub — pause / resume / cancel, with SHA-256 verification.
+- **Hugging Face browser** (`b`): search or browse the hub inside the TUI — trending / downloads / likes / newest / recently-updated rankings, language / license / task / size filters, per-repo metadata and rendered model card with clickable links, and a one-key hand-off into your config or a download.
+- **Themes & preferences**: 23 curated palettes (+ `auto`) with a live-preview preferences screen (`p`) and instant `t` / `T` cycling from Main.
 - Shell completions for `bash`, `zsh`, and `fish`.
 - **Router mode**: serve every model in a `my-models.ini` (llama.cpp model presets) from a single `llama-server`, with per-model load/unload and full live statistics.
 - **Import / export**: `llamaman import` ingests a `my-models.ini` as config presets; `llamaman export` / TUI `x` writes one. Every config save also keeps a derived `models.ini` in sync, which doubles as the default Router source.
@@ -35,7 +38,7 @@ llamaman spawns `llama-server` in its own session (`setsid(2)`), so the child ou
 
 ### TUI experience
 
-Three modes — main (centred launcher with embedded model list), run (status header + log viewport with search), and configuration (three-pane master/detail editor with type-aware param picker). Modal dialogs overlay the existing screen rather than blanking it, so you never lose context. The figlet-style wordmark adapts to terminal width; status indicators use colour but respect `NO_COLOR`.
+Five modes — main (launcher with embedded model list), run (status header + log viewport with search), configuration (three-pane master/detail editor with type-aware param picker), storage (cache scan + download manager), and browse (Hugging Face search). A preferences screen (`p`) re-themes the app live from 23 curated palettes. Modal dialogs overlay the existing screen rather than blanking it, so you never lose context. The wordmark adapts to terminal width; status indicators use colour but respect `NO_COLOR`, and the subtle animations can be toggled off (`a` in run mode or in Preferences).
 
 ### Sources & translation
 
@@ -68,6 +71,9 @@ Copy the launch command to your clipboard with `c` (Wayland's `wl-copy` first, X
   - [Main mode](#main-mode)
   - [Run mode](#run-mode)
   - [Configuration mode](#configuration-mode)
+  - [Preferences (`p`)](#preferences-p)
+  - [Storage & Downloads manager (`s`)](#storage--downloads-manager-s)
+  - [Hugging Face browser (`b`)](#hugging-face-browser-b)
 - [How it works](#how-it-works)
 - [Configuration schema](#configuration-schema)
 - [Parameter translation](#parameter-translation)
@@ -277,9 +283,7 @@ Models you ran outside llamaman (via `llama-cli` / `llama-server -hf`) show up h
 
 ### Main mode
 
-A centred window: the figlet "llamaman" wordmark, version line, and an inline single-row-per-model selection list (when at least one model is configured). Pre-selected: the first model. Each row shows the alias, an optional `(running)` marker, and a subtle preset count.
-
-> The information density and layout of this top window are an early cut. A future release will iterate on how model identity, source, presets, and run state are surfaced — see [Known limitations](#known-limitations).
+A centred window: the figlet "llamaman" wordmark, version line, and an inline single-row-per-model selection list (when at least one model is configured). Pre-selected: the first model. Each row shows the alias with a leading **source tag** (`local` for `.gguf` paths, `hf` for Hugging Face ids, `router` for `my-models.ini` sources), the preset count, and an optional `(running)` marker. The highlighted row previews its preset names when a model has 2+ presets.
 
 If a session is running, an extra line above the list reads `▶ Detached: <alias>/<preset> listening on :<port> — press a to attach`. In Router mode (toggle with `tab`), the list shows your `my-models.ini` sources instead — see [Router mode (multi-model)](#router-mode-multi-model).
 
@@ -291,7 +295,11 @@ If **no** models are configured (e.g. immediately after first-run setup), the li
 | `tab` | Toggle **Single Model ↔ Router** mode (Router shows `my-models.ini` sources) |
 | `Enter` | Run the selected model. With 2+ presets, the box pivots to a preset sub-list (Enter to confirm, Esc to back out) |
 | `Esc` | Back out of the preset sub-list to the model list |
+| `s` | Storage & Downloads manager |
+| `b` | Hugging Face browser |
 | `c` | Configuration mode |
+| `p` | Preferences (theme, animations, log colours, models dir) |
+| `t` / `T` | Cycle the theme forward / backward |
 | `a` | Attach to running session (only shown when a session is running) |
 | `?` | Help overlay |
 | `q` | Quit |
@@ -332,6 +340,9 @@ Status state machine: `starting → ready → exited|error`. `ready` is detected
 | Key | Action |
 |---|---|
 | `q` / `Ctrl+C` | Quit prompt: `(k)ill` returns to main, `(d)etach` exits llamaman leaving `llama-server` running, `(c)ancel` stays put |
+| `esc` | Back to main — detach (the server keeps running) |
+| `o` | Toggle log line-kind colours (persists to preferences) |
+| `a` | Toggle subtle animations (persists to preferences) |
 | `k` | Direct kill (with `(y)es / (n)o` confirm). Stops the server, removes log + session, returns to main; llamaman stays open |
 | `r` | Restart the server (confirm if status is `ready`) |
 | `c` | Copy the full launch command to clipboard (`wl-copy` → `xclip` fallback) |
@@ -399,6 +410,51 @@ A three-pane master/detail editor:
 The new-param picker shows every flag's bare name + parsed help description. Just start typing to filter — there's no `/`-then-prompt step. The value editor is type-aware: booleans are yes/no toggles, numerics use a numeric input, parsed enums (e.g. `ctk`/`ctv`'s known set, or any `[a|b|c]` placeholder in `--help`) are pickers, everything else is a text input.
 
 Form behaviour: forms are `huh` instances mounted via the Bubble Tea message loop. Modal dialogs (kill confirm, restart confirm, save/discard prompt, help) overlay the existing screen rather than blanking it.
+
+The **location** (`location: "~/models/foo.gguf"`) and **HF** (`hf: "org/repo:QUANT"`) fields of the model form carry a **`ctrl+o` picker**: the local picker is a standard file browser (`↑`/`↓` navigate, `enter` selects, `.` toggles hidden files) and the HF picker is a live type-to-filter list of cached repos with `(cached)` markers. Typing an HF id and pressing Enter runs a **typed-repo check** against the hub; a repo that exposes quants is offered the shared quant chooser (`Tag — size`, `(cached)` markers), so `hf: "org/repo"` becomes `hf: "org/repo:Q4_K_M"` in one step — the same chooser the Storage manager uses.
+
+### Preferences (`p`)
+
+A preferences form applied and persisted immediately:
+
+| Setting | Meaning |
+|---|---|
+| **theme** | One of **23 curated palettes** plus `auto` (the default — picks dark/light from your terminal background). Every palette shows its dark and light variant where applicable, and the whole app re-themes live as you move through the list. |
+| **animations** | Subtle transitions (dot pulse, badge breathing). Also toggled with `a` in run mode. |
+| **log colours** | Render-time line-kind colouring of the run-mode log. Also toggled with `o` in run mode. |
+| **models directory** | The cache root for HF models and downloads. Default: `$LLAMA_CACHE` → `~/.cache/huggingface/hub`, shared with `llama-cli`. |
+
+`t` / `T` on the main screen cycle the theme without opening preferences; a mismatched palette (light palette on a dark terminal, say) still applies but flashes a warning.
+
+### Storage & Downloads manager (`s`)
+
+Everything that touches disk, in one place: local models, HF cache repos, and downloads — grouped with `(cached)` markers on quant rows wherever you look. `↑`/`↓` move, `enter` opens a context action menu (download a repo's quant, delete files, open the containing folder, remove a config entry), `d` starts a new download (type `org/repo`, then pick the quant), `esc` backs out.
+
+Downloads run in the manager with **pause / resume / cancel** — resume reuses the partial file via HTTP `Range` — and **SHA-256 verification** against the hub's declared hashes. Progress shows bytes/total and speed; completed files land in the models directory and show up as `(cached)` everywhere else.
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` | Select a row |
+| `enter` | Action menu (download / pause / resume / cancel / delete / open folder — depends on the row) |
+| `d` | New download: type `org/repo`, then pick a quant from the chooser |
+| `esc` | Back to main |
+
+### Hugging Face browser (`b`)
+
+Search or browse the hub without leaving the TUI. An empty query **browses** by rank; `s` cycles the sort (**trending → downloads → likes → newest → updated**). `l` / `L` / `k` / `m` filter by **language, license, task**, and **params size** (params is a name-derived estimate, filtered client-side over the current page). The right column auto-follows the selected repo: **model info** (params, downloads, likes, license, task), the **quants list** with real sizes and `(cached)` markers, and the **rendered model card** — markdown with headings, tables, code blocks and ctrl+clickable links.
+
+`tab` cycles the three zones (search bar ↔ results ↔ quants). `↑`/`↓` navigate the results (the right column follows) or select a quant; `enter` in the quants list hands the picked repo+quant off — **add to config** (the new-model form opens pre-filled) or **download now** (the Storage manager starts it). `pgup` / `pgdn` scroll the model card from any zone.
+
+| Key | Action |
+|---|---|
+| `enter` | Run the search (empty query = browse) |
+| `s` | Cycle sort: trending → downloads → likes → newest → updated |
+| `l` / `L` / `k` / `m` | Filter: language / license / task / params size |
+| `tab` / `Shift+tab` | Cycle zones: search bar ↔ results ↔ quants |
+| `↑` / `↓` | Results: navigate (right column follows) · Quants: select a quant |
+| `enter` | Quants: hand off the selected quant (add to config / download now) |
+| `pgup` / `pgdn` | Scroll the model card (any zone) |
+| `esc` | Back one step, then to main |
 
 ## How it works
 
@@ -519,6 +575,7 @@ This keeps llamaman forward-compatible with new llama-server flags without requi
 | Flag-name cache | `${XDG_CACHE_HOME:-~/.cache}/llamaman/flags-<mtime>.json` |
 | Debug log | `${XDG_STATE_HOME:-~/.local/state}/llamaman/llamaman.log` |
 | Derived `my-models.ini` (auto-written on every config save) | `${XDG_CONFIG_HOME:-~/.config}/llamaman/models.ini` |
+| HF cache / downloads (Storage manager + browser `(cached)` markers) | `preferences.models-dir` (default `$LLAMA_CACHE` → `~/.cache/huggingface/hub`) |
 | Config backup (rolling) | `${XDG_CONFIG_HOME:-~/.config}/llamaman/config.json.bak` |
 
 Set `LLAMAMAN_DEBUG=1` to raise the debug log level to `DEBUG`.
@@ -543,10 +600,17 @@ The minimum tested `llama-server` build is **`build 8994 (aab68217b)`**. Older b
 | Main | `tab` | Toggle Single Model ↔ Router mode |
 | Main | `Enter` | Run selected model (pivot to preset sub-list if 2+ presets) |
 | Main | `Esc` | Back out of preset sub-list |
+| Main | `s` | Storage & Downloads manager |
+| Main | `b` | Hugging Face browser |
 | Main | `c` | Open configuration mode |
+| Main | `p` | Preferences (theme, animations, log colours, models dir) |
+| Main | `t` / `T` | Cycle theme forward / backward |
 | Main | `a` | Attach to running session |
 | Main | `?` | Help overlay |
 | Main | `q` | Quit |
+| Run | `esc` | Back to main — detach (server keeps running) |
+| Run | `o` | Toggle log line-kind colours (persists) |
+| Run | `a` | Toggle animations (persists) |
 | Run | `q` / `Ctrl+C` | Quit prompt: `(k)ill / (d)etach / (c)ancel` |
 | Run | `k` | Direct kill (with confirm), back to main |
 | Run | `r` | Restart server (confirm if `ready`) |
@@ -565,6 +629,17 @@ The minimum tested `llama-server` build is **`build 8994 (aab68217b)`**. Older b
 | Router | `l` / `u` | Models panel: load / unload selected model (`u` confirms) |
 | Router | `p` | Models panel: toggle ini-only filter (hide `(cache)` leftovers) |
 | Router | `d` | Log panel: toggle denoise (default on) |
+| Storage | `↑` / `↓` | Select a row |
+| Storage | `enter` | Action menu (download / pause / resume / cancel / delete / open folder) |
+| Storage | `d` | New download: type `org/repo`, then pick a quant |
+| Storage | `esc` | Back to main |
+| Browser | `enter` | Search (empty query = browse) |
+| Browser | `s` | Cycle sort: trending → downloads → likes → newest → updated |
+| Browser | `l` / `L` / `k` / `m` | Filter: language / license / task / params size |
+| Browser | `tab` / `Shift+tab` | Cycle zones: search ↔ results ↔ quants |
+| Browser | `↑` / `↓` | Results: navigate (right column follows) · Quants: select a quant |
+| Browser | `enter` | Quants: hand off selected quant (add to config / download now) |
+| Browser | `pgup` / `pgdn` | Scroll the model card (any zone) |
 | Config | `Tab` / `Shift+Tab` | Cycle panes (also `←` / `→`, `h` / `l`) |
 | Config | `↑` / `↓` | Navigate within pane |
 | Config | `Shift+↑` / `Shift+↓` | Reorder rows |
@@ -587,9 +662,9 @@ The current scope is deliberately tight. The following are not in the box today:
 - **No headless / `--detach` flag.** Detach is a TUI action only — there's no way to spawn a session from the CLI without dropping into run mode first.
 - **No live editing.** Configuration changes don't apply to a running server; restart with `r` to pick them up.
 - **Sessions buffer fully in memory.** The run-mode log viewport reads the entire log file into memory and tails new writes. Acceptable for realistic session sizes; not designed for week-long runs producing gigabytes of logs.
-- **No theme customisation.** Two built-in palettes (auto-selected by `lipgloss.HasDarkBackground()`); `NO_COLOR` is honoured.
 - **No config schema migrations *yet*.** Schema version is `1` and evolves additively — new optional fields don't break old configs, so no migration is needed today. Automatic in-place migration (with a `.bak` of the prior file) is planned for whenever a future release introduces `version: 2` or higher.
-- **Main mode's top window is a first cut.** The current centred window (wordmark + version line + inline model list) is functional but spartan. A future release will iterate on how model identity, source (local vs HF), preset counts, and detached-session state are surfaced; expect the layout to change.
+- **Browser metadata heuristics.** The params count is derived from the repo name (the search API exposes no params field) and the params-size filter applies to the current page only — treat both as estimates, not facts.
+- **Gated / private models** need an `HF_TOKEN` (read from the environment); without one, downloads fail with a clear message rather than guessing.
 
 ## Troubleshooting
 
@@ -689,7 +764,7 @@ llamaman stands on the work of others. Sincere thanks to:
 - **[Bubble Tea](https://github.com/charmbracelet/bubbletea)**, **[Lip Gloss](https://github.com/charmbracelet/lipgloss)**, **[Bubbles](https://github.com/charmbracelet/bubbles)**, and **[Huh](https://github.com/charmbracelet/huh)** by the [Charm](https://charm.sh/) crew — the TUI quality is largely theirs.
 - **[Kong](https://github.com/alecthomas/kong)** by Alec Thomas — the CLI parser, including the completion machinery exposed via `--completion`.
 - **[fsnotify](https://github.com/fsnotify/fsnotify)** — log tailing without polling.
-- **[teatest](https://github.com/charmbracelet/x/tree/main/exp/teatest)** — TUI snapshot tests that catch regressions across the four modes.
+- **In-process TUI snapshot tests** (a stub spawner plus a custom `drainCmds` harness) — render every mode without a terminal and catch layout regressions across the modes.
 
 The `llama-server` CLI surface is the inspiration for llamaman's translation layer. Many small UI choices (the embedded model list, the `c`-to-copy shortcut, the live-highlighted search) were shamelessly inspired by terminal tools that have nothing to do with LLMs but a lot to do with not getting in your way.
 

@@ -38,6 +38,14 @@ type Preferences struct {
 	// LogColors defaults to true: render-time line-kind coloring of the
 	// run-mode log (§15.3). Same pointer semantics as Animations.
 	LogColors *bool `json:"log-colors,omitempty"`
+	// ModelsDir, when set, is the single llama.cpp HF cache root
+	// (DESIGN §16.1): it wins over every environment variable
+	// (LLAMA_CACHE, HF_HOME, …). Empty (the default) means follow
+	// llama.cpp's chain. A plain string, not a pointer: the default is
+	// the empty string, and there is no meaningful explicit-empty
+	// distinct from absent (unlike Animations). Expanded ~/$VAR at load
+	// time (§3.3).
+	ModelsDir string `json:"models-dir,omitempty"`
 }
 
 // Prefs returns the effective preferences, or the zero value (==

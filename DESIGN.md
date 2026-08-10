@@ -56,7 +56,8 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
   "preferences": {          // optional; absent == defaults
     "theme": "auto",        // palette ID from the TUI table; "auto" is default
     "animations": true,      // default true; explicit false is honored
-    "log-colors": true       // default true; explicit false is honored (§15.3)
+    "log-colors": true,      // default true; explicit false is honored (§15.3)
+    "models-dir": ""        // llama.cpp HF cache root; "" = follow llama.cpp's chain (§16.1)
   },
   "models": [
     {
@@ -98,6 +99,7 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
 Applied at config-load time to:
 - `globals.llama-server-bin`
 - every `models[].location`
+- `preferences.models-dir` (Release 2, §16.1)
 
 Expansions:
 - Leading `~` → `$HOME` (via `os/user.Current()`)
@@ -583,7 +585,7 @@ Three-pane master-detail:
 `Tab` / `Shift+Tab` cycle focus across panes. `Right` / `Left` (and `l` / `h`) do the same — the user can navigate to any pane with arrow keys without lifting from the navigation cluster.
 
 **Models pane**:
-- `e` rename alias / change source (modal form: alias, source select [`local` | `huggingface`], then either a path input or a `org/repo[:quant]` input depending on the selection).
+- `e` rename alias / change source (modal form: alias, source select [`local` | `huggingface`], then either a path input or a `org/repo[:quant]` input depending on the selection). Both value inputs stay free-type and are picker-assisted (§16.5): `ctrl+o` in the path input opens a `.gguf` filepicker (starting in `preferences.models-dir` → the current value's dir → the first local model's dir → `~`), and `ctrl+o` in the HF input opens a cached-repo list (one row per cached repo with quants + sizes, plus "type a new repo…"; a single cached quant pre-fills `org/repo:QUANT`, several pre-fill bare `org/repo`; an empty cache skips the list). Confirming a *typed* bare `org/repo` in the HF field runs one async `tree/main` check offering the shared quant chooser with real sizes; failures open a Save/Dismiss dialog with a distinct message — Save keeps the id, Dismiss returns to the field (§16.6).
 - `n` new model (same modal as edit).
 - `c` duplicate, prompt for new alias (presets and params copied; source kind and value preserved).
 - `d` delete (confirm with preset count).
@@ -939,28 +941,43 @@ not relitigated. Three releases, in priority order 4 → 2 → (3 + 1).
   `preferences.animations`, default **on**; toggled in Settings mode.
 - **Main-mode layout rework.** Implement §12.2 as designed.
 
-### 14.2 Release 2 — Acquisition
+### 14.2 Release 2 — Storage Manager
 
 - **Hybrid storage.** Managed downloads write into llama.cpp's HF cache
-  layout by default (`$LLAMA_CACHE` / `~/.cache/llama.cpp`, `<org>__<model>/`
-  folders; tolerate the legacy `~/.cache/huggingface/hub` layout for reads),
-  with optional `preferences.models-dir` override. One copy shared with
-  `llama-cli`/`--hf-repo`; router `(cache)` tags line up.
-- **Managed downloads.** llamaman downloads GGUFs itself (HF API `tree/main`
-  for list+sizes+sha256, `resolve/main` with `Range` for resume), live
-  progress in the TUI, sha256 verify. An `hf` config model is checked against
-  the cache first and only downloaded when missing, then run via `--model`.
-  Token support for gated repos (`HF_TOKEN` env or config). `mmproj`
-  downloaded alongside when present.
+  layout by default — the HF hub chain (`$LLAMA_CACHE` → `$HF_HUB_CACHE` →
+  `$HUGGINGFACE_HUB_CACHE` → `$HF_HOME/hub` → `$XDG_CACHE_HOME/huggingface/hub`
+  → `~/.cache/huggingface/hub`, first set wins), repo folders
+  `models--<org>--<model>/` — with optional `preferences.models-dir`
+  override (§16.1). The legacy llama.cpp layout (`~/.cache/llama.cpp`,
+  `<org>__<model>` / flat `org__repo__file.gguf`) is tolerated for reads.
+  One copy shared with `llama-cli`/`--hf-repo`; router `(cache)` tags line
+  up.
+- **Delegated launch + Downloads manager (owner decision C).** `hf` models
+  stay fire-and-forget `--hf-repo`: llama.cpp downloads at startup
+  (cache-first, `Range` resume, sha256-oid blob dedup, `mmproj`, `HF_TOKEN`),
+  and the run-mode panel shows progress via the §15.4 classifier. No managed
+  download on the launch path. A **Storage & Downloads manager** (new mode
+  from Main) is the single place downloads are managed: cache listing (both
+  layouts, §16.1), sizes, free space, delete-with-confirmation, and a
+  "download now" pre-fetch (HF API `tree/main` for list+sizes+sha256,
+  `resolve/main` with `Range`, pause/resume, sha256 verify, clear failures).
+  Never deletes config entries without asking.
 - **Quantization picker.** Per-quant real file sizes from the HF API, with a
-  "fits VRAM" hint powered by the §14.3 estimator.
-- **Storage manager.** Sizes, free space, delete-with-confirmation; never
-  deletes config entries without asking.
+  "fits VRAM" hint powered by the §14.3 estimator; hand-off into config or the
+  manager's download action.
+- **Model editor integration (owner decision, ROADMAP §3.8).** The config
+  editor's free-type `location`/`hf` fields become picker-assisted: a GGUF
+  `filepicker` overlay for local files, a cached-repo list from the §16.1
+  reader for HF, and — for a newly typed repo — one async `tree/main` check
+  offering the quant chooser with real sizes (mmproj informational only).
+  No new config fields; failures non-blocking (P3).
 - **HF model browser.** Search/browse HF in the TUI (search API,
   `filter=gguf`), metadata display, hand-off into config/download. Largest
   item; may slip to Release 3 under effort pressure.
-- **Router note.** llama.cpp's router downloads internally; managed downloads
-  apply to single-model runs; router progress is surfaced only. Rewriting
+- **Router note.** llama.cpp's router downloads internally; manager-only
+  downloads (prefetch into the shared cache) apply to router and
+  single-model runs alike; llama.cpp's own download progress is surfaced
+  only. Rewriting
   router presets to local paths is a deferred implementation decision.
 
 ### 14.3 Release 3 — Trust & Touch
@@ -1638,3 +1655,1360 @@ session only), footer + help gain `esc back`. `main.go` — no-args
 launch lands on Main when a session is live (§4.3).
 `snapshot_test.go` + `main_test.go` — updated and new assertions.
 
+---
+
+## 16. Release 2 (Storage Manager) — implementation design
+
+One subsection per work item, in §3.7 order. Each subsection is the
+implementation design note for its item: written *before* code (P5) and
+reviewed by the owner; the owner's validation declares the unit done.
+Cross-cutting rules from §14.5 and ROADMAP.md §1 apply to every item.
+The note is updated in the same change as the code it describes; if
+implementation forces a deviation, the note is amended in that same
+change.
+
+### 16.1 Hybrid storage foundation — the cache-layout reader
+
+**Scope.** First item of Release 2 (ROADMAP §3.7). Two deliverables in
+one unit:
+
+1. `preferences.models-dir` — the additive Release-2 field (ROADMAP §5,
+   DESIGN §14.5) with its full P2 field-arrival contract: JSON tag,
+   validation rule, Settings-mode editor, and a documented default, all
+   in the same change.
+2. The cache-layout reader — a new `internal/storage/` package that
+   resolves llama.cpp's HF cache root, classifies the entries it finds,
+   reads both known layouts, and warns on unrecognized entries
+   (ROADMAP §3.1; §8 risk row).
+
+**Non-goals.** No downloader (the manager's download action is the
+storage-manager item, ROADMAP §3.4), no HF API client (item 2), no
+storage-manager TUI (ROADMAP §3.4), no write path (the manager's
+download action creates cache entries), no quant-level filtering (quant
+picker item). The reader ships tested and ready; its first production
+consumer is the config editor's cached-repo list (ROADMAP §3.8 step A),
+then the Storage & Downloads manager (§3.4). The only new
+user-visible surface in this item is the Settings-mode field.
+
+#### Cache-path resolution rules
+
+The effective cache root resolves first-match-wins, in this order:
+
+| Priority | Source | Resolved root |
+|---|---|---|
+| 1 | `preferences.models-dir` (set) | the value, `~`/`$VAR`-expanded at load time (§3.3); wins over every environment variable |
+| 2 | `$LLAMA_CACHE` | the value, used as-is |
+| 3 | `$HF_HUB_CACHE` | the value, used as-is |
+| 4 | `$HUGGINGFACE_HUB_CACHE` | the value, used as-is |
+| 5 | `$HF_HOME` | `<HF_HOME>/hub` |
+| 6 | `$XDG_CACHE_HOME` | `<XDG_CACHE_HOME>/huggingface/hub` |
+| 7 | `$HOME` | `~/.cache/huggingface/hub` |
+
+This mirrors llama.cpp's `get_cache_directory()` in
+`common/hf-cache.cpp` exactly (verified against master at the time of
+writing: `LLAMA_CACHE` → `HF_HUB_CACHE` → `HUGGINGFACE_HUB_CACHE` →
+`HF_HOME/hub` → `XDG_CACHE_HOME/huggingface/hub` →
+`HOME/.cache/huggingface/hub`; llama.cpp's `getpwuid` fallback is
+covered by Go's `os.UserHomeDir`). First non-empty wins.
+
+Rules:
+
+- `models-dir` outranks the environment: an explicit config preference
+  beats a shell variable (P8 — config.json is the only definition of
+  preferences; the env chain is llama.cpp's fallback, not the user's
+  choice).
+- The root is **llama.cpp's** cache root, never llamaman's own
+  `$XDG_CACHE_HOME/llamaman` (`paths.CacheDir`). The two never merge.
+- The root does not need to exist (the manager's download action
+  creates it on first download).
+- `CacheRoot(modelsDir string) (string, error)` takes the preference
+  value; it does not expand paths (load-time job) and does not
+  absolutize relative values (pass-through, documented).
+
+#### Layout detection and tolerance
+
+**Two known layouts** (verified against llama.cpp history; see the
+acceptance-risk note):
+
+| Layout | Shape at root | Verified origin |
+|---|---|---|
+| **HF hub** (primary; written and read by llama.cpp since PR #20775, ~Mar 2025, and by master today) | `<root>/models--<org>--<model>/` — `refs/main` (commit hash), `snapshots/<commit>/<file>`, `blobs/<sha256>`; `snapshots/` files are usually symlinks to `../../blobs/<oid>` (`finalize_file`) | `repo_to_folder_name`: `"models--" + repo_id` with `/` → `--` |
+| **Legacy llama.cpp** (pre-#20775; llama.cpp stopped migrating it in PR #23266) | flat `<root>/<org>__<repo>__<file>.gguf` (+ `.etag` sidecars, `manifest=<org>=<repo>=latest.json`); tolerated folder variant `<root>/<org>__<model>/<file>` | #20775's migration code (the commit message shows the flat names); ROADMAP §3.1 documents the folder form |
+
+**Detection** — every child of the cache root is classified once, by
+name and type:
+
+1. Directory named `models--…` → HF hub repo (repo id: strip
+   `models--`, then `--` → `/`). Recognized even without `snapshots/`
+   (empty cache state — normal during or after a download; returns zero
+   files, no warning). A `models--` name whose converted repo id is
+   invalid (no `/`) → unrecognized → warning.
+2. Directory matching `^[\w.-]+__[\w.-]+$` → legacy folder repo.
+3. File matching `<org>__<repo>__<file>.gguf` / `.mmproj` → legacy flat
+   file (repo = the first two `__` segments).
+4. Metadata — `*.etag` sidecars, `manifest=…` files, and the HF hub
+   root files (`CACHEDIR.TAG`, `version.txt`, `.locks/`, written by
+   `huggingface_hub`) → recognized, skipped silently.
+5. Anything else → **unrecognized** → warning (tolerance strategy
+   below).
+
+**Lookup** — `Lookup(root, hfID)` with `hfID` = `org/repo[:quant]`:
+
+- Strip `:quant` (the quant lives in the file *name*; llama.cpp's repo
+  folder never encodes it).
+- Hub: read `refs/main` for the commit; enumerate files under
+  `snapshots/<commit>/`; if no ref resolves, fall back to any
+  `snapshots/*/` directory. Sizes via `os.Stat` (follows symlinks); the
+  reported path is the snapshots path (llama.cpp's `final_path`), the
+  canonical file for the cached model.
+- Legacy: files matching `org__repo__*` in the root (skip `.etag`),
+  plus files under the `<org>__<model>` folder variant.
+- Return `[]CachedFile{RepoID, Path, Size, Layout}` for `.gguf` and
+  `.mmproj` files only (tokenizers, `config.json` etc. are metadata,
+  not models). No quant filtering in this item.
+
+**Tolerance strategy (P6, P3):**
+
+- Both known layouts read without error. Unrecognized entries are a
+  **Warning**, never a Block, never a crash.
+- A missing or empty root is not an error: "not cached" is a normal
+  answer (the manager's download action and the cache listing depend on
+  this).
+- The reader never mutates anything (P8 — no silent reconciliation;
+  item 5 owns deletion).
+- Warnings leave the package through a `warn func(string)` callback;
+  item 1 routes it to the app log (`internal/logging`). Warn once per
+  entry.
+
+#### models-dir field-arrival contract (P2)
+
+- `Preferences.ModelsDir string` with JSON tag `models-dir,omitempty`.
+  A plain string, not a pointer: the default is `""` = "follow
+  llama.cpp's chain", and there is no meaningful explicit-empty
+  distinct from absent (unlike `animations`, where explicit `false`
+  must survive a round trip).
+- Absent or `""` → env chain (table above). Set → single root.
+- The zero value is the default, so the existing nil-safe
+  `Config.Prefs()` already covers access; no new accessor.
+- Older binaries reject the whole config with
+  `json: unknown field "models-dir"` — the accepted P2 contract;
+  `version` stays 1.
+
+**Config / load / validate changes (same change):**
+
+- `internal/config/types.go` — the field plus doc.
+- `internal/config/load.go` — extend the §3.3 expansion pass to
+  `preferences.models-dir` (`paths.ExpandPath`).
+- `internal/config/validate.go` — `validatePreferences` gains one
+  rule: when set and the path exists and is not a directory → Warning
+  (`models-dir is not a directory`). No existence requirement
+  otherwise (the directory is created later).
+- `internal/tui/settings.go` — a `huh.NewInput` field after log-colors;
+  the description states the default chain and the llama-cli sharing
+  benefit. Empty input removes the field from the persisted object
+  (`snapshot()` contract: only non-default values persist; untouched
+  configs stay byte-identical on save).
+- `DESIGN.md` §3.2 (schema example) and §3.3 (path-expansion list)
+  updated in the same change (P5).
+
+#### Interplay with downloads (owner decision C: delegated launch,
+#### manager-owned downloads)
+
+Recorded here so the storage-manager item implements against the right
+foundation:
+
+- The **launch path stays delegated** (`--hf-repo`): llama.cpp downloads
+  at startup, cache-first, into the same root the reader resolves.
+  `Lookup` is NOT used on the launch path — there is no `--model <cached
+  path>` takeover (ROADMAP §3.2).
+- The reader's first production consumer is the config editor's
+  cached-repo list (§3.8 step A); the **Storage & Downloads manager**
+  (§3.4) lists cached files via `Scan`/`Lookup`, and its "download
+  now" action writes into the same root (the writer reuses `CacheRoot` +
+  `RepoFolderNames`), verifies sha256, and leaves the cache populated
+  for the next launch.
+- Router `(cache)` rows in run mode (llama.cpp's own downloads) line up
+  with the manager's listing because both read and write the same hub
+  layout.
+- Users with `LLAMA_CACHE` set get downloads in their custom root,
+  matching `llama-cli`.
+
+#### Acceptance risk (owner confirmation)
+
+1. **ROADMAP §3.1 and DESIGN §14.2 describe a layout llama.cpp no
+   longer writes.** Both say: default chain `$LLAMA_CACHE → ~/.cache/
+   llama.cpp → HF hub layout` and repo folder form `<org>__<model>/
+   <file>` via `repo_to_folder_name`. Verified against llama.cpp
+   history and master at the time of writing: PR #20775 (~Mar 2025)
+   switched llama.cpp to the **standard HF hub layout** — chain
+   `LLAMA_CACHE → HF_HUB_CACHE → HUGGINGFACE_HUB_CACHE → HF_HOME/hub →
+   XDG_CACHE_HOME/huggingface/hub → ~/.cache/huggingface/hub`, repo
+   folder `models--<org>--<model>`, files under `snapshots/<commit>/`
+   (+ `blobs/`, `refs/`). `~/.cache/llama.cpp` and the
+   `<org>__<model>` / `<org>__<repo>__<file>` forms are the **legacy**
+   layout; llama.cpp stopped migrating it in PR #23266. **This note
+   adopts the verified current layout as default and treats the legacy
+   forms as the second known layout (read-only).** Confirming this also
+   amends §14.2 and ROADMAP §3.1 (same-change P5). If the owner prefers
+   the §3.1 wording as the default, that desyncs from llama.cpp ≥ b5xxx
+   and breaks the "one copy shared with `llama-cli`/`--hf-repo`" goal
+   (§3.1 Why) — the note asks the owner to confirm the verified-current
+   default.
+2. **Layout-change risk (ROADMAP §8).** llama.cpp may change the layout
+   again; the reader concentrates every pattern in two tables (env
+   chain + layout rules), degrades to warnings (P6), and never crashes;
+   the tables are the single update point, each table-driven tested.
+3. **Env-chain mirroring.** llamaman mirrors llama.cpp's env-var order
+   so behavior matches `llama-cli` under `LLAMA_CACHE` / `HF_HOME`; if
+   llama.cpp renames or reorders variables, only the one table changes.
+
+#### Determinism and tests (P9)
+
+No network, no llama-server, no real terminal.
+
+- `CacheRoot` — table-driven env matrix with `t.Setenv` (each var
+  alone; priority order; `models-dir` beats all env; HOME fallback; the
+  `getpwuid` path is not unit-tested — `os.UserHomeDir` covers it).
+- `RepoFolderNames`, `DetectLayout` — table tests (hub folder, legacy
+  folder, legacy flat, `.etag`, `manifest=`, junk file, junk dir,
+  dotfiles, invalid `models--` name).
+- `Scan`, `Lookup` — fake cache trees in `t.TempDir`: hub repo with
+  `refs/main` + `snapshots/<commit>/file`, the symlink-to-blob
+  variant, no-ref fallback to any snapshot; legacy flat + `.etag`;
+  legacy folder; unrecognized entries captured via the warn callback;
+  unknown repo → empty, no error; missing root → empty, no error.
+- Config — round trip: `"models-dir": "~/models"` loads expanded; empty
+  stays absent on save; validation Warning when the path is a file.
+- Settings — form gains the field; `snapshot()` writes it only when
+  non-empty and removes it on empty; existing settings form tests
+  updated for the extra field.
+
+**File map.** New `internal/storage/` — `root.go` (cache-root
+resolution), `layout.go` (folder-name mapping + detection), `scan.go`
+(scan/lookup + types), each with tests. `internal/config/types.go`,
+`load.go`, `validate.go` + tests. `internal/tui/settings.go` +
+`settings_test.go`. `DESIGN.md` — this §16.1, §3.2, §3.3 (and, on
+owner confirmation, §14.2). No `main.go` change.
+
+
+### 16.2 HF API client
+
+**Scope.** Second item of Release 2 (ROADMAP §3.7). A small,
+dependency-free HTTP client for the Hugging Face API surface named in
+ROADMAP §3.2 — the piece shared by every network-consuming item that
+follows (quant picker §3.3, the manager's download action §3.4, the
+config editor's repo check §3.8b, the browser §3.5). New package
+`internal/hf/`. **Non-goals:** no download loop (the manager's download
+action owns resume/sha256, §3.4), no quant filtering (item 3), no search
+(item 7), no config token (`HF_TOKEN` env only; `preferences.hf-token`
+stays deferred).
+
+**Endpoints** (P7: requests only on explicit caller actions, only to
+huggingface.co unless overridden):
+
+| Call | Request | Returns |
+|---|---|---|
+| File tree | `GET {endpoint}/api/models/{repo}/tree/{revision}?recursive=true` | `[]RepoFile{Path, Size, OID}` — existence check + quant list + sizes + LFS sha256 in one round trip |
+| Repo metadata | `GET {endpoint}/api/models/{repo}` | `RepoMeta{ID, SHA, Downloads, Likes, Tags}` (browser extends later) |
+
+- **Endpoint:** `$HF_ENDPOINT`, default `https://huggingface.co`
+  (mirrors llama.cpp's `common_get_model_endpoint` and
+  `huggingface_hub`; keeps a mirror usable and is the single update
+  point if the API moves). Revision defaults to `main`; callers may
+  pass a branch or commit.
+- **Tree entries:** `type: "file"` only; size = `lfs.size` when present
+  else `size`; OID = `lfs.oid` else `oid` (the LFS oid is the sha256
+  the downloader verifies against). Directories are skipped.
+- **Token:** read `HF_TOKEN` once per client; when non-empty, send
+  `Authorization: Bearer <token>` on every request (gated repos).
+- **Errors (P3, for §3.8b's distinct messages):** typed `hf.Error` with
+  a kind: `ErrNotFound` (404), `ErrGated` (401/403), `ErrNetwork`
+  (DNS/timeout/transport), `ErrHTTP` (other status, carries the code).
+  Convenience predicates `IsNotFound`/`IsGated`.
+
+**API surface.**
+
+```go
+func New() (*Client, error)                     // endpoint/token from env
+func NewWithEndpoint(endpoint, token string) *Client // tests + injection
+func (c *Client) Tree(ctx, repo, revision string) ([]RepoFile, error)
+func (c *Client) Repo(ctx, repo string) (RepoMeta, error)
+func (c *Client) RepoExists(ctx, repo string) (bool, error) // Tree, kind-filtered
+```
+
+- Repo ids are path-escaped per segment (`Qwen/Qwen3-32B-GGUF`).
+- A bounded `http.Client` timeout; `ctx` passes cancellation through
+  (P10 — user control later).
+- `RepoExists` is `Tree` with `IsNotFound` → false, other errors
+  surfaced (a gated repo *exists*).
+
+**Determinism (P9).** All tests run against `httptest.Server` — no
+network, no llama-server. Cover: URL path + `recursive=true` query;
+Bearer header with `HF_TOKEN` set (`t.Setenv`) and absent; lfs-oid and
+lfs-size extraction; directory entries skipped; 404 → `ErrNotFound`,
+401/403 → `ErrGated`, transport error → `ErrNetwork`; malformed JSON →
+error; `HF_ENDPOINT` honored; empty repo response.
+
+**File map.** New `internal/hf/` — `client.go` (endpoint/token/HTTP,
+error types), `types.go` (`RepoFile`, `RepoMeta`), `client_test.go`,
+`types_test.go`. No `main.go` change, no TUI change, no config change.
+DESIGN §14.2 / ROADMAP §3.2 already describe the item; this note adds
+the implementation contract.
+
+### 16.3 Quantization picker — the shared quant chooser
+
+**Scope.** Third item of Release 2 (ROADMAP §3.7). Under owner decision C
+and §3.8, the "quantization picker" is a **shared data component**, not
+a UI host: it turns a repo's `hf.Tree` listing into a pickable, sized
+quant list. The UI pickers that render it land with their hosts — the
+Storage & Downloads manager's download action (§3.4) and the config
+editor's typed-repo flow (§3.8 step B). Ships in `internal/hf/`
+(`quant.go`) on top of the §16.2 client. **Non-goals:** no download loop
+(item 4), no VRAM math (the §14.3 estimator is a hook, sizes-only until
+it ships), no search (item 7), no mmproj *selection* (informational
+only — llama.cpp auto-downloads it), no TUI code in this item.
+
+**Quant parsing.** The quant lives in the file name, matching llama.cpp's
+`get_gguf_split_info` (verified): strip `.gguf`, then a trailing
+`[-.]([A-Z0-9_]+)` tag (case-insensitive match, uppercased) — e.g.
+`qwen3-UD-Q4_K_XL.gguf` → `UD-Q4_K_XL`, `model-Q8_0.gguf` → `Q8_0`,
+`model-F16.gguf` → `F16`. Split models (`-NNNNN-of-NNNNN`) share one
+quant: their parts group into a single option whose size is the **sum**
+of the parts. Files with no parseable tag fall back to their basename as
+the option name.
+
+**API surface.**
+
+```go
+type QuantOption struct {
+    Tag   string // quant tag (uppercased) or basename fallback
+    Files []hf.RepoFile
+    Size  int64 // total (split parts summed)
+}
+
+func Quants(files []hf.RepoFile) []QuantOption // filters .gguf, groups, sorts
+func HasMMProj(files []hf.RepoFile) bool       // informational note for §3.8b
+func HumanSize(n int64) string                 // 1.2 GiB style, for pickers
+func Choose(ctx context.Context, c *hf.Client, repo string) ([]QuantOption, error)
+    // Tree(repo, "main") → Quants; the single fetch behind the pickers
+```
+
+- `Quants` is a pure function of `[]hf.RepoFile` — fully testable
+  without network (P9); `Choose` is the only network wrapper.
+- Sort: size ascending, ties by tag — the natural "smallest first"
+  order for a "fits in VRAM" picker.
+- The chosen `Tag` becomes the `:quant` suffix of the config `hf` entry
+  (`org/repo:Q4_K_XL`). Verified: llama.cpp's `find_best_model` matches
+  the tag as a regex `tag + "[.-]"` **substring over the file path**, so
+  the strict tag always selects the right file — e.g. `Q4_K_XL` selects
+  `Qwen3.6-27B-UD-Q4_K_XL.gguf` (the `UD-` prefix is irrelevant to
+  matching). Two files with the same strict tag in one repo merge into
+  one option — upstream selection is equally ambiguous there.
+- **VRAM hint hook (R3 §4.2):** hosts attach the estimate; `QuantOption`
+  carries `Size` only, so the hint is a render-time addition — no
+  coupling to the estimator in this item.
+
+**Determinism (P9).** Table tests on synthetic file lists: real quant
+shapes (Q4_K_M, Q8_0, F16, IQ3_XXS, UD-Q4_K_XL), split files summing,
+case-insensitive tags, no-tag fallback, `.mmproj` excluded from `Quants`
+but detected by `HasMMProj`, non-model files ignored, deterministic
+ordering. `Choose` tested against `httptest.Server` reusing the §16.2
+client.
+
+**File map.** New `internal/hf/quant.go`, `quant_test.go`. No `main.go`,
+TUI, config, or storage changes. DESIGN §14.2 / ROADMAP §3.3 already
+describe the item; this note adds the component contract.
+
+### 16.4 Storage & Downloads manager
+
+**Scope.** Fourth item of Release 2 (ROADMAP §3.7; §3.4 with owner
+decision C). The first user-visible surface of the release and the
+**single place downloads are managed**: a new TUI mode from Main that
+lists what is on disk, deletes it with confirmation, and pre-fetches
+repos into the cache ("download now") with pause/resume/cancel, sha256
+verification, and clear failures. Launch stays delegated (§3.2) — the
+run-mode panel keeps only the passive §15.4 progress. **Non-goals:** no
+search/browse (item 7), no config-editor pickers (§3.8), no VRAM math
+(R3), no router-mode changes.
+
+**Esc keeps downloads alive.** Leaving the manager with Esc does not
+cancel an in-flight download: the manager is reused on re-entry, and
+Main surfaces a `⬇ downloading … — s to view` status line (refreshed on
+the session tick) so a download is never silently orphaned.
+
+**Concurrent downloads.** Several downloads may run at once; each has
+its own row (spinner, progress, speed), is individually
+pausable/resumable/cancellable via its action menu (or `x` for the
+selected one), and Main aggregates them (`⣾ 2 downloads: a:q, b:q —
+s to view`).
+
+#### Mode structure
+
+- New `ViewStorage` under Root; entry key **`s`** in Main (`s storage`).
+  The Settings key moves from `s` to **`p`** (`p preferences` — the
+  config object is `preferences`, so the label matches; owner
+  decision). List-based view: cache repos + local config models +
+  in-flight downloads, one pane, footer of actions — mirrors the
+  router model-panel action-menu pattern (Enter → action menu).
+- Rendering groups: **(1) cache repos** (from `storage.Scan` grouped by
+  repo — each shows its quants + total size, `storage.HumanSize`-style),
+  **(2) local config models** (each `location` file with on-disk size;
+  missing files marked), **(3) in-flight downloads** (own state, §16.3
+  progress), plus a **free-disk** line for the cache root's filesystem
+  (`syscall.Statfs`). Sizes via `os.Stat`; all read-only rendering.
+- Actions per entry: cache repo → **delete** (confirm) / **re-download**;
+  local model → **reveal** (open parent dir); a *missing* local model
+  additionally offers **delete from config** (confirmed — the entry is
+  removed and persisted via the standard atomic save; P8's "never
+  without asking" is the confirmation); download row → **pause /
+  resume / cancel**.
+
+#### Delete
+
+- Cache repo: hub layout → remove the whole `models--org--model/` dir
+  (blobs die with it); legacy → remove the flat `.gguf`/`.mmproj` files
+  plus their `.etag` and `manifest=` sidecars. Confirmation prompt
+  first. Config entries are never touched here (P8).
+- Only files llamaman can account for are ever removed (§3.4).
+
+#### Download action ("download now")
+
+1. User types `org/repo[:quant]` (explicit action, P7) — or picks a
+   cached repo to re-download.
+2. `hf.Choose` → the §16.3 quant picker (sizes shown; no quant suffix →
+   pick; suffix present → confirm only). mmproj noted when present
+   (auto-downloaded by llama.cpp at launch, informational).
+3. `hf.Download` fetches into the resolved cache root (§16.1) with a
+   live progress bar (bytes done / total, per file and overall),
+   **pause / resume / cancel** keys, sha256 verify (the LFS oid), and
+   distinct failure messages (not-found / gated / network — §16.2
+   errors). Pause keeps the partial; cancel discards it.
+
+#### The downloader (`internal/hf/download.go`)
+
+- New client call **`Refs(ctx, repo)`** — `GET /api/models/{repo}/refs`
+  → the `main` branch's target commit (llama.cpp's `get_repo_commit`;
+  the downloader needs the commit for `refs/main` + `snapshots/`).
+- Writer mirrors llama.cpp's hub layout exactly (verified): blobs
+  written to `blobs/<oid>` (partial as `<oid>.incomplete`), then
+  `refs/main` = commit, and `snapshots/<commit>/<file>` as a symlink to
+  the blob (`finalize_file` behavior) — so llama.cpp reads the result
+  directly. Split parts download individually; the model is complete
+  only when every part is in place.
+- **Range resume:** a blob already at N bytes (from `<oid>.incomplete`)
+  continues with `Range: bytes=N-`; 206 handled, 200 restarts cleanly.
+- **sha256 verify:** after each blob completes, hash it and compare to
+  the oid; mismatch → error, partial removed, clear message.
+- Progress via a callback (`done, total int64` per file); cancellation
+  via `ctx`. `Download` is synchronous; the TUI runs it as a Bubble Tea
+  task and renders pause/resume/cancel from task state.
+
+#### Determinism (P9)
+
+- Downloader tests against `httptest.Server`: full download, Range
+  resume (pre-seeded `.incomplete`), 206/200 handling, sha256 mismatch,
+  refs parsing, split parts, cancel via ctx, blob/symlink layout
+  assertions against a `t.TempDir` root. No real network.
+- TUI tests with a **stub downloader** (the `stubSpawner` pattern) and
+  fake cache trees: listing groups/sizes, delete-with-confirmation,
+  action flow, free-disk line (`Statfs` on a TempDir works).
+- Snapshot tests render the manager in-process (P9).
+
+**File map.** `internal/hf/refs.go`, `download.go`, `download_test.go`
+(the client gains `Refs`). New `internal/tui/storage.go` +
+`storage_test.go` (the manager mode). `internal/tui/root.go` —
+`ViewStorage`, `m` dispatch, `returnFromStorageMsg`. `main.go` —
+shortcut-row text. `DESIGN.md` §16.4 + §7.5 mode list (same change,
+P5). No config, no `internal/storage` changes.
+
+### 16.5 Config-editor pickers — GGUF filepicker + cached-repo list
+
+**Scope.** Fifth item of Release 2 (ROADMAP §3.7, delivered after the
+Storage & Downloads manager per the owner's order; §3.8 **step A**). The
+config editor's free-type `location` / `hf` fields (DESIGN §7.5) become
+picker-assisted: a `bubbles/filepicker` overlay for local `.gguf` files,
+and a cached-repo list (from `storage.Scan`) for the HF branch. This
+makes the config editor the storage reader's first production consumer
+(§16.1). **Non-goals:** step B — typed-repo existence check and quant
+offer (`tree/main` round-trip) is item 6 (§3.8 step B); no VRAM hint;
+no network in the pickers; no config schema change (P8); the pickers
+never write anything — they only pre-fill the form's staging pointers,
+and nothing is persisted except through the normal save flow.
+
+**UX shape (unchanged schema, picker-assisted inputs).** In the model
+form, the location and HF identifier inputs keep working exactly as
+free-type inputs; a new hotkey **`ctrl+o`** ("open picker") while
+focused in either input opens its picker as a centered overlay (the
+§7.5 `paramPicker` pattern — a custom picker outside huh, driven by a
+done message). Esc in the overlay returns to the
+form with the field value unchanged; picking pre-fills the field and
+returns to the form **on the same field** (no field advance). huh's
+help line shows the new binding automatically.
+
+#### The trigger: a custom huh field
+
+huh v1.0.0 has no custom-key escape hatch: an `Input` field consumes
+every key except Prev/Next/Submit (verified in `field_input.go`), so a
+hotkey typed in a plain input never reaches `ConfigMode`. (huh v1.0.0's
+built-in `FilePicker` field was considered and rejected: it replaces
+free typing entirely, which §3.8 explicitly requires as a fallback, and
+it cannot render the cached-repo list.) Instead the model form uses a
+small custom huh field — `pickerInput` — that **embeds `*huh.Input`**
+and overrides three methods:
+
+- `Update`: when a `tea.KeyMsg` matches the field's `openKey`
+  (`ctrl+o`), return a cmd emitting `openModelPickerMsg{kind}` **and do
+  not forward the key to the embedded input**; otherwise delegate to the
+  embedded input unchanged.
+- `KeyBinds`: embedded input's binds plus the `openKey` binding, so
+  huh's help row renders `ctrl+o open picker`.
+- `View`: delegate to the embedded input (form rendering is otherwise
+  byte-identical to today — no existing snapshot churn).
+
+The rest of the `huh.Field` interface (Focus/Blur/WithKeyMap/
+WithPosition/GetKey/GetValue/…) is inherited from the embedded input.
+`buildModelForm` swaps the plain `huh.NewInput()` in the local and HF
+groups for `pickerInput` with the matching `kind`; alias and the other
+forms stay plain inputs.
+
+`ConfigMode.Update` gains the picker-open arm **before** the
+`c.form != nil` branch (alongside the existing `paramPickerDoneMsg`
+arm, config.go:180): `openModelPickerMsg` → build the overlay and
+return a nil cmd; `modelPickerDoneMsg` → consume and route. This keeps
+the "overlay handlers run on EVERY message" discipline: the done msg
+arrives as its own message through the tea loop and must be consumed
+before the form ever sees it (a form left un-updated mid-flow is what
+produces the swallowed-`nextFieldMsg` failure mode recorded in §16.4's
+gotchas).
+
+#### Local branch — the GGUF filepicker
+
+The standard `bubbles/filepicker` v1.0.0 control (owner round-3: back
+to the widget — the round-2 custom filterable browser was dropped; no
+filtering in the local picker):
+
+- `AllowedTypes = [".gguf"]` — other files render disabled (the
+  picker's `canSelect` suffix rule; selecting one is a no-op that shows
+  a brief `.gguf files only` error line, matching `DidSelectDisabledFile`).
+- `ShowSize = true`; `ShowPermissions = false`; **`ShowHidden = true`**
+  — hidden files/dirs are listed by default, and **`.`** toggles them
+  (owner feedback; `fp.Init()` re-reads the current directory with the
+  new visibility; the hint line shows the current state).
+  `DirAllowed` stays **false** — directories remain navigable via
+  enter, but never selectable: with it true, entering a directory sets
+  `fp.Path` and `DidSelectFile` reports the directory itself as picked
+  (huh keeps it false for the same reason).
+- Keymap trimmed to the config-mode arrow convention (same rationale as
+  `paramPicker` dropping j/k): `↑`/`↓` move, `enter` opens a directory
+  or selects a file, `←`/`backspace` **always go up one level — even
+  from the opening directory** (owner round-4), `esc` always cancels
+  the picker. `g`/`G`/`j`/`k`/`h`/`l` removed.
+- Sized via the existing `pickerSize()` height + `overlayCenter` (the
+  same box treatment `paramPicker.View` uses), height through
+  `picker.SetHeight`.
+
+**Start-directory resolution**, first candidate that exists wins:
+
+1. `preferences.models-dir` when set (the user's explicit choice wins,
+   P8 — same precedence as `storage.CacheRoot`).
+2. When editing an existing model whose current value is a non-empty
+   path, that value's directory (the natural "last-used" for the edit
+   case).
+3. The directory of the **first local model** in the config (a proxy
+   for "last-used model directory": llamaman keeps no usage history and
+   P8 forbids adding a field to record one — flagged for the owner).
+   (As implemented, the filepicker is rebuilt on every open at the
+   resolved start dir; the in-session "remembers the last browsed
+   directory" nicety of the original note was dropped — amending per
+   P5.)
+4. `~`.
+
+If every candidate is unset or nonexistent, `~` is used. The resolved
+dir is the filepicker's opening directory (where `←`/`backspace` can
+still go up — only `esc` cancels); the picker reads it at construction.
+
+#### HF branch — the cached-repo list
+
+On `ctrl+o` in the HF input, resolve the cache root with
+`storage.CacheRoot(c.work.Prefs().ModelsDir)` — the same call root.go
+makes for `ViewStorage` (§16.4) — and `storage.Scan(root, warn)`.
+Grouping and formatting reuse the Storage manager's repo-row logic
+exactly (the same helpers, so both surfaces always agree): group
+`CachedFile`s by `RepoID` (`byRepo` map, sorted keys), quants + sizes
+via `hf.Quants(repoFiles(fs))` + `hf.HumanSize` — both package-level in
+`internal/tui`/`internal/hf` already.
+
+The overlay is a `bubbles/list` picker in the `paramPicker` shape
+(arrows-only keymap, reverse-video selection, no
+chrome). The repo list is sized to **half the screen width**
+(`width/2 - 6` inner), and the popup box is padded to exactly
+`width/2` cells (owner round-4: no full width) — the enclosing
+rectangle never changes size when the selection moves (owner round-3:
+all four row styles share the same 2-cell left padding, every line is
+padded — and truncated if longer than the list — via the
+`repoPicker.View` pass, and the box is right-padded via `padLinesTo`).
+The delegate ellipsizes anything longer than the screen, it never
+wraps. ROADMAP §3.8 names
+`huh.Select`, but per-option descriptions
+(quants + sizes) are exactly what `huh.Select` cannot render — the same
+reason `paramPicker` exists — so the custom list picker is used
+instead; the mechanism (overlay outside huh driven by a done message)
+is the one §3.8 itself prescribes to reuse. Rows:
+
+- One per cached repo: title `org/repo`, description =
+  `Q4_K_M — 4.2 GB, Q8_0 — 8.4 GB` (comma-joined, `hf.HumanSize`), or
+  `no model quants cached` when the repo has files but no quants (e.g.
+  only mmproj — same "empty cache repo" rule as the manager).
+- A trailing **`select a repo…`** row, always present (never
+  filterable out); selecting it closes the picker and lets the user
+  type an id in the field (owner-chosen label).
+- **Live filter**: typing filters as you go and `enter` picks the
+  selected repo directly; `esc` clears the filter first. `enter`
+  picks; `esc` cancels (both emit `modelPickerDoneMsg`).
+- **Empty cache** (zero repos) → the picker does not open; the field
+  stays a plain free-type input (§3.8: "an empty cache skips the
+  list"). Scan errors / unresolvable root → same no-op (P3; never a
+  blocking error in a form).
+
+**Pre-fill rule** (writes into the form's staging `hf` pointer, so the
+input displays the value and the form continues from that field):
+
+- repo with exactly one quant → `org/repo:QUANT`
+- repo with several quants, or none → `org/repo` (no suffix; §3.8:
+  "quant empty when the repo has several")
+- `type a new repo…` → field untouched (keeps whatever was typed)
+
+#### Routing and state
+
+`ConfigMode` gains one overlay slot, `modelPicker *modelPicker`
+(active only during `formNewModel`/`formEditModel`), holding the kind
+(`local`|`hf`) and either the filepicker or the list model. Routing,
+mirroring the existing `picker` slot (config.go:160–199):
+
+1. `modelPickerDoneMsg` → consume, write staging if not cancelled,
+   clear the slot, return to the form (no cmd).
+2. `modelPicker != nil` → forward the message exclusively to the
+   overlay (the form underneath is shielded while it is open).
+3. otherwise the existing routing (form → keys) continues unchanged.
+
+`SetSize` propagates to the overlay like it does for `picker`;
+`View` renders the overlay via `overlayCenter` when the slot is set,
+ahead of the form (same precedence as the param picker).
+
+#### Determinism and tests (P9)
+
+- `pickerInput` unit tests: `ctrl+o` emits `openModelPickerMsg` and
+  does not mutate the input value; other keys (typing, arrows, enter)
+  delegate to the embedded input unchanged; `KeyBinds` includes the
+  binding.
+- Start-dir resolution table test: models-dir set/unset, edit-value
+  dir, first-local-model dir, nonexistent candidates falling through,
+  home fallback — over `t.TempDir` trees.
+- ConfigMode flow tests (synchronous, the existing config_test.go
+  style): open the model form, drive to the location field, send
+  `ctrl+o` → overlay active; a temp dir holding `model.gguf` +
+  `notes.txt` renders with the `.txt` disabled; `enter` on the `.gguf`
+  → done msg → staging `location` set and the form is still on the
+  location field. Esc cancels without touching the value.
+- HF branch: fake hub-layout cache trees in `t.TempDir` (the
+  `scan_test.go` fixture style: `refs/main` + `snapshots/<commit>/`
+  symlinked files): single-quant repo pre-fills `org/repo:QUANT`,
+  multi-quant pre-fills `org/repo`, empty cache makes `ctrl+o` a no-op,
+  `type a new repo…` leaves the field as typed.
+- Overlay render assertions (in-process, deterministic temp dirs);
+  existing snapshots are unaffected (the form view is unchanged apart
+  from the help row).
+
+**File map.** New `internal/tui/modelpicker.go` + `modelpicker_test.go`
+(the `pickerInput` field, both overlays, the done/open messages,
+start-dir resolution; the form-flow test harness reuses the
+`snapshot_test.go` `drainCmds` via a `tea.Model` adapter). `internal/tui/config.go` — `buildModelForm` uses
+`pickerInput`, `Update` gains the two message arms and the overlay
+slot, `SetSize`/`View` propagate it, `handleModelPickerDone` rebuilds
+the form's cached view after a pre-fill. `DESIGN.md` §16.5 + the §7.5 Models
+pane bullet (same change, P5). No changes to `internal/storage`,
+`internal/hf`, the config schema, or ROADMAP.
+
+### 16.6 Typed-repo check + quant offer — config editor, §3.8 step B
+
+**Scope.** Sixth item of Release 2 (ROADMAP §3.7 item 6, §3.8 **step
+B**), delivered after the Storage & Downloads manager and the config-
+editor pickers per the owner's order. When the user confirms a **typed,
+bare** `org/repo` id in the model form's HF field, one async `tree/main`
+call (via the §16.2 client) checks existence and fetches the quant list
+with real sizes; on success the shared quant chooser (§16.3 data, §16.4
+UI shape) offers the quants, and the picked quant is written back as the
+`:quant` suffix. **Non-goals:** no VRAM math (the §14.3 estimator is a
+render-time hook, sizes-only until it ships), no existence validation
+for ids that already carry a `:quant` (that is R3's pre-spawn "HF repo
+existence validation", §14.3 — a quanted id is an explicit choice and
+llama-server surfaces problems at launch), no mmproj handling (llama.cpp
+auto-downloads it; presets already set `no-mmproj`), no config schema
+change (P8), no new dependency, no `internal/hf` change (the check
+composes the existing exported `Tree` + `hf.Quants` + `hf.HasMMProj`).
+
+**Trigger — what counts as "a typed repo id".** The check fires only
+when the user **confirms the HF field with enter** (the "explicit user
+action" P7 requires) and all of these hold:
+
+- the id is **valid** (`hfFormValidator`, the same check the form runs
+  today — otherwise the key is delegated so huh shows its inline error),
+- the id is **bare** — no `:quant` suffix (the check's point is the
+  quant *offer*; a suffix means the quant is already decided),
+- the id was **typed in this form session** — tracked by a new `edited`
+  flag on `pickerInput`, set whenever the field's `Update` sees any key
+  other than `ctrl+o`/enter. A pre-fill from the cached-repo picker
+  (§16.5) goes through `RefreshValue()` *outside* `Update`, so `edited`
+  stays false for picked ids; an unchanged id in edit mode likewise
+  skips the check. Typing anything (even a single backspace fix) flips
+  the flag — the check is advisory, so over-eagerness is acceptable.
+
+The cache list is the offline path (no network), and an unchanged
+existing entry was never "typed" — both skip. When the check is
+skipped, enter behaves exactly as today (delegate to the embedded
+input; the form advances normally). When the runner is unavailable
+(see below), the same.
+
+**Mechanism.** `pickerInput.Update` (modelpicker.go:94) gains, after the
+`ctrl+o` arm and before delegating: when `kind == sourceHF` and the key
+is enter and `edited && hfFormValidator(*p.value) == nil && bare` —
+return the wrapper unchanged plus a cmd emitting a new
+`hfCheckRequestedMsg{id: strings.TrimSpace(*p.value)}`, **without**
+forwarding the key. Swallowing the enter means the form does not
+advance; the user stays on the HF field while the check runs. The
+validator gate keeps huh's inline error display intact for invalid ids.
+
+**The async check.** ConfigMode gains:
+
+- `hfRunner hfCheckRunner` — `CheckHF(ctx, repo) ([]hf.QuantOption,
+  bool /*mmproj*/, error)`, nil = check disabled (P3: the form just
+  advances). The production adapter `hfCheckClient{c *hf.Client}`
+  composes one `Tree(repo, "main")` round trip into `hf.Quants` +
+  `hf.HasMMProj` — the ROADMAP's "existence + quant list + sizes + LFS
+  sha256 in a single round-trip". Wired via a new `SetHFCheckRunner`
+  setter, mirroring `StorageMode.SetEngine` (storage.go:183); root
+  builds a lazy `hf.New()` at the two ConfigMode creation sites
+  (root.go:272, 457) and a nil-safe adapter (client error → runner nil
+  → check disabled, never a crash).
+- `hfCheck *hfCheckState{repo, cancel}` — the in-flight state. On
+  `hfCheckRequestedMsg`: guard `formKind` is new/edit model, split the
+  id (`splitRepoQuant`, storage.go:748 — bare, so repo = trimmed id),
+  create a cancellable ctx, set the slot, and return the check cmd
+  (`func() tea.Msg { opts, mmproj, err := runner.CheckHF(ctx, repo);
+  return hfCheckDoneMsg{id, opts, mmproj, err} }` — the same cmd-returns-
+  a-msg shape as `fetchPropsCmd`, fetcher.go:230). The request is
+  bounded by the §16.2 client's 30s `requestTimeout`; esc cancels the
+  ctx (P10).
+- **Shield:** while `hfCheck != nil`, every key is swallowed except
+  `esc` (cancel the ctx, clear the slot, stay on the HF field) and the
+  `hfCheckDoneMsg` itself. `View` renders a small centered box
+  (`overlayCenter`, `pickerSize`) — static text
+  `checking org/repo…` + `esc: cancel` (static, no spinner — the check
+  is one bounded call and static text keeps snapshot tests
+  deterministic).
+- **Cancel surfaces as cancellation:** the §16.2 client wraps the
+  transport error (including a canceled request) into an `hf.Error`
+  with no `Unwrap`/`Is`, so the adapter re-raises `ctx.Err()` when the
+  ctx is done — `errors.Is(err, context.Canceled)` must match for esc
+  to abort cleanly. Each check gets a generation counter
+  (`hfCheckGen`); the done msg carries it and `handleHFCheckDone`
+  drops any result whose gen does not match the current check (a stale
+  msg from a canceled earlier check must never resolve — or clear the
+  shield of — a later one).
+
+**On `hfCheckDoneMsg`** (handled on every message, before the errorModal
+arm, alongside the other overlay-done messages — the §16.4 discipline):
+
+- `ctx.Canceled` → no dialog, no chooser; clear the slot, stay on the
+  HF field (the user aborted).
+- success, `len(opts) > 0` → open the **quant chooser** (below).
+- every other outcome (no quants, not-found, gated, network/HTTP) →
+  a **Save/Dismiss dialog** (owner round: a flash was too quick to
+  read), titled with the distinct message (`org/repo: no GGUF files
+  found` + ` (mmproj only)` when `HasMMProj`; `org/repo: not found on
+  Hugging Face`; `org/repo: gated — requires HF_TOKEN`; `org/repo:
+  could not reach Hugging Face` / `org/repo: HTTP <code>`). **Save**
+  completes the form via `c.form.NextField()` (huh v1.0.0 exports it,
+  form.go:488 — the gotcha's "forms complete on a follow-up
+  nextFieldMsg" chain drives completion; the HF field is the last
+  visible field, so `applyForm` saves the model with the typed id
+  as-is) — non-blocking per ROADMAP §3.8: "the id can still be saved
+  (llama-server surfaces it at launch)". **Dismiss** (or `esc`) closes
+  the dialog and returns to the HF field, nothing committed — the
+  model form stayed alive underneath (its enter was swallowed), so the
+  user can fix the id and re-confirm. The dialog is a dedicated
+  `hfFail *huh.Form` slot with a `huh.Select` (Save pre-selected),
+  rendered boxed like the chooser.
+
+**The quant chooser.** Reuses the §16.4 label shape exactly — the same
+`Tag — hf.HumanSize(Size)` rows plus ` (cached)` markers from
+`storage.Lookup(root, repo)` when the cache root resolves (P3: lookup
+failure → empty marker set). Extracted into a shared
+`quantChooserForm(repo string, opts []hf.QuantOption, cached
+map[string]bool, note string, value *string, maxRows int) *huh.Form`
+helper (new `hfcheck.go`); `StorageMode.openQuantPicker`
+(storage.go:756) switches to it so both hosts always agree (the same
+"same helpers" rule item 5 applied to the repo list). The mmproj note
+(`mmproj present — llama.cpp auto-downloads it`) rides the form's
+`Description` as an informational line only.
+**VRAM hint:** sizes-only; per §16.3 the hint is a render-time addition
+hosts attach when the §14.3 estimator ships — no coupling here. The
+chooser is a dedicated ConfigMode slot `hfQuant *huh.Form`, rendered
+via `overlayCenter` ahead of the form **inside the standard bordered
+popup box** (`overlayBox` — the same treatment the pickers and the
+checking overlay use; owner round: it rendered unboxed and diverged
+from the app's style), sized like §16.4's form (`formWidth()`).
+`maxRows` caps the visible option rows to the host height minus
+overhead, so the box always fits small terminals — huh Select's
+viewport scrolls past the cap (owner round: an uncapped list
+overflowed the screen and its bottom rows were clipped).
+
+Chooser exits: **enter on a quant** writes `repo + ":" + tag` into the
+staging `hf` pointer, calls `hfField.RefreshValue()` (the item-5
+gotcha: the input's internal text must be re-synced or the form's
+`GetValue` at completion saves the stale bare id), then `NextField()`
+— the form completes and `applyForm` persists `org/repo:QUANT`.
+**`esc` saves the bare id** (owner round: the keep-bare row was
+dropped — the Save/Dismiss dialog already covers "keep the id", so the
+chooser needs only two exits, pick-quant and no-quant; esc is never
+forwarded to the form, which would abort it). `esc` always means "no
+quant" regardless of the current selection, because huh.Select syncs
+its bound value on focus — `hfQuantVal` cannot distinguish "picked"
+from "initial selection"; only enter commits a pick. The chooser's
+completion msgs are routed on every message while `hfQuant` is set,
+same discipline as the other overlays.
+
+**Routing and state.** `Update` order (config.go:168): `savedExpiredMsg`
+→ `hfCheckDoneMsg` → errorModal → `hfCheckRequestedMsg` → `hfCheck`
+shield → `hfQuant` routing → the existing picker/modelPicker/form arms.
+The new slots are mutually exclusive with the existing overlays, so the
+relative order within the overlay block is immaterial; `dismissForm`
+clears `hfCheck`/`hfQuant` defensively. `SetSize` propagates to the new
+overlays like it does for `modelPicker` (config.go:151).
+
+**Determinism and tests (P9).**
+
+- `pickerInput` unit: enter on the HF field with a typed bare id emits
+  `hfCheckRequestedMsg` and does **not** advance; quanted id → delegates
+  (no msg); invalid id → delegates (huh shows the error); `edited ==
+  false` (fresh edit-form, or after a picker pre-fill) → delegates;
+  local field → delegates; `ctrl+o` still wins (checked first).
+- ConfigMode flow (the modelpicker_test harness + `drainCmds`): drive
+  the model form to the HF field, type a bare id, enter → checking
+  overlay renders; esc → canceled, no flash, still on the field; stub
+  runner (synchronous, `SetHFCheckRunner`) → success+quants → chooser
+  renders sizes + mmproj note **inside the bordered box**; enter on a
+  quant → staging `org/repo:QUANT`, form completes, model applied
+  with the suffix; esc on the chooser → bare id saved (no quant);
+  `ErrNotFound` / `ErrGated` / network / no-quants → the Save/Dismiss
+  dialog opens with its distinct message and **Save** completes the
+  form with the bare id, **Dismiss**/esc returns to the HF field with
+  nothing committed (the id stays editable and re-checkable); runner
+  nil → enter completes the form with no check.
+- `hfCheckClient` adapter: `httptest.Server` tree fixture → quants +
+  mmproj derived from one response; the §16.2 typed errors map through
+  unchanged.
+- Existing snapshots are unaffected: the model form's `View` is
+  byte-identical (the enter intercept changes no rendering, and the
+  help row gains no binding).
+
+**File map.** New `internal/tui/hfcheck.go` + `hfcheck_test.go` (the two
+messages, `hfCheckRunner` + `hfCheckClient` adapter, the check cmd, the
+checking overlay, `quantChooserForm`). `internal/tui/modelpicker.go` —
+`pickerInput` gains `edited` + the enter-intercept. `internal/tui/config.go`
+— `SetHFCheckRunner`, the `hfCheck`/`hfQuant` slots, the Update arms +
+ordering, `View`/`SetSize` propagation, `handleHFCheckDone`,
+`handleQuantChooserDone`. `internal/tui/storage.go` — `openQuantPicker`
+switches to the shared `quantChooserForm`. `internal/tui/root.go` — wire
+the lazy real runner at the two ConfigMode creation sites.
+`DESIGN.md` §16.6 + the §7.5 Models pane bullet (same change, P5). No
+changes to `internal/hf`, the config schema, or ROADMAP.
+
+### 16.7 HF model browser — search/browse Hugging Face from the TUI
+
+**Scope.** Final item of Release 2 (ROADMAP §3.5, §3.7 item 7), delivered
+after the Storage & Downloads manager, the config-editor pickers, and the
+typed-repo check per the owner's order. A new **Browse** mode from Main
+searches/browses Hugging Face inside the TUI: a search box with
+server-side tag filters (language, license) — the HF search endpoint
+with the `gguf` library filter — a result list (downloads / likes /
+license / languages / task), a metadata + quant pane for the selected
+repo (real sizes
+from one `tree/main` round trip, `(cached)` markers), and a **hand-off** of
+the picked `org/repo:QUANT` straight into either the config editor's new-
+model form or the Storage manager's download action. **Non-goals:** no
+download loop here (the manager owns downloads — §16.4), no model-card
+parsing for params/context (see scope cut below), no write path of its own
+(hand-offs go through the existing editor save flow and the existing
+download engine), no config schema change (P8), no pagination beyond one
+page (see scope cut below), no VRAM math (R3).
+
+**API reality check (verified against the live API at the time of
+writing).** The search endpoint is
+
+```
+GET {endpoint}/api/models?search=<q>&filter=gguf&sort=<field>&direction=<±1>&limit=<N>
+```
+
+and returns a **plain JSON array** of repo objects with `id` (+ `modelId`
+alias), `downloads`, `likes`, `tags` (carries `license:<id>`,
+`base_model:<id>`, and language-code entries), `pipeline_tag`,
+`createdAt`, `private`. Three facts shape the design:
+
+1. **No file sizes in the search response — not even with `full=true`**
+   (verified: `full=true` adds `sha`, `lastModified`, `siblings` whose
+   entries carry only `rfilename`, `library_name`, `gated` — no size, no
+   LFS info). Per-repo sizes therefore require the existing `tree/main`
+   round trip; the design fetches it once, per selected repo, on the
+   user's explicit enter (§16.6's P7 discipline), and reuses the existing
+   §16.3/§16.6 machinery for quants + sizes + `(cached)`.
+2. **No server-side quant or size filter.** `filter=gguf` is the only
+   library filter; quant tags and file sizes are not queryable. "Filter
+   by quant/size" (§3.5) is therefore client-side: the search query
+   itself, plus the per-repo quant pane that lists every quant with its
+   real size (a GiB-budget filter over that pane was proposed and **cut
+   by owner decision** — see scope cuts). Quant *names* are served by
+   the search box (repo-level) and the quant pane (file-level).
+3. **Tags are a server-side browse axis.** Every search hit carries
+   `license:<id>`, bare language codes (`en`, `ja`, …), task tags, and
+   `base_model:<id>` / `base_model:quantized:<id>`. The `filter` param
+   is comma-joined and accepts **any** tag — `filter=gguf,ja` and
+   `filter=gguf,license:cc-by-nc-4.0` both verified live — so language
+   and license filters are one query param, zero client-side logic
+   (owner decision: included; §3.5's "filter by quant/size" reading).
+
+**Scope cut — params/context metadata (owner decision).** ROADMAP §3.5
+lists "params, context, license" as metadata. `license` comes free from
+`tags`; **params (parameter count) and context length are not fields of
+the search or repo APIs** — they live in model cards / `config.json`,
+which would mean fetching and parsing card text per repo (heavy, brittle,
+and only present on a subset of GGUF repos). This note cuts them: the
+metadata pane shows downloads, likes, license, task, base model, and
+repo-commit recency where cheap, and the quant pane carries the size
+story. Params/context are a deferred extension ("read the
+model card" button) — the owner confirms the cut or the note grows a card
+parser. This is the §14.2 "largest item" pressure valve.
+
+**Scope cut — size filter (owner decision).** A client-side GiB-budget
+filter hiding over-budget quant rows was proposed as the "filter by
+size" reading of §3.5; the owner cut it — the quant pane is sizes-only.
+The R3 VRAM estimator (§14.3) is the natural future home of a
+budget/fits-VRAM filter.
+
+**Scope cut — pagination.** One request of `limit=50` (verified
+accepted; the API returns up to at least 110 in practice) ranked by
+downloads; a "load more" / cursor loop is deferred. Search is
+stateless and re-runnable, so the browse loop stays useful without it.
+
+#### The client (`internal/hf/search.go`)
+
+The §16.2 client gains one method (its "browser extends later" hook from
+§16.2). No changes to existing methods or types:
+
+```go
+type SearchOpts struct {
+    Query     string // "" = browse: top GGUF repos by sort
+    Limit     int    // 0 → 50
+    Sort      string // "downloads" | "likes" | "lastModified"; "" → downloads
+    Direction int    // -1 desc (default), 1 asc
+    Filter    []string // extra tags beyond the fixed "gguf", in order
+                       // (e.g. "ja", "license:apache-2.0")
+}
+
+type SearchResult struct {
+    ID          string
+    Downloads   int64
+    Likes       int64
+    Tags        []string // raw: "license:*", "base_model:*", language codes
+    PipelineTag string
+}
+
+func (c *Client) Search(ctx context.Context, opts SearchOpts) ([]SearchResult, error)
+```
+
+- `filter=gguf` always, then `opts.Filter` tags appended in order
+  (`filter=gguf,ja,license:apache-2.0`); `search` omitted when empty;
+  query and each filter tag are URL-escaped per segment (same escaping
+  rule as §16.2). Errors map
+  through the existing typed `hf.Error` kinds (404 → `ErrNotFound`,
+  401/403 → `ErrGated`, transport → `ErrNetwork`, other → `ErrHTTP`)
+  and the Bearer-token rule (HF_TOKEN) applies unchanged.
+- Decode only the fields above; unknown fields ignored (forward
+  compatibility). Malformed JSON → error.
+
+#### Browser mode (`internal/tui/browser.go`)
+
+New `ViewBrowser` under Root; entry key **`b`** in Main
+(`b browse` — free in the current shortcut row; the reattach row gains
+it too), shortcut text and help line updated (main.go:544–580,
+654–666). Mirror of the `ViewStorage` wiring: a Root-owned
+`browser *BrowserMode` reused across entries (its search state and
+loaded quants survive Esc), `openBrowser()` builds it lazily like
+`openStorage` (root.go:563) — `storage.CacheRoot(r.cfg.Prefs().ModelsDir)`
+for the `(cached)` markers — and injects the runner.
+
+**Runner injection.** Same lazy, nil-safe pattern as §16.6's
+`hfCheckRunner` (root.go:549–557):
+
+```go
+type browserRunner interface {
+    Search(ctx context.Context, opts hf.SearchOpts) ([]hf.SearchResult, error)
+    // CheckHF is the §16.6 tree/main check — one round trip yields the
+    // quant list, sizes, and mmproj presence for the quant pane.
+    CheckHF(ctx context.Context, repo string) ([]hf.QuantOption, bool, error)
+}
+```
+
+`SetBrowserRunner` setter; `r.browserRunner()` builds a lazy `hf.New()`
+(the production adapter reuses the §16.6 `hfCheckClient` for the check);
+client error → nil runner → search disabled (P3: the mode renders and
+Esc works; search shows a "search unavailable" flash, never a crash).
+
+**Layout — three zones, Tab cycles.** The mode is a static layout, not
+an overlay (this is a full screen like the Storage manager, not a form
+popup):
+
+```
+┌ browse — Hugging Face (gguf) ────────────────────────────────┐
+│ ╭ search ──────────────────────────────────────────────────╮ │
+│ │ search: [llama 3          ]  sort: downloads            │ │
+│ ╰─────────────────────────────────────────────────────────╯ │
+│ ╭─ results (2) ───────────╮ ╭─ model info ────────────────╮ │
+│ │ ▶ lm-anon/vntl-llama3…  │ │ org/repo                   │ │
+│ │   743k dl · 17 likes …  │ │ from meta-llama/Llama-3…   │ │
+│ │   bartowski/Meta-Llama… │ │ ────────────────────────   │ │
+│ │   …                     │ │ ⬇ 743.5k downloads        │ │
+│ └─────────────────────────┘ │ ♥ 17 likes                 │ │
+│                             │ license: llama3.1          │ │
+│                             │ task: text-generation      │ │
+│                             │ ⚠ non-commercial license   │ │
+│                             │ ────────────────────────   │ │
+│                             │ quants (2)                 │ │
+│                             │ ▶ Q4_K_M — 5 GiB ●cached   │ │
+│ ─────────────────────────   │   Q8_0 — 10 GiB            │ │
+│ ↑/↓ navigate · tab quants · l/L filter · t sort · esc    │ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Layout — three zones; the panes follow the cursor.** The model-info
++ quants + card panes **auto-update as the results are navigated**
+(owner flow): moving in the results list re-renders the right column
+instantly from the search response and fires one gen-guarded
+`tree/main` fetch (quants) plus a `raw/main/README.md` fetch (card) in
+the background — no enter needed on a result, so enter is free for
+selecting a quant. **All panels carry their title embedded in the top
+border line** (`╭─ search ─…`, `╭─ results (N) ─…`, `╭─ model info ─…`,
+`╭─ quants (N) ─…`, `╭─ model card ─…`), drawn manually (`titledBoxLines`
+— lipgloss `Width()` wraps long lines instead of truncating, which
+previously pushed boxes past their allocation; `truncatePad` clamps
+content). The sort indicator sits at the top right of the search
+panel with the input width reserved so it never overlaps the border,
+and the value is accent-bold with a friendly label. **The default sort
+is `trendingScore`** (owner round — browse *and* search start at
+"trending", HF-site parity); the **`s` key** (owner round: renamed from
+`t`) cycles trending → downloads → likes → newest → updated. There is
+**no `search: ` prompt** — the panel's `search` title makes it
+redundant (owner round); the placeholder reads `search Hugging Face…
+(empty = browse)`. **The search bar is part of the tab cycle**: tab cycles search → results → quants → search; esc still backs
+out one step. **The focused panel's border lights up** (`BorderFocus`,
+the router-mode pattern) — search / results / quants panels; the info
+and card panels are display-only. Result rows are colored (titles
+Subtle, descriptions Muted, selection accent-bold on reversed
+background). **Browsing without a search term works** — an empty query
+lists the top GGUF repos by the current sort (the placeholder reads
+`search Hugging Face… (empty = browse)`).
+
+- **focusSearch** — a `bubbles/textinput` line inside its thin box
+  (accent-bold `search: ` prompt). Typing goes to it; `enter` runs the
+  search — or, with an empty query, **browses** the top GGUF repos by
+  the current sort (gen-guarded async, shield + `esc: cancel` like
+  §16.6); `esc` returns to Main. The input is re-shown pre-filled with
+  the last query so edits re-search. (Sort cycling and the filters
+  live in the results zone — every printable key must type, the §16.5
+  modifier precedent.)
+- **focusResults** — a `bubbles/list` (the §16.5 repoPicker delegate
+  shape: **arrows-only** keymap — page jumps, help, and quit unbound —
+  no chrome, colored rows) over the results; row = `org/repo`,
+  description = `Nk downloads · N likes · <languages> · license: <id>`
+  (languages = the bare tag codes, space-joined; license pulled from
+  `tags`). Moving the cursor (or a fresh search's first hit) runs the
+  auto-fetch: the §16.6 async discipline (cancellable ctx, per-request
+  gen counter, `ctx.Canceled` re-raised by the adapter because the
+  §16.2 client swallows it — the item-6 gotcha, hfcheck.go:64–77), but
+  **background** — no full-screen shield (that would flicker during
+  fast navigation): the pane shows an inline `loading quants…` line and
+  a superseded fetch is cancelled and gen-dropped. `esc` returns to
+  focusSearch. In this zone **`s` cycles sort trending → downloads →
+  likes → newest → updated** (re-runs the same query, same gen guard)
+  and `l`/`L`/`k`/`m` open the filters (below).
+- **Right column — three titled panels** (owner round), stacking to the
+  results height so the column bottom-aligns:
+  1. **model info** (content-sized) — repo name (accent bold); the
+     **params line** `8B params · from <base_model>` (count
+     StatusReady-green, "from" Muted, base Subtle; **name-derived** —
+     the search API has no params field, so `paramCountOf` regexes the
+     `8B`-style suffix out of the base-model/repo id, a flagged display
+     heuristic; missing values render as blank rows); a blank line; 
+     `↓ N downloads` (count green) and `♥ N likes` (count accent);
+     `© license: <id>` (the non-commercial `▲` marker folds into this
+     row) and `▷ task: <pipeline_tag>` (the `mmproj` note folds in).
+     **The panel is ALWAYS exactly 7 rows** (owner round: name,
+     params·from, blank, downloads, likes, license, task) — any missing
+     value keeps its row blank, so the quants/card panels below never
+     shift.
+  2. **quants (N)** — a **fixed 5-row window** (owner round: the panel
+     is a short 7-line box — title border + 5 rows + bottom border —
+     so the model card panel below gets every freed line); the window
+     follows the cursor (standard list behavior) and the `quants (N)`
+     title carries the total count. Rows `Tag — hf.HumanSize(Size)`
+     with the size in Muted plus the green `● cached` badge when
+     `storage.Lookup(root, repo)` marks it (the storage.go:764–769
+     logic); the mmproj note lives in the model info panel now (repo
+     level, and the quants box has no spare slot). This panel is the
+     tab focus target of the quants zone: ↑/↓ select a quant, enter
+     opens the hand-off dialog.
+  3. **model card** — the README text, fetched alongside the quants
+     (new `hf.Client.Card` — `GET {endpoint}/{repo}/raw/main/README.md`,
+     the §16.6 async discipline with its own gen/cancel; YAML
+     frontmatter trimmed — **robustly**: some cards put HTML comments
+     before the frontmatter, so the first `---` line is found anywhere
+     in the card head, owner round), then **rendered from markdown to
+     styled lines** (`internal/tui/markdown.go` — goldmark v1.7.11 +
+     GFM, a custom `cardRenderer` emits lipgloss-styled text instead
+     of HTML). Renderer notes (round 7): the custom renderer registers
+     at **priority 100** — `extension.GFM` adds its own HTML table
+     renderer at 500 and goldmark lets the LAST registered func win,
+     so without the lower priority raw `<table>`/`<th>` HTML leaked
+     into cards (owner report: unsloth cards); **blank lines follow a
+     sections-only policy** (owner round): headings, thematic breaks,
+     code blocks, tables and lists get one blank line before AND after
+     them, while consecutive paragraphs flow together (thematic breaks
+     and tables used to drop their after-blank entirely — fixed;
+     **consecutive quoted lines flow together** — goldmark parses
+     `> a` blank-separated lines as separate Blockquote nodes, and the
+     inner paragraph's newline already separates them, so only the
+     last line of a quoted run adds the trailing blank;
+     **list items add their newline only when the content didn't end
+     with one** — blank-separated `*`/`-` items are Paragraph-wrapped
+     (their paragraph newline already separates them; without the
+     guard every bullet got a blank after it, owner report:
+     RichardErkhov/microsoft_-_phi-1-gguf), while simple items are
+     TextBlocks that need the item's own newline);
+     **links and
+     autolinks are OSC 8 terminal hyperlinks** — `ESC]8;;URL ESC\
+     … ESC]8;; ESC\\` — so ctrl/cmd-click opens the URL in the
+     user's browser (owner round); **the OSC 8 wrap is the OUTERMOST
+     transformation** — a style applied after it (e.g. a heading
+     wrapping the link) would mangle the escape sequence and kill
+     ctrl+click (owner report: the Guide! link inside the unsloth
+     card's heading). **Emoji-capable runes are stripped** — READMEs
+     carry ✨/⚡/♥+VS16 etc. that render at width 2 in emoji-aware
+     terminals while runewidth counts 1; the cursor drifts, lines wrap,
+     and the whole view overlaps (owner report: the layout broke when
+     the unsloth Qwen3-Coder card loaded after 's'; tmux rendered it
+     clean because its font uses width 1). `stripWidthAmbiguous`
+     removes the emoji-capable ranges + variation selectors + format
+     controls from card text and result descriptions (width-2 CJK is
+     kept — runewidth and terminals agree there), and the browser's own
+     icons use width-safe glyphs (↓ ♥\ufe0e © ▲ instead of ⬇ ♥ ⚖ ⚠).
+     **The panel never re-styles card lines** — the
+     renderer bakes a Subtle base color into plain text, and
+     cardPanelLines passes the lines through untouched, because a
+     lipgloss re-style strips the OSC 8 sequences (links rendered but
+     dead) and a corrupted one garbles the whole view (owner report:
+     's' broke the layout once a link line was on screen); raw HTML
+     skipped; tables render
+     cell-separated (`a │ b`). Windowed and scrollable — **`pgup`/
+     `pgdown` scroll the card from ANY zone** (owner round: moved out
+     of the quants-zone key handler into the browser-wide routing; the
+     footer advertises `pgup/pgdn` in every zone, compactly; **the
+     footer (and flash/filter lines) are clamped to the content width
+     and the empty-label shortcut emits no trailing space** — the outer
+     box sizes itself to its widest line and Place cannot shrink it, so
+     an unclamped footer pushed the box past the terminal, clipping the
+     right edge of the whole view on narrow terminals (owner report:
+     's' broke the layout — the results-zone footer is the widest, and
+     `shortcut("pgup/pgdn", "", …)` added a trailing space making it 71
+     chars, overflowing anything ≤ 77 cols)) — with a
+     **scroll indicator** `NN% ▰▱▱▱▱▱▱▱▱▱` (10-dot bar filling as you
+     scroll). Friendly non-blocking states: `loading card…`, `no model
+     card` (404), `could not load model card` (other). The panel takes
+     the column's remaining height — `quantsH = min(7, rem)`,
+     `cardH = rem - quantsH` — so the card grows as much as the
+     terminal allows. **The Preferences theme reaches the browser**:
+     Root.applyTheme (Settings save / `t` cycle) pushes the resolved
+     palette into every live mode — the browser (and the Storage
+     manager) are lazily created once and reused, so a theme changed
+     after their creation must still apply (`SetTheme`; the rendered
+     card is re-rendered under the new theme, and the results list is
+     rebuilt — its delegate captures palette colors at creation, so it
+     would otherwise stay on the stale palette, the owner's remaining
+     report after the first push; the cursor survives the rebuild).
+- **focusQuants** — the quant list with its own cursor (↑/↓); `enter`
+  on a quant opens the **hand-off dialog** (below); a repo with no
+  GGUF quants shows a `use org/repo without a quant` row that hands
+  off the **bare** id (same semantics as the chooser's esc-saves-bare
+  and §16.6's Save path); while a fetch is in flight `enter` is a
+  no-op. `esc` returns to focusResults.
+
+Tab / Shift+Tab **toggle the results/quants pair** (the pane follows
+the cursor, so tab just picks which side you act on); from the search
+box either direction lands on the results. The footer is **zone-
+aware** (owner): the quants zone advertises `↑/↓ quant · enter hand off
+· tab results · esc back`, the results zone `↑/↓ navigate · tab quants
+· l/L filter · t sort · esc search`. Each zone's key handling is
+exclusive (the same "overlay handlers run on EVERY message" discipline
+— zone messages are consumed in `Update` before anything else).
+
+**Filters (`l` / `L` / `k` / `m`, results zone).** Curated overlays —
+the §16.6 dialog pattern (boxed, height-capped huh select, dedicated
+slot `tagFilter *huh.Form` + `tagFilterVal`). The keys live in
+**focusResults**, not focusSearch: the search box must own every
+printable key (typing `llama` starts with `l`), the same reason §16.5's
+picker hotkey is a modifier (`ctrl+o`) — the owner's keys are
+preserved, just where no text entry happens:
+
+- `l` — **language**: `all languages`, en, es, de, fr, it, pt, ja, zh,
+  ko, ru, ar, hi, th, multilingual → `Filter: ["ja"]`.
+- `L` — **license**: `any license`, apache-2.0, mit, llama3.1/3.2/3.3,
+  gemma, openrail, cc-by-nc-4.0, other → `Filter: ["license:<id>"]`.
+- `k` — **task** (owner round; verified server-side): `any task`,
+  text-generation, translation, text2text-generation,
+  feature-extraction, sentence-similarity, image-text-to-text → the
+  `pipeline_tag` query param (a new `SearchOpts.PipelineTag` field).
+- `m` — **params min/max** (owner round): a boxed two-input form (min /
+  max in billions, empty = none). **Client-side and page-scoped** — the
+  search API has no params field, so the filter prunes the fetched page
+  through the name-derived `paramCountOf` heuristic (repos whose count
+  is unparseable are kept); the header shows `filter: 7B-70B`.
+
+Language/license/task combine into the request (`filter=gguf,ja,
+license:apache-2.0` + `pipeline_tag=text-generation` — all verified
+server-side), re-run with the same gen guard as sort changes; the
+params filter applies locally on top. Each picker's clear row (`all
+languages` / `any license` / `any task` / empty-empty) resets it; esc
+**dismisses without changing the filter**. The header renders the
+active filters (`filter: en · apache-2.0 · text-generation · 7B-70B`,
+key hint `(l/L/k/m)`). Escaping a tag uses the same per-segment rule as
+the query. The curated lists are package-level constants (the "same
+helpers" rule — the picker options and the request assembly both read
+from them), so the two surfaces can never disagree.
+
+**Hand-off dialog.** `enter` on a quant (or the no-quant row) opens a
+boxed, height-capped huh select — the §16.6 dialog pattern
+(hfFail/hfQuant: dedicated slot, `overlayBox`, `maxRows` = height −
+overhead):
+
+- **`add to config`** → emits `browserConfigHandoffMsg{id}`. Root opens
+  the config editor's **new-model form pre-filled**: `configEntry`
+  (root.go:450) gains `prefillHF string`; `openConfig` sets a new
+  `ConfigMode.prefillHF` and `openNewModelForm` (config.go:844) seeds
+  the staging `source = sourceHF` and `hf = prefillHF` instead of `""`
+  (cleared after use). The pre-fill goes through the staging-pointer +
+  `RefreshValue()` path, so `edited` stays false and the §16.6 check
+  does **not** fire on the pre-filled id (correct: it was never typed).
+  The form opens on the alias field; the user names the model and saves
+  normally (the existing save flow, P8).
+- **`download now`** → emits `browserDownloadHandoffMsg{id}`. Root opens
+  the Storage manager (`openStorage()`, reusing the live instance so
+  existing downloads survive) and starts the download directly:
+  `splitRepoQuant(id)` → `r.storage.startDownload(repo, quant)` +
+  `rebuild()` + `focusDownloadRow()` (the openStorage pattern,
+  root.go:573–593). Downloads stay in the manager — the single place
+  downloads are managed (§16.4); the browser never spawns its own rows.
+- **`cancel`** → closes the dialog, stays on the quant pane.
+
+`esc` in the dialog = cancel. Errors during the quant fetch (not-found /
+gated / network / HTTP — the §16.2 kinds) flash the distinct message in
+the browser footer and leave the pane on the metadata-only state, so the
+user can still hand off the bare id (mirrors §16.6's Save path). The
+runner-nil case (search disabled) also disables hand-off (flash only).
+
+**Routing and state.** `BrowserMode` fields: `query string`, `input
+textinput.Model`, `sort string`, `filterLang, filterLic, filterTask
+string`, `paramMin, paramMax float64` (billions; 0 = none),
+`allResults []hf.SearchResult` (the fetched page; the displayed
+`results list.Model` is the params-filtered view), `zone browserZone`,
+`selected *hf.SearchResult`, `quants []hf.QuantOption`, `cached
+map[string]bool`, `mmproj bool`, `quantsLoaded/quantsLoading bool`,
+`quantIdx int`, `searchGen/quantGen` counters + `quantCancel
+context.CancelFunc` (the pane's fetch is cancelled on navigation; the
+search keeps the `shield` popup), `handoff *huh.Form` + `handoffVal`,
+`tagFilter *huh.Form` + `tagFilterVal` (kinds `lang`/`lic`/`task`),
+`paramsForm *huh.Form` + `paramsMinVal/paramsMaxVal`, `flash string`.
+`SetSize` propagates to the textinput/list/dialogs like `StorageMode`'s.
+Stale-result discipline (the item-6 gotcha): a done msg whose gen
+mismatches the current request is dropped — a stale search may never
+overwrite a newer query's results, and a stale quant fetch (user
+selected another repo meanwhile) may never fill the pane. The search
+shield's esc also bumps the gen, so a done msg landing just after a
+cancel is dropped (cancel-then-complete race).
+
+**Determinism and tests (P9).**
+
+- `hf/search_test.go` against `httptest.Server` (the §16.2 style): URL
+  path + query assembly (`filter=gguf` always; `search` absent when
+  empty; **filter-tag assembly** — `Filter: []string{"ja"}` →
+  `filter=gguf,ja`, `["ja","license:apache-2.0"]` →
+  `filter=gguf,ja,license:apache-2.0`, order preserved, escaping;
+  limit/sort/direction; query escaping incl. `+`/spaces);
+  Bearer header with and without `HF_TOKEN`; response parse (id,
+  downloads, likes, tags, pipeline_tag; absent fields → zero values);
+  `full=true` not requested; 404/401/transport → typed kinds; empty
+  list; malformed JSON → error.
+- Browser flow tests with a **stub runner** (the stubSpawner pattern,
+  `SetBrowserRunner`): type query → enter → results render and the
+  **panes auto-follow the first hit** (no enter on a result);
+  navigating with ↓ auto-updates the right column (metadata instantly,
+  quants + card async, superseded fetches cancelled/gen-dropped) with
+  `(cached)` markers (fake hub cache trees via `storage.Lookup`, the
+  scan_test fixture style) + mmproj note + the `● cached` badge; tab →
+  quants → enter on a quant → hand-off dialog → **add to config**
+  yields `browserConfigHandoffMsg{org/repo:QUANT}` and Root's arm opens
+  ConfigMode with the new-model form pre-filled source=hf,
+  hf=`org/repo:QUANT` (assert the form's staging, and that no
+  `hfCheckRequestedMsg` fires — pre-filled, not typed); **download
+  now** yields `browserDownloadHandoffMsg` and Root's arm opens the
+  Storage manager with a running download row for the split repo/quant
+  (stub engine); esc paths at every zone and the dialog; the search
+  shield renders static text and its esc bumps the gen (cancel-then-
+  complete race); gen-mismatch drop (stale search, quant, and card
+  msgs); the no-quant bare hand-off row; the sort cycle (s key,
+  trending default) re-runs the search; **card panel** — README text
+  rendered frontmatter-trimmed, 404 → `no model card`, pgup/pgdown
+  scroll with ▴/▾ indicators; **quants window** — the panel windows
+  its rows with a `▾ more` marker and the window follows the cursor;
+  **width-fit regression** — no rendered line may exceed the terminal
+  width (the lipgloss Width-wrap bug); **per-rune typing regression**
+  (keystrokes arrive one rune at a time — "mistral" must type, s/l/L
+  must not hijack the input); **`l`/`L` tag filters** — the picker
+  opens, picking `ja` re-runs the search with `Filter: ["ja"]`,
+  picking a license appends `license:<id>`, both combine in one
+  request, `all languages`/`any license` clear, esc dismisses without
+  changing, header shows the active filters; **metadata pane** — stub
+  results with `base_model:quantized:<id>` render the
+  `quantized from` line, `license:cc-by-nc-4.0` renders the
+  non-commercial warning, language codes render in the pane and the
+  result row; runner nil → search flash, no crash.
+- Root dispatch: `b` opens ViewBrowser from both Main states (idle +
+  reattach); shortcut-row and help text updated; size propagation and
+  `forward`/`View` wiring (the §16.4 checklist).
+- Snapshot tests render the browser in-process with the stub runner:
+  empty search, results + metadata pane, quant pane with a cached
+  marker, hand-off dialog — deterministic (no network, no timing).
+
+**File map.** New `internal/hf/search.go` + `search_test.go`.
+New `internal/tui/browser.go` + `browser_test.go` (BrowserMode, the zone
+state, search/quant-fetch cmds + gen counters, shield, tag-filter
+overlays (`l`/`L`) + the curated constants, hand-off dialog,
+the two hand-off messages, runner interface).
+`internal/tui/hfcheck.go` — extract `quantRowLabel` (chooser + browser
+share it). `internal/tui/root.go` — `ViewBrowser`, `b` key + dispatch,
+`openBrowser` + lazy `browserRunner`, size/forward/View wiring, the two
+hand-off msg arms (`browserConfigHandoffMsg` → openConfig prefill;
+`browserDownloadHandoffMsg` → openStorage + startDownload +
+focusDownloadRow). `internal/tui/config.go` — `prefillHF` field + the
+`openNewModelForm` seeding branch; `configEntry` gains `prefillHF`.
+`internal/tui/main.go` — `b browse` shortcut + help line. `DESIGN.md`
+§16.7 + §7.5 mode list + §14.2 browser bullet (same change, P5). No
+changes to the config schema, `internal/storage`, or ROADMAP.

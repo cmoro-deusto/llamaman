@@ -202,7 +202,7 @@ no new llama-server interaction.
 
 ---
 
-## 3. Release 2 — "Acquisition" (Theme 2)
+## 3. Release 2 — "Storage Manager" (Theme 2)
 
 **Goal:** remove the biggest setup friction — getting model files onto disk
 with confidence and managing them.
@@ -211,34 +211,45 @@ with confidence and managing them.
 
 - **Decision (owner):** managed downloads write into **llama.cpp's HF cache
   layout by default**, with an optional `preferences.models-dir` override.
-- Cache layout to match (verified in llama.cpp `common/hf-cache.cpp`):
-  - `$LLAMA_CACHE`, else `~/.cache/llama.cpp`, else the Hugging Face hub
-    layout `~/.cache/huggingface/hub` (for reading legacy files).
-  - Repo folder form: `<org>__<model>/<file>` via `repo_to_folder_name`.
+- Cache layout to match (verified in llama.cpp `common/hf-cache.cpp`;
+  amended per DESIGN §16.1, owner-confirmed):
+  - `$LLAMA_CACHE`, else `$HF_HUB_CACHE`, else `$HUGGINGFACE_HUB_CACHE`,
+    else `$HF_HOME/hub`, else `$XDG_CACHE_HOME/huggingface/hub`, else
+    `~/.cache/huggingface/hub` (first set wins).
+  - Repo folder form: `models--<org>--<model>/<file>` via
+    `repo_to_folder_name` (HF hub layout). The legacy llama.cpp layout
+    (`~/.cache/llama.cpp`, `<org>__<model>` folders / flat
+    `<org>__<repo>__<file>` files) is tolerated for reads.
+  - **Amendment:** the earlier wording (`~/.cache/llama.cpp` chain,
+    `<org>__<model>` folders) described llama.cpp before PR #20775, which
+    switched llama.cpp to the standard HF hub layout. The verified current
+    layout above is the default; the legacy forms are read-only.
 - **Why:** one copy on disk shared with `llama-cli` and `--hf-repo`; the
   router's `(cache)` tags in run mode line up with managed downloads.
 - **Risk (accepted):** llama.cpp may change cache layout in a release; the
   reader tolerates both known layouts and warns on unrecognized ones.
 
-### 3.2 Managed downloads
+### 3.2 Launch path: delegated downloads (amended — owner decision C)
 
-- **What:** llamaman downloads the GGUF itself with a live progress bar in the
-  TUI; supports pause/resume (`HTTP Range`), sha256 verification, and clear
-  failure messages.
-- **HF API surface (for implementation):**
+- **Decision (owner):** `hf` models stay **fire-and-forget `--hf-repo`**.
+  llama.cpp downloads at server start, cache-first (verified:
+  `get_repo_files` API list → `get_cached_files` fallback), with `Range`
+  resume, blob dedup by sha256 oid, `mmproj` sidecars, and gated-repo tokens
+  (`HF_TOKEN` env / `--hf-token`). Live progress is already visible in the
+  run-mode panel via the §15.4 tolerant classifier (llama.cpp's
+  `downloading … %` lines).
+- **No managed download on the launch path** — no `--model <cached path>`
+  takeover, no download overlay in run mode. Cancelling a startup download =
+  kill the server; resuming = relaunch (Range makes it cheap).
+- **HF API surface** (for implementation; consumed by the §3.4 manager's
+  download action, the quant picker, and the browser):
   - File list + sizes + LFS sha256: `GET /api/models/{repo}/tree/main`
   - Repo metadata: `GET /api/models/{repo}`
   - Download: `GET https://huggingface.co/{repo}/resolve/main/{file}`
     (Range-supported)
-- **Flow change:** an `hf` model in config is no longer fire-and-forget
-  `--hf-repo`. llamaman checks the cache first; if absent, downloads with
-  progress, then runs `--model <cached path>`. If the file is already cached,
-  behavior is identical to today (single copy, no re-download).
-- **Token support (default, unless vetoed):** gated repos via `HF_TOKEN` env
-  or a config token; passed to both the downloader and (when delegating) the
-  server.
-- **mmproj:** multimodal projectors are downloaded alongside the model when
-  the repo provides one (mirrors llama.cpp's `--hf-repo` behavior).
+- **Token:** gated repos via `HF_TOKEN` env — used by llama.cpp when
+  delegating and by the manager's download action. A config token
+  (`preferences.hf-token`) stays an open question for the §3.4 design note.
 
 ### 3.3 Quantization picker
 
@@ -247,10 +258,16 @@ with confidence and managing them.
   per quant (wired to §4.2's estimator — see synergies, §6).
 - The chosen quant becomes the `location`/`hf` entry in config.
 
-### 3.4 Storage manager
+### 3.4 Storage & Downloads manager
 
-- **What:** a TUI view listing local models + HF-cache files with sizes,
-  free disk space, and delete-with-confirmation.
+- **What:** a TUI view (new mode from Main) — the **single place** where
+  downloads are managed. Lists local models + HF-cache files with sizes, free
+  disk space, in-flight download state, and delete-with-confirmation.
+- **Download action (owner decision C):** "download now" pre-fetches
+  `org/repo:quant` into the cache using the HF API client (§3.2 surface):
+  pause/resume (`Range`), sha256 verification, clear failure messages. Launch
+  stays delegated (§3.2); this action is prefetch and management only — the
+  run-mode panel keeps just the passive §15.4 progress, no download UI there.
 - Needs the cache-layout reader from §3.1; respects `preferences.models-dir`.
 - Delete only removes files llamaman can account for (cached downloads,
   managed models); never deletes config entries without asking.
@@ -268,8 +285,10 @@ with confidence and managing them.
 ### 3.6 Router-mode interaction (design note)
 
 - llama.cpp's router downloads models **internally** (child processes fetch
-  via the cache). Managed downloads therefore apply cleanly to single-model
-  runs; in router mode llamaman can only *surface* progress.
+  via the cache). Manager-only downloads (prefetch into the shared cache,
+  §3.4) therefore apply to router and single-model runs alike; llama.cpp's own
+  download progress is only *surfaced* (the §15.4 classifier and the manager's
+  listing of in-flight state).
 - Deferred decision (implementation time): rewrite router presets to point at
   locally managed files vs. leave router downloads to llama.cpp. Not a
   user-visible promise in this release.
@@ -277,11 +296,48 @@ with confidence and managing them.
 ### 3.7 Suggested order within Release 2
 
 1. Hybrid storage + cache-layout reader
-2. HF API client (shared by downloader, quant picker, browser)
-3. Managed downloads + progress
-4. Quantization picker
-5. Storage manager
-6. HF model browser
+2. HF API client (shared by the manager's download action, quant picker,
+   §3.8b repo check, browser)
+3. Quantization picker
+4. Model editor integration — step A: local GGUF picker + cached-repo
+   list (§3.8; makes the config editor the reader's first consumer)
+5. Storage & Downloads manager (its download action is the managed
+   downloader)
+6. Model editor integration — step B: typed-repo existence check + quant
+   offer (§3.8)
+7. HF model browser
+
+### 3.8 Model editor integration (owner decision)
+
+**Goal.** Replace the free-type `location` / `hf` fields of the config
+editor's model form (DESIGN §7.5) with picker-assisted flows, making the
+editor a real consumer of the storage layer (§3.1) and the HF API (§3.2
+surface). No new config fields — the schema is unchanged (P8).
+
+**Step A — local file + cached-repo selection** (needs §3.1; lands right
+after the reader):
+- Local branch: a `bubbles/filepicker` overlay (bubbles v1.0.0, already
+  a dependency) filtered to `*.gguf`, opening in `preferences.models-dir`
+  when set, else the last-used model directory, else `~`. A hotkey in the
+  location input opens it; the free-type input stays as the fallback.
+- HF branch: on opening, build a `huh.Select` from the cache reader
+  (`storage.Scan`, grouped by repo): one option per cached repo, showing
+  its cached quants + sizes. Selecting one pre-fills `org/repo[:quant]`
+  (quant empty when the repo has several). A "type a new repo…" option is
+  always present; an empty cache skips the list.
+- Reuses the `paramPicker` overlay pattern (a custom picker outside huh,
+  driven by a done message) already in config mode.
+
+**Step B — typed-repo validation + quant offer** (needs items 2 + 3):
+- After the user confirms a typed repo id, one async `tree/main` call
+  (existence + quant list + sizes + LFS sha256 in a single round-trip).
+- On success: offer the quant chooser (shared with §3.3) with real sizes,
+  plus the "fits VRAM" hint when the §14.3 estimator exists (sizes-only
+  before then). `mmproj` presence is informational only — llama.cpp
+  auto-downloads it; presets already have `no-mmproj`.
+- Failures non-blocking (P3): distinct messages for not-found vs gated
+  (401) vs network; the id can still be saved (llama-server surfaces it
+  at launch).
 
 ---
 
@@ -381,7 +437,8 @@ Expected new packages/modes (suggested, not committed):
   picker/preflight)
 - storage/cache-layout reader (inside `internal/hf/` or `internal/storage/`)
 - New TUI surfaces: Settings mode (§2.6), palette cycle (Main mode),
-  load-progress line (run mode), download progress overlay, storage manager
+  load-progress line (run mode), model-editor pickers (GGUF file picker,
+  cached-repo list, quant offer — §3.8), storage & downloads manager
   view, HF browser mode, crash view, saved-slots list
 
 ---
