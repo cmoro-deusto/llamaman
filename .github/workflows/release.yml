@@ -92,4 +92,3 @@ jobs:
           gh release upload "$TAG" "llamaman-bin-${TAG}-aur.tar.gz" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
