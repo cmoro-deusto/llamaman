@@ -977,14 +977,26 @@ not relitigated. Three releases, in priority order 4 → 2 → (3 + 1).
   No new config fields; failures non-blocking (P3).
 - **HF model browser.** Search/browse HF in the TUI (search API,
   `filter=gguf`), metadata display, hand-off into config/download. Largest
-  item; may slip to Release 3 under effort pressure.
+  item; may slip to the backlog (§14.3) under effort pressure.
+- **Paste a llama-server command line (owner decision — next after §16.7).**
+  From the config editor's Models pane, paste a llama-server command line
+  (binary name optional); tokenize, validate against the live
+  `flags.Registry`, and commit — via a confirm step — as a model + preset,
+  a preset on an existing entry, or a preset on a model from a selector.
+  No new config fields (§16.8).
 - **Router note.** llama.cpp's router downloads internally; manager-only
   downloads (prefetch into the shared cache) apply to router and
   single-model runs alike; llama.cpp's own download progress is surfaced
   only. Rewriting
   router presets to local paths is a deferred implementation decision.
 
-### 14.3 Release 3 — Trust & Touch
+### 14.3 Backlog — potential items (formerly Release 3, "Trust & Touch")
+
+**Owner decision (August 2026):** Release 3 is **not** a committed release.
+All items below stay in the roadmap as *potential* items — they are not
+final for implementation; picking any of them up requires a fresh decision
+(and, per ROADMAP §9, a design note first). Item numbers §4.1–§4.6 refer to
+ROADMAP §4.
 
 - **Crash diagnostics & auto-restart.** Crash view (exit code with
   interpretation + log tail) and optional auto-restart with exponential
@@ -3118,3 +3130,91 @@ focusDownloadRow). `internal/tui/config.go` — `prefillHF` field + the
 `internal/tui/main.go` — `b browse` shortcut + help line. `DESIGN.md`
 §16.7 + §7.5 mode list + §14.2 browser bullet (same change, P5). No
 changes to the config schema, `internal/storage`, or ROADMAP.
+
+---
+
+### 16.8 Paste a llama-server command line — config editor import
+
+**Scope.** New config-editor capability (owner-requested): in the Models
+pane, key **`p`** opens a paste box; the pasted llama-server command line
+(the `llama-server` binary name optional — bare flag lists allowed) is
+tokenized, validated against the live `flags.Registry`, and committed —
+through a **confirm step** (P8) — as a model entry + preset, or as a preset
+on an existing entry, or (when no model flag is present) as a preset on a
+model chosen from a selector. It is the argv-text sibling of the
+`modelsini` import mapping (DESIGN §13 precedent), but never executes
+anything. Ships in a new `internal/cmdline/` package plus glue in
+`internal/tui/config.go`. **Non-goals:** no shell execution from the paste
+(the text is never spawned); no config-schema changes (additive v1, P8); no
+reverse "export argv" command; no `$VAR`/`~`/glob expansion.
+
+**Tokenizer (`internal/cmdline.Tokenize`).** POSIX-ish splitting: unquoted
+whitespace separates tokens; `'…'` groups literally; `"…"` groups (no
+expansion); `\` escapes the next character outside quotes; `--flag=value`
+and `-m=value` forms supported (llama.cpp's arg parser accepts both). **No
+expansion** — values are stored literally: the model `Location` is expanded
+later by the existing config-load machinery (`internal/config/load.go`),
+and every other param goes to llama-server literally (exec argv semantics,
+matching how the shell-received string would behave once the shell is gone).
+
+**Validation (`internal/cmdline.Parse(argv, reg)`).** Produces the parsed
+model source (if any), an ordered `config.Params` slice, warnings, and
+errors. The registry is the live `<bin> --help` cache (keyed by binary
+mtime) with the hard-coded fallback set when the binary is missing; keys
+resolve per-alias (`-m`, `--model`, `--model-file` are separate registry
+keys — `flags/parser.go`), so tokens look up directly.
+- **Errors** (block the import; shown in the form with the offending
+  token): a value-flag with a missing value; `--flag=` with an empty value;
+  a known numeric flag with a non-numeric value (e.g. `-ngl abc`); `-m`
+  and `-hf` both present; the same model source repeated.
+- **Warnings** (import proceeds): unknown flags (registry may be stale or
+  the fallback set is in use — the confirm step notes
+  "validated against built-in flag set" in that case); a repeated flag
+  overwritten (last wins — matches llama.cpp and `config.Params.Set`); a
+  `-m` file that does not exist on disk (config validation already warns
+  non-blocking).
+
+**Model source.** `-m/--model` (file) **XOR** `-hf/--hf-repo` (repo).
+`--alias` is extracted as the new model's alias and removed from the preset
+(translate re-emits `--alias`); in the preset-only path it stays in the
+preset (fidelity). Every other flag — including `--host`/`--port` — becomes
+a preset param; preset overrides already win over the auto-emitted host/
+port/alias at launch (translate `overrideSet`).
+
+**Outcomes (chosen in the confirm step).**
+1. **New model:** `-m` → `Location`, `-hf` → `HF` (`org/repo[:quant]`).
+   Alias derived `--alias` > `-m` basename (extension stripped) > repo
+   name; editable in the confirm step; `uniquify` on collision (modelsini
+   pattern).
+2. **Existing model:** exact match on the expanded `Location` or the full
+   `org/repo[:quant]` HF id (a different quant counts as a *different*
+   model — the quant lives in the model's HF field, not the preset) →
+   **preset only**, the existing entry is never mutated otherwise.
+3. **No model flag:** model selector overlay — existing models (alias +
+   source) plus a "＋ create new model…" entry (the parsed params are held
+   until the model exists), reusing the `modelpicker` overlay pattern.
+
+A preset is **always** created (even for a bare `-m`), named via a field in
+the confirm step defaulting to `"pasted"`, uniquified per model.
+
+**Bare `-hf org/repo`** (no `:quant`) chains the existing quant chooser
+(§16.6 machinery) before commit, so every HF entry carries a `:QUANT`.
+
+**Confirm step.** A huh summary form: parsed model (alias + source), the
+preset-name field, a params preview (renderParams-style), and the warnings
+list; errors block commit. Commit writes to the working copy `c.work` via a
+new `applyForm` branch (persisted on `s` — P8).
+
+**Determinism (P9).** Table tests: tokenizer (quotes, escapes, `=`-forms,
+empty input), `Parse` against a synthetic registry (the error-vs-warning
+matrix), outcome routing (new / existing / no-model), alias + preset naming
+and `uniquify`, the preset-only path. TUI: `drainCmds` snapshot of
+paste → confirm → committed working copy with a stub registry.
+
+**File map.** New `internal/cmdline/tokenize.go`, `parse.go`,
+`*_test.go`. `internal/tui/config.go` gains a Models-pane key `p`, a new
+`formKind`, and an `applyForm` branch; the model selector reuses
+`modelpicker.go`. `internal/flags` is unchanged (Lookup reused).
+`modelsini`'s `typedValue`/`sourceOf`/`uniquify` logic is either lifted
+into a shared helper or mirrored deliberately. No changes to `main.go`,
+the config schema, `internal/storage`, or the launch path.
