@@ -320,6 +320,25 @@ func TestDownloadRequiresQuant(t *testing.T) {
 	}
 }
 
+// TestSelectModelFilesSkipsSidecars guards the primary pick: an
+// mmproj-* or dflash-* .gguf (listed first, alphabetically) must never
+// become the downloaded model — llama.cpp's is_model_file excludes the
+// same names (common/download.cpp).
+func TestSelectModelFilesSkipsSidecars(t *testing.T) {
+	files := []RepoFile{
+		{Path: "mmproj-Muse-Glimmer-30B-Q8_0.gguf", Size: 2 << 30},
+		{Path: "Muse-Glimmer-30B-Q8_0.gguf", Size: 5 << 30},
+		{Path: "dflash-kquant.gguf", Size: 1 << 30},
+	}
+	got := selectModelFiles(files, "Q8_0")
+	if len(got) != 1 || got[0].Path != "Muse-Glimmer-30B-Q8_0.gguf" {
+		t.Fatalf("Q8_0 selected %+v, want the model file only", got)
+	}
+	if got := selectModelFiles(files, "KQUANT"); got != nil {
+		t.Fatalf("KQUANT selected %+v, want none (dflash is a sidecar)", got)
+	}
+}
+
 // TestDownloadClientHasNoTimeout pins the owner-reported regression:
 // the 30s API timeout must never apply to downloads — a 16 GiB body
 // read would die mid-stream with "context deadline exceeded". Only ctx

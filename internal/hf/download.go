@@ -263,14 +263,15 @@ func sha256File(path string) (string, error) {
 
 // selectModelFiles picks the files of repo:quant per llama.cpp's
 // find_best_model + get_split_files: first .gguf whose path matches
-// `quant[.-]` (case-insensitive), skipping only non-first split parts,
-// then every file sharing its split prefix.
+// `quant[.-]` (case-insensitive), skipping only non-first split parts
+// and non-model sidecars (mmproj / imatrix / draft heads — llama.cpp's
+// is_model_file), then every file sharing its split prefix.
 func selectModelFiles(files []RepoFile, quant string) []RepoFile {
 	pattern := regexp.MustCompile(`(?i)` + regexp.QuoteMeta(quant) + `[.-]`)
 	var primary *RepoFile
 	for i := range files {
 		f := &files[i]
-		if !isGGUF(f.Path) || !pattern.MatchString(f.Path) {
+		if !isGGUF(f.Path) || isSidecar(f.Path) || !pattern.MatchString(f.Path) {
 			continue
 		}
 		if splitCount(f.Path) > 1 && splitIndex(f.Path) != 1 {

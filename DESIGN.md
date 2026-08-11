@@ -2068,11 +2068,13 @@ only — llama.cpp auto-downloads it), no TUI code in this item.
 **Quant parsing.** The quant lives in the file name, matching llama.cpp's
 `get_gguf_split_info` (verified): strip `.gguf`, then a trailing
 `[-.]([A-Z0-9_]+)` tag (case-insensitive match, uppercased) — e.g.
-`qwen3-UD-Q4_K_XL.gguf` → `UD-Q4_K_XL`, `model-Q8_0.gguf` → `Q8_0`,
-`model-F16.gguf` → `F16`. Split models (`-NNNNN-of-NNNNN`) share one
-quant: their parts group into a single option whose size is the **sum**
-of the parts. Files with no parseable tag fall back to their basename as
-the option name.
+`qwen3-UD-Q4_K_XL.gguf` → `Q4_K_XL` (the `UD-` variant prefix is **not**
+part of the tag; llama.cpp's `find_best_model` matches the strict tag
+as a `tag[.-]` path substring, so `Q4_K_XL` selects the UD file either
+way), `model-Q8_0.gguf` → `Q8_0`, `model-F16.gguf` → `F16`. Split
+models (`-NNNNN-of-NNNNN`) share one quant: their parts group into a
+single option whose size is the **sum** of the parts. Files with no
+parseable tag fall back to their basename as the option name.
 
 **API surface.**
 
@@ -2107,10 +2109,13 @@ func Choose(ctx context.Context, c *hf.Client, repo string) ([]QuantOption, erro
 
 **Determinism (P9).** Table tests on synthetic file lists: real quant
 shapes (Q4_K_M, Q8_0, F16, IQ3_XXS, UD-Q4_K_XL), split files summing,
-case-insensitive tags, no-tag fallback, `.mmproj` excluded from `Quants`
-but detected by `HasMMProj`, non-model files ignored, deterministic
-ordering. `Choose` tested against `httptest.Server` reusing the §16.2
-client.
+case-insensitive tags, no-tag fallback, non-model sidecars excluded
+from `Quants` (basename containing `mmproj`, `imatrix`, `mtp-`,
+`eagle3-`, `dflash-`, `dspark-`, per llama.cpp's `is_model_file` —
+e.g. `dflash-kquant.gguf` or `mmproj-<model>-Q8_0.gguf` never become
+options) but mmproj detected by `HasMMProj`, non-model files ignored,
+deterministic ordering. `Choose` tested against `httptest.Server`
+reusing the §16.2 client.
 
 **File map.** New `internal/hf/quant.go`, `quant_test.go`. No `main.go`,
 TUI, config, or storage changes. DESIGN §14.2 / ROADMAP §3.3 already
@@ -2192,6 +2197,10 @@ s to view`).
   the blob (`finalize_file` behavior) — so llama.cpp reads the result
   directly. Split parts download individually; the model is complete
   only when every part is in place.
+- **Model-file matching** mirrors `find_best_model`: first `.gguf`
+  matching `quant[.-]` (case-insensitive), excluding non-model sidecars
+  (`mmproj`, `imatrix`, draft heads — same `is_model_file` rule as
+  `Quants`) so a `mmproj-*.gguf` never becomes the downloaded model.
 - **Range resume:** a blob already at N bytes (from `<oid>.incomplete`)
   continues with `Range: bytes=N-`; 206 handled, 200 restarts cleanly.
 - **sha256 verify:** after each blob completes, hash it and compare to

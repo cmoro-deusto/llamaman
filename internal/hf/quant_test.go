@@ -8,9 +8,10 @@ import (
 )
 
 // TestQuants covers the §16.3 parsing contract: real quant shapes,
-// split-file summing, case-insensitive tags, no-tag fallback, mmproj
-// exclusion, deterministic ordering (P9). Note the strict tag rule:
-// "qwen3-UD-Q4_K_XL.gguf" extracts to Q4_K_XL (llama.cpp's
+// split-file summing, case-insensitive tags, no-tag fallback, sidecar
+// exclusion (mmproj projectors, draft heads — llama.cpp's
+// is_model_file), deterministic ordering (P9). Note the strict tag
+// rule: "qwen3-UD-Q4_K_XL.gguf" extracts to Q4_K_XL (llama.cpp's
 // get_gguf_split_info), which still selects the UD variant because
 // find_best_model matches tag + "[.-]" as a path substring.
 func TestQuants(t *testing.T) {
@@ -23,6 +24,9 @@ func TestQuants(t *testing.T) {
 		{Path: "big-Q4_K_M-00002-of-00002.gguf", Size: 5 << 30},
 		{Path: "stories260K.gguf", Size: 10 << 20}, // no tag → basename fallback
 		{Path: "vision.mmproj", Size: 1 << 20},     // excluded from Quants
+		{Path: "mmproj-Muse-Glimmer-30B-Q8_0.gguf", Size: 2 << 30}, // sidecar, excluded
+		{Path: "dflash-kquant.gguf", Size: 1 << 30},                // draft head, excluded
+		{Path: "model-imatrix.gguf", Size: 1 << 20},                // calibration data, excluded
 		{Path: "config.json", Size: 100},           // not a model file
 	}
 	quants := Quants(files)
@@ -75,6 +79,14 @@ func TestHasMMProj(t *testing.T) {
 	}
 	if !HasMMProj([]RepoFile{{Path: "vision.MMPROJ"}}) {
 		t.Error("case-insensitive mmproj not detected")
+	}
+	// unsloth-style: the projector ships as a .gguf named mmproj-*.
+	if !HasMMProj([]RepoFile{{Path: "model-Q8_0.gguf"}, {Path: "mmproj-Muse-Glimmer-30B-Q8_0.gguf"}}) {
+		t.Error("mmproj-*.gguf not detected")
+	}
+	// a draft head is not a projector.
+	if HasMMProj([]RepoFile{{Path: "dflash-kquant.gguf"}}) {
+		t.Error("dflash sidecar misdetected as mmproj")
 	}
 }
 
