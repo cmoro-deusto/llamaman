@@ -3199,6 +3199,9 @@ the confirm step defaulting to `"pasted"`, uniquified per model.
 
 **Bare `-hf org/repo`** (no `:quant`) chains the existing quant chooser
 (§16.6 machinery) before commit, so every HF entry carries a `:QUANT`.
+Once the quant is known the source is **re-matched** against existing
+entries: a bare repo that resolves to an existing model's exact quant
+becomes a preset-only import (a different quant still means a new model).
 
 **Confirm step.** A huh summary form: parsed model (alias + source), the
 preset-name field, a params preview (renderParams-style), and the warnings
