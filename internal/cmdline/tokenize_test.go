@@ -34,6 +34,13 @@ func TestTokenize(t *testing.T) {
 			[]string{"-m"}, false},
 		{"dollar and tilde literal", "-m $HOME/x.gguf ~/y.gguf",
 			[]string{"-m", "$HOME/x.gguf", "~/y.gguf"}, false},
+		{"line continuation dropped", "-hf org/repo \\\n    -ngl 99",
+			[]string{"-hf", "org/repo", "-ngl", "99"}, false},
+		{"crlf line continuation dropped", "-m /x \\\r\n    -ngl 1",
+			[]string{"-m", "/x", "-ngl", "1"}, false},
+		{"escaped newline in quotes kept", `--alias "a\
+b"`,
+			[]string{"--alias", "ab"}, false},
 		{"unterminated single quote", "-m 'x", nil, true},
 		{"unterminated double quote", `-m "x`, nil, true},
 		{"dangling backslash", `-m x\`, nil, true},

@@ -454,6 +454,56 @@ func TestPasteQuantChainSurvivesDismiss(t *testing.T) {
 	}
 }
 
+// TestPasteFullFlowThroughLoop drives the ENTIRE paste flow through the
+// real message loop, including accepting the Confirm dialog with the
+// affirmative key — guards the .Value(&confirm) binding (a missing
+// accessor left the staging bool false and produced a spurious
+// "paste canceled" after Add).
+func TestPasteFullFlowThroughLoop(t *testing.T) {
+	cm := pasteMode()
+	c := &cm
+
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	// Multi-line paste with backslash continuations (shell style).
+	text := "-hf acme/Widget:Q4_K_M \\\n    -ngl 99 \\\n    --ctx-size 8192"
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(text)})
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyEnter}) // submit the paste box
+
+	if c.formKind != formPasteConfirm || c.form == nil {
+		t.Fatalf("after paste submit: formKind=%d form=%v", c.formKind, c.form)
+	}
+	if c.pasteMode != pasteNew || c.pasteAlias != "Widget" {
+		t.Fatalf("paste state: mode=%d alias=%q", c.pasteMode, c.pasteAlias)
+	}
+
+	// alias (pre-filled "Widget") → preset name (pre-filled "pasted") → Confirm.
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyEnter})
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyEnter})
+	// Accept with the affirmative key — on the last field, huh's Accept
+	// completes the form in the same keypress.
+	c = drive(t, c, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+
+	if len(c.work.Models) != 3 {
+		t.Fatalf("models = %d, want 3 (committed)", len(c.work.Models))
+	}
+	m := c.work.Models[2]
+	if m.Alias != "Widget" || m.HF != "acme/Widget:Q4_K_M" {
+		t.Errorf("model = %+v", m)
+	}
+	if len(m.Presets) != 1 || m.Presets[0].Name != "pasted" {
+		t.Errorf("presets = %+v", m.Presets)
+	}
+	if _, ok := m.Presets[0].Params.Get("ngl"); !ok {
+		t.Errorf("params missing ngl: %v", m.Presets[0].Params)
+	}
+	if c.flash == "paste canceled" {
+		t.Error("flash = paste canceled — the confirm Add was not honored")
+	}
+	if c.paste != nil || c.formKind != formNone {
+		t.Errorf("paste state not cleared after commit: kind=%d paste=%v", c.formKind, c.paste)
+	}
+}
+
 func TestPasteConfirmCancel(t *testing.T) {
 	c := pasteMode()
 

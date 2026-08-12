@@ -43,6 +43,10 @@ func Tokenize(s string) ([]string, error) {
 			if ch == '"' {
 				inDouble = false
 			} else if ch == '\\' {
+				if i+1 < len(s) && s[i+1] == '\n' {
+					i++ // POSIX line continuation: backslash-newline is dropped
+					break
+				}
 				if i+1 >= len(s) {
 					return nil, fmt.Errorf("dangling backslash inside double quotes")
 				}
@@ -52,6 +56,17 @@ func Tokenize(s string) ([]string, error) {
 				cur.WriteByte(ch)
 			}
 		case ch == '\\':
+			// POSIX line continuation: backslash-newline (or \r\n) is
+			// removed entirely, so a pasted multi-line command with
+			// trailing backslashes tokenizes like the shell saw it.
+			if i+1 < len(s) && s[i+1] == '\n' {
+				i++
+				break
+			}
+			if i+1 < len(s) && s[i+1] == '\r' && i+2 < len(s) && s[i+2] == '\n' {
+				i += 2
+				break
+			}
 			if i+1 >= len(s) {
 				return nil, fmt.Errorf("dangling backslash")
 			}

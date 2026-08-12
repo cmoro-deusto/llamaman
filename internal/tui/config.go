@@ -1103,7 +1103,8 @@ func (c *ConfigMode) openPasteConfirm() tea.Cmd {
 			Title(c.pasteConfirmTitle()).
 			Description(c.pasteConfirmBody()).
 			Affirmative("add").
-			Negative("cancel"),
+			Negative("cancel").
+			Value(&confirm), // required: huh writes the choice into the accessor
 	)
 	form := huh.NewForm(gAlias, gName, gConfirm)
 	return c.installForm(form, formPasteConfirm)
