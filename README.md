@@ -410,6 +410,7 @@ A three-pane master/detail editor:
 | `Shift+↑` / `Shift+↓` | Reorder the focused row (models, presets, or params) |
 | `e` | Edit the highlighted item |
 | `n` | New item (model / preset / param, depending on focused pane) |
+| `p` | Paste a llama-server command line (Models pane — imports a model + preset) |
 | `c` | Duplicate (models and presets, within the same parent) |
 | `k` | Clone preset to another model (Presets pane only — opens a target-model select + new-name input) |
 | `d` | Delete (with confirm where lossy) |
@@ -423,6 +424,8 @@ The new-param picker shows every flag's bare name + parsed help description. Jus
 Form behaviour: forms are `huh` instances mounted via the Bubble Tea message loop. Modal dialogs (kill confirm, restart confirm, save/discard prompt, help) overlay the existing screen rather than blanking it.
 
 The **location** (`location: "~/models/foo.gguf"`) and **HF** (`hf: "org/repo:QUANT"`) fields of the model form carry a **`ctrl+o` picker**: the local picker is a standard file browser (`↑`/`↓` navigate, `enter` selects, `.` toggles hidden files) and the HF picker is a live type-to-filter list of cached repos with `(cached)` markers. Typing an HF id and pressing Enter runs a **typed-repo check** against the hub; a repo that exposes quants is offered the shared quant chooser (`Tag — size`, `(cached)` markers), so `hf: "org/repo"` becomes `hf: "org/repo:Q4_K_M"` in one step — the same chooser the Storage manager uses.
+
+**Paste a command line (`p`, Models pane).** Paste a llama-server command line — with or without the `llama-server` binary name — and it is tokenized, validated against the installed server's flags, and turned into config: a **model + preset** (new model, alias derived from `--alias` > file basename > repo name, editable in the confirm step), a **preset on an existing entry** (matched by the model path or the full `org/repo:quant` id — a different quant is a different model), or, when the command line has no model flag, a **preset on a model you pick** (existing models or "＋ create new model…"). A preset is always created (name defaults to `pasted`). Quotes and escapes are honoured; `$VAR`/`~`/globs are stored literally (the model path is expanded at load like any other config path). Malformed flags (missing/empty values, non-numeric numerics, both `-m` and `-hf`, an invalid HF id) block the import with the offending tokens; unknown flags and overwritten repeats import with warnings. A bare `-hf org/repo` chains the shared quant chooser before committing.
 
 ### Preferences (`p`)
 

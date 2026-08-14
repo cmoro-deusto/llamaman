@@ -977,14 +977,26 @@ not relitigated. Three releases, in priority order 4 → 2 → (3 + 1).
   No new config fields; failures non-blocking (P3).
 - **HF model browser.** Search/browse HF in the TUI (search API,
   `filter=gguf`), metadata display, hand-off into config/download. Largest
-  item; may slip to Release 3 under effort pressure.
+  item; may slip to the backlog (§14.3) under effort pressure.
+- **Paste a llama-server command line (owner decision — next after §16.7).**
+  From the config editor's Models pane, paste a llama-server command line
+  (binary name optional); tokenize, validate against the live
+  `flags.Registry`, and commit — via a confirm step — as a model + preset,
+  a preset on an existing entry, or a preset on a model from a selector.
+  No new config fields (§16.8).
 - **Router note.** llama.cpp's router downloads internally; manager-only
   downloads (prefetch into the shared cache) apply to router and
   single-model runs alike; llama.cpp's own download progress is surfaced
   only. Rewriting
   router presets to local paths is a deferred implementation decision.
 
-### 14.3 Release 3 — Trust & Touch
+### 14.3 Backlog — potential items (formerly Release 3, "Trust & Touch")
+
+**Owner decision (August 2026):** Release 3 is **not** a committed release.
+All items below stay in the roadmap as *potential* items — they are not
+final for implementation; picking any of them up requires a fresh decision
+(and, per ROADMAP §9, a design note first). Item numbers §4.1–§4.6 refer to
+ROADMAP §4.
 
 - **Crash diagnostics & auto-restart.** Crash view (exit code with
   interpretation + log tail) and optional auto-restart with exponential
@@ -2068,11 +2080,13 @@ only — llama.cpp auto-downloads it), no TUI code in this item.
 **Quant parsing.** The quant lives in the file name, matching llama.cpp's
 `get_gguf_split_info` (verified): strip `.gguf`, then a trailing
 `[-.]([A-Z0-9_]+)` tag (case-insensitive match, uppercased) — e.g.
-`qwen3-UD-Q4_K_XL.gguf` → `UD-Q4_K_XL`, `model-Q8_0.gguf` → `Q8_0`,
-`model-F16.gguf` → `F16`. Split models (`-NNNNN-of-NNNNN`) share one
-quant: their parts group into a single option whose size is the **sum**
-of the parts. Files with no parseable tag fall back to their basename as
-the option name.
+`qwen3-UD-Q4_K_XL.gguf` → `Q4_K_XL` (the `UD-` variant prefix is **not**
+part of the tag; llama.cpp's `find_best_model` matches the strict tag
+as a `tag[.-]` path substring, so `Q4_K_XL` selects the UD file either
+way), `model-Q8_0.gguf` → `Q8_0`, `model-F16.gguf` → `F16`. Split
+models (`-NNNNN-of-NNNNN`) share one quant: their parts group into a
+single option whose size is the **sum** of the parts. Files with no
+parseable tag fall back to their basename as the option name.
 
 **API surface.**
 
@@ -2107,10 +2121,13 @@ func Choose(ctx context.Context, c *hf.Client, repo string) ([]QuantOption, erro
 
 **Determinism (P9).** Table tests on synthetic file lists: real quant
 shapes (Q4_K_M, Q8_0, F16, IQ3_XXS, UD-Q4_K_XL), split files summing,
-case-insensitive tags, no-tag fallback, `.mmproj` excluded from `Quants`
-but detected by `HasMMProj`, non-model files ignored, deterministic
-ordering. `Choose` tested against `httptest.Server` reusing the §16.2
-client.
+case-insensitive tags, no-tag fallback, non-model sidecars excluded
+from `Quants` (basename containing `mmproj`, `imatrix`, `mtp-`,
+`eagle3-`, `dflash-`, `dspark-`, per llama.cpp's `is_model_file` —
+e.g. `dflash-kquant.gguf` or `mmproj-<model>-Q8_0.gguf` never become
+options) but mmproj detected by `HasMMProj`, non-model files ignored,
+deterministic ordering. `Choose` tested against `httptest.Server`
+reusing the §16.2 client.
 
 **File map.** New `internal/hf/quant.go`, `quant_test.go`. No `main.go`,
 TUI, config, or storage changes. DESIGN §14.2 / ROADMAP §3.3 already
@@ -2192,6 +2209,10 @@ s to view`).
   the blob (`finalize_file` behavior) — so llama.cpp reads the result
   directly. Split parts download individually; the model is complete
   only when every part is in place.
+- **Model-file matching** mirrors `find_best_model`: first `.gguf`
+  matching `quant[.-]` (case-insensitive), excluding non-model sidecars
+  (`mmproj`, `imatrix`, draft heads — same `is_model_file` rule as
+  `Quants`) so a `mmproj-*.gguf` never becomes the downloaded model.
 - **Range resume:** a blob already at N bytes (from `<oid>.incomplete`)
   continues with `Range: bytes=N-`; 206 handled, 200 restarts cleanly.
 - **sha256 verify:** after each blob completes, hash it and compare to
@@ -2908,7 +2929,18 @@ lists the top GGUF repos by the current sort (the placeholder reads
      controls from card text and result descriptions (width-2 CJK is
      kept — runewidth and terminals agree there), and the browser's own
      icons use width-safe glyphs (↓ ♥\ufe0e © ▲ instead of ⬇ ♥ ⚖ ⚠).
-     **The panel never re-styles card lines** — the
+     **Control runes are neutralized too** — the terminal EXECUTES C0/C1
+     controls instead of printing them (a literal VT in a table cell
+     moves the cursor down a row; CR returns to column 0; a tab jumps
+     to the next tab stop, width 0 in runewidth but N on screen), so a
+     single one garbles the whole panel (owner report: the
+     unsloth/Muse-Glimmer-30B-GGUF benchmark-table header carries a
+     literal VT after "30B" — the layout broke after a few PgDn pages;
+     the same card's 𝛕3-Bench names are math-alphanumeric symbols,
+     U+1D400–U+1D7FF, the same ambiguous-width class as emoji, so that
+     block is stripped as well). They become spaces (card authors use
+     them as separators); \n survives for the parser. **The panel never
+     re-styles card lines** — the
      renderer bakes a Subtle base color into plain text, and
      cardPanelLines passes the lines through untouched, because a
      lipgloss re-style strips the OSC 8 sequences (links rendered but
@@ -3109,3 +3141,94 @@ focusDownloadRow). `internal/tui/config.go` — `prefillHF` field + the
 `internal/tui/main.go` — `b browse` shortcut + help line. `DESIGN.md`
 §16.7 + §7.5 mode list + §14.2 browser bullet (same change, P5). No
 changes to the config schema, `internal/storage`, or ROADMAP.
+
+---
+
+### 16.8 Paste a llama-server command line — config editor import
+
+**Scope.** New config-editor capability (owner-requested): in the Models
+pane, key **`p`** opens a paste box; the pasted llama-server command line
+(the `llama-server` binary name optional — bare flag lists allowed) is
+tokenized, validated against the live `flags.Registry`, and committed —
+through a **confirm step** (P8) — as a model entry + preset, or as a preset
+on an existing entry, or (when no model flag is present) as a preset on a
+model chosen from a selector. It is the argv-text sibling of the
+`modelsini` import mapping (DESIGN §13 precedent), but never executes
+anything. Ships in a new `internal/cmdline/` package plus glue in
+`internal/tui/config.go`. **Non-goals:** no shell execution from the paste
+(the text is never spawned); no config-schema changes (additive v1, P8); no
+reverse "export argv" command; no `$VAR`/`~`/glob expansion.
+
+**Tokenizer (`internal/cmdline.Tokenize`).** POSIX-ish splitting: unquoted
+whitespace separates tokens; `'…'` groups literally; `"…"` groups (no
+expansion); `\` escapes the next character outside quotes; `--flag=value`
+and `-m=value` forms supported (llama.cpp's arg parser accepts both). **No
+expansion** — values are stored literally: the model `Location` is expanded
+later by the existing config-load machinery (`internal/config/load.go`),
+and every other param goes to llama-server literally (exec argv semantics,
+matching how the shell-received string would behave once the shell is gone).
+
+**Validation (`internal/cmdline.Parse(argv, reg)`).** Produces the parsed
+model source (if any), an ordered `config.Params` slice, warnings, and
+errors. The registry is the live `<bin> --help` cache (keyed by binary
+mtime) with the hard-coded fallback set when the binary is missing; keys
+resolve per-alias (`-m`, `--model`, `--model-file` are separate registry
+keys — `flags/parser.go`), so tokens look up directly.
+- **Errors** (block the import; shown in the form with the offending
+  token): a value-flag with a missing value; `--flag=` with an empty value;
+  a known numeric flag with a non-numeric value (e.g. `-ngl abc`); `-m`
+  and `-hf` both present; the same model source repeated.
+- **Warnings** (import proceeds): unknown flags (registry may be stale or
+  the fallback set is in use — the confirm step notes
+  "validated against built-in flag set" in that case); a repeated flag
+  overwritten (last wins — matches llama.cpp and `config.Params.Set`); a
+  `-m` file that does not exist on disk (config validation already warns
+  non-blocking).
+
+**Model source.** `-m/--model` (file) **XOR** `-hf/--hf-repo` (repo).
+`--alias` is extracted as the new model's alias and removed from the preset
+(translate re-emits `--alias`); in the preset-only path it stays in the
+preset (fidelity). Every other flag — including `--host`/`--port` — becomes
+a preset param; preset overrides already win over the auto-emitted host/
+port/alias at launch (translate `overrideSet`).
+
+**Outcomes (chosen in the confirm step).**
+1. **New model:** `-m` → `Location`, `-hf` → `HF` (`org/repo[:quant]`).
+   Alias derived `--alias` > `-m` basename (extension stripped) > repo
+   name; editable in the confirm step; `uniquify` on collision (modelsini
+   pattern).
+2. **Existing model:** exact match on the expanded `Location` or the full
+   `org/repo[:quant]` HF id (a different quant counts as a *different*
+   model — the quant lives in the model's HF field, not the preset) →
+   **preset only**, the existing entry is never mutated otherwise.
+3. **No model flag:** model selector overlay — existing models (alias +
+   source) plus a "＋ create new model…" entry (the parsed params are held
+   until the model exists), reusing the `modelpicker` overlay pattern.
+
+A preset is **always** created (even for a bare `-m`), named via a field in
+the confirm step defaulting to `"pasted"`, uniquified per model.
+
+**Bare `-hf org/repo`** (no `:quant`) chains the existing quant chooser
+(§16.6 machinery) before commit, so every HF entry carries a `:QUANT`.
+Once the quant is known the source is **re-matched** against existing
+entries: a bare repo that resolves to an existing model's exact quant
+becomes a preset-only import (a different quant still means a new model).
+
+**Confirm step.** A huh summary form: parsed model (alias + source), the
+preset-name field, a params preview (renderParams-style), and the warnings
+list; errors block commit. Commit writes to the working copy `c.work` via a
+new `applyForm` branch (persisted on `s` — P8).
+
+**Determinism (P9).** Table tests: tokenizer (quotes, escapes, `=`-forms,
+empty input), `Parse` against a synthetic registry (the error-vs-warning
+matrix), outcome routing (new / existing / no-model), alias + preset naming
+and `uniquify`, the preset-only path. TUI: `drainCmds` snapshot of
+paste → confirm → committed working copy with a stub registry.
+
+**File map.** New `internal/cmdline/tokenize.go`, `parse.go`,
+`*_test.go`. `internal/tui/config.go` gains a Models-pane key `p`, a new
+`formKind`, and an `applyForm` branch; the model selector reuses
+`modelpicker.go`. `internal/flags` is unchanged (Lookup reused).
+`modelsini`'s `typedValue`/`sourceOf`/`uniquify` logic is either lifted
+into a shared helper or mirrored deliberately. No changes to `main.go`,
+the config schema, `internal/storage`, or the launch path.

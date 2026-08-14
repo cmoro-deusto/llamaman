@@ -293,23 +293,38 @@ func (r *cardRenderer) write(s string) {
 }
 
 // stripWidthAmbiguous removes runes whose display width is
-// terminal-dependent (emoji-presentation characters and format
-// controls). A README's ✨, ⚡, ♥ etc. render at width 2 in emoji-aware
-// terminals while lipgloss counts 1 — the cursor drifts, lines wrap,
-// and the whole view overlaps (owner report: the layout broke when a
-// card with emoji loaded after pressing 's'; tmux reproduced a clean
-// screen because its font renders them width 1). Width-2 CJK is kept
-// (runewidth and terminals agree on 2, so it is consistent).
+// terminal-dependent (emoji-presentation characters, mathematical
+// alphanumerics, and format controls) and neutralizes control
+// characters. A README's ✨, ⚡, ♥, 𝛕 etc. render at width 2 in
+// emoji-aware terminals while lipgloss counts 1 — the cursor drifts,
+// lines wrap, and the whole view overlaps (owner report: the layout
+// broke when a card with emoji loaded after pressing 's'; tmux
+// reproduced a clean screen because its font renders them width 1).
+// C0/C1 controls are worse: the terminal EXECUTES them instead of
+// printing them — a literal VT moves the cursor down a row, CR returns
+// to column 0, a tab jumps to the next tab stop (width 0 in runewidth
+// but N in the terminal) — so a single one in a table cell garbles the
+// whole panel (owner report: the unsloth/Muse-Glimmer-30B-GGUF
+// benchmark-table header carries a literal VT after "30B"; the layout
+// broke after a few PgDn pages). They become spaces (card authors use
+// them as separators). Width-2 CJK is kept (runewidth and terminals
+// agree on 2, so it is consistent).
 func stripWidthAmbiguous(s string) string {
 	var b strings.Builder
 	for _, r := range s {
 		switch {
 		case r >= 0x2600 && r <= 0x27BF: // Misc Symbols, Dingbats (⚡♥⚖⚠✨…)
 		case r >= 0x2B00 && r <= 0x2BFF: // Misc Symbols and Arrows (⬇…)
+		case r >= 0x1D400 && r <= 0x1D7FF: // Math Alphanumeric Symbols (𝛕…)
 		case r >= 0x1F000 && r <= 0x1FAFF: // Emoji blocks
 		case r >= 0xFE00 && r <= 0xFE0F: // Variation Selectors (VS16 forces emoji)
 		case r == 0x200D || r == 0x200E || r == 0x200F: // ZWJ + bidi marks
 		case r >= 0x2060 && r <= 0x206F: // invisible format chars
+		case r == 0x2028 || r == 0x2029: // line/paragraph separators (variable-width tofu)
+		case r == '\n': // structural newline the markdown parser needs
+			b.WriteRune(r)
+		case r < 0x20 || (r >= 0x7F && r <= 0x9F): // C0/C1 controls → one space
+			b.WriteByte(' ')
 		default:
 			b.WriteRune(r)
 		}

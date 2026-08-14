@@ -286,8 +286,9 @@ with confidence and managing them.
   repo+quant straight into the config or a download.
 - **HF API:** search endpoint with library filter (`filter=gguf`).
 - **Scope note:** this is the largest single item in the roadmap; if effort
-  pressure appears, it can slip to Release 3 — its consumers (config editor,
-  downloader) ship without it.
+  pressure appears, it can slip to the backlog (§4) — its consumers (config
+  editor, downloader) ship without it. (Shipped in Release 2; note kept for
+  history.)
 
 ### 3.6 Router-mode interaction (design note)
 
@@ -313,6 +314,7 @@ with confidence and managing them.
 6. Model editor integration — step B: typed-repo existence check + quant
    offer (§3.8)
 7. HF model browser
+8. Paste a llama-server command line (§3.9 — owner decision: **next**)
 
 ### 3.8 Model editor integration (owner decision)
 
@@ -346,12 +348,58 @@ after the reader):
   (401) vs network; the id can still be saved (llama-server surfaces it
   at launch).
 
+### 3.9 Paste a llama-server command line (owner decision — next)
+
+**What:** in the config editor's Models pane, key **`p`** opens a paste box;
+the pasted llama-server command line (the `llama-server` binary name
+optional — bare flag lists allowed) is tokenized, validated against the
+live `flags.Registry`, and committed — through a **confirm step** (P8) — as
+a model + preset, as a preset on an existing entry, or (no model flag
+present) as a preset on a model from a selector. The argv-text sibling of
+the `modelsini` import (§13); never executes anything.
+
+- **Parsing (`internal/cmdline`):** POSIX-ish tokenizer (whitespace split,
+  `'`/`"` quoting, backslash escapes, `--flag=value` / `-m=value`); **no**
+  `$VAR`/`~`/glob expansion — values stored literally (the model `Location`
+  is expanded later by the config loader; other params pass to llama-server
+  literally).
+- **Validation vs. the registry** (live `--help` cache, fallback set when
+  the binary is missing): **errors** (block) — value-flag missing its
+  value, empty `--flag=`, non-numeric value for a known numeric flag,
+  `-m`+`-hf` together, same source repeated. **Warnings** (import
+  proceeds) — unknown flags (with a "validated against built-in flag set"
+  note when the fallback is in use), repeated flag overwritten (last wins),
+  `-m` file not found.
+- **Model source:** `-m/--model` XOR `-hf/--hf-repo`; `--alias` becomes the
+  new model's alias (kept in the preset on the preset-only path). All other
+  flags — incl. `--host`/`--port` — become preset params (preset overrides
+  win at launch).
+- **Outcomes:** new model (alias derived `--alias` > file basename > repo
+  name, editable, uniquified); existing model (exact match on expanded
+  `Location` / full `org/repo[:quant]` — a different quant is a different
+  model) → preset only; no model flag → selector (existing models + "＋
+  create new model…"). A preset is **always** created (name field, default
+  `"pasted"`, uniquified). Bare `-hf org/repo` chains the §16.6 quant
+  chooser before commit.
+- **No config-schema changes** (additive v1, P8).
+
+**Design note:** DESIGN §16.8. **File map:** new `internal/cmdline/`
+(tokenize + parse + tests), `internal/tui/config.go` (Models-pane key `p`,
+new `formKind`, `applyForm` branch), modelpicker overlay reuse.
+
 ---
 
-## 4. Release 3 — "Trust & Touch" (Themes 3 + 1)
+## 4. Backlog — potential items (formerly "Release 3 — Trust & Touch")
 
-**Goal:** make llamaman trustworthy in daily use (it survives crashes, warns
-before bad launches) and *actionable* (it can drive a running server).
+**Owner decision (August 2026):** Release 3 is **not** a committed release.
+Nothing below is final for implementation — these items are potential scope,
+kept in the roadmap so they are not lost. Picking any of them up requires a
+fresh owner decision and, per §9, a design note before code. (The current
+committed release is Release 2 — §3 — extended by §3.9.)
+
+**Goal if ever picked up:** make llamaman trustworthy in daily use (it
+survives crashes, warns before bad launches) and *actionable* (it can drive
+a running server).
 
 ### 4.1 Crash diagnostics & auto-restart
 
@@ -416,13 +464,12 @@ before bad launches) and *actionable* (it can drive a running server).
   browser (`xdg-open http://<host>:<port>/`).
 - **Failure mode:** no `xdg-open` → warning line, no crash.
 
-### 4.7 Suggested order within Release 3
+### 4.7 Backlog order (if ever picked up)
 
 1. Quick test prompt + Web-UI shortcut (small, immediate value)
 2. Crash diagnostics → auto-restart
 3. Pre-spawn checks
-4. VRAM preflight (feeds back into §3.3 only if shipped before Release 2's
-   quant picker — otherwise lands as its own feature)
+4. VRAM preflight
 5. KV-cache pause/resume
 
 ---
@@ -435,18 +482,21 @@ All additive `version: 1` fields:
   - `preferences.theme` (string, Release 1)
   - `preferences.animations` (bool, default true, Release 1)
   - `preferences.models-dir` (string, Release 2)
-  - auto-restart toggle (Release 3; exact shape TBD — `preferences` field
-    and/or CLI flag)
+  - auto-restart toggle (backlog §4.1; exact shape TBD — `preferences`
+    field and/or CLI flag)
 
 Expected new packages/modes (suggested, not committed):
 
 - `internal/hf/` — HF API client + downloader (reused by browser/quant
   picker/preflight)
 - storage/cache-layout reader (inside `internal/hf/` or `internal/storage/`)
+- `internal/cmdline/` — llama-server argv tokenizer/parser for the §3.9
+  paste feature
 - New TUI surfaces: Settings mode (§2.6), palette cycle (Main mode),
   load-progress line (run mode), model-editor pickers (GGUF file picker,
   cached-repo list, quant offer — §3.8), storage & downloads manager
-  view, HF browser mode, crash view, saved-slots list
+  view, HF browser mode, paste box (config editor, §3.9), crash view,
+  saved-slots list
 
 ---
 

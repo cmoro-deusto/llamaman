@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -15,10 +16,12 @@ import (
 
 	"log/slog"
 
+	"github.com/cmoro-deusto/llamaman/internal/cmdline"
 	"github.com/cmoro-deusto/llamaman/internal/config"
 	"github.com/cmoro-deusto/llamaman/internal/flags"
 	"github.com/cmoro-deusto/llamaman/internal/hf"
 	"github.com/cmoro-deusto/llamaman/internal/modelsini"
+	"github.com/cmoro-deusto/llamaman/internal/paths"
 	"github.com/cmoro-deusto/llamaman/internal/storage"
 )
 
@@ -62,6 +65,24 @@ const (
 	formDeleteParam
 	formExitPrompt
 	formExportIni
+	formPasteCmd
+	formPasteConfirm
+	formPastePickModel
+)
+
+// pasteOutcome is what the §16.8 paste-command-line import will do
+// once the confirm step commits: create a new model, add a preset to an
+// existing model (matched by source), add a preset to a model picked
+// from the selector, or add a preset to a model just created through
+// the standard model form.
+type pasteOutcome int
+
+const (
+	pasteNone pasteOutcome = iota
+	pasteNew
+	pasteExisting
+	pastePickExisting
+	pastePickNew
 )
 
 // returnFromConfigMsg pops back to the previous view (main / selection).
@@ -78,6 +99,7 @@ type formStaging struct {
 	name, desc         *string
 	paramKey, paramVal *string
 	exportPath         *string
+	pasteText          *string // §16.8 paste-command-line box
 	confirm            *bool
 	choice             *string
 	targetIdx          *int // for clone-to-model preset form
@@ -118,6 +140,16 @@ type ConfigMode struct {
 	hfQuantVal string        // chooser selection staging (quant tag, or "" = esc → keep bare)
 	hfFail     *huh.Form     // Save/Dismiss dialog after a failed check
 	hfFailVal  string        // dialog selection staging ("save" | "dismiss")
+
+	// §16.8 paste-command-line import staging (Models pane `p`).
+	paste        *cmdline.Result // parsed command line between the paste and confirm forms
+	pasteMode    pasteOutcome    // what the import will do
+	pasteModel   int             // target model index (existing / picked / just-created)
+	pasteAlias   string          // new-model alias (editable in the confirm step)
+	pasteName    string          // preset name (editable in the confirm step)
+	pasteHF      *string         // stable pointer to pasteHFVal for the §16.6 quant chain
+	pasteHFVal   string          // hf staging target written by the quant chooser
+	pastePending bool            // bare-hf quant chain in flight; commit when it resolves
 
 	saveErr error
 	flash   string
@@ -222,6 +254,12 @@ func (c *ConfigMode) Update(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 		if k, ok := msg.(tea.KeyMsg); ok && k.String() == "esc" {
 			c.hfCheck.cancel()
 			c.hfCheck = nil
+			// §16.8: esc during the paste flow's quant chain aborts
+			// the whole import (the confirm form is already gone).
+			if c.pastePending {
+				c.clearPaste()
+				c.flash = "paste canceled"
+			}
 		}
 		return c, nil
 	}
@@ -440,6 +478,12 @@ func (c *ConfigMode) openHFFailDialog(message string) (*ConfigMode, tea.Cmd) {
 func (c *ConfigMode) updateHFFail(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok && k.String() == "esc" {
 		c.hfFail = nil
+		// §16.8: esc on the fail dialog during the paste quant chain
+		// aborts the whole import (there is no HF field to return to).
+		if c.pastePending {
+			c.clearPaste()
+			c.flash = "paste canceled"
+		}
 		return c, nil
 	}
 	next, cmd := c.hfFail.Update(msg)
@@ -449,6 +493,13 @@ func (c *ConfigMode) updateHFFail(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 	if c.hfFail != nil && c.hfFail.State == huh.StateCompleted {
 		save := c.hfFailVal == "save"
 		c.hfFail = nil
+		// §16.8 paste flow: both Save and Dismiss keep the bare id and
+		// commit (non-blocking P3 — llama-server surfaces problems at
+		// launch); there is no HF field to go back to. pastePending is
+		// the one-shot guard — commitPaste clears it.
+		if c.pastePending {
+			return c, c.commitPaste()
+		}
 		if !save || c.form == nil {
 			return c, nil
 		}
@@ -517,6 +568,32 @@ func (c *ConfigMode) updateHFQuant(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 // item-5 gotcha, §16.6).
 func (c *ConfigMode) applyHFQuantChoice(picked bool) (*ConfigMode, tea.Cmd) {
 	c.hfQuant = nil
+	// §16.8 paste flow: the confirm form is already gone; write the
+	// quant into the paste staging pointer and commit. esc = keep the
+	// bare id, enter = org/repo:QUANT — same rule as the model form.
+	if c.pastePending && c.pasteHF != nil {
+		repo := strings.TrimSpace(*c.pasteHF)
+		if picked {
+			if quant := c.hfQuantVal; quant != "" && repo != "" {
+				repo += ":" + quant
+			}
+		}
+		*c.pasteHF = repo
+		c.paste.Source.HF = repo // sync so commitPaste sees the quant
+		// The quant is now known — re-match against existing entries:
+		// a bare -hf that resolves to an existing model's exact quant
+		// becomes a preset-only import instead of a duplicate model.
+		if c.pasteMode == pasteNew && repo != "" {
+			if idx := c.findPasteTarget(c.paste.Source); idx >= 0 {
+				c.pasteMode = pasteExisting
+				c.pasteModel = idx
+				c.pasteName = uniquifyPasteName(c.pasteName, c.pasteTargetPresetNames())
+			}
+		}
+		// pastePending stays set: it is the one-shot guard that stops
+		// commitPaste re-arming the chain; commitPaste clears it.
+		return c, c.commitPaste()
+	}
 	if c.formStaging.hf != nil {
 		repo := strings.TrimSpace(*c.formStaging.hf)
 		if picked {
@@ -537,6 +614,11 @@ func (c *ConfigMode) applyHFQuantChoice(picked bool) (*ConfigMode, tea.Cmd) {
 
 func (c *ConfigMode) updateForm(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok && k.String() == "esc" && c.formKind != formExitPrompt {
+		// §16.8: esc on the model form while "create new model…" is
+		// pending aborts the whole paste import.
+		if c.pasteMode == pastePickNew {
+			c.clearPaste()
+		}
 		c.dismissForm()
 		return c, nil
 	}
@@ -557,6 +639,12 @@ func (c *ConfigMode) updateForm(msg tea.Msg) (*ConfigMode, tea.Cmd) {
 }
 
 func (c *ConfigMode) dismissForm() {
+	// §16.8: a dismissed paste form abandons the import — except when a
+	// bare-hf quant chain is in flight (its confirm form is already
+	// gone and commitPaste still needs the staging).
+	if (c.formKind == formPasteCmd || c.formKind == formPasteConfirm || c.formKind == formPastePickModel) && !c.pastePending {
+		c.clearPaste()
+	}
 	c.form = nil
 	c.formKind = formNone
 	c.formStaging = formStaging{}
@@ -564,10 +652,14 @@ func (c *ConfigMode) dismissForm() {
 	c.locField, c.hfField = nil, nil
 	// Defensive: the check/chooser/dialog overlays are shielded while
 	// active, so nothing here can normally be dismissed mid-flow, but
-	// clear them rather than strand a stale overlay.
-	c.hfCheck = nil
-	c.hfQuant = nil
-	c.hfFail = nil
+	// clear them rather than strand a stale overlay. The paste flow's
+	// armed quant chain must survive the confirm form's dismissal —
+	// its hfCheck is the only live reference to the pending commit.
+	if !c.pastePending {
+		c.hfCheck = nil
+		c.hfQuant = nil
+		c.hfFail = nil
+	}
 }
 
 // installForm wires a freshly constructed huh.Form into ConfigMode,
@@ -696,6 +788,9 @@ func (c *ConfigMode) handleModelsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 	case "n":
 		c.firstRunBanner = false
 		return c, c.openNewModelForm()
+	case "p":
+		c.firstRunBanner = false
+		return c, c.openPasteForm()
 	case "e", "enter":
 		if c.hasModel() {
 			return c, c.openEditModelForm()
@@ -933,6 +1028,305 @@ func hfFormValidator(s string) error {
 		return fmt.Errorf("expected org/repo[:quant]")
 	}
 	return nil
+}
+
+// ---- §16.8 paste a llama-server command line ----
+
+// openPasteForm opens the paste box from the Models pane (`p`). The
+// pasted text is tokenized, validated against the registry, and routed
+// on submit: to the confirm step (model + preset, or preset on an
+// existing entry) or to the model selector when no model flag is
+// present. The text is never executed.
+func (c *ConfigMode) openPasteForm() tea.Cmd {
+	text := ""
+	c.flash = ""
+	c.clearPaste()
+	c.formStaging = formStaging{pasteText: &text}
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewText().
+			Title("paste llama-server command line").
+			Description("e.g.  llama-server -m ~/models/m.gguf -ngl 99 --ctx-size 8192\nbinary name optional · flags only are fine · no shell expansion").
+			Value(&text).
+			CharLimit(8192).
+			Validate(nonEmpty("command line")),
+	))
+	return c.installForm(form, formPasteCmd)
+}
+
+// openPasteModelPicker is the §16.8 selector for a command line with no
+// model flag: pick an existing model to attach the preset to, or create
+// a new one first (the parsed params are held until the model exists).
+func (c *ConfigMode) openPasteModelPicker() tea.Cmd {
+	c.pasteMode = pastePickExisting
+	choice := ""
+	c.formStaging = formStaging{choice: &choice}
+	opts := make([]huh.Option[string], 0, len(c.work.Models)+1)
+	for i, m := range c.work.Models {
+		label := m.Alias + " — " + m.SourceLabel()
+		if m.Location != "" {
+			label += " " + m.Location
+		} else {
+			label += " " + m.HF
+		}
+		opts = append(opts, huh.NewOption(label, strconv.Itoa(i)))
+	}
+	opts = append(opts, huh.NewOption("＋ create new model…", "new"))
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().
+			Title("no model in the command line — pick a target").
+			Description("the parsed flags become a preset on the chosen model").
+			Options(opts...).
+			Value(&choice),
+	))
+	return c.installForm(form, formPastePickModel)
+}
+
+// openPasteConfirm shows the §16.8 confirm step: an editable alias (new
+// models only), the preset name, and a summary (source, params preview,
+// warnings) with an add/cancel confirm. Parse errors block earlier, so
+// this form only ever commits a valid import (P8).
+func (c *ConfigMode) openPasteConfirm() tea.Cmd {
+	if c.paste == nil {
+		return nil
+	}
+	c.pasteName = uniquifyPasteName("pasted", c.pasteTargetPresetNames())
+	confirm := false
+	c.formStaging = formStaging{alias: &c.pasteAlias, name: &c.pasteName, confirm: &confirm}
+	gAlias := huh.NewGroup(
+		huh.NewInput().Title("alias").Value(&c.pasteAlias).Validate(nonEmpty("alias")),
+	).WithHideFunc(func() bool { return c.pasteMode != pasteNew })
+	gName := huh.NewGroup(
+		huh.NewInput().Title("preset name").Value(&c.pasteName).Validate(nonEmpty("preset name")),
+	)
+	gConfirm := huh.NewGroup(
+		huh.NewConfirm().
+			Title(c.pasteConfirmTitle()).
+			Description(c.pasteConfirmBody()).
+			Affirmative("add").
+			Negative("cancel").
+			Value(&confirm), // required: huh writes the choice into the accessor
+	)
+	form := huh.NewForm(gAlias, gName, gConfirm)
+	return c.installForm(form, formPasteConfirm)
+}
+
+// pasteConfirmTitle names the import in the confirm step.
+func (c *ConfigMode) pasteConfirmTitle() string {
+	switch c.pasteMode {
+	case pasteNew:
+		return fmt.Sprintf("add model %q + preset %q", c.pasteAlias, c.pasteName)
+	case pasteExisting, pastePickExisting:
+		return fmt.Sprintf("add preset %q to model %q", c.pasteName, c.work.Models[c.pasteModel].Alias)
+	case pastePickNew:
+		return fmt.Sprintf("add preset %q to new model %q", c.pasteName, c.work.Models[c.pasteModel].Alias)
+	}
+	return "paste"
+}
+
+// pasteConfirmBody renders the confirm summary: the resolved source, a
+// params preview (flag forms via the registry), and any warnings. For a
+// new model the alias param is hidden — translate re-emits the model
+// alias itself.
+func (c *ConfigMode) pasteConfirmBody() string {
+	var lines []string
+	src := c.paste.Source
+	switch {
+	case src.Location != "":
+		lines = append(lines, "source: local "+src.Location)
+	case src.HF != "":
+		lines = append(lines, "source: hf "+src.HF)
+	default:
+		lines = append(lines, "source: (existing model)")
+	}
+	params := c.paste.Params
+	if c.pasteMode == pasteNew {
+		cp := append(config.Params(nil), params...)
+		cp.Delete("alias")
+		params = cp
+	}
+	if len(params) == 0 {
+		lines = append(lines, "(no extra flags)")
+	}
+	for _, p := range params {
+		flag := flags.CanonicalForm(p.Key, c.registry)
+		if b, ok := p.Value.(bool); ok {
+			if b {
+				lines = append(lines, "  "+flag)
+			}
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("  %s %s", flag, paramValueAsString(p.Value)))
+	}
+	for _, w := range c.paste.Warnings {
+		lines = append(lines, "⚠ "+w)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// pasteTargetPresetNames collects the preset names of the paste's
+// target model (empty for a not-yet-created model) so the default
+// preset name can be uniquified.
+func (c *ConfigMode) pasteTargetPresetNames() map[string]bool {
+	names := map[string]bool{}
+	if c.pasteModel < 0 || c.pasteModel >= len(c.work.Models) {
+		return names
+	}
+	for _, p := range c.work.Models[c.pasteModel].Presets {
+		names[p.Name] = true
+	}
+	return names
+}
+
+// uniquifyPasteName finds an unused name: name, name-2, name-3, …
+func uniquifyPasteName(name string, taken map[string]bool) string {
+	if !taken[name] {
+		return name
+	}
+	for n := 2; ; n++ {
+		cand := fmt.Sprintf("%s-%d", name, n)
+		if !taken[cand] {
+			return cand
+		}
+	}
+}
+
+// findPasteTarget matches the parsed source against the config's
+// models: the expanded Location path, or the full HF id (a different
+// quant counts as a different model — the quant lives in the model's
+// HF field, not the preset). Returns -1 when nothing matches.
+func (c *ConfigMode) findPasteTarget(src cmdline.Source) int {
+	for i, m := range c.work.Models {
+		if src.Location != "" {
+			loc, err := paths.ExpandPath(src.Location)
+			if err == nil && m.Location == loc {
+				return i
+			}
+		} else if src.HF != "" && m.HF == src.HF {
+			return i
+		}
+	}
+	return -1
+}
+
+// derivePasteAlias picks the new model's alias: the --alias value, else
+// the -m basename (extension stripped), else the HF repo name. Always
+// non-empty and unique among the existing models (-2, -3, … on
+// collision).
+func (c *ConfigMode) derivePasteAlias(src cmdline.Source) string {
+	alias := strings.TrimSpace(src.Alias)
+	switch {
+	case alias != "":
+	case src.Location != "":
+		base := filepath.Base(src.Location)
+		alias = strings.TrimSuffix(base, filepath.Ext(base))
+	case src.HF != "":
+		id := strings.TrimSpace(src.HF)
+		if q, _, _ := strings.Cut(id, ":"); q != "" {
+			id = q
+		}
+		alias = id
+		if _, repo, ok := strings.Cut(id, "/"); ok {
+			alias = repo
+		}
+	}
+	if alias == "" {
+		alias = "pasted"
+	}
+	taken := map[string]bool{}
+	for _, m := range c.work.Models {
+		taken[m.Alias] = true
+	}
+	if taken[alias] {
+		for n := 2; ; n++ {
+			cand := fmt.Sprintf("%s-%d", alias, n)
+			if !taken[cand] {
+				return cand
+			}
+		}
+	}
+	return alias
+}
+
+// commitPaste performs the §16.8 import once the confirm step (and, for
+// a bare -hf, the §16.6 quant chain) is done. Returns a cmd when the
+// commit is deferred to the quant chain, nil otherwise.
+func (c *ConfigMode) commitPaste() tea.Cmd {
+	if c.paste == nil {
+		return nil
+	}
+	src := c.paste.Source
+	params := c.paste.Params
+	switch c.pasteMode {
+	case pasteNew:
+		if !c.pastePending && src.HF != "" && bareRepo(src.HF) {
+			// Bare -hf: chain the §16.6 quant chooser before commit.
+			// One-shot — pastePending is only cleared by the final
+			// commit (or by abort), so re-entry skips this branch.
+			c.pastePending = true
+			c.pasteHFVal = src.HF
+			c.pasteHF = &c.pasteHFVal
+			return c.startPasteHFCheck()
+		}
+		m := config.Model{Alias: strings.TrimSpace(c.pasteAlias)}
+		if src.HF != "" {
+			m.HF = strings.TrimSpace(src.HF)
+		} else {
+			m.Location = strings.TrimSpace(src.Location)
+		}
+		params.Delete("alias") // translate re-emits the model alias
+		m.Presets = []config.Preset{{Name: c.pasteName, Params: params}}
+		c.work.Models = append(c.work.Models, m)
+		c.modelIdx = len(c.work.Models) - 1
+		c.presetIdx, c.paramIdx = 0, 0
+		c.flash = fmt.Sprintf("model %q + preset %q added", m.Alias, c.pasteName)
+	default:
+		if c.pasteModel < 0 || c.pasteModel >= len(c.work.Models) {
+			c.clearPaste()
+			c.flash = "paste canceled"
+			return nil
+		}
+		target := &c.work.Models[c.pasteModel]
+		target.Presets = append(target.Presets, config.Preset{Name: c.pasteName, Params: params})
+		c.modelIdx = c.pasteModel
+		c.presetIdx = len(target.Presets) - 1
+		c.paramIdx = 0
+		c.flash = fmt.Sprintf("preset %q added to %q", c.pasteName, target.Alias)
+	}
+	c.paste = nil
+	c.pasteMode = pasteNone
+	c.pastePending = false
+	return nil
+}
+
+// startPasteHFCheck runs the §16.6 typed-repo check for a bare -hf in
+// the paste flow (the confirm form is already dismissed). The done /
+// fail / quant-chooser overlays are shared with the model-form flow;
+// when they resolve, applyHFQuantChoice / updateHFFail commit the
+// paste. With no runner the bare id is committed directly (P3,
+// non-blocking).
+func (c *ConfigMode) startPasteHFCheck() tea.Cmd {
+	repo := strings.TrimSpace(c.paste.Source.HF)
+	if repo == "" || !bareRepo(repo) || c.hfRunner == nil {
+		// No runner (or not bare): commit — pastePending is still set,
+		// so the one-shot chain branch is skipped.
+		return c.commitPaste()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.hfCheckGen++
+	c.hfCheck = &hfCheckState{repo: repo, gen: c.hfCheckGen, cancel: cancel}
+	return hfCheckCmd(ctx, c.hfRunner, repo, c.hfCheckGen)
+}
+
+// clearPaste resets the §16.8 import staging.
+func (c *ConfigMode) clearPaste() {
+	c.paste = nil
+	c.pasteMode = pasteNone
+	c.pasteModel = 0
+	c.pasteAlias = ""
+	c.pasteName = ""
+	c.pasteHF = nil
+	c.pasteHFVal = ""
+	c.pastePending = false
 }
 
 func (c *ConfigMode) openDuplicateModelForm() tea.Cmd {
@@ -1287,6 +1681,15 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		applyModelSourceFromStaging(&m, c.formStaging)
 		c.work.Models = append(c.work.Models, m)
 		c.modelIdx = len(c.work.Models) - 1
+		// §16.8: the paste flow's "＋ create new model…" — hold the
+		// parsed preset until this model exists, then confirm it. The
+		// chained confirm form is already installed; keep it (dismiss
+		// would destroy it — same contract as formNewParamPickKey).
+		if c.pasteMode == pastePickNew && c.paste != nil {
+			c.pasteModel = c.modelIdx
+			c.flash = ""
+			return c.openPasteConfirm(), false
+		}
 		// A pending flash (e.g. the §16.6 check's not-found/gated/
 		// network message) outranks the generic confirmation.
 		if c.flash == "" {
@@ -1396,6 +1799,55 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		if c.formStaging.confirm != nil && *c.formStaging.confirm {
 			c.deleteParam()
 		}
+	case formPasteCmd:
+		tokens, terr := cmdline.Tokenize(deref(c.formStaging.pasteText))
+		if terr != nil {
+			c.errorModal = "could not parse command line:\n\n" + terr.Error()
+			return nil, true
+		}
+		res, perr := cmdline.Parse(tokens, c.registry)
+		c.paste = &res
+		if perr != nil {
+			c.errorModal = "command line has errors:\n\n" + perr.Error()
+			return nil, true
+		}
+		if res.Source.Location == "" && res.Source.HF == "" {
+			return c.openPasteModelPicker(), false
+		}
+		if idx := c.findPasteTarget(res.Source); idx >= 0 {
+			c.pasteMode = pasteExisting
+			c.pasteModel = idx
+		} else {
+			c.pasteMode = pasteNew
+			c.pasteAlias = c.derivePasteAlias(res.Source)
+		}
+		return c.openPasteConfirm(), false
+	case formPastePickModel:
+		if c.paste == nil {
+			return nil, true
+		}
+		if sel := deref(c.formStaging.choice); sel == "new" {
+			c.pasteMode = pastePickNew
+			c.pasteModel = -1
+			return c.openNewModelForm(), false
+		} else if idx, err := strconv.Atoi(sel); err == nil && idx >= 0 && idx < len(c.work.Models) {
+			c.pasteMode = pastePickExisting
+			c.pasteModel = idx
+			return c.openPasteConfirm(), false
+		}
+		c.clearPaste()
+		c.flash = "paste canceled"
+		return nil, true
+	case formPasteConfirm:
+		if c.paste == nil {
+			return nil, true
+		}
+		if c.formStaging.confirm == nil || !*c.formStaging.confirm {
+			c.clearPaste()
+			c.flash = "paste canceled"
+			return nil, true
+		}
+		return c.commitPaste(), true
 	case formExitPrompt:
 		switch deref(c.formStaging.choice) {
 		case "save":
@@ -1823,6 +2275,7 @@ func (c *ConfigMode) renderPaneHint() string {
 		has := c.hasModel()
 		return subtle.Render("[Models] ") + strings.Join([]string{
 			paneShortcut("n new", c.theme, true),
+			paneShortcut("p paste", c.theme, true),
 			paneShortcut("e/⏎ edit", c.theme, has),
 			paneShortcut("c clone", c.theme, has),
 			paneShortcut("d delete", c.theme, has),
@@ -1898,6 +2351,7 @@ func (c *ConfigMode) renderHelpOverlay() string {
 		"",
 		heading.Render("MODELS / PRESETS"),
 		"  n new      e or ⏎ edit      c clone      d delete (confirms)      x export to .ini",
+		"  p paste    import a llama-server command line (model + preset)",
 		muted.Render("  Presets only:  k clone-to (copy preset to another model)."),
 		"",
 		heading.Render("PARAMS"),

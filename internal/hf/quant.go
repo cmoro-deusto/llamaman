@@ -29,12 +29,13 @@ var quantTagRE = regexp.MustCompile(`(?i)[-.]([a-z0-9_]+)$`)
 var splitRE = regexp.MustCompile(`(?i)^(.+)-([0-9]{5})-of-([0-9]{5})$`)
 
 // Quants turns a repo file listing into a sized quant list (DESIGN
-// §16.3): .gguf files only, split parts grouped and summed, sorted by
-// size ascending with ties by tag. A pure function — no network.
+// §16.3): .gguf model files only (non-model sidecars excluded), split
+// parts grouped and summed, sorted by size ascending with ties by tag.
+// A pure function — no network.
 func Quants(files []RepoFile) []QuantOption {
 	groups := make(map[string][]RepoFile)
 	for _, f := range files {
-		if !isGGUF(f.Path) {
+		if !isGGUF(f.Path) || isSidecar(f.Path) {
 			continue
 		}
 		key := quantTag(f.Path)
@@ -59,10 +60,12 @@ func Quants(files []RepoFile) []QuantOption {
 
 // HasMMProj reports whether the repo provides a multimodal projector
 // (informational only — llama.cpp downloads it alongside the model;
-// DESIGN §16.3, §3.8b).
+// DESIGN §16.3, §3.8b). Detects both naming conventions llama.cpp
+// accepts: `vision.mmproj` style and `mmproj-<model>-Q8_0.gguf` style
+// (basename contains "mmproj", case-insensitive).
 func HasMMProj(files []RepoFile) bool {
 	for _, f := range files {
-		if strings.HasSuffix(strings.ToLower(f.Path), ".mmproj") {
+		if strings.Contains(strings.ToLower(filepath.Base(f.Path)), "mmproj") {
 			return true
 		}
 	}
@@ -105,6 +108,27 @@ func trimOne(n, unit int64) string {
 func isGGUF(p string) bool {
 	base := filepath.Base(p)
 	return len(base) >= 5 && strings.EqualFold(base[len(base)-5:], ".gguf")
+}
+
+// sidecarMarkers are the basename substrings that mark a .gguf as a
+// non-model sidecar rather than a quant option, mirroring llama.cpp's
+// is_model_file (common/download.cpp, verified): mmproj projectors,
+// imatrix calibration data, and speculative-draft heads (MTP, Eagle3,
+// DFlash, DSpark). Unsloth-style repos ship e.g. `dflash-kquant.gguf`
+// and `mmproj-<model>-Q8_0.gguf` — none are runnable models, and none
+// may be picked as the primary download (llama.cpp fetches them as
+// sidecars only when requested).
+var sidecarMarkers = []string{"mmproj", "imatrix", "mtp-", "eagle3-", "dflash-", "dspark-"}
+
+// isSidecar reports whether a repo path names a non-model sidecar file.
+func isSidecar(p string) bool {
+	base := strings.ToLower(filepath.Base(p))
+	for _, m := range sidecarMarkers {
+		if strings.Contains(base, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // quantTag extracts the quant tag from a repo path per llama.cpp's

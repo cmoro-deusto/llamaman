@@ -216,3 +216,47 @@ func TestCardMarkdownStripsEmoji(t *testing.T) {
 		t.Errorf("CJK content must survive (width-2 is consistent)\n%s", got)
 	}
 }
+
+// TestCardMarkdownStripsControlChars: C0/C1 control runes must not
+// reach the card — the terminal EXECUTES them instead of printing them
+// (a literal VT moves the cursor down a row, CR returns to column 0, a
+// tab jumps to the next tab stop), so a single one in a table cell
+// garbles the whole panel layout (owner report: the
+// unsloth/Muse-Glimmer-30B-GGUF benchmark-table header carries a
+// literal VT after "30B" — after a few PgDn pages the layout broke).
+// They become spaces (card authors use them as separators); the
+// structural \n survives.
+func TestCardMarkdownStripsControlChars(t *testing.T) {
+	md := "# Muse Glimmer-30B\x0bHigh Reasoning\n\nBody\x0ctext with\ta tab.\r\n"
+	lines := renderCardMarkdown(DefaultTheme(), []byte(md))
+	got := strings.Join(lines, "\n")
+	for _, bad := range []string{"\x0b", "\x0c", "\r", "\x7f", "\t"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("control char %q leaked into the card\n%q", bad, got)
+		}
+	}
+	if !strings.Contains(got, "Muse Glimmer-30B High Reasoning") {
+		t.Errorf("VT must become a space\n%s", stripANSI(got))
+	}
+	if !strings.Contains(got, "Body text with a tab.") {
+		t.Errorf("card body mangled\n%s", stripANSI(got))
+	}
+}
+
+// TestCardMarkdownStripsMathAlphanumerics: mathematical alphanumeric
+// symbols (U+1D400–U+1D7FF) are the same ambiguous-width class as
+// emoji — most terminal fonts lack the glyph and the fallback renders
+// it at an unpredictable width (owner report: the Muse-Glimmer card's
+// 𝛕3-Bench/𝛕3-Banking benchmark names sit in the same scroll region
+// as the VT above).
+func TestCardMarkdownStripsMathAlphanumerics(t *testing.T) {
+	md := "# Benchmarks\n\n𝛕3-Banking and DeepSearch QA.\n"
+	lines := renderCardMarkdown(DefaultTheme(), []byte(md))
+	got := strings.Join(lines, "\n")
+	if strings.Contains(got, "𝛕") {
+		t.Errorf("math alphanumeric leaked into the card\n%s", got)
+	}
+	if !strings.Contains(got, "3-Banking and DeepSearch QA.") {
+		t.Errorf("card body mangled\n%s", stripANSI(got))
+	}
+}
