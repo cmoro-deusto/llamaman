@@ -89,16 +89,29 @@ func driveRoot(t *testing.T, root *Root, msgs ...tea.Msg) string {
 // model, recursing into the next Cmd up to a bounded depth. BatchMsg
 // children are drained individually.
 func drainCmds(m tea.Model, cmd tea.Cmd, depth int) tea.Model {
+	return drainCmdsWith(m, cmd, depth, cmdTimeout)
+}
+
+// cmdTimeout bounds each individual Cmd wait in drainCmds — small so
+// blocking cmds don't accumulate. See safeCmd for why.
+const cmdTimeout = 25 * time.Millisecond
+
+// dlTickTimeout is the bound used for download-tick chains (see
+// drainCmdsWith): long enough for the spinner-interval re-arm
+// (100ms) to complete, matching the pre-optimization behavior.
+const dlTickTimeout = 300 * time.Millisecond
+
+func drainCmdsWith(m tea.Model, cmd tea.Cmd, depth int, timeout time.Duration) tea.Model {
 	if cmd == nil || depth > 8 {
 		return m
 	}
-	out := safeCmd(cmd)
+	out := safeCmdTimeout(cmd, timeout)
 	if out == nil {
 		return m
 	}
 	if b, ok := out.(tea.BatchMsg); ok {
 		for _, sub := range b {
-			m = drainCmds(m, sub, depth+1)
+			m = drainCmdsWith(m, sub, depth+1, timeout)
 		}
 		return m
 	}
@@ -108,13 +121,53 @@ func drainCmds(m tea.Model, cmd tea.Cmd, depth int) tea.Model {
 	// leaves forms unfocusable). Match by type name via reflection.
 	if seq, ok := asSequenceMsg(out); ok {
 		for _, sub := range seq {
-			m = drainCmds(m, sub, depth+1)
+			m = drainCmdsWith(m, sub, depth+1, timeout)
 		}
 		return m
 	}
 	next, c := m.Update(out)
 	m = next
-	return drainCmds(m, c, depth+1)
+	if isPacingTick(out) {
+		// Pure-pacing tick msgs re-arm their own next tick in Update
+		// (animation, session refresh, live polls). The harness cannot
+		// pace ticks — feeding the re-armed cmd back only burns another
+		// time-boxed wait per recursion level (up to depth 8) and the
+		// tick dies anyway once the bound is hit. Run the state
+		// transition once, drop the re-arm.
+		return m
+	}
+	if isDlTick(out) {
+		// Download ticks are productive, not pacing: handleDlTick
+		// polls the engine's progress/finish slots, and the re-arm runs
+		// on the spinner interval (100ms). Give the chain the long
+		// bound so the completion signal is observed.
+		return drainCmdsWith(m, c, depth+1, dlTickTimeout)
+	}
+	return drainCmdsWith(m, c, depth+1, timeout)
+}
+
+// isPacingTick reports the tick messages whose Update handler only
+// re-arms the next tick (animation, session refresh, live polls).
+// drainCmds delivers them once but drops the re-armed cmd (see
+// drainCmdsWith). Ticks of 1s+ were never delivered even before the
+// timeout reduction — the anim frame tick (~17ms) is the one that used
+// to chain.
+func isPacingTick(msg tea.Msg) bool {
+	switch msg.(type) {
+	case animTickMsg, sessionTickMsg, livePollTickMsg, hwTickMsg, uptimeTickMsg:
+		return true
+	}
+	return false
+}
+
+// isDlTick reports the download-progress tick messages, whose re-arm
+// chains need the longer dlTickTimeout (see drainCmdsWith).
+func isDlTick(msg tea.Msg) bool {
+	switch msg.(type) {
+	case dlTickMsg, dlMainTickMsg:
+		return true
+	}
+	return false
 }
 
 // asSequenceMsg extracts the cmds of bubbletea's unexported
@@ -151,9 +204,23 @@ func collectCmds(cmd tea.Cmd) []tea.Cmd {
 	}
 }
 
-// safeCmd executes a tea.Cmd and recovers from panics. Bounded by a
-// short timeout so blocking Cmds (tea.Tick) don't slow down tests.
+// safeCmd executes a tea.Cmd and recovers from panics, bounded by
+// cmdTimeout so blocking Cmds don't slow down tests.
 func safeCmd(cmd tea.Cmd) tea.Msg {
+	return safeCmdTimeout(cmd, cmdTimeout)
+}
+
+// safeCmdTimeout runs a tea.Cmd in a goroutine and returns its message
+// if it lands within timeout, else nil (panics recover to nil). The
+// bound matters because of a harness hazard: bubbles' cursor.BlinkCmd
+// blocks for BlinkSpeed (530ms) before emitting BlinkMsg — feeding
+// that back would re-arm it forever — and every keystroke into a
+// focused input returns one, so each keystroke used to cost the full
+// 300ms timeout (the old value). 25ms still lets the fast synchronous
+// stub cmds (µs) and the 60fps animation tick (~17ms) complete while
+// discarding the slow ones (cursor blink, 100ms+ spinner/live-poll
+// ticks, flash TTLs) almost immediately.
+func safeCmdTimeout(cmd tea.Cmd, timeout time.Duration) tea.Msg {
 	if cmd == nil {
 		return nil
 	}
@@ -170,7 +237,7 @@ func safeCmd(cmd tea.Cmd) tea.Msg {
 	select {
 	case msg := <-done:
 		return msg
-	case <-time.After(300 * time.Millisecond):
+	case <-time.After(timeout):
 		return nil
 	}
 }
