@@ -2929,7 +2929,18 @@ lists the top GGUF repos by the current sort (the placeholder reads
      controls from card text and result descriptions (width-2 CJK is
      kept — runewidth and terminals agree there), and the browser's own
      icons use width-safe glyphs (↓ ♥\ufe0e © ▲ instead of ⬇ ♥ ⚖ ⚠).
-     **The panel never re-styles card lines** — the
+     **Control runes are neutralized too** — the terminal EXECUTES C0/C1
+     controls instead of printing them (a literal VT in a table cell
+     moves the cursor down a row; CR returns to column 0; a tab jumps
+     to the next tab stop, width 0 in runewidth but N on screen), so a
+     single one garbles the whole panel (owner report: the
+     unsloth/Muse-Glimmer-30B-GGUF benchmark-table header carries a
+     literal VT after "30B" — the layout broke after a few PgDn pages;
+     the same card's 𝛕3-Bench names are math-alphanumeric symbols,
+     U+1D400–U+1D7FF, the same ambiguous-width class as emoji, so that
+     block is stripped as well). They become spaces (card authors use
+     them as separators); \n survives for the parser. **The panel never
+     re-styles card lines** — the
      renderer bakes a Subtle base color into plain text, and
      cardPanelLines passes the lines through untouched, because a
      lipgloss re-style strips the OSC 8 sequences (links rendered but
