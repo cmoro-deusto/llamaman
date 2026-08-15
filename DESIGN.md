@@ -496,7 +496,7 @@ Status state machine: `starting → ready → exited|error`.
 | `q` / `Ctrl+C` | Quit prompt: `(k)ill / (d)etach / (c)ancel`. `(k)ill` returns to the main screen; `(d)etach` exits llamaman and leaves llama-server running. |
 | `k` | Direct kill shortcut (with `(y)es / (n)o` confirm). On confirm: stops llama-server, removes the log + session record, and returns to the main screen — llamaman itself stays open. |
 | `r` | Restart server (confirm if currently ready) |
-| `c` | Copy full launch command to clipboard (`wl-copy`, fallback `xclip`, fallback flash status) |
+| `c` | Copy the launch command to clipboard (`wl-copy`, fallback `xclip`). With neither available (e.g. over SSH) it fills the screen with the command on a **blank field** for manual copying (the live log is hidden while it's open, so a selection can't grab log text) — each flag on a line with its value, `\` continuations right-aligned to one column so a rectangular mouse selection stays clean, the binary as bare `llama-server`, values shell-quoted where needed. Scroll with `j`/`k`/`↑`/`↓`/`PgUp`/`PgDn` or the mouse (wheel + rubber-band drag that auto-scrolls past the visible edge) when the command is taller than the terminal. `Enter`/`Esc` closes. The clipboard path quotes args the same way, so both are paste-ready. |
 | `i` | Show model & preset detail overlay (alias + Source/HF + preset name + every preset param in source order). Any key closes. |
 | `/` | Search forward in output. Live highlights (reverse video + bold) wrap matches as you type; `Enter` applies, `Esc` cancels. |
 | `n` / `N` | Next / previous search match |

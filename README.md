@@ -46,7 +46,7 @@ A model is **either** local (`location: "~/models/foo.gguf"`) **or** Hugging Fac
 
 ### Quality of life
 
-Copy the launch command to your clipboard with `c` (Wayland's `wl-copy` first, X11's `xclip` as fallback). Restart the running server in place with `r`. List models or a model's presets non-interactively (`-l`, `-p`) for scripting. First-run setup autodetects `llama-server` from `which`, then `/usr/local`, then `/opt/llama.cpp`. Unknown flag warnings (a key your llama-server build doesn't expose) are non-blocking — surface in the run-mode header and config-mode pane, never crash the launch.
+Copy the launch command to your clipboard with `c` (Wayland's `wl-copy` first, X11's `xclip` as fallback); over SSH, where neither exists, `c` shows the command in a dialog for manual copying instead. Restart the running server in place with `r`. List models or a model's presets non-interactively (`-l`, `-p`) for scripting. First-run setup autodetects `llama-server` from `which`, then `/usr/local`, then `/opt/llama.cpp`. Unknown flag warnings (a key your llama-server build doesn't expose) are non-blocking — surface in the run-mode header and config-mode pane, never crash the launch.
 
 <details>
 <summary>Table of contents</summary>
@@ -95,7 +95,7 @@ Copy the launch command to your clipboard with `c` (Wayland's `wl-copy` first, X
 - **Terminal**: any modern terminal emulator with UTF-8 and 24-bit colour. The TUI degrades gracefully below that, but boxes and accents look best with truecolor. `NO_COLOR` is honoured.
 - **Width**: 80 columns minimum; 90+ enables wide mode in run mode (wordmark + live band with `llama-server` and `Hardware` panels). Below 90 cols, run mode collapses to a compact identity strip.
 - **Locale**: a UTF-8 locale (`LANG=*.UTF-8`).
-- **Clipboard (optional)**: `wl-clipboard` (Wayland) or `xclip` (X11) for the `c` "copy launch command" shortcut. Without either, the shortcut becomes a no-op with a brief status flash.
+- **Clipboard (optional)**: `wl-clipboard` (Wayland) or `xclip` (X11) for the `c` "copy launch command" shortcut. Without either (e.g. over SSH), `c` falls back to a dialog showing the command for manual copying — see [Troubleshooting](#c-copy-launch-command-cant-use-the-clipboard).
 - **`llama-server`**: a working build of llama.cpp's HTTP server on `PATH` or under one of the standard prefixes (`/usr/local/bin`, `/usr/local/llama.cpp/bin`, `/opt/llama.cpp/bin`). See [Compatibility](#compatibility).
 - **Router mode (optional)**: a llama.cpp build with `--models-preset` support (the model-presets feature, Dec 2025 or later). Single-model mode works with any supported build; on an older binary, Router mode shows a clear version-gate error instead of failing to spawn.
 
@@ -356,7 +356,7 @@ Status state machine: `starting → ready → exited|error`. `ready` is detected
 | `a` | Toggle subtle animations (persists to preferences) |
 | `k` | Direct kill (with `(y)es / (n)o` confirm). Stops the server, removes log + session, returns to main; llamaman stays open |
 | `r` | Restart the server (confirm if status is `ready`) |
-| `c` | Copy the full launch command to clipboard (`wl-copy` → `xclip` fallback) |
+| `c` | Copy the launch command to clipboard (`wl-copy` → `xclip` fallback); with neither available it fills the screen with the command on a blank field (flag+value per line, `\`-continued) for manual copying — select it and paste, scroll with `j`/`k`/`↑`/`↓`/`PgUp`/`PgDn` or the mouse, `Enter`/`Esc` closes |
 | `i` | Show model & preset detail overlay — alias + Source/HF + every preset param in source order. Any key closes |
 | `/` | Search forward — matches highlighted live (reverse video) as you type, persist after `Enter` for `n`/`N` |
 | `Esc` | Clear the active search and remove highlights |
@@ -706,14 +706,14 @@ Two `llamaman` processes raced to start a session and you lost. The other instan
 
 llamaman cleans these up automatically on next launch. If you're stuck, manually remove `${XDG_RUNTIME_DIR}/llamaman/session.json` and `llama-server.log`.
 
-### `c` (copy launch command) does nothing
+### `c` (copy launch command) can't use the clipboard
 
-You're missing both `wl-copy` (Wayland) and `xclip` (X11). Install whichever fits your session:
+You're missing both `wl-copy` (Wayland) and `xclip` (X11) — most often because you're connected over **SSH**, where no local clipboard exists. Install whichever fits your session to restore real clipboard copying:
 
 - Wayland: `pacman -S wl-clipboard` / `apt install wl-clipboard` / etc.
 - X11: `pacman -S xclip` / `apt install xclip` / etc.
 
-The shortcut briefly flashes a status indicator when neither tool is found.
+Without either, `c` fills the screen with the full launch command on a blank background (the live log is hidden) — one line per flag with its value, `\`-continued and right-aligned so you can select the whole block and paste it cleanly into another terminal, the binary as bare `llama-server`, values shell-quoted where needed. Rubber-band-drag to select (the block auto-scrolls past the visible edge); `j`/`k`/`↑`/`↓`/`PgUp`/`PgDn` or the mouse wheel scroll when the command is taller than the screen; `Enter`/`Esc` closes.
 
 ### Unknown flag warning in run mode
 

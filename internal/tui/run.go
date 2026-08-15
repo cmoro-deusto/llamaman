@@ -144,7 +144,10 @@ type RunMode struct {
 	showQuit      bool   // quit prompt overlay active
 	showHelp      bool   // help overlay active
 	showInfo      bool   // i-info overlay active (model + preset detail)
-	copyResult    string // when non-empty, a centered "command copied" modal is shown; any key dismisses
+	copyResult    string // when non-empty, a centered "command copied" modal is shown; Enter/Esc dismisses
+	copyCmdLines  []string // no-clipboard failure: one-param-per-line launch command block (\-continued)
+	copyScroll    int      // scroll offset (lines) into copyCmdLines when the block overflows
+	copyDragHeld  bool     // a left-button drag is in progress over the copy dialog
 	restartPrompt bool   // r-confirm overlay
 	killPrompt    bool   // k-confirm overlay
 	unloadPrompt  bool   // router u-confirm overlay
@@ -759,6 +762,15 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		}
 		return r, nil
 
+	case tea.MouseMsg:
+		// Mouse is only claimed while the copy modal is up (to scroll the
+		// command block / rubber-band-select it); otherwise it falls
+		// through to the log viewport below for wheel scrolling.
+		if r.copyResult != "" {
+			r.handleCopyResultMouse(m)
+			return r, nil
+		}
+
 	case tea.KeyMsg:
 		if r.showQuit {
 			return r.handleQuitPrompt(m)
@@ -784,8 +796,7 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			return r, nil
 		}
 		if r.copyResult != "" {
-			r.copyResult = ""
-			return r, nil
+			return r, r.handleCopyResultKey(m)
 		}
 		if r.routerMenu {
 			return r.handleRouterMenuKey(m)
@@ -1170,12 +1181,16 @@ func (r *RunMode) requestRestart() tea.Cmd {
 // copyCommand pushes the launch argv onto the clipboard via wl-copy then
 // xclip; surfaces the outcome in a centered modal (`r.copyResult`) so
 // the success / failure is unmissable instead of buried in the footer.
+// When no clipboard tool is available (e.g. over SSH) it falls back to
+// rendering the launch command in the dialog for manual copying.
 func (r *RunMode) copyCommand() {
+	r.copyScroll = 0
+	r.copyCmdLines = nil
 	if len(r.argv) == 0 {
 		r.copyResult = "Nothing to copy — the launch command is empty."
 		return
 	}
-	cmdLine := strings.Join(r.argv, " ")
+	cmdLine := joinShellArgs(r.launchArgv())
 	for _, candidate := range []struct {
 		name string
 		args []string
@@ -1193,7 +1208,134 @@ func (r *RunMode) copyCommand() {
 			return
 		}
 	}
-	r.copyResult = "No clipboard tool found.\n\nInstall wl-copy (Wayland) or xclip (X11) and try again."
+	// No clipboard tool: show the command for manual copying.
+	r.copyCmdLines = formatShellArgvLines(r.launchArgv())
+	r.copyResult = "No clipboard tool found"
+}
+
+// launchArgv returns the launch argv with the binary replaced by the
+// bare "llama-server" name — the path is session-specific and unhelpful
+// for a command the user copies and re-runs elsewhere.
+func (r *RunMode) launchArgv() []string {
+	if len(r.argv) == 0 {
+		return nil
+	}
+	out := make([]string, len(r.argv))
+	copy(out, r.argv)
+	out[0] = "llama-server"
+	return out
+}
+
+// shellArg quotes a single argv element for safe single-line shell
+// pasting: elements containing whitespace or shell metacharacters are
+// wrapped in single quotes (embedded quotes escaped), safe elements pass
+// through verbatim. The safe set mirrors what shells treat as literal.
+func shellArg(s string) string {
+	if s == "" {
+		return "''"
+	}
+	for _, r := range s {
+		if isShellSafeChar(r) {
+			continue
+		}
+		// Wrap in single quotes; each embedded single quote becomes the
+		// 4-char sequence close-quote + escaped-quote + open-quote so the
+		// word round-trips under POSIX single-quoting.
+		var b strings.Builder
+		b.WriteByte('\'')
+		for _, c := range s {
+			if c == '\'' {
+				b.WriteString("'\\''")
+			} else {
+				b.WriteRune(c)
+			}
+		}
+		b.WriteByte('\'')
+		return b.String()
+	}
+	return s
+}
+
+// isShellSafeChar reports whether a rune may appear unquoted inside a
+// shell word: alphanumerics and the punctuation that carries no special
+// meaning to the shell. Anything else (spaces, quotes, glob/expand/
+// control chars) forces quoting.
+func isShellSafeChar(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z':
+		return true
+	case r >= 'A' && r <= 'Z':
+		return true
+	case r >= '0' && r <= '9':
+		return true
+	}
+	switch r {
+	case '@', '%', '+', '=', ':', ',', '.', '/', '-', '_':
+		return true
+	}
+	return false
+}
+
+// joinShellArgs quotes each element and joins with single spaces into a
+// single-line, paste-ready command.
+func joinShellArgs(argv []string) string {
+	q := make([]string, len(argv))
+	for i, a := range argv {
+		q[i] = shellArg(a)
+	}
+	return strings.Join(q, " ")
+}
+
+// formatShellArgvLines renders an argv as a multi-line, paste-ready
+// command: the binary (argv[0]) on its own first line, then each flag on
+// a line with its value (when the next token is a value rather than
+// another flag), and boolean flags alone. Every line except the last ends
+// with a backslash continuation so the block pastes as one logical command.
+// The binary sits at column 0 and every param line is indented by
+// paramIndent spaces (shell-safe: leading whitespace between tokens is
+// ignored), so the flags read as arguments of the command.
+const paramIndent = 8
+
+func formatShellArgvLines(argv []string) []string {
+	n := len(argv)
+	if n == 0 {
+		return nil
+	}
+	indent := strings.Repeat(" ", paramIndent)
+	raw := make([]string, 0, n)
+	raw = append(raw, shellArg(argv[0]))
+	for i := 1; i < n; {
+		tok := argv[i]
+		if strings.HasPrefix(tok, "-") && i+1 < n && !strings.HasPrefix(argv[i+1], "-") {
+			// Flag with a value: keep them together on one line.
+			raw = append(raw, indent+shellArg(tok)+" "+shellArg(argv[i+1]))
+			i += 2
+			continue
+		}
+		// Boolean flag (or a stray value): its own line.
+		raw = append(raw, indent+shellArg(tok))
+		i++
+	}
+	// Right-align the continuation backslash so every \ sits in the same
+	// column. A rectangular mouse selection always ends at a single right
+	// edge; with the \ column aligned, selecting to that edge captures no
+	// trailing whitespace after any \ (trailing space after \ would turn
+	// it into an escaped space and break the line continuation on paste).
+	maxW := 0
+	for _, l := range raw {
+		if w := lipgloss.Width(l); w > maxW {
+			maxW = w
+		}
+	}
+	lines := make([]string, len(raw))
+	for i, l := range raw {
+		if i < len(raw)-1 {
+			lines[i] = padRight(l, maxW) + " \\"
+		} else {
+			lines[i] = l
+		}
+	}
+	return lines
 }
 
 // effectiveQuery returns the query whose matches should be highlighted
@@ -1520,6 +1662,11 @@ func (r *RunMode) View() string {
 		out = overlayCenter(bg, r.renderHelp(), r.width, r.height)
 	case r.showInfo:
 		out = overlayCenter(bg, r.renderInfoOverlay(), r.width, r.height)
+	case r.copyResult != "" && len(r.copyCmdLines) > 0:
+		// No-clipboard fallback: full-screen borderless command on a blank
+		// field (the live log is intentionally NOT shown) so a native mouse
+		// selection captures only the command.
+		out = r.renderCopyNoClipboard()
 	case r.copyResult != "":
 		out = overlayCenter(bg, r.renderCopyResult(), r.width, r.height)
 	default:
@@ -1608,10 +1755,12 @@ func (r *RunMode) renderRestartPrompt() string {
 }
 
 // renderCopyResult is the centered modal that surfaces the outcome of
-// `c` (copy launch command). Same shape as the error modal in config
-// mode: focus-styled [Dismiss] button, "(any key)" hint, accent border
-// — except the border colour reflects success vs failure so a glance
-// at the modal tells you whether the clipboard write actually worked.
+// `c` (copy launch command). When a clipboard tool worked (or there was
+// nothing to copy) it is a small success/failure note; when no clipboard
+// tool is available it grows to show the launch command in a copyable
+// one-param-per-line block for manual copying over SSH. The border colour
+// reflects success vs failure so a glance tells you whether the clipboard
+// write worked. Dismissed by Enter/Esc only (so the scroll keys stay free).
 func (r *RunMode) renderCopyResult() string {
 	success := strings.HasPrefix(r.copyResult, "Command copied")
 	border := r.theme.StatusErr
@@ -1623,7 +1772,7 @@ func (r *RunMode) renderCopyResult() string {
 	title := lipgloss.NewStyle().Foreground(border).Bold(true).Render(titleText)
 	msg := lipgloss.NewStyle().Foreground(r.theme.Subtle).Render(r.copyResult)
 	button := lipgloss.NewStyle().Reverse(true).Padding(0, 2).Render(" Dismiss ")
-	hint := lipgloss.NewStyle().Foreground(r.theme.Muted).Render("(any key)")
+	hint := lipgloss.NewStyle().Foreground(r.theme.Muted).Render("(Enter / Esc)")
 	body := strings.Join([]string{
 		title,
 		"",
@@ -1636,6 +1785,205 @@ func (r *RunMode) renderCopyResult() string {
 		BorderForeground(border).
 		Padding(1, 2).
 		Render(body)
+}
+
+// copyBlockMetrics sizes the no-clipboard command block so the whole
+// dialog fits within r.height. It returns the max visible content rows
+// (visibleMax) and whether the block overflows (scrollable, which costs
+// one extra row for the scroll hint). fixedChrome counts every row that
+// is not part of the command block: outer border+padding, title, the two
+// advisory lines, the inner box border, and the footer rows.
+func (r *RunMode) copyBlockMetrics() (visibleMax int, scrollable bool) {
+	// The borderless layout is: an 8-row header + the visible command
+	// window + (filler) + 1 footer row, so the window is height-9.
+	const fixedChrome = 9
+	n := len(r.copyCmdLines)
+	v := r.height - fixedChrome
+	if v < 1 {
+		v = 1
+	}
+	if v > n {
+		v = n
+	}
+	scrollable = n > v
+	return v, scrollable
+}
+
+// renderCopyNoClipboard is the no-clipboard fallback. It renders the
+// launch command as raw text at column 0 on a blank field — no box, no
+// outer border, no live log behind it — because a native terminal mouse
+// selection always grabs a full-width rectangle and can't be clipped to a
+// sub-region: making the command the only non-blank content on screen is
+// what keeps the copied text clean. The command is one param per line with
+// \\ continuations (flag and value together, params indented); it scrolls
+// when taller than the terminal (r.copyScroll tracks the offset, clamped).
+func (r *RunMode) renderCopyNoClipboard() string {
+	visibleMax, scrollable := r.copyBlockMetrics()
+
+	// Fixed 8-row header (the layout the user asked for): blank, the error
+	// title, blank, the two advisory lines in regular colour, then two
+	// blank rows before the command begins.
+	errTitle := lipgloss.NewStyle().Foreground(r.theme.StatusErr).Bold(true)
+	header := []string{
+		"",
+		errTitle.Render("⚠  No clipboard tool found"),
+		"",
+		"wl-copy and xclip are both unavailable (e.g. you're connected over SSH).",
+		"",
+		"Copy the launch command below manually:",
+		"",
+		"",
+	}
+
+	// Footer reuses the run-screen shortcut styling (key accent+bold,
+	// label subtle, · separators) for consistency.
+	subtle := lipgloss.NewStyle().Foreground(r.theme.Subtle)
+	sep := subtle.Render(" · ")
+	tokens := []string{"enter/esc close"}
+	if scrollable {
+		tokens = append(tokens, "j/k/↑↓ scroll", "PgUp/PgDn page")
+	}
+	parts := make([]string, len(tokens))
+	for i, t := range tokens {
+		parts[i] = paneShortcut(t, r.theme, true)
+	}
+	footer := strings.Join(parts, sep)
+
+	off := r.copyScroll
+	if off < 0 {
+		off = 0
+	}
+	if maxOff := len(r.copyCmdLines) - visibleMax; off > maxOff {
+		off = maxOff
+	}
+	if off < 0 {
+		off = 0
+	}
+	visible := r.copyCmdLines[off : off+visibleMax]
+	// Truncate any line that would exceed the terminal width so it can't
+	// wrap and silently add a row (which would break the height math).
+	cmdLines := make([]string, len(visible))
+	for i, l := range visible {
+		if ansi.StringWidth(l) > r.width {
+			l = ansi.Truncate(l, r.width, "")
+		}
+		cmdLines[i] = l
+	}
+
+	// Header + visible command window + footer, filling exactly r.height
+	// rows with the footer pinned to the bottom row.
+	rows := make([]string, 0, r.height)
+	rows = append(rows, header...)
+	rows = append(rows, cmdLines...)
+	for len(rows) < r.height-1 {
+		rows = append(rows, "")
+	}
+	rows = append(rows, footer)
+	return strings.Join(rows, "\n")
+}
+// dismissCopyResult closes the copy modal and clears its transient state.
+func (r *RunMode) dismissCopyResult() {
+	r.copyResult = ""
+	r.copyCmdLines = nil
+	r.copyScroll = 0
+	r.copyDragHeld = false
+}
+
+// clampCopyScroll keeps r.copyScroll within [0, len-copyBlock] so the
+// render's visible window never runs past the end.
+func (r *RunMode) clampCopyScroll() {
+	v, _ := r.copyBlockMetrics()
+	max := len(r.copyCmdLines) - v
+	if max < 0 {
+		max = 0
+	}
+	if r.copyScroll < 0 {
+		r.copyScroll = 0
+	}
+	if r.copyScroll > max {
+		r.copyScroll = max
+	}
+}
+
+// handleCopyResultKey routes keys while the copy modal is up. Enter/Esc
+// dismiss; the movement keys scroll the command block only when it
+// overflows (scrollable). Other keys are ignored — the modal no longer
+// closes on an arbitrary key so j/k/↑/↓ stay reserved for scrolling.
+func (r *RunMode) handleCopyResultKey(m tea.KeyMsg) tea.Cmd {
+	switch m.String() {
+	case "enter", "esc":
+		r.dismissCopyResult()
+		return nil
+	}
+	if len(r.copyCmdLines) > 0 {
+		_, scrollable := r.copyBlockMetrics()
+		if scrollable {
+			v, _ := r.copyBlockMetrics()
+			switch m.String() {
+			case "j", "down":
+				r.copyScroll++
+			case "k", "up":
+				r.copyScroll--
+			case "pgdown":
+				r.copyScroll += v
+			case "pgup":
+				r.copyScroll -= v
+			}
+			r.clampCopyScroll()
+		}
+	}
+	return nil
+}
+
+// handleCopyResultMouse handles mouse input over the copy modal: the
+// wheel scrolls the command block when it overflows, and a left-button
+// drag that moves past the visible edge of the block auto-scrolls it —
+// this is what lets the user rubber-band-select a command taller than
+// the terminal and grab the whole thing.
+func (r *RunMode) handleCopyResultMouse(m tea.MouseMsg) {
+	if len(r.copyCmdLines) == 0 {
+		return
+	}
+	_, scrollable := r.copyBlockMetrics()
+	switch m.Action {
+	case tea.MouseActionPress:
+		switch m.Button {
+		case tea.MouseButtonWheelUp:
+			if scrollable {
+				r.copyScroll--
+				r.clampCopyScroll()
+			}
+		case tea.MouseButtonWheelDown:
+			if scrollable {
+				r.copyScroll++
+				r.clampCopyScroll()
+			}
+		case tea.MouseButtonLeft:
+			r.copyDragHeld = true
+		}
+	case tea.MouseActionRelease:
+		if m.Button == tea.MouseButtonLeft {
+			r.copyDragHeld = false
+		}
+	case tea.MouseActionMotion:
+		if r.copyDragHeld && scrollable {
+			top, bottom := r.copyBlockScreenYRange()
+			if m.Y < top {
+				r.copyScroll--
+			} else if m.Y > bottom {
+				r.copyScroll++
+			}
+			r.clampCopyScroll()
+		}
+	}
+}
+
+// copyBlockScreenYRange returns the on-screen row span (0-based) of the
+// no-clipboard command block's visible content, for drag auto-scroll. The
+// command sits right below the 8-row header, so it starts at row 8.
+func (r *RunMode) copyBlockScreenYRange() (top, bottom int) {
+	visibleMax, _ := r.copyBlockMetrics()
+	return 8, 7 + visibleMax
 }
 
 func (r *RunMode) renderKillPrompt() string {
