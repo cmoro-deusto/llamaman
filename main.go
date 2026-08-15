@@ -331,6 +331,7 @@ func acquireAndSpawn(cfg *config.Config, registry flags.Registry, sessMgr *serve
 		SessionMgr: sessMgr,
 		Registry:   registry,
 		Fetcher:    fetcherFor(res.Argv, registry),
+		Version:    versionString(),
 	}, nil
 }
 
@@ -401,6 +402,7 @@ func acquireAndSpawnRouter(cfg *config.Config, registry flags.Registry, registry
 		SessionMgr: sessMgr,
 		Registry:   registry,
 		Fetcher:    fetcherFor(res.Argv, registry),
+		Version:    versionString(),
 	}, nil
 }
 
@@ -487,6 +489,7 @@ func buildReattachOpts(cfg *config.Config, registry flags.Registry, sess server.
 			SessionMgr: sessMgr,
 			Registry:   registry,
 			Fetcher:    fetcherFor(sess.Command, registry),
+			Version:    versionString(),
 			Reattach:   true,
 		}, nil
 	}
@@ -513,6 +516,7 @@ func buildReattachOpts(cfg *config.Config, registry flags.Registry, sess server.
 		SessionMgr: sessMgr,
 		Registry:   registry,
 		Fetcher:    fetcherFor(sess.Command, registry),
+		Version:    versionString(),
 		Reattach:   true,
 	}, nil
 }

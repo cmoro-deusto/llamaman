@@ -407,6 +407,55 @@ func TestTopStripColumnsAlign(t *testing.T) {
 	}
 }
 
+// TestTopStripVersionRow pins the wide-mode version row: the llamaman
+// build version renders in the fourth row of the top strip (right of
+// the wordmark's last line), left-aligned directly under the Preset
+// cell. With no version set the row stays blank and the box height
+// is unchanged.
+func TestTopStripVersionRow(t *testing.T) {
+	r := newHeaderTestRunMode(
+		config.Model{Alias: "alpha"},
+		config.Preset{Name: "default"},
+		nil, runHeaderWideWidth,
+	)
+	r.version = "v0.4.0"
+	plain := stripANSI(r.renderTopStrip())
+	lines := strings.Split(plain, "\n")
+	if len(lines) != headerHeightWithWordmark {
+		t.Fatalf("top strip = %d rows, want %d\n%s", len(lines), headerHeightWithWordmark, plain)
+	}
+	// Box rows: border, blank, wordmark0, wordmark1+row1, wordmark2+row2,
+	// wordmark3+versionRow, blank, border — so row2 (Preset) is lines[4]
+	// and the version row is lines[5].
+	presetLine, versionLine := lines[4], lines[5]
+	col := func(s, needle string) int {
+		if i := strings.Index(s, needle); i >= 0 {
+			return len([]rune(s[:i]))
+		}
+		return -1
+	}
+	p := col(presetLine, "Preset:")
+	if p < 0 {
+		t.Fatalf("no Preset cell in %q", presetLine)
+	}
+	v := col(versionLine, "v0.4.0")
+	if v < 0 {
+		t.Fatalf("version not shown in %q", versionLine)
+	}
+	if v != p {
+		t.Errorf("version at col %d, want col %d (under Preset)\npreset:  %q\nversion: %q", v, p, presetLine, versionLine)
+	}
+	// No version set: row stays blank, height unchanged.
+	r.version = ""
+	plain = stripANSI(r.renderTopStrip())
+	if got := strings.Count(plain, "\n") + 1; got != headerHeightWithWordmark {
+		t.Errorf("empty version: height = %d, want %d", got, headerHeightWithWordmark)
+	}
+	if strings.Contains(plain, "v0.4.0") {
+		t.Errorf("version must not render when unset:\n%s", plain)
+	}
+}
+
 // newRouterTestRunMode builds a minimal router-mode RunMode mirroring
 // newHeaderTestRunMode: routerFile set, status Starting, a live fetch
 // context, and (optionally) a fakeFetcher for polling tests.
