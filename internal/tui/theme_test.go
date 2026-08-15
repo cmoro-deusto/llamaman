@@ -1,11 +1,78 @@
 package tui
 
 import (
+	"math"
+	"os"
+	"regexp"
+	"strconv"
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 )
+
+// TestPalette256AnnotationsAccurate pins the P1 discipline (§10.4):
+// every `// 256 ≈ N` annotation in theme.go — on the palette table and
+// on the llamamanDark/llamamanLight "maps to 256-color" comments — must
+// equal the true nearest xterm-256 index (6x6x6 cube + 16-step gray
+// ramp, ties resolve to the lower index, matching the file comment).
+// Regression: the llamaman vars used to carry stale indices (e.g.
+// "118" for #73D216; the true nearest is 76, a tie with 118 resolved
+// downward) that contradicted the table.
+func TestPalette256AnnotationsAccurate(t *testing.T) {
+	src, err := os.ReadFile("theme.go")
+	if err != nil {
+		t.Fatalf("read theme.go: %v", err)
+	}
+	// hex("#RRGGBB"), // 256 ≈ N   (palette table)
+	tableRE := regexp.MustCompile(`hex\("#([0-9A-Fa-f]{6})"\)\s*,?\s*//\s*256\s*≈\s*(\d+)`)
+	// lipgloss.Color("#RRGGBB"), // ... maps to 256-color N  (llamaman vars)
+	varRE := regexp.MustCompile(`#([0-9A-Fa-f]{6})"\)\s*,?\s*//.*maps to 256-color (\d+)`)
+
+	check := func(matches [][]string, where string) {
+		for _, m := range matches {
+			rgb := m[1]
+			want := nearestXterm256(rgb)
+			claimed, _ := strconv.Atoi(m[2])
+			if claimed != want {
+				t.Errorf("theme.go (%s): #%s claimed 256 ≈ %d, true nearest is %d", where, rgb, claimed, want)
+			}
+		}
+	}
+	check(tableRE.FindAllStringSubmatch(string(src), -1), "palette table")
+	check(varRE.FindAllStringSubmatch(string(src), -1), "llamaman vars")
+}
+
+// nearestXterm256 returns the xterm-256 index closest to the given hex
+// color over the 6x6x6 color cube (16..231) and the 16-step gray ramp
+// (232..255), with ties resolving to the lower index. The 16 system
+// colors are excluded (they are terminal-dependent).
+func nearestXterm256(hex string) int {
+	r, g, b := hexChan(hex, 0), hexChan(hex, 2), hexChan(hex, 4)
+	levels := [6]int{0, 95, 135, 175, 215, 255}
+	best, bestD := 0, math.MaxInt64
+	for i := 16; i < 232; i++ {
+		n := i - 16
+		cr, cg, cb := levels[n/36], levels[(n/6)%6], levels[n%6]
+		if d := sq(r-cr) + sq(g-cg) + sq(b-cb); d < bestD {
+			best, bestD = i, d
+		}
+	}
+	for i := 232; i < 256; i++ {
+		v := 8 + 10*(i-232)
+		if d := sq(r-v) + sq(g-v) + sq(b-v); d < bestD {
+			best, bestD = i, d
+		}
+	}
+	return best
+}
+
+func hexChan(s string, off int) int {
+	v, _ := strconv.ParseUint(s[off:off+2], 16, 8)
+	return int(v)
+}
+
+func sq(v int) int { return v * v }
 
 // TestPaletteTableShape pins the curated table: 23 palettes + the auto
 // value, all with stable IDs, unique display names, and valid hex
@@ -40,7 +107,7 @@ func TestPaletteTableShape(t *testing.T) {
 func TestPaletteHexesAreValid(t *testing.T) {
 	for _, p := range palettes {
 		for _, c := range []lipgloss.Color{
-			p.T.Accent, p.T.Subtle, p.T.Muted,
+			p.T.Accent, p.T.SegmentPrompt, p.T.SegmentGen, p.T.Subtle, p.T.Muted,
 			p.T.StatusIdle, p.T.StatusReady, p.T.StatusStart, p.T.StatusErr, p.T.StatusGone,
 			p.T.BorderFocus, p.T.Border,
 		} {
@@ -48,6 +115,37 @@ func TestPaletteHexesAreValid(t *testing.T) {
 			if len(s) != 7 || s[0] != '#' {
 				t.Errorf("%s: invalid color %q", p.ID, s)
 			}
+		}
+	}
+}
+
+// TestSegmentColorsPinned pins the theme-driven prompt/gen segment
+// colors: the default theme must resolve non-empty segment colors, the
+// two llamaman variants must keep the historical hard-coded values
+// (the pre-theme look), and the palette table entries must carry
+// distinct prompt/gen colors (purple vs orange).
+func TestSegmentColorsPinned(t *testing.T) {
+	dark, _, ok := ResolveTheme("auto", true)
+	if !ok || dark.SegmentPrompt == "" || dark.SegmentGen == "" {
+		t.Fatalf("dark default must resolve segment colors, got prompt=%q gen=%q", dark.SegmentPrompt, dark.SegmentGen)
+	}
+	light, _, _ := ResolveTheme("auto", false)
+	if string(dark.SegmentPrompt) != "#9B59B6" || string(dark.SegmentGen) != "#FF8C00" {
+		t.Errorf("dark default segments = %q/%q, want the historical #9B59B6/#FF8C00", dark.SegmentPrompt, dark.SegmentGen)
+	}
+	if string(light.SegmentPrompt) != "#8E44AD" || string(light.SegmentGen) != "#D35400" {
+		t.Errorf("light default segments = %q/%q, want #8E44AD/#D35400", light.SegmentPrompt, light.SegmentGen)
+	}
+	for _, p := range palettes {
+		if p.ID == "llamaman" {
+			continue
+		}
+		if p.T.SegmentPrompt == "" || p.T.SegmentGen == "" {
+			t.Errorf("%s: missing segment colors", p.ID)
+			continue
+		}
+		if p.T.SegmentPrompt == p.T.SegmentGen {
+			t.Errorf("%s: prompt and gen segment colors are identical", p.ID)
 		}
 	}
 }

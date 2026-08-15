@@ -23,16 +23,23 @@ var Wordmark string
 // drives the run-mode status badge tints bars, sparklines, and
 // trailing values when their value crosses the threshold cuts.
 type Theme struct {
-	Accent      lipgloss.Color
-	Subtle      lipgloss.Color
-	Muted       lipgloss.Color
-	StatusIdle  lipgloss.Color // light blue — low/idle utilization (Q6a Blue zone)
-	StatusReady lipgloss.Color // green   — healthy operating range
-	StatusStart lipgloss.Color // yellow  — elevated; warning
-	StatusErr   lipgloss.Color // red     — saturated; danger
-	StatusGone  lipgloss.Color
-	BorderFocus lipgloss.Color
-	Border      lipgloss.Color
+	Accent lipgloss.Color
+	// SegmentPrompt and SegmentGen tint the context-breakdown bar
+	// (run.go renderContextBreakdownRow / renderSegmentedBar): prompt
+	// tokens purple, generated tokens orange. Per-palette values are
+	// each family's canonical purple/orange (or a light/dark-adapted
+	// variant for custom light themes).
+	SegmentPrompt lipgloss.Color
+	SegmentGen    lipgloss.Color
+	Subtle        lipgloss.Color
+	Muted         lipgloss.Color
+	StatusIdle    lipgloss.Color // light blue — low/idle utilization (Q6a Blue zone)
+	StatusReady   lipgloss.Color // green   — healthy operating range
+	StatusStart   lipgloss.Color // yellow  — elevated; warning
+	StatusErr     lipgloss.Color // red     — saturated; danger
+	StatusGone    lipgloss.Color
+	BorderFocus   lipgloss.Color
+	Border        lipgloss.Color
 }
 
 // Keymap groups the key bindings shared across modes. Mode-specific
