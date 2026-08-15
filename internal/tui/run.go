@@ -3049,8 +3049,8 @@ func (r *RunMode) renderContextBreakdownRow(sv *statsView) string {
 	// Build a segmented bar: prompt (purple), gen (orange), empty (dim).
 	bar := r.renderSegmentedBar(sv.contextPromptToks, sv.contextGenToks, sv.contextMax)
 
-	purpleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9B59B6"))
-	orangeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF8C00"))
+	purpleStyle := lipgloss.NewStyle().Foreground(r.theme.SegmentPrompt)
+	orangeStyle := lipgloss.NewStyle().Foreground(r.theme.SegmentGen)
 	promptStr := purpleStyle.Render(formatTokenCount(sv.contextPromptToks))
 	genStr := orangeStyle.Render(formatTokenCount(sv.contextGenToks))
 	freeToks := sv.contextMax - sv.contextPromptToks - sv.contextGenToks
@@ -3075,8 +3075,8 @@ func (r *RunMode) renderSegmentedBar(seg1, seg2, total int) string {
 	seg1Cells := int((seg1Pct/100)*liveBarWidth + 0.5)
 	seg2Cells := int((seg2Pct/100)*liveBarWidth + 0.5)
 
-	purpleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#9B59B6")) // purple — prompt
-	orangeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF8C00")) // dark orange — generated
+	purpleStyle := lipgloss.NewStyle().Foreground(r.theme.SegmentPrompt) // purple — prompt
+	orangeStyle := lipgloss.NewStyle().Foreground(r.theme.SegmentGen)    // orange — generated
 	dimStyle := lipgloss.NewStyle().Foreground(r.theme.Muted)
 
 	var b strings.Builder
