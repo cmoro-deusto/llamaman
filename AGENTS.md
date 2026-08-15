@@ -115,3 +115,9 @@ Release: GoReleaser v2 (`~> v2`) builds `llamaman` (CGO_ENABLED=1, cross-compile
 - Run order: build fakeserver first if needed, then `go vet ./...` then `go test ./...`.
 - No external test framework, no explicit coverage thresholds.
 - **Trap:** DESIGN.md still mentions `teatest`, but it is NOT in go.mod — TUI snapshot tests render in-process via a stub spawner + `drainCmds` (see `internal/tui/snapshot_test.go`). Don't add teatest.
+
+## Git & PR Workflow
+- Commits: allowed. Always on a feature branch — **never commit directly to `main`**.
+- Pushing and opening PRs: only with **explicit user consent** in the current session. Never assume or infer consent.
+- Never merge a PR — not even when CI is green or the PR looks ready. Merging into `main` is always the user's action.
+- Flow: create branch → commit → (with consent) push + open PR → watch CI → notify the user that the PR is ready to merge. Stop there.

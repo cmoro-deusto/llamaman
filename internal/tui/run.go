@@ -130,6 +130,7 @@ type RunMode struct {
 	sessionMgr    *server.SessionManager
 	registry      flags.Registry
 	serverVersion string // parsed from `<bin> --version`; "" on failure
+	version       string // llamaman build version; wide-mode header bottom row
 
 	viewport viewport.Model
 	buf      strings.Builder
@@ -247,6 +248,7 @@ type RunModeOpts struct {
 	SessionMgr *server.SessionManager // optional; needed to clear session.json on kill
 	Registry   flags.Registry         // optional; used by the header to canonicalize param keys
 	Fetcher    Fetcher                // optional; nil disables the live ctx-size /props fetch
+	Version    string                 // llamaman build version (main.versionString); wide-mode header
 }
 
 // NewRunMode wires a RunMode around an already-spawned (or adopted)
@@ -295,6 +297,7 @@ func NewRunMode(opts RunModeOpts, theme Theme) (*RunMode, tea.Cmd, error) {
 		theme:                  theme,
 		searchInput:            ti,
 		serverVersion:          loadServerVersion(opts.Cfg.Globals.Bin),
+		version:                opts.Version,
 		fetcher:                opts.Fetcher,
 		metricsAvailable:       true,
 		routerMetricsAvailable: true,
@@ -2380,8 +2383,15 @@ func (r *RunMode) renderTopStrip() string {
 		flash := lipgloss.NewStyle().Foreground(r.theme.StatusStart).Render(r.flash)
 		row1 = rightFlash(row1, flash, rightWidth)
 	}
-	// 4 rows total: 1 blank top + row1 + row2 + 1 blank bottom.
-	rightCol := strings.Join([]string{"", row1, row2, ""}, "\n")
+	// 4 rows total: 1 blank top + row1 + row2 + version row. The
+	// llamaman build version sits left-aligned in the remaining row
+	// (right of the wordmark's last line, directly under the Preset
+	// column); empty when unset so the row stays blank (tests).
+	versionRow := ""
+	if r.version != "" {
+		versionRow = subtle.Render(r.version)
+	}
+	rightCol := strings.Join([]string{"", row1, row2, versionRow}, "\n")
 
 	twoColumn := lipgloss.JoinHorizontal(lipgloss.Top, wordmark, "  ", rightCol)
 	body := strings.Join([]string{"", twoColumn, ""}, "\n")

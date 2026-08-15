@@ -368,7 +368,7 @@ There is no separate "selection mode" — model selection is the main mode.
 │ ▜  ▜                                                                             │
 │ ▐  ▐  ▝▀▖ ...   Alias: alpha    Server: 8994     Context Size: 8192              │
 │ ▐  ▐  ▞▀▌ ...   Preset: fast    Uptime: 00:01:30   [READY]                       │
-│  ▘  ▘ ▝▀▘ ...                                                                    │
+│  ▘  ▘ ▝▀▘ ...   v0.4.0                                                           │
 ╰──────────────────────────────────────────────────────────────────────────────────╯
 ╭── llama-server ──────────────────────╮╭── Hardware ──────────────────────────────╮
 │ Tokens ▁▂▃▅▇█▆▄▃ 80.0 /s  Busy 2/4   ││ [0] AMD Ryzen 9 7950X                    │
@@ -417,6 +417,12 @@ preset value, else `n/a`), `Preset`, `Uptime`, status badge. The
 badge is bracketed, bold, themed-foreground only — `[STARTING]` /
 `[READY]` / `[EXITED]` / `[ERROR]` — no background fill, so it
 works in both dark and light themes.
+
+**Version row** (wide mode only): the fourth row of the top strip
+— right of the wordmark's last line, directly under the `Preset`
+column — shows the llamaman build version (ldflags-embedded,
+`dev` for local builds) in the subtle theme color. Compact mode
+keeps that row blank.
 
 **Live band — `llama-server` panel** (SP3 shape): two content rows,
 each with a 20-cell sparkline of the rate's last 30 seconds, the
