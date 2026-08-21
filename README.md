@@ -19,7 +19,7 @@ If you've already chosen llama.cpp, you've felt the friction: every model wants 
 - Log tailing with live forward search, mouse-wheel scrollback, and `n`/`N` / `g`/`G` navigation.
 - Type-aware parameter editor whose autocomplete and validation come straight from `llama-server --help`.
 - Local `.gguf` files or Hugging Face identifiers (`-m` vs `-hf`) on a per-model basis.
-- **Storage & Downloads manager** (`s`): scan the cache (local models + HF downloads), spot `(cached)` quants, and download GGUF files straight from the hub — pause / resume / cancel, with SHA-256 verification.
+- **Storage & Downloads manager** (`s`): scan the cache (local models + HF downloads), spot `(cached)` quants, and download GGUF files straight from the hub — multi-connection transfers with stall auto-reconnect, pause / resume / cancel, and SHA-256 verification.
 - **Hugging Face browser** (`b`): search or browse the hub inside the TUI — trending / downloads / likes / newest / recently-updated rankings, language / license / task / size filters, per-repo metadata and rendered model card with clickable links, and a one-key hand-off into your config or a download.
 - **Themes & preferences**: 23 curated palettes (+ `auto`) with a live-preview preferences screen (`p`) and instant `t` / `T` cycling from Main.
 - Shell completions for `bash`, `zsh`, and `fish`.
@@ -426,6 +426,7 @@ A preferences form applied and persisted immediately:
 | **animations** | Subtle transitions (dot pulse, badge breathing). Also toggled with `a` in run mode. |
 | **log colours** | Render-time line-kind colouring of the run-mode log. Also toggled with `o` in run mode. |
 | **models directory** | The cache root for HF models and downloads. Default: `$LLAMA_CACHE` → `~/.cache/huggingface/hub`, shared with `llama-cli`. |
+| **download connections** | Parallel connections per model download in the Storage manager (`1`–`16`). Empty = default (`6`). More streams avoid the slow-crawl of a single degraded TCP connection; `1` restores single-stream downloads. |
 
 `t` / `T` on the main screen cycle the theme without opening preferences; a mismatched palette (light palette on a dark terminal, say) still applies but flashes a warning.
 

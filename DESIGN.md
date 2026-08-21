@@ -57,7 +57,8 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
     "theme": "auto",        // palette ID from the TUI table; "auto" is default
     "animations": true,      // default true; explicit false is honored
     "log-colors": true,      // default true; explicit false is honored (§15.3)
-    "models-dir": ""        // llama.cpp HF cache root; "" = follow llama.cpp's chain (§16.1)
+    "models-dir": "",       // llama.cpp HF cache root; "" = follow llama.cpp's chain (§16.1)
+    "download-connections": 6 // parallel connections per download; absent/0 = default (§16.4)
   },
   "models": [
     {
@@ -1119,6 +1120,14 @@ Additive `version: 1`, per P2:
     and a continuous loop (§15.5a); `preferences.animations` off
     disables the sweep entirely. Unknown values warn (P3) and fall back
     to `"once"`.
+  - `download-connections` is a plain int, default `0` (absent == the
+    downloader's default, `hf.DefaultConnections` = 6). It sets the
+    parallel-connection count for Storage-manager downloads (§16.4);
+    the Settings form writes an explicit default back as absent
+    (minimal object, like `theme` "auto"). Out-of-range values warn at
+    config level (P3) and clamp at runtime — `hf.SetConnections` owns
+    the default and the [1, 16] cap, so the semantics stay
+    single-sourced in `internal/hf` (the theme-resolver pattern).
 - Nil-safe accessor `Config.Prefs() Preferences` (returns the zero
   value when the pointer is nil) is the only way the TUI reads
   preferences; callers never dereference the pointer directly.
@@ -2238,8 +2247,11 @@ stream is dropped and re-established instead of sitting there forever.
 
 - **Chunk grid.** Blobs of ≥ 2 chunks (chunk = 32 MiB) fetch as
   bounded `Range: bytes=a-b` requests over up to N parallel streams
-  (N = `SetConnections`, default 6, max 16 — beyond that the extra
-  streams only fragment disk writes). Workers pull chunk indices from
+  (N = `SetConnections`, wired from `preferences.download-connections`
+  — default 6, max 16; beyond that the extra streams only fragment
+  disk writes). Root retunes the live engine when Settings change (the
+  Storage manager is reused across visits); the next blob picks the
+  new count up. Workers pull chunk indices from
   a queue, write via `WriteAt` into the full-size-preallocated
   `<oid>.incomplete`, and the first failure cancels the fleet. Small
   blobs (or N = 1) keep the sequential path unchanged.

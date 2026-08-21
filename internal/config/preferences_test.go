@@ -328,6 +328,47 @@ func TestModelsDirRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDownloadConnectionsRoundTrip pins the field-arrival contract for
+// preferences.download-connections (DESIGN §16.4): an explicit value
+// survives a round trip, and 0 (the default) stays omitted.
+func TestDownloadConnectionsRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg := &Config{
+		Version:     1,
+		Globals:     Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Preferences: &Preferences{DownloadConnections: 8},
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsSubstring(string(data), `"download-connections": 8`) {
+		t.Errorf("download-connections should be written verbatim:\n%s", data)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := loaded.Prefs(); p.DownloadConnections != 8 {
+		t.Errorf("download-connections = %d after round trip, want 8", p.DownloadConnections)
+	}
+
+	cfg.Preferences = &Preferences{Theme: "nord"} // object exists, count default
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if data, err = os.ReadFile(path); err != nil {
+		t.Fatal(err)
+	}
+	if containsSubstring(string(data), "download-connections") {
+		t.Errorf("default download-connections must stay omitted:\n%s", data)
+	}
+}
+
 // TestModelsDirExpandedAtLoad verifies ~/$VAR expansion applies to
 // preferences.models-dir at load time (DESIGN §3.3 extension).
 func TestModelsDirExpandedAtLoad(t *testing.T) {
