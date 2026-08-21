@@ -2226,6 +2226,45 @@ s to view`).
   it even when the API calls succeeded. `net/http` strips the header on
   the cross-host redirect to the signed CDN URL, so the token never
   leaves huggingface.co.
+
+#### Parallel chunked transfer
+
+Owner report: single-stream downloads start fast and decay to a crawl —
+the signature of a long-lived TCP connection degrading (congestion
+collapse, CDN per-connection shaping). The fix is the same one
+`hf_transfer`/aria2 use: **N concurrent ranged GETs** against the
+Range-capable CDN, plus **stall detection** so a throttled-to-nothing
+stream is dropped and re-established instead of sitting there forever.
+
+- **Chunk grid.** Blobs of ≥ 2 chunks (chunk = 32 MiB) fetch as
+  bounded `Range: bytes=a-b` requests over up to N parallel streams
+  (N = `SetConnections`, default 6, max 16 — beyond that the extra
+  streams only fragment disk writes). Workers pull chunk indices from
+  a queue, write via `WriteAt` into the full-size-preallocated
+  `<oid>.incomplete`, and the first failure cancels the fleet. Small
+  blobs (or N = 1) keep the sequential path unchanged.
+- **Resume sidecar.** Parallel writes break the "partial length ==
+  progress" invariant, so a parallel download keeps
+  `<oid>.incomplete.state` (JSON: size, chunk, per-chunk done bytes),
+  persisted atomically on every chunk completion and once more on the
+  way out — pause/cancel resumes exactly, mid-chunk. The sidecar is
+  the source of truth for resume and for the progress-bar seed; it is
+  removed when the blob verifies. A legacy contiguous partial (no
+  sidecar) is credited into a fresh grid, so old partials resume
+  instead of restarting; a sidecar-less partial at full size skips
+  straight to verify (crash between EOF and rename).
+- **Stall reconnect.** Both paths: a request that delivers no byte for
+  `stallTimeout` (30s) is killed and re-issued from the current offset
+  — a fresh connection typically restores full speed. Reconnects back
+  off (500ms doubling, 5s cap); `maxChunkAttempts` (5) consecutive
+  zero-progress attempts surface the underlying error. HTTP-status
+  failures (404/gated) never retry.
+- **Fallback.** A 200 to a bounded chunk request means no Range
+  support: the parallel attempt aborts, progress rewinds (the callback
+  may go negative once), and the blob streams sequentially from zero.
+- **Progress.** Chunk workers report concurrently; `Download`
+  accumulates atomically, so the (done, total) stream stays exact
+  (near-simultaneous snapshots may reorder — harmless).
 - **sha256 verify:** after each blob completes, hash it and compare to
   the oid; mismatch → error, partial removed, clear message.
 - Progress via a callback (`done, total int64` per file); cancellation
@@ -2237,7 +2276,12 @@ s to view`).
 - Downloader tests against `httptest.Server`: full download, Range
   resume (pre-seeded `.incomplete`), 206/200 handling, sha256 mismatch,
   refs parsing, split parts, cancel via ctx, blob/symlink layout
-  assertions against a `t.TempDir` root. No real network.
+  assertions against a `t.TempDir` root. No real network. The chunked
+  path adds (chunk size / stall timeout / retry delay are Client test
+  knobs): bounded-range reassembly, pause → sidecar survives → resume
+  fetches only the missing tail, legacy-prefix credit, stall →
+  reconnect from offset, Range-less server fallback, Bearer token on
+  resolve, connection clamping, grid/sidecar validation.
 - TUI tests with a **stub downloader** (the `stubSpawner` pattern) and
   fake cache trees: listing groups/sizes, delete-with-confirmation,
   action flow, free-disk line (`Statfs` on a TempDir works).
