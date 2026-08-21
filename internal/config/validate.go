@@ -145,6 +145,13 @@ func validatePreferences(p Preferences) Issues {
 			Message: fmt.Sprintf("unknown logo-effect %q (want %q or %q), using %q",
 				p.LogoEffect, LogoEffectOnce, LogoEffectLoop, LogoEffectOnce)})
 	}
+	// keep the bounds in sync with hf.MaxConnections (config cannot
+	// import the network client; the runtime clamp lives there)
+	if p.DownloadConnections < 0 || p.DownloadConnections > 16 {
+		out = append(out, Issue{Severity: Warning, Path: "preferences.download-connections",
+			Message: fmt.Sprintf("download-connections %d out of range (1–16; 0/absent = default), clamped at runtime",
+				p.DownloadConnections)})
+	}
 	if p.ModelsDir == "" {
 		return out
 	}

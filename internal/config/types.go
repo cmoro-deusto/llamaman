@@ -53,6 +53,13 @@ type Preferences struct {
 	// distinct from absent (unlike Animations). Expanded ~/$VAR at load
 	// time (§3.3).
 	ModelsDir string `json:"models-dir,omitempty"`
+	// DownloadConnections is the parallel-connection count for model
+	// downloads in the Storage manager (DESIGN §16.4). 0 (the default,
+	// kept absent via omitempty) means the downloader's default;
+	// out-of-range values warn (P3) and are clamped at use time
+	// (hf.SetConnections owns the default and the cap, mirroring the
+	// theme pattern of resolving semantics outside config).
+	DownloadConnections int `json:"download-connections,omitempty"`
 }
 
 // Prefs returns the effective preferences, or the zero value (==

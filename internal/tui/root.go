@@ -681,6 +681,7 @@ func (r *Root) openStorage() (tea.Model, tea.Cmd) {
 		if r.dlEngine != nil {
 			sm.SetEngine(r.dlEngine)
 		} else if c, err := hf.New(); err == nil {
+			c.SetConnections(r.cfg.Prefs().DownloadConnections)
 			sm.SetEngine(c)
 		}
 		r.storage = sm
@@ -783,6 +784,13 @@ func (r *Root) applyPreferences(p *config.Preferences) {
 		return
 	}
 	r.applyTheme()
+	// retune the live download engine (the Storage manager is reused
+	// across visits); the next blob picks the new count up.
+	if r.storage != nil {
+		if c, ok := r.storage.engine.(*hf.Client); ok {
+			c.SetConnections(p.DownloadConnections)
+		}
+	}
 }
 
 // cycleTheme steps the theme cycle forward (+1) or backward (-1),

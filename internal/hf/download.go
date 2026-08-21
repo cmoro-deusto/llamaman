@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/cmoro-deusto/llamaman/internal/storage"
 )
@@ -66,13 +70,7 @@ func (c *Client) Download(ctx context.Context, root, repo, quant string, progres
 		if _, err := os.Stat(snapPath); err == nil {
 			continue // already cached
 		}
-		off := int64(0)
-		if info, err := os.Stat(filepath.Join(blobsDir, f.OID) + ".incomplete"); err == nil {
-			off = info.Size()
-		}
-		if off > f.Size {
-			off = 0 // corrupt partial: restart clean
-		}
+		off := resumeDone(filepath.Join(blobsDir, f.OID), f)
 		jobs = append(jobs, job{file: f, offset: off})
 	}
 	if len(jobs) == 0 {
@@ -91,32 +89,34 @@ func (c *Client) Download(ctx context.Context, root, repo, quant string, progres
 		total += f.Size
 	}
 	inJobs := make(map[string]bool, len(jobs))
-	done := int64(0)
+	var done atomic.Int64
 	for _, j := range jobs {
 		inJobs[j.file.Path] = true
-		done += j.offset
+		done.Add(j.offset)
 	}
 	for _, f := range files {
 		if !inJobs[f.Path] {
-			done += f.Size // already cached
+			done.Add(f.Size) // already cached
 		}
 	}
 	if progress != nil {
-		progress(done, total)
+		progress(done.Load(), total)
+	}
+	// report accumulates deltas from possibly-concurrent chunk workers
+	// (§16.4); slight reordering of two near-simultaneous snapshots is
+	// harmless — the sum itself is exact.
+	report := func(d int64) {
+		v := done.Add(d)
+		if progress != nil {
+			progress(v, total)
+		}
 	}
 	refsWritten := false
 	for _, j := range jobs {
 		blobPath := filepath.Join(blobsDir, j.file.OID)
-		n, err := c.downloadOne(ctx, j.file, blobPath, commit, repo, j.offset, func(d int64) {
-			done += d
-			if progress != nil {
-				progress(done, total)
-			}
-		})
-		if err != nil {
+		if err := c.downloadOne(ctx, j.file, blobPath, commit, repo, report); err != nil {
 			return err
 		}
-		_ = n
 		if !refsWritten {
 			if err := writeRef(refsFile, commit); err != nil {
 				return err
@@ -131,91 +131,545 @@ func (c *Client) Download(ctx context.Context, root, repo, quant string, progres
 	return nil
 }
 
-// downloadOne fetches one blob into blobsDir/<oid> starting at offset
-// (the resume position from a partial <oid>.incomplete). The blob is
-// verified (full sha256 == oid) before the caller renames it into
-// place. progress reports bytes fetched this run.
-func (c *Client) downloadOne(ctx context.Context, f RepoFile, blobPath, commit, repo string, offset int64, progress func(done int64)) (int64, error) {
-	if f.OID == "" {
-		return 0, fmt.Errorf("hf: %s has no oid to verify against", f.Path)
+// Tunables of the chunked downloader (§16.4). chunkSize, stallTimeout,
+// and retryDelay live on the Client so tests can shrink them; these are
+// the production values.
+const (
+	defaultChunkSize    = 32 << 20         // per-chunk range size
+	defaultStallTimeout = 30 * time.Second // no-progress window before reconnecting
+	defaultRetryDelay   = 500 * time.Millisecond
+	maxChunkAttempts    = 5 // consecutive zero-progress attempts before giving up
+	maxRestarts         = 3 // sequential from-zero restarts (server ignoring Range)
+)
+
+// errNoRanges signals the server answered a ranged request with a
+// plain 200 — it does not support Range, so the parallel path falls
+// back to a single sequential stream.
+var errNoRanges = errors.New("hf: server ignored Range request")
+
+// chunkState is the resume sidecar of a parallel download
+// (`<oid>.incomplete.state`): the blob is cut into a fixed chunk grid
+// and Done[i] holds the completed bytes at the start of chunk i. The
+// partial is preallocated to full size, so — unlike the sequential
+// path — its length says nothing about progress; the sidecar is the
+// source of truth. It is persisted when a chunk completes and when the
+// download stops (pause/cancel/error), and removed once the blob
+// verifies.
+type chunkState struct {
+	Version int     `json:"version"`
+	Size    int64   `json:"size"`
+	Chunk   int64   `json:"chunk"`
+	Done    []int64 `json:"done"`
+}
+
+// bounds returns chunk i's byte range [from, to).
+func (st *chunkState) bounds(i int) (from, to int64) {
+	from = int64(i) * st.Chunk
+	to = min(from+st.Chunk, st.Size)
+	return from, to
+}
+
+// doneBytes sums the completed bytes across all chunks.
+func (st *chunkState) doneBytes() int64 {
+	var sum int64
+	for _, d := range st.Done {
+		sum += d
 	}
-	partial := blobPath + ".incomplete"
-	if offset > 0 {
-		if info, err := os.Stat(partial); err == nil && info.Size() != offset {
-			offset = 0 // partial changed under us; restart clean
+	return sum
+}
+
+// valid reports whether the sidecar matches a blob of the given size.
+// An invalid sidecar is discarded (the partial cannot be trusted — its
+// preallocated length lies about progress — so the download restarts).
+func (st *chunkState) valid(size int64) bool {
+	if st.Version != 1 || st.Size != size || st.Chunk <= 0 || size <= 0 {
+		return false
+	}
+	if int64(len(st.Done)) != (size+st.Chunk-1)/st.Chunk {
+		return false
+	}
+	for i, d := range st.Done {
+		from, to := st.bounds(i)
+		if d < 0 || d > to-from {
+			return false
 		}
 	}
+	return true
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.resolveURL(repo, commit, f.Path), nil)
+// newChunkState builds a fresh grid over size bytes, crediting a
+// legacy contiguous prefix (a pre-sidecar `.incomplete`) so an old
+// partial resumes instead of restarting.
+func newChunkState(size, chunk, prefix int64) *chunkState {
+	st := &chunkState{Version: 1, Size: size, Chunk: chunk,
+		Done: make([]int64, (size+chunk-1)/chunk)}
+	for i := range st.Done {
+		from, to := st.bounds(i)
+		if prefix <= from {
+			break
+		}
+		st.Done[i] = min(prefix, to) - from
+	}
+	return st
+}
+
+// loadChunkState reads and validates a sidecar; nil when absent or
+// unusable.
+func loadChunkState(path string, size int64) *chunkState {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var st chunkState
+	if json.Unmarshal(data, &st) != nil || !st.valid(size) {
+		return nil
+	}
+	return &st
+}
+
+// persist writes the sidecar atomically (tmp + rename), so a crash
+// never leaves a torn state file.
+func (st *chunkState) persist(path string) error {
+	data, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// resumeDone reports the bytes of f already present in a partial — the
+// seed of the absolute progress bar. Parallel partials answer from
+// their sidecar; legacy partials from their contiguous length.
+func resumeDone(blobPath string, f RepoFile) int64 {
+	partial := blobPath + ".incomplete"
+	if st := loadChunkState(partial+".state", f.Size); st != nil {
+		return st.doneBytes()
+	}
+	if info, err := os.Stat(partial); err == nil && info.Size() <= f.Size {
+		return info.Size()
+	}
+	return 0
+}
+
+// downloadOne fetches one blob into blobs/<oid>, resuming any partial,
+// and verifies it (full sha256 == oid) before the caller links it into
+// the snapshot. Blobs of at least two chunks fetch as parallel ranged
+// chunks when more than one connection is configured; small blobs (and
+// connections == 1) stream sequentially with the legacy
+// contiguous-partial resume. progress reports bytes fetched this run,
+// incrementally, possibly from several goroutines — and may go
+// negative once (rewind) when a parallel attempt falls back to
+// sequential-from-zero.
+func (c *Client) downloadOne(ctx context.Context, f RepoFile, blobPath, commit, repo string, progress func(done int64)) error {
+	if f.OID == "" {
+		return fmt.Errorf("hf: %s has no oid to verify against", f.Path)
+	}
+	partial := blobPath + ".incomplete"
+	statePath := partial + ".state"
+	url := c.resolveURL(repo, commit, f.Path)
+	if err := os.MkdirAll(filepath.Dir(partial), 0o755); err != nil {
+		return &Error{Kind: ErrNetwork, Message: err.Error()}
+	}
+
+	// A parallel partial resumes from its sidecar grid regardless of
+	// the currently configured connection count.
+	if st := loadChunkState(statePath, f.Size); st != nil {
+		err := c.downloadChunks(ctx, url, partial, statePath, st, progress)
+		if errors.Is(err, errNoRanges) {
+			return c.sequentialFallback(ctx, url, blobPath, f, progress)
+		}
+		if err != nil {
+			return err
+		}
+		return c.verifyBlob(f, blobPath)
+	}
+
+	// No sidecar: any partial is a legacy contiguous prefix.
+	prefix := int64(0)
+	if info, err := os.Stat(partial); err == nil {
+		prefix = info.Size()
+		if prefix > f.Size {
+			prefix = 0 // corrupt partial: restart clean
+		}
+	}
+	if prefix == f.Size && f.Size > 0 {
+		// fully fetched but never verified/renamed: finish the job
+		return c.verifyBlob(f, blobPath)
+	}
+	if c.connections() > 1 && f.Size >= 2*c.chunkSize {
+		st := newChunkState(f.Size, c.chunkSize, prefix)
+		if err := st.persist(statePath); err != nil {
+			return &Error{Kind: ErrNetwork, Message: err.Error()}
+		}
+		err := c.downloadChunks(ctx, url, partial, statePath, st, progress)
+		if errors.Is(err, errNoRanges) {
+			return c.sequentialFallback(ctx, url, blobPath, f, progress)
+		}
+		if err != nil {
+			return err
+		}
+		return c.verifyBlob(f, blobPath)
+	}
+	if err := c.downloadSequential(ctx, url, partial, f.Size, prefix, progress); err != nil {
+		return err
+	}
+	return c.verifyBlob(f, blobPath)
+}
+
+// sequentialFallback restarts a blob from zero over one stream after
+// the server ignored ranged requests: rewind the progress already
+// credited (sidecar bytes), drop the sidecar, truncate the partial —
+// its preallocated content cannot be trusted — and stream.
+func (c *Client) sequentialFallback(ctx context.Context, url, blobPath string, f RepoFile, progress func(int64)) error {
+	partial := blobPath + ".incomplete"
+	statePath := partial + ".state"
+	if st := loadChunkState(statePath, f.Size); st != nil && progress != nil && st.doneBytes() > 0 {
+		progress(-st.doneBytes())
+	}
+	_ = os.Remove(statePath)
+	if err := os.Truncate(partial, 0); err != nil {
+		return &Error{Kind: ErrNetwork, Message: err.Error()}
+	}
+	if err := c.downloadSequential(ctx, url, partial, f.Size, 0, progress); err != nil {
+		return err
+	}
+	return c.verifyBlob(f, blobPath)
+}
+
+// downloadChunks fetches the pending chunks of st over up to
+// connections() parallel ranged streams, each with its own
+// stall-reconnect loop. The first error cancels the rest; the sidecar
+// is persisted once more on the way out, so a pause mid-chunk resumes
+// exactly. errNoRanges aborts the whole attempt (the caller falls back
+// to sequential).
+func (c *Client) downloadChunks(ctx context.Context, url, partial, statePath string, st *chunkState, progress func(int64)) error {
+	fh, err := os.OpenFile(partial, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return &Error{Kind: ErrNetwork, Message: err.Error()}
+	}
+	defer fh.Close()
+	if err := fh.Truncate(st.Size); err != nil {
+		return &Error{Kind: ErrNetwork, Message: err.Error()}
+	}
+
+	var mu sync.Mutex // guards st.Done and sidecar writes
+	defer func() {
+		mu.Lock()
+		_ = st.persist(statePath)
+		mu.Unlock()
+	}()
+
+	var pending []int
+	for i := range st.Done {
+		from, to := st.bounds(i)
+		if st.Done[i] < to-from {
+			pending = append(pending, i)
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	workers := min(c.connections(), len(pending))
+
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	idxCh := make(chan int)
+	go func() {
+		defer close(idxCh)
+		for _, i := range pending {
+			select {
+			case idxCh <- i:
+			case <-cctx.Done():
+				return
+			}
+		}
+	}()
+
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range idxCh {
+				if err := c.fetchChunk(cctx, url, fh, st, i, statePath, &mu, progress); err != nil {
+					errCh <- err
+					cancel() // first failure stops the fleet
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+
+	if err := ctx.Err(); err != nil {
+		return err // user pause/cancel wins over induced worker aborts
+	}
+	var firstErr error
+	for err := range errCh {
+		if errors.Is(err, errNoRanges) {
+			return err
+		}
+		if firstErr == nil && !errors.Is(err, context.Canceled) {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// fetchChunk brings chunk i to completion: ranged requests from the
+// chunk's current offset, reconnecting on stalls and transport errors,
+// giving up after maxChunkAttempts consecutive attempts without a
+// byte of progress. Done[i] advances as bytes land, so a pause
+// mid-chunk resumes exactly where it stopped.
+func (c *Client) fetchChunk(ctx context.Context, url string, fh *os.File, st *chunkState, i int, statePath string, mu *sync.Mutex, progress func(int64)) error {
+	from0, to := st.bounds(i)
+	attempts := 0
+	for {
+		mu.Lock()
+		from := from0 + st.Done[i]
+		mu.Unlock()
+		if from >= to {
+			mu.Lock()
+			err := st.persist(statePath)
+			mu.Unlock()
+			if err != nil {
+				return &Error{Kind: ErrNetwork, Message: err.Error()}
+			}
+			return nil
+		}
+		n, err := c.fetchRange(ctx, url, fh, from, to, func(w int64) {
+			mu.Lock()
+			st.Done[i] += w
+			mu.Unlock()
+			if progress != nil {
+				progress(w)
+			}
+		})
+		if err == nil {
+			continue // loop persists and returns once the chunk is full
+		}
+		if ctx.Err() != nil {
+			return ctx.Err() // pause/cancel: the deferred persist keeps progress
+		}
+		if errors.Is(err, errNoRanges) {
+			return err
+		}
+		var he *Error
+		if errors.As(err, &he) && he.Kind != ErrNetwork {
+			return err // HTTP-status failures (404/gated/…) don't retry
+		}
+		if n == 0 {
+			attempts++
+		} else {
+			attempts = 0
+		}
+		if attempts >= maxChunkAttempts {
+			return err
+		}
+		if serr := c.sleepBackoff(ctx, attempts); serr != nil {
+			return serr
+		}
+	}
+}
+
+// downloadSequential streams the blob over one connection — the legacy
+// path for small blobs and connections == 1. The partial is a
+// contiguous prefix whose length is the resume offset. Stalled or
+// dropped connections reconnect from the current offset; a 200 to a
+// ranged request restarts from zero (server without Range support).
+func (c *Client) downloadSequential(ctx context.Context, url, partial string, size, offset int64, progress func(int64)) error {
+	fh, err := os.OpenFile(partial, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return &Error{Kind: ErrNetwork, Message: err.Error()}
+	}
+	defer fh.Close()
+	attempts, restarts := 0, 0
+	for offset < size {
+		n, err := c.fetchRange(ctx, url, fh, offset, -1, progress)
+		offset += n
+		if err == nil {
+			break // clean EOF — the sha verify judges completeness
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if errors.Is(err, errNoRanges) {
+			restarts++
+			if restarts > maxRestarts {
+				return &Error{Kind: ErrNetwork, Message: "server ignored Range resume repeatedly"}
+			}
+			if progress != nil && offset > 0 {
+				progress(-offset) // rewind the bar with the restart
+			}
+			offset = 0
+			if terr := fh.Truncate(0); terr != nil {
+				return &Error{Kind: ErrNetwork, Message: terr.Error()}
+			}
+			continue
+		}
+		var he *Error
+		if errors.As(err, &he) && he.Kind != ErrNetwork {
+			return err
+		}
+		if n == 0 {
+			attempts++
+		} else {
+			attempts = 0
+		}
+		if attempts >= maxChunkAttempts {
+			return err
+		}
+		if serr := c.sleepBackoff(ctx, attempts); serr != nil {
+			return serr
+		}
+	}
+	return nil
+}
+
+// fetchRange GETs url bytes [from, to) — to < 0 means to EOF — writing
+// them into fh at their absolute offsets and reporting each landed
+// slice via report. A watchdog kills the request when no byte arrives
+// for stallTimeout (a single throttled-to-nothing TCP stream otherwise
+// hangs forever); the caller reconnects from the current offset, which
+// a fresh connection typically restores to full speed.
+func (c *Client) fetchRange(ctx context.Context, url string, fh *os.File, from, to int64, report func(int64)) (int64, error) {
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(rctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, &Error{Kind: ErrNetwork, Message: err.Error()}
 	}
-	if offset > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	c.authorize(req)
+	ranged := false
+	switch {
+	case to >= 0:
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", from, to-1))
+		ranged = true
+	case from > 0:
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", from))
+		ranged = true
 	}
 	resp, err := c.dlHTTP.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
 		return 0, &Error{Kind: ErrNetwork, Message: err.Error()}
 	}
 	defer resp.Body.Close()
-
 	switch resp.StatusCode {
-	case http.StatusOK:
-		offset = 0 // server ignored the Range; start clean
 	case http.StatusPartialContent:
+	case http.StatusOK:
+		if ranged {
+			return 0, errNoRanges
+		}
 	default:
 		return 0, downloadStatusError(resp.StatusCode)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(partial), 0o755); err != nil {
-		return 0, &Error{Kind: ErrNetwork, Message: err.Error()}
-	}
-	fh, err := os.OpenFile(partial, os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return 0, &Error{Kind: ErrNetwork, Message: err.Error()}
-	}
-	defer fh.Close()
-	if offset > 0 {
-		if _, err := fh.Seek(offset, io.SeekStart); err != nil {
-			return 0, &Error{Kind: ErrNetwork, Message: err.Error()}
+	var last atomic.Int64
+	last.Store(time.Now().UnixNano())
+	var stalled atomic.Bool
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		tick := max(c.stallTimeout/4, time.Millisecond)
+		tick = min(tick, time.Second)
+		t := time.NewTicker(tick)
+		defer t.Stop()
+		for {
+			select {
+			case <-watchDone:
+				return
+			case <-rctx.Done():
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, last.Load())) > c.stallTimeout {
+					stalled.Store(true)
+					cancel()
+					return
+				}
+			}
 		}
-	}
+	}()
 
+	var body io.Reader = resp.Body
+	if to >= 0 {
+		body = io.LimitReader(resp.Body, to-from)
+	}
 	written := int64(0)
 	buf := make([]byte, 256<<10)
 	for {
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-		n, rerr := resp.Body.Read(buf)
+		n, rerr := body.Read(buf)
 		if n > 0 {
-			if _, werr := fh.Write(buf[:n]); werr != nil {
-				return 0, &Error{Kind: ErrNetwork, Message: werr.Error()}
+			if _, werr := fh.WriteAt(buf[:n], from+written); werr != nil {
+				return written, &Error{Kind: ErrNetwork, Message: werr.Error()}
 			}
 			written += int64(n)
-			progress(int64(n)) // incremental — the caller accumulates
+			last.Store(time.Now().UnixNano())
+			if report != nil {
+				report(int64(n))
+			}
 		}
 		if rerr == io.EOF {
-			break
+			return written, nil
 		}
 		if rerr != nil {
-			return 0, &Error{Kind: ErrNetwork, Message: rerr.Error()}
+			if ctx.Err() != nil {
+				return written, ctx.Err()
+			}
+			if stalled.Load() {
+				return written, &Error{Kind: ErrNetwork,
+					Message: fmt.Sprintf("stalled: no data for %s — reconnecting", c.stallTimeout)}
+			}
+			return written, &Error{Kind: ErrNetwork, Message: rerr.Error()}
 		}
 	}
+}
 
-	// verify the full file against the LFS sha256
+// sleepBackoff waits before a reconnect attempt (retryDelay doubling
+// per consecutive failure, capped at 5s), aborting early on cancel.
+func (c *Client) sleepBackoff(ctx context.Context, attempt int) error {
+	d := c.retryDelay
+	for i := 1; i < attempt; i++ {
+		d *= 2
+	}
+	d = min(d, 5*time.Second)
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// verifyBlob hashes the completed partial against the LFS oid, then
+// renames it into place and drops the resume sidecar. A mismatch
+// removes both so the next attempt starts clean.
+func (c *Client) verifyBlob(f RepoFile, blobPath string) error {
+	partial := blobPath + ".incomplete"
 	got, err := sha256File(partial)
 	if err != nil {
-		return 0, &Error{Kind: ErrNetwork, Message: err.Error()}
+		return &Error{Kind: ErrNetwork, Message: err.Error()}
 	}
 	if got != strings.ToLower(f.OID) {
 		_ = os.Remove(partial)
-		return 0, fmt.Errorf("hf: sha256 mismatch for %s (got %s, want %s)", f.Path, got, f.OID)
+		_ = os.Remove(partial + ".state")
+		return fmt.Errorf("hf: sha256 mismatch for %s (got %s, want %s)", f.Path, got, f.OID)
 	}
+	_ = os.Remove(partial + ".state")
 	if err := os.Rename(partial, blobPath); err != nil {
-		return 0, &Error{Kind: ErrNetwork, Message: err.Error()}
+		return &Error{Kind: ErrNetwork, Message: err.Error()}
 	}
-	return written, nil
+	return nil
 }
 
 // finalizeBlob links snapshots/<commit>/<file> → ../../blobs/<oid>,

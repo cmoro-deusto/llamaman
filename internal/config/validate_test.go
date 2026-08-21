@@ -59,6 +59,33 @@ func TestConfigRoundTripWithModelsFiles(t *testing.T) {
 	}
 }
 
+// TestValidateDownloadConnectionsRange verifies out-of-range
+// download-connections values Warn (P3, clamped at runtime) and
+// in-range values (including 0 = default) are clean.
+func TestValidateDownloadConnectionsRange(t *testing.T) {
+	base := func(n int) *Config {
+		return &Config{
+			Version:     SchemaVersion,
+			Globals:     Globals{Bin: "/usr/local/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+			Preferences: &Preferences{DownloadConnections: n},
+		}
+	}
+	for _, n := range []int{-1, 17, 100} {
+		issues := Validate(base(n))
+		if issues.HasErrors() {
+			t.Errorf("download-connections=%d must warn, not block: %+v", n, issues)
+		}
+		if !hasIssue(issues, "preferences.download-connections", "out of range") {
+			t.Errorf("download-connections=%d: expected range warning, got %+v", n, issues)
+		}
+	}
+	for _, n := range []int{0, 1, 6, 16} {
+		if issues := Validate(base(n)); hasIssue(issues, "preferences.download-connections", "") {
+			t.Errorf("download-connections=%d must be clean, got %+v", n, issues)
+		}
+	}
+}
+
 // TestValidateModelsDirNotADirectory verifies the single models-dir
 // rule (DESIGN §16.1): when set and the path exists but is not a
 // directory → Warning, never a Block.

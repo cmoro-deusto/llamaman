@@ -16,6 +16,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,6 +27,15 @@ const defaultEndpoint = "https://huggingface.co"
 // requestTimeout bounds every request; callers cancel via ctx.
 const requestTimeout = 30 * time.Second
 
+// DefaultConnections is the parallel-connection count for blob
+// downloads when none is configured (SetConnections, §16.4);
+// MaxConnections caps configuration — beyond it the extra streams
+// only fragment the disk writes without adding bandwidth.
+const (
+	DefaultConnections = 6
+	MaxConnections     = 16
+)
+
 // Client talks to the Hugging Face API.
 type Client struct {
 	endpoint string
@@ -34,6 +44,18 @@ type Client struct {
 	dlHTTP   *http.Client // downloads: no timeout — ctx governs (a big
 	// model takes longer than any API-style deadline; the 30s API
 	// timeout must never kill a 16 GiB body read)
+
+	// conns is the parallel-connection count for downloads; 0 means
+	// DefaultConnections. Atomic so Settings can retune it while a
+	// download runs (the next blob picks it up).
+	conns atomic.Int32
+
+	// chunkSize, stallTimeout, and retryDelay tune the chunked
+	// downloader (§16.4); production values are the defaults, tests
+	// shrink them.
+	chunkSize    int64
+	stallTimeout time.Duration
+	retryDelay   time.Duration
 }
 
 // New builds a Client from the environment: $HF_ENDPOINT (or the
@@ -51,11 +73,36 @@ func NewWithEndpoint(endpoint, token string) *Client {
 		endpoint = defaultEndpoint
 	}
 	return &Client{
-		endpoint: strings.TrimRight(endpoint, "/"),
-		token:    token,
-		http:     &http.Client{Timeout: requestTimeout},
-		dlHTTP:   &http.Client{},
+		endpoint:     strings.TrimRight(endpoint, "/"),
+		token:        token,
+		http:         &http.Client{Timeout: requestTimeout},
+		dlHTTP:       &http.Client{},
+		chunkSize:    defaultChunkSize,
+		stallTimeout: defaultStallTimeout,
+		retryDelay:   defaultRetryDelay,
 	}
+}
+
+// SetConnections sets the parallel-connection count for downloads:
+// n <= 0 restores DefaultConnections, values above MaxConnections
+// clamp. Safe to call while a download runs.
+func (c *Client) SetConnections(n int) {
+	if n < 0 {
+		n = 0
+	}
+	if n > MaxConnections {
+		n = MaxConnections
+	}
+	c.conns.Store(int32(n))
+}
+
+// connections returns the effective parallel-connection count.
+func (c *Client) connections() int {
+	n := int(c.conns.Load())
+	if n < 1 {
+		return DefaultConnections
+	}
+	return n
 }
 
 // Tree lists the files of a repo at a revision (branch or commit).
@@ -165,6 +212,16 @@ func kindOf(err error) ErrorKind {
 		return he.Kind
 	}
 	return ErrNetwork
+}
+
+// authorize attaches the Bearer token when one is configured (§16.2:
+// every request, downloads included — gated repos 401 without it).
+// net/http strips the header on cross-host redirects, so the signed
+// CDN URL a resolve request redirects to never sees the token.
+func (c *Client) authorize(req *http.Request) {
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 }
 
 // getJSON GETs u and decodes the JSON body into v.

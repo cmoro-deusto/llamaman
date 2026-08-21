@@ -2,12 +2,15 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
+	"github.com/cmoro-deusto/llamaman/internal/hf"
 )
 
 // SettingsMode edits exactly the top-level `preferences` config object
@@ -28,6 +31,7 @@ type SettingsMode struct {
 	logColors  bool
 	modelsDir  string
 	logoEffect string
+	dlConns    string // download connections as typed; "" = default
 
 	// lastThemeVal tracks the select's live value so Update can detect
 	// arrow-key changes and re-theme the chrome + preview immediately
@@ -66,6 +70,10 @@ func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg boo
 		warn = fmt.Sprintf("%s — applied anyway", mismatchWarning(themeVal, darkBg))
 	}
 
+	dlConns := ""
+	if prefs.DownloadConnections != 0 {
+		dlConns = strconv.Itoa(prefs.DownloadConnections)
+	}
 	sm := &SettingsMode{
 		cfgPath:      cfgPath,
 		cfg:          cfg,
@@ -77,6 +85,7 @@ func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg boo
 		logColors:    prefs.LogColorsEnabled(),
 		modelsDir:    prefs.ModelsDir,
 		logoEffect:   prefs.LogoEffectMode(),
+		dlConns:      dlConns,
 		lastThemeVal: themeVal,
 		warn:         warn,
 	}
@@ -123,6 +132,14 @@ func NewSettingsMode(cfgPath string, cfg *config.Config, theme Theme, darkBg boo
 			Placeholder("e.g. ~/models or /opt/llama-cache").
 			CharLimit(1024).
 			Value(&sm.modelsDir),
+		huh.NewInput().
+			Title("download connections").
+			Description(fmt.Sprintf("parallel connections per model download (1–%d); empty = default (%d)",
+				hf.MaxConnections, hf.DefaultConnections)).
+			Placeholder(strconv.Itoa(hf.DefaultConnections)).
+			CharLimit(2).
+			Validate(validateDownloadConns).
+			Value(&sm.dlConns),
 	)).WithTheme(configHuhTheme(theme))
 	return sm
 }
@@ -243,10 +260,36 @@ func (s *SettingsMode) snapshot() *config.Preferences {
 		changed = true
 	}
 
+	dlConns := 0
+	if raw := strings.TrimSpace(s.dlConns); raw != "" {
+		dlConns, _ = strconv.Atoi(raw) // the form validated it
+	}
+	if dlConns == hf.DefaultConnections {
+		dlConns = 0 // an explicit default stays absent (minimal object)
+	}
+	if dlConns != prefs.DownloadConnections {
+		prefs.DownloadConnections = dlConns
+		changed = true
+	}
+
 	if !changed {
 		return nil
 	}
 	return &prefs
+}
+
+// validateDownloadConns accepts an empty value (the default) or an
+// integer within the downloader's [1, MaxConnections] range.
+func validateDownloadConns(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 || n > hf.MaxConnections {
+		return fmt.Errorf("1–%d, or empty for the default (%d)", hf.MaxConnections, hf.DefaultConnections)
+	}
+	return nil
 }
 
 // View renders the settings form in a bordered popup, with the detected

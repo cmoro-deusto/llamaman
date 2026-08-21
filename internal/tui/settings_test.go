@@ -3,6 +3,7 @@ package tui
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/muesli/termenv"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
+	"github.com/cmoro-deusto/llamaman/internal/hf"
 )
 
 // forceDarkBg pins the terminal background for deterministic cycle
@@ -176,6 +178,7 @@ func TestSettingsSubmitNoChangePersistsNothing(t *testing.T) {
 		keyMsg("enter"),                // animations → wordmark highlight
 		keyMsg("enter"),                // wordmark highlight → log colors
 		keyMsg("enter"),                // log colors → models dir
+		tea.KeyMsg{Type: tea.KeyEnter}, // models dir → download connections
 		tea.KeyMsg{Type: tea.KeyEnter}, // complete on the input field
 	)
 	if root.view != ViewMain {
@@ -208,6 +211,7 @@ func TestSettingsSubmitPersistsThemeChange(t *testing.T) {
 		keyMsg("enter"),                // animations → wordmark highlight
 		keyMsg("enter"),                // wordmark highlight → log colors
 		keyMsg("enter"),                // log colors → models dir
+		tea.KeyMsg{Type: tea.KeyEnter}, // models dir → download connections
 		tea.KeyMsg{Type: tea.KeyEnter}, // complete on the input field
 	)
 
@@ -240,6 +244,7 @@ func TestSettingsSubmitAnimationsOff(t *testing.T) {
 		keyMsg("enter"),                // confirm → wordmark highlight
 		keyMsg("enter"),                // wordmark highlight (default once) → log colors
 		keyMsg("enter"),                // log colors → models dir
+		tea.KeyMsg{Type: tea.KeyEnter}, // models dir → download connections
 		tea.KeyMsg{Type: tea.KeyEnter}, // complete form on the input field
 	)
 	if root.view != ViewMain {
@@ -268,6 +273,7 @@ func TestSettingsSubmitLogoEffectLoop(t *testing.T) {
 		tea.KeyMsg{Type: tea.KeyDown},  // once → loop
 		keyMsg("enter"),                // wordmark highlight → log colors
 		keyMsg("enter"),                // log colors → models dir
+		tea.KeyMsg{Type: tea.KeyEnter}, // models dir → download connections
 		tea.KeyMsg{Type: tea.KeyEnter}, // complete form
 	)
 	if root.view != ViewMain {
@@ -305,6 +311,45 @@ func TestSettingsSnapshotLogoEffect(t *testing.T) {
 	got := root.settings.snapshot()
 	if got == nil || got.LogoEffect != "" {
 		t.Fatalf("revert to once → snapshot = %+v, want LogoEffect cleared to \"\"", got)
+	}
+}
+
+// TestSettingsSnapshotDownloadConnections pins the field's snapshot
+// contract (DESIGN §16.4): an explicit count persists, empty and the
+// explicit default both stay absent, and the input validator bounds
+// the value to [1, hf.MaxConnections].
+func TestSettingsSnapshotDownloadConnections(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40}, keyMsg("p"))
+
+	root.settings.dlConns = "8"
+	if got := root.settings.snapshot(); got == nil || got.DownloadConnections != 8 {
+		t.Fatalf("dlConns=8 → snapshot = %+v, want DownloadConnections=8", got)
+	}
+	root.settings.dlConns = strconv.Itoa(hf.DefaultConnections)
+	if got := root.settings.snapshot(); got != nil {
+		t.Fatalf("explicit default → snapshot = %+v, want nil (stays absent)", got)
+	}
+
+	cfg.Preferences = &config.Preferences{DownloadConnections: 8}
+	root = NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 120, Height: 40}, keyMsg("p"))
+	if root.settings.dlConns != "8" {
+		t.Fatalf("stored count must prefill the form, got %q", root.settings.dlConns)
+	}
+	root.settings.dlConns = ""
+	if got := root.settings.snapshot(); got == nil || got.DownloadConnections != 0 {
+		t.Fatalf("cleared field → snapshot = %+v, want DownloadConnections=0", got)
+	}
+
+	for raw, ok := range map[string]bool{
+		"": true, "1": true, "16": true, "6": true,
+		"0": false, "17": false, "-2": false, "abc": false,
+	} {
+		if err := validateDownloadConns(raw); (err == nil) != ok {
+			t.Errorf("validateDownloadConns(%q) err = %v, want ok=%v", raw, err, ok)
+		}
 	}
 }
 
@@ -392,7 +437,7 @@ func TestSettingsMismatchedThemeAppliesWithWarning(t *testing.T) {
 	}
 
 	// Submit with a change (animations off): the mismatch applies, not auto.
-	driveRoot(t, root, keyMsg("enter"), tea.KeyMsg{Type: tea.KeyLeft}, keyMsg("enter"), keyMsg("enter"), keyMsg("enter"), tea.KeyMsg{Type: tea.KeyEnter})
+	driveRoot(t, root, keyMsg("enter"), tea.KeyMsg{Type: tea.KeyLeft}, keyMsg("enter"), keyMsg("enter"), keyMsg("enter"), tea.KeyMsg{Type: tea.KeyEnter}, tea.KeyMsg{Type: tea.KeyEnter})
 	if got := root.cfg.Prefs().Theme; got != "solarized-light" {
 		t.Fatalf("after submit: theme = %q, want solarized-light", got)
 	}
@@ -484,6 +529,7 @@ func TestSettingsSubmitModelsDir(t *testing.T) {
 		keyMsg("enter"), // wordmark highlight → log colors
 		keyMsg("enter"), // log colors → models dir
 		keyMsg("/opt/llama-models"),
+		tea.KeyMsg{Type: tea.KeyEnter}, // models dir → download connections
 		tea.KeyMsg{Type: tea.KeyEnter}, // complete form
 	)
 	if root.view != ViewMain {
@@ -508,6 +554,7 @@ func TestSettingsSubmitModelsDir(t *testing.T) {
 		keyMsg("enter"),                // log colors → models dir
 		tea.KeyMsg{Type: tea.KeyCtrlA}, // line start
 		tea.KeyMsg{Type: tea.KeyCtrlK}, // delete after cursor → empty input
+		tea.KeyMsg{Type: tea.KeyEnter}, // models dir → download connections
 		tea.KeyMsg{Type: tea.KeyEnter}, // complete form
 	)
 	if got := root.cfg.Prefs().ModelsDir; got != "" {
