@@ -44,9 +44,7 @@ func (c *Client) get(ctx context.Context, u string) ([]byte, error) {
 		return nil, &Error{Kind: ErrNetwork, Message: err.Error()}
 	}
 	req.Header.Set("Accept", "application/json")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
+	c.authorize(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, &Error{Kind: ErrNetwork, Message: err.Error()}

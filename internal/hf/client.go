@@ -167,6 +167,16 @@ func kindOf(err error) ErrorKind {
 	return ErrNetwork
 }
 
+// authorize attaches the Bearer token when one is configured (§16.2:
+// every request, downloads included — gated repos 401 without it).
+// net/http strips the header on cross-host redirects, so the signed
+// CDN URL a resolve request redirects to never sees the token.
+func (c *Client) authorize(req *http.Request) {
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+}
+
 // getJSON GETs u and decodes the JSON body into v.
 func (c *Client) getJSON(ctx context.Context, u string, v any) error {
 	body, err := c.get(ctx, u)

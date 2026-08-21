@@ -2221,6 +2221,11 @@ s to view`).
   `Quants`) so a `mmproj-*.gguf` never becomes the downloaded model.
 - **Range resume:** a blob already at N bytes (from `<oid>.incomplete`)
   continues with `Range: bytes=N-`; 206 handled, 200 restarts cleanly.
+- **Token:** blob requests carry `Authorization: Bearer $HF_TOKEN` like
+  every other request (§16.2) — a gated repo's `resolve/` 401s without
+  it even when the API calls succeeded. `net/http` strips the header on
+  the cross-host redirect to the signed CDN URL, so the token never
+  leaves huggingface.co.
 - **sha256 verify:** after each blob completes, hash it and compare to
   the oid; mismatch → error, partial removed, clear message.
 - Progress via a callback (`done, total int64` per file); cancellation

@@ -26,6 +26,7 @@ type fakeHFS struct {
 	t            *testing.T
 	files        map[string][]byte
 	rangeHeaders []string
+	authHeaders  []string // Authorization header of each resolve request
 	resolveCalls int
 }
 
@@ -55,6 +56,7 @@ func newFakeHFS(t *testing.T, files map[string][]byte) (*fakeHFS, *httptest.Serv
 			json.NewEncoder(w).Encode(entries)
 		case strings.Contains(p, "/resolve/"):
 			f.resolveCalls++
+			f.authHeaders = append(f.authHeaders, r.Header.Get("Authorization"))
 			file := p[strings.Index(p, "/resolve/")+len("/resolve/"):]
 			file = file[strings.Index(file, "/")+1:] // strip the commit
 			data, ok := f.files[file]
@@ -336,6 +338,40 @@ func TestSelectModelFilesSkipsSidecars(t *testing.T) {
 	}
 	if got := selectModelFiles(files, "KQUANT"); got != nil {
 		t.Fatalf("KQUANT selected %+v, want none (dflash is a sidecar)", got)
+	}
+}
+
+// TestDownloadSendsBearerToken pins the gated-repo fix: the blob
+// download itself must carry the Bearer token (§16.2: every request),
+// not only the API calls — a gated repo's resolve 401s without it.
+// Without a token the header must stay absent.
+func TestDownloadSendsBearerToken(t *testing.T) {
+	content := "0123456789"
+	files := map[string][]byte{"model-Q4_K_M.gguf": []byte(content)}
+
+	f, srv := newFakeHFS(t, files)
+	c := NewWithEndpoint(srv.URL, "hf_secret12345678901234567890")
+	if err := c.Download(context.Background(), t.TempDir(), "org/repo", "Q4_K_M", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.authHeaders) == 0 {
+		t.Fatal("no resolve requests recorded")
+	}
+	for _, h := range f.authHeaders {
+		if h != "Bearer hf_secret12345678901234567890" {
+			t.Errorf("resolve Authorization = %q, want Bearer token", h)
+		}
+	}
+
+	f2, srv2 := newFakeHFS(t, files)
+	c2 := NewWithEndpoint(srv2.URL, "")
+	if err := c2.Download(context.Background(), t.TempDir(), "org/repo", "Q4_K_M", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range f2.authHeaders {
+		if h != "" {
+			t.Errorf("no token set, resolve Authorization = %q, want absent", h)
+		}
 	}
 }
 
