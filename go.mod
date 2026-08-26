@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	github.com/NVIDIA/go-nvml v0.13.3-1
-	github.com/alecthomas/kong v1.16.0
+	github.com/alecthomas/kong v1.16.1
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/huh v1.0.0
