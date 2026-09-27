@@ -1845,10 +1845,14 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		// with a `choice`; entry add/edit is a formBinariesNew/Edit with
 		// binName. Distinguish by which staging pointers are set.
 		if c.formStaging.choice != nil && c.formStaging.binName == nil {
-			// Hub select: route the choice.
+			// Route the choice. dismissForm must run BEFORE the sub-form
+			// opens: openBinariesEntryForm etc. install a new form via
+			// installForm, and a later dismissForm would wipe it (the
+			// bug that made every hub action a silent no-op).
 			ch := deref(c.formStaging.choice)
 			c.formStaging = formStaging{}
-			return c.binariesApplyChoice(ch), true
+			c.dismissForm()
+			return c.binariesApplyChoice(ch), false
 		}
 		name := strings.TrimSpace(deref(c.formStaging.binName))
 		path := strings.TrimSpace(deref(c.formStaging.binPath))
