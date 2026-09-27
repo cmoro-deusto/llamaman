@@ -18,7 +18,7 @@ import (
 func duplicateTestConfig() *config.Config {
 	return &config.Config{
 		Version: 1,
-		Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Models: []config.Model{
 			{Alias: "alpha", Location: "/m/alpha.gguf", Presets: []config.Preset{
 				{Name: "default", Description: "balanced", Params: config.Params{
@@ -358,7 +358,7 @@ func TestClonePresetNameCollisionRejected(t *testing.T) {
 func TestClonePresetToSingleModelIsNoOp(t *testing.T) {
 	cfg := &config.Config{
 		Version: 1,
-		Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Models: []config.Model{
 			{Alias: "alpha", Location: "/m/alpha.gguf", Presets: []config.Preset{
 				{Name: "default"},

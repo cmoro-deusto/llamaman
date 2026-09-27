@@ -239,7 +239,7 @@ func hfFlowConfig(t *testing.T, stub *stubHFCheck) *ConfigMode {
 	t.Helper()
 	c := newModelFormConfig(t, &config.Config{
 		Version:     1,
-		Globals:     config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals:     config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Preferences: &config.Preferences{ModelsDir: t.TempDir()},
 	})
 	if stub != nil {
@@ -508,7 +508,7 @@ func TestConfigHFCheckRunnerNil(t *testing.T) {
 func TestConfigHFCheckEditMode(t *testing.T) {
 	cfg := &config.Config{
 		Version:     1,
-		Globals:     config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals:     config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Models:      []config.Model{{Alias: "beta", HF: "Qwen/Qwen3-32B-GGUF"}},
 		Preferences: &config.Preferences{ModelsDir: t.TempDir()},
 	}
@@ -562,7 +562,7 @@ func TestConfigHFCheckCachedMarker(t *testing.T) {
 	stub := &stubHFCheck{opts: []hf.QuantOption{{Tag: "Q4_K_M", Size: 100}, {Tag: "Q8_0", Size: 200}}}
 	c := newModelFormConfig(t, &config.Config{
 		Version:     1,
-		Globals:     config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals:     config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Preferences: &config.Preferences{ModelsDir: root},
 	})
 	c.SetHFCheckRunner(stub)

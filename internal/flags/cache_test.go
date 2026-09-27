@@ -66,6 +66,20 @@ func TestCacheRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCachePathDistinguishesSameMtimeDifferentPaths(t *testing.T) {
+	l1 := &Loader{BinPath: "/a/llama-server", CacheDir: t.TempDir()}
+	l2 := &Loader{BinPath: "/b/llama-server", CacheDir: l1.CacheDir}
+	mt := time.Unix(1700000000, 0)
+	if l1.cachePath(mt) == l2.cachePath(mt) {
+		t.Fatal("two different binaries with the same mtime must not share a cache file")
+	}
+	// Same path twice → same name (cache hit).
+	l3 := &Loader{BinPath: "/a/llama-server", CacheDir: l1.CacheDir}
+	if l1.cachePath(mt) != l3.cachePath(mt) {
+		t.Fatal("same path + mtime must map to the same cache file")
+	}
+}
+
 func repoRoot(t *testing.T) string {
 	t.Helper()
 	dir, err := filepath.Abs(".")

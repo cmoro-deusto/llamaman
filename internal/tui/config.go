@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -68,6 +69,11 @@ const (
 	formPasteCmd
 	formPasteConfirm
 	formPastePickModel
+	formBinariesNew
+	formBinariesEdit
+	formBinariesDelete
+	formBinariesDefaultMarker
+	formPresetBinaryPin
 )
 
 // pasteOutcome is what the §16.8 paste-command-line import will do
@@ -103,6 +109,10 @@ type formStaging struct {
 	confirm            *bool
 	choice             *string
 	targetIdx          *int // for clone-to-model preset form
+	binName, binNote   *string
+	binPath            *string
+	binDelete          *bool
+	binPin             *string // preset binary pin: entry name or "" = default
 }
 
 const (
@@ -126,6 +136,7 @@ type ConfigMode struct {
 	formKind    formKind
 	formStaging formStaging
 	pendingKey  string       // staged param key between PickKey and PickValue
+	binIdx      int          // selected binaries entry inside the binaries screen
 	picker      *paramPicker // active when adding a new param
 	modelPicker *modelPicker // picker overlay for the model form's location/hf inputs
 	locField    *pickerInput // picker-assisted location input, for post-pick refresh
@@ -731,6 +742,8 @@ func (c *ConfigMode) handleKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 		return c, nil
 	case "g":
 		return c, c.openGlobalsForm()
+	case "b":
+		return c, c.openBinariesScreen()
 	case "s":
 		return c, c.save()
 	case "?":
@@ -904,13 +917,11 @@ func (c *ConfigMode) handleParamsKey(k tea.KeyMsg) (*ConfigMode, tea.Cmd) {
 // ---- form openers ----
 
 func (c *ConfigMode) openGlobalsForm() tea.Cmd {
-	bin := c.work.Globals.Bin
 	host := c.work.Globals.Host
 	port := strconv.Itoa(c.work.Globals.Port)
 	files := strings.Join(c.work.Globals.ModelsFiles, "\n")
-	c.formStaging = formStaging{bin: &bin, host: &host, port: &port, modelsFiles: &files}
+	c.formStaging = formStaging{host: &host, port: &port, modelsFiles: &files}
 	form := huh.NewForm(huh.NewGroup(
-		huh.NewInput().Title("llama-server binary").Value(&bin).Validate(nonEmpty("binary")),
 		huh.NewInput().Title("host (IPv4 / [::IPv6] / hostname)").Value(&host).Validate(hostValidator),
 		huh.NewInput().Title("port").Value(&port).Validate(numericRange(1, 65535)),
 		huh.NewText().Title("models files (my-models.ini — router sources, one per line)").
@@ -918,6 +929,138 @@ func (c *ConfigMode) openGlobalsForm() tea.Cmd {
 			Value(&files),
 	))
 	return c.installForm(form, formGlobals)
+}
+
+// openBinariesScreen is the management surface for named llama-server
+// binaries (DESIGN §3.2a). It renders a small selection form: the
+// default marker plus per-entry add/edit/delete. Implemented as a huh
+// select + sub-forms to stay inside the existing form machinery.
+func (c *ConfigMode) openBinariesScreen() tea.Cmd {
+	// The screen is a select over actions; entry management lives in
+	// sub-forms opened from here. "set default" is an action row.
+	choices := []string{}
+	if len(c.work.Globals.Binaries) > 0 {
+		choices = append(choices, "add binary", "edit binary", "delete binary", "set default")
+	} else {
+		choices = append(choices, "add binary")
+	}
+	choice := choices[0]
+	c.formStaging = formStaging{choice: &choice}
+	var opts []huh.Option[string]
+	for _, ch := range choices {
+		opts = append(opts, huh.NewOption(ch, ch))
+	}
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().Title("binaries — llama-server builds").
+			Description("manage named llama-server binaries; the default runs when nothing pins one").
+			Options(opts...).Value(&choice),
+	))
+	return c.installForm(form, formBinariesEdit)
+}
+
+// binariesApplyChoice routes the binaries-screen selection.
+func (c *ConfigMode) binariesApplyChoice(ch string) tea.Cmd {
+	switch ch {
+	case "add binary":
+		return c.openBinariesEntryForm(-1)
+	case "edit binary":
+		return c.openBinariesEntryForm(c.binIdx)
+	case "delete binary":
+		return c.openBinariesDeleteForm()
+	case "set default":
+		return c.openBinariesDefaultForm()
+	}
+	return nil
+}
+
+// openBinariesEntryForm adds (-1) or edits a binaries entry.
+func (c *ConfigMode) openBinariesEntryForm(idx int) tea.Cmd {
+	name, path, note := "", "", ""
+	if idx >= 0 && idx < len(c.work.Globals.Binaries) {
+		c.binIdx = idx
+		b := c.work.Globals.Binaries[idx]
+		name, path, note = b.Name, b.Path, b.Note
+	} else {
+		c.binIdx = -1
+	}
+	c.formStaging = formStaging{binName: &name, binPath: &path, binNote: &note}
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewInput().Title("name (referenced by preset binary pins)").Value(&name).Validate(nonEmpty("name")),
+		huh.NewInput().Title("path to llama-server").Value(&path).Validate(nonEmpty("path")),
+		huh.NewInput().Title("note (optional)").Value(&note),
+	))
+	kind := formBinariesEdit
+	if idx < 0 {
+		kind = formBinariesNew
+	}
+	return c.installForm(form, kind)
+}
+
+// openBinariesDeleteForm confirms deletion of the entry at c.binIdx.
+func (c *ConfigMode) openBinariesDeleteForm() tea.Cmd {
+	if c.binIdx < 0 || c.binIdx >= len(c.work.Globals.Binaries) {
+		c.flash = "no binary selected"
+		return nil
+	}
+	b := c.work.Globals.Binaries[c.binIdx]
+	confirm := false
+	c.formStaging = formStaging{binDelete: &confirm}
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewConfirm().Title(fmt.Sprintf("Delete binary %q (%s)?", b.Name, b.Path)).
+			Affirmative("Delete").Negative("Cancel").Value(&confirm),
+	))
+	return c.installForm(form, formBinariesDelete)
+}
+
+// openBinariesDefaultForm picks which entry is the default.
+func (c *ConfigMode) openBinariesDefaultForm() tea.Cmd {
+	if len(c.work.Globals.Binaries) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(c.work.Globals.Binaries))
+	var opts []huh.Option[string]
+	for _, b := range c.work.Globals.Binaries {
+		names = append(names, b.Name)
+	}
+	picked := c.work.Globals.DefaultBinary
+	if picked == "" {
+		picked = names[0]
+	}
+	for _, n := range names {
+		opts = append(opts, huh.NewOption(n, n))
+	}
+	c.formStaging = formStaging{binPin: &picked}
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().Title("default binary").Options(opts...).Value(&picked),
+	))
+	return c.installForm(form, formBinariesDefaultMarker)
+}
+
+// openPresetBinaryPinForm pins the selected preset to a named binary.
+func (c *ConfigMode) openPresetBinaryPinForm() tea.Cmd {
+	if len(c.work.Models) == 0 || c.presetIdx >= len(c.work.Models[c.modelIdx].Presets) {
+		c.flash = "no preset selected"
+		return nil
+	}
+	names := []string{""}
+	var opts []huh.Option[string]
+	opts = append(opts, huh.NewOption("(default binary)", ""))
+	for _, b := range c.work.Globals.Binaries {
+		names = append(names, b.Name)
+	}
+	for _, n := range names {
+		if n != "" {
+			opts = append(opts, huh.NewOption(n, n))
+		}
+	}
+	cur := c.work.Models[c.modelIdx].Presets[c.presetIdx].Binary
+	c.formStaging = formStaging{binPin: &cur}
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[string]().Title("binary for this preset").
+			Description("(default binary) runs with the default entry").
+			Options(opts...).Value(&cur),
+	))
+	return c.installForm(form, formPresetBinaryPin)
 }
 
 // openExportIniForm prompts for an output path (pre-filled with the
@@ -1382,10 +1525,32 @@ func (c *ConfigMode) openNewPresetForm() tea.Cmd {
 func (c *ConfigMode) openEditPresetForm() tea.Cmd {
 	p := c.work.Models[c.modelIdx].Presets[c.presetIdx]
 	name, desc := p.Name, p.Description
-	c.formStaging = formStaging{name: &name, desc: &desc}
+	binPin := p.Binary
+	c.formStaging = formStaging{name: &name, desc: &desc, binPin: &binPin}
+	// Binary pin: one row per configured entry plus the default. A pin
+	// naming a since-deleted entry still renders (validation warns).
+	opts := []huh.Option[string]{huh.NewOption("(default binary)", "")}
+	for _, b := range c.work.Globals.Binaries {
+		opts = append(opts, huh.NewOption(b.Name, b.Name))
+	}
+	if binPin != "" {
+		known := false
+		for _, b := range c.work.Globals.Binaries {
+			if b.Name == binPin {
+				known = true
+				break
+			}
+		}
+		if !known {
+			opts = append(opts, huh.NewOption(binPin+" (missing)", binPin))
+		}
+	}
 	form := huh.NewForm(huh.NewGroup(
 		huh.NewInput().Title("preset name").Value(&name).Validate(nonEmpty("name")),
 		huh.NewInput().Title("description").Value(&desc),
+		huh.NewSelect[string]().Title("binary").
+			Description("(default binary) runs on the default entry").
+			Options(opts...).Value(&binPin),
 	))
 	return c.installForm(form, formEditPreset)
 }
@@ -1657,7 +1822,6 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 			c.flash = fmt.Sprintf("invalid port %q", deref(c.formStaging.port))
 			return nil, true
 		}
-		c.work.Globals.Bin = deref(c.formStaging.bin)
 		c.work.Globals.Host = deref(c.formStaging.host)
 		c.work.Globals.Port = port
 		c.work.Globals.ModelsFiles = parseLines(deref(c.formStaging.modelsFiles))
@@ -1674,6 +1838,91 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 		if len(warnings) > 0 {
 			for _, w := range warnings {
 				slog.Warn("export warning", "warn", w)
+			}
+		}
+	case formBinariesEdit, formBinariesNew:
+		// The binaries screen's hub selection is a formBinariesEdit form
+		// with a `choice`; entry add/edit is a formBinariesNew/Edit with
+		// binName. Distinguish by which staging pointers are set.
+		if c.formStaging.choice != nil && c.formStaging.binName == nil {
+			// Hub select: route the choice.
+			ch := deref(c.formStaging.choice)
+			c.formStaging = formStaging{}
+			return c.binariesApplyChoice(ch), true
+		}
+		name := strings.TrimSpace(deref(c.formStaging.binName))
+		path := strings.TrimSpace(deref(c.formStaging.binPath))
+		note := deref(c.formStaging.binNote)
+		// Validate name/path uniqueness inline (§3.5).
+		for i, b := range c.work.Globals.Binaries {
+			if i == c.binIdx {
+				continue
+			}
+			if b.Name == name {
+				c.errorModal = fmt.Sprintf("Cannot save — a binary named %q already exists.", name)
+				return nil, true
+			}
+		}
+		entry := config.Binary{Name: name, Path: path, Note: note}
+		if c.formKind == formBinariesNew || c.binIdx < 0 || c.binIdx >= len(c.work.Globals.Binaries) {
+			c.work.Globals.Binaries = append(c.work.Globals.Binaries, entry)
+			c.binIdx = len(c.work.Globals.Binaries) - 1
+			// First entry ever: make it the default automatically.
+			if len(c.work.Globals.Binaries) == 1 {
+				c.work.Globals.DefaultBinary = entry.Name
+			}
+		} else {
+			old := c.work.Globals.Binaries[c.binIdx].Name
+			c.work.Globals.Binaries[c.binIdx] = entry
+			if c.work.Globals.DefaultBinary == old {
+				c.work.Globals.DefaultBinary = entry.Name
+			}
+		}
+		// Warn (non-blocking) when the path is missing/not executable.
+		if info, err := os.Stat(entry.Path); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				c.flash = fmt.Sprintf("binary %q saved (warning: path does not exist)", entry.Name)
+				return nil, true
+			}
+		} else if info.Mode()&0o111 == 0 {
+			c.flash = fmt.Sprintf("binary %q saved (warning: not executable)", entry.Name)
+			return nil, true
+		}
+		c.flash = fmt.Sprintf("binary %q saved", entry.Name)
+	case formBinariesDelete:
+		if c.formStaging.binDelete != nil && *c.formStaging.binDelete {
+			if c.binIdx >= 0 && c.binIdx < len(c.work.Globals.Binaries) {
+				b := c.work.Globals.Binaries[c.binIdx]
+				c.work.Globals.Binaries = append(c.work.Globals.Binaries[:c.binIdx], c.work.Globals.Binaries[c.binIdx+1:]...)
+				if c.work.Globals.DefaultBinary == b.Name {
+					// Default was deleted: fall back to the first remaining
+					// entry (or none — validation errors at save).
+					if len(c.work.Globals.Binaries) > 0 {
+						c.work.Globals.DefaultBinary = c.work.Globals.Binaries[0].Name
+					} else {
+						c.work.Globals.DefaultBinary = ""
+					}
+				}
+				if c.binIdx >= len(c.work.Globals.Binaries) && c.binIdx > 0 {
+					c.binIdx--
+				}
+				c.flash = fmt.Sprintf("binary %q deleted", b.Name)
+			}
+		}
+	case formBinariesDefaultMarker:
+		name := deref(c.formStaging.binPin)
+		if name != "" {
+			c.work.Globals.DefaultBinary = name
+			c.flash = fmt.Sprintf("default binary: %s", name)
+		}
+	case formPresetBinaryPin:
+		pin := deref(c.formStaging.binPin)
+		if c.modelIdx < len(c.work.Models) && c.presetIdx < len(c.work.Models[c.modelIdx].Presets) {
+			c.work.Models[c.modelIdx].Presets[c.presetIdx].Binary = pin
+			if pin == "" {
+				c.flash = "preset binary: default"
+			} else {
+				c.flash = fmt.Sprintf("preset pinned to %s", pin)
 			}
 		}
 	case formNewModel:
@@ -1738,6 +1987,7 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 	case formEditPreset:
 		c.work.Models[c.modelIdx].Presets[c.presetIdx].Name = deref(c.formStaging.name)
 		c.work.Models[c.modelIdx].Presets[c.presetIdx].Description = deref(c.formStaging.desc)
+		c.work.Models[c.modelIdx].Presets[c.presetIdx].Binary = deref(c.formStaging.binPin)
 		c.flash = "preset updated"
 	case formDuplicatePreset:
 		src := c.work.Models[c.modelIdx].Presets[c.presetIdx]
@@ -2404,6 +2654,9 @@ func cloneConfig(in *config.Config) *config.Config {
 		}
 		out.Models[i] = mm
 	}
+	// Deep-copy the binaries list (§3.2a) — slices share backing arrays,
+	// so appending through one clone would leak into the other.
+	out.Globals.Binaries = append([]config.Binary(nil), in.Globals.Binaries...)
 	return &out
 }
 

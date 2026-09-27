@@ -59,8 +59,14 @@ func TestLoadSampleConfig(t *testing.T) {
 	if cfg.Version != 1 {
 		t.Errorf("Version = %d, want 1", cfg.Version)
 	}
-	if cfg.Globals.Bin != "/usr/local/bin/llama-server" {
-		t.Errorf("Bin = %q", cfg.Globals.Bin)
+	if len(cfg.Globals.Binaries) != 1 || cfg.Globals.Binaries[0].Path != "/usr/local/bin/llama-server" {
+		t.Errorf("Binaries = %+v", cfg.Globals.Binaries)
+	}
+	if cfg.Globals.Bin != "" {
+		t.Errorf("legacy Bin not cleared after migration: %q", cfg.Globals.Bin)
+	}
+	if cfg.Globals.DefaultBinary != DefaultBinaryName {
+		t.Errorf("DefaultBinary = %q, want %q", cfg.Globals.DefaultBinary, DefaultBinaryName)
 	}
 	if cfg.Globals.Host != "127.0.0.1" {
 		t.Errorf("Host = %q", cfg.Globals.Host)
@@ -98,8 +104,8 @@ func TestLoadExpandsBinaryPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Globals.Bin != "/h/alice/bin/llama-server" {
-		t.Errorf("Bin not expanded: %q", cfg.Globals.Bin)
+	if len(cfg.Globals.Binaries) != 1 || cfg.Globals.Binaries[0].Path != "/h/alice/bin/llama-server" {
+		t.Errorf("Binaries not expanded/migrated: %+v", cfg.Globals.Binaries)
 	}
 }
 

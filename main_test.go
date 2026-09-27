@@ -54,7 +54,7 @@ func testConfig(t *testing.T) string {
 	t.Helper()
 	cfg := &config.Config{
 		Version: 1,
-		Globals: config.Globals{Bin: "/bin/true", Host: "127.0.0.1", Port: 9080},
+		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/true"}}, DefaultBinary: "default", Bin: "/bin/true", Host: "127.0.0.1", Port: 9080},
 		Models: []config.Model{
 			{
 				Alias:    "m",
@@ -153,7 +153,7 @@ func TestImportDispatchBeforeKong(t *testing.T) {
 	// runners have none — binary path is required otherwise).
 	if err := config.Save(cfgPath, &config.Config{
 		Version: config.SchemaVersion,
-		Globals: config.Globals{Bin: "/bin/true", Host: "127.0.0.1", Port: 9080},
+		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/true"}}, DefaultBinary: "default", Bin: "/bin/true", Host: "127.0.0.1", Port: 9080},
 	}); err != nil {
 		t.Fatalf("seed config: %v", err)
 	}
@@ -206,9 +206,9 @@ func liveSession(t *testing.T) *server.SessionManager {
 func TestDecideEntryNoArgsLandsOnMainWhenSessionRunning(t *testing.T) {
 	cfg := &config.Config{
 		Version: 1,
-		Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 	}
-	opts, code := decideEntry(cfg, nil, liveSession(t), "", "")
+	opts, code := decideEntry(cfg, nil, liveSession(t), "", "", "")
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
@@ -222,9 +222,9 @@ func TestDecideEntryNoArgsLandsOnMainWhenSessionRunning(t *testing.T) {
 func TestDecideEntryAliasStillReattaches(t *testing.T) {
 	cfg := &config.Config{
 		Version: 1,
-		Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 	}
-	opts, code := decideEntry(cfg, nil, liveSession(t), "alpha", "default")
+	opts, code := decideEntry(cfg, nil, liveSession(t), "alpha", "default", "")
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}

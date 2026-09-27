@@ -27,15 +27,19 @@ const (
 // (DESIGN.md §5.2). Reattaching processes parse it to find the live child;
 // owners overwrite it on every spawn.
 type Session struct {
-	PID       int       `json:"pid"`
-	Alias     string    `json:"alias"`
-	Preset    string    `json:"preset"`
-	Kind      string    `json:"kind,omitempty"`
-	Host      string    `json:"host"`
-	Port      int       `json:"port"`
-	StartedAt time.Time `json:"started_at"`
-	Command   []string  `json:"command"`
-	LogPath   string    `json:"log_path"`
+	PID    int    `json:"pid"`
+	Alias  string `json:"alias"`
+	Preset string `json:"preset"`
+	Kind   string `json:"kind,omitempty"`
+	// BinaryName records which named llama-server (globals.binaries
+	// entry, §3.2a) spawned the session. Additive P4 field: old session
+	// files without it load fine (empty name).
+	BinaryName string    `json:"binary_name,omitempty"`
+	Host       string    `json:"host"`
+	Port       int       `json:"port"`
+	StartedAt  time.Time `json:"started_at"`
+	Command    []string  `json:"command"`
+	LogPath    string    `json:"log_path"`
 }
 
 // IsRouter reports whether this session runs llama-server in router mode

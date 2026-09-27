@@ -100,19 +100,85 @@ func (p Preferences) LogoEffectMode() string {
 	return p.LogoEffect
 }
 
-// Globals holds the binary path and the listen host/port. The JSON tag for
-// the host is `ip_address` for compatibility with the user's draft schema,
-// but the Go field is named Host because the value can be a hostname or an
-// IPv6 literal too.
+// Binary is one named llama-server build (DESIGN §3.2a): mainline plus
+// any forks/branches. Name is the user-facing identifier referenced by
+// Preset.Binary and Globals.DefaultBinary; Path is expanded ~/$VAR at
+// load time.
+type Binary struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	Note string `json:"note,omitempty"`
+}
+
+// DefaultBinaryName is the name assigned by load-time migration when a
+// legacy config has only globals.llama-server-bin (DESIGN §3.2a).
+const DefaultBinaryName = "default"
+
+// Globals holds the listen host/port, the named llama-server binaries,
+// and the my-models.ini router sources. The JSON tag for the host is
+// `ip_address` for compatibility with the user's draft schema, but the
+// Go field is named Host because the value can be a hostname or an IPv6
+// literal too.
 //
 // ModelsFiles lists my-models.ini files (llama.cpp model-presets) that
 // appear as router-mode run entries in the TUI. Each is a llama-server
 // `--models-preset` source, one process hosting every model in the file.
 type Globals struct {
-	Bin         string   `json:"llama-server-bin"`
-	Host        string   `json:"ip_address"`
-	Port        int      `json:"port"`
-	ModelsFiles []string `json:"models-files,omitempty"`
+	// Bin is the legacy single-binary key: read-compat only. On Load,
+	// when Binaries is absent, Bin is migrated into a Binaries entry
+	// named DefaultBinaryName and Bin is cleared in memory — so the next
+	// Save writes only the new form (DESIGN §3.2a). Callers must use
+	// ResolveBinary instead of reading Bin directly.
+	Bin string `json:"llama-server-bin,omitempty"`
+	// Binaries lists every named llama-server build. Empty (absent) with
+	// a legacy Bin set is migrated at load; both absent is a validation
+	// error.
+	Binaries []Binary `json:"binaries,omitempty"`
+	// DefaultBinary names the Binaries entry used when nothing else
+	// pins one. Empty means the first entry (or the migrated legacy
+	// entry, DefaultBinaryName).
+	DefaultBinary string   `json:"default-binary,omitempty"`
+	Host          string   `json:"ip_address"`
+	Port          int      `json:"port"`
+	ModelsFiles   []string `json:"models-files,omitempty"`
+}
+
+// ResolveBinary returns the binary to launch with, per the DESIGN §3.2a
+// chain: override (CLI --binary or the TUI one-shot quick-switch) →
+// preset pin → default. Source reports why: "override", "preset", or
+// "default". A preset pin naming an unknown entry warns (caller's job)
+// and falls through to the default; an unknown/empty default resolves
+// to the first entry. With no binaries at all, a placeholder built from
+// the legacy Bin is returned so the launch attempt fails with a path
+// named in the error.
+func (g Globals) ResolveBinary(override, presetPin string) (Binary, string) {
+	find := func(name string) (Binary, bool) {
+		for _, b := range g.Binaries {
+			if b.Name == name {
+				return b, true
+			}
+		}
+		return Binary{}, false
+	}
+	if override != "" {
+		if b, ok := find(override); ok {
+			return b, "override"
+		}
+	}
+	if presetPin != "" {
+		if b, ok := find(presetPin); ok {
+			return b, "preset"
+		}
+	}
+	if g.DefaultBinary != "" {
+		if b, ok := find(g.DefaultBinary); ok {
+			return b, "default"
+		}
+	}
+	if len(g.Binaries) > 0 {
+		return g.Binaries[0], "default"
+	}
+	return Binary{Name: DefaultBinaryName, Path: g.Bin}, "default"
 }
 
 // Model is a single named model with its launch presets. Exactly one
@@ -149,5 +215,10 @@ func (m Model) SourceLabel() string {
 type Preset struct {
 	Name        string `json:"preset"`
 	Description string `json:"description"`
-	Params      Params `json:"params"`
+	// Binary, when set, pins the preset to a named Globals.Binaries
+	// entry (DESIGN §3.2a). Absent = default binary. An unknown name is
+	// a validation warning that falls back to the default at launch.
+	Binary string `json:"binary,omitempty"`
+
+	Params Params `json:"params"`
 }

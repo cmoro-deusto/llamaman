@@ -2,6 +2,8 @@ package flags
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -67,8 +69,13 @@ func (l *Loader) Load() (Registry, bool) {
 	return reg, true
 }
 
+// cachePath builds the per-binary cache filename: the path hash (first
+// 8 bytes of sha256) + the binary mtime. Two different binaries can
+// share an mtime (e.g. a copied build), but never an absolute path
+// (DESIGN §3.2a), so the hash rules out cross-binary cache collisions.
 func (l *Loader) cachePath(mtime time.Time) string {
-	name := fmt.Sprintf("flags-%d.json", mtime.UnixNano())
+	sum := sha256.Sum256([]byte(l.BinPath))
+	name := fmt.Sprintf("flags-%s-%d.json", hex.EncodeToString(sum[:8]), mtime.UnixNano())
 	return filepath.Join(l.CacheDir, name)
 }
 

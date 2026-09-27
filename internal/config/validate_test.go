@@ -16,7 +16,7 @@ func TestValidateModelsFiles(t *testing.T) {
 
 	cfg := &Config{
 		Version: SchemaVersion,
-		Globals: Globals{Bin: "/usr/local/bin/llama-server", Host: "127.0.0.1", Port: 9080,
+		Globals: Globals{Binaries: []Binary{{Name: "default", Path: "/usr/local/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/local/bin/llama-server", Host: "127.0.0.1", Port: 9080,
 			ModelsFiles: []string{existing, filepath.Join(dir, "missing.ini"), ""}},
 	}
 	issues := Validate(cfg)
@@ -42,7 +42,7 @@ func TestValidateModelsFiles(t *testing.T) {
 func TestConfigRoundTripWithModelsFiles(t *testing.T) {
 	cfg := &Config{
 		Version: SchemaVersion,
-		Globals: Globals{Bin: "/usr/local/bin/llama-server", Host: "127.0.0.1", Port: 9080,
+		Globals: Globals{Binaries: []Binary{{Name: "default", Path: "/usr/local/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/local/bin/llama-server", Host: "127.0.0.1", Port: 9080,
 			ModelsFiles: []string{"/etc/llamaman/models.ini"}},
 	}
 	data, err := MarshalForDiff(cfg)
@@ -66,7 +66,7 @@ func TestValidateDownloadConnectionsRange(t *testing.T) {
 	base := func(n int) *Config {
 		return &Config{
 			Version:     SchemaVersion,
-			Globals:     Globals{Bin: "/usr/local/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+			Globals:     Globals{Binaries: []Binary{{Name: "default", Path: "/usr/local/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/local/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 			Preferences: &Preferences{DownloadConnections: n},
 		}
 	}
@@ -103,7 +103,7 @@ func TestValidateModelsDirNotADirectory(t *testing.T) {
 	base := func() *Config {
 		return &Config{
 			Version: SchemaVersion,
-			Globals: Globals{Bin: "/usr/local/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+			Globals: Globals{Binaries: []Binary{{Name: "default", Path: "/usr/local/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/local/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		}
 	}
 

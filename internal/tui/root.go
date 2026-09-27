@@ -31,8 +31,14 @@ const (
 // SpawnRequestMsg asks the root to spawn llama-server for (Model, Preset)
 // and transition to run mode. Main mode emits this on Enter.
 type SpawnRequestMsg struct {
-	Model  config.Model
+	Model config.Model
+	// Preset is the chosen launch preset. Its Binary pin (§3.2a)
+	// participates in resolution.
 	Preset config.Preset
+	// BinaryOverride is the one-shot quick-switch override (§3.2a):
+	// the named binary wins over the preset pin and default for this
+	// spawn only. Empty = no override.
+	BinaryOverride string
 }
 
 // RouterSpawnRequestMsg asks the root to spawn llama-server in router
@@ -53,7 +59,9 @@ type reattachRequestMsg struct{}
 // handle on its own (translate, session lock, fork/exec). main.go
 // implements this; the TUI only knows it can ask for a launched Process.
 type Spawner interface {
-	Spawn(model config.Model, preset config.Preset) (RunModeOpts, error)
+	// Spawn launches llama-server for (model, preset). binaryOverride is
+	// the one-shot quick-switch name (§3.2a); empty = preset pin/default.
+	Spawn(model config.Model, preset config.Preset, binaryOverride string) (RunModeOpts, error)
 	// SpawnRouter launches llama-server in router mode for a my-models.ini
 	// file (one process hosting every model in the file).
 	SpawnRouter(file string) (RunModeOpts, error)
@@ -434,7 +442,15 @@ func (r *Root) handleSpawn(msg SpawnRequestMsg) (tea.Model, tea.Cmd) {
 		r.flashSpawnError(errSpawnerMissing)
 		return r, nil
 	}
-	opts, err := r.spawner.Spawn(msg.Model, msg.Preset)
+	// The one-shot §3.2a override lives on MainMode: consume it on the
+	// next spawn regardless of success so it can't silently leak to a
+	// later launch.
+	override := msg.BinaryOverride
+	if override == "" {
+		override = r.mainMode.BinaryOverride()
+	}
+	r.mainMode.ClearBinaryOverride()
+	opts, err := r.spawner.Spawn(msg.Model, msg.Preset, override)
 	if err != nil {
 		r.flashSpawnError(err)
 		return r, nil

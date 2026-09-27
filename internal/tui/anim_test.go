@@ -141,7 +141,7 @@ func TestBadgeColorAnimations(t *testing.T) {
 	defer lipgloss.SetColorProfile(termenv.ColorProfile())
 	base := time.UnixMilli(2_000_000_000_000)
 
-	cfg := &config.Config{Version: 1, Globals: config.Globals{Bin: "b", Host: "h", Port: 1}}
+	cfg := &config.Config{Version: 1, Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "b"}}, DefaultBinary: "default", Bin: "b", Host: "h", Port: 1}}
 	r := &RunMode{cfg: cfg, status: StatusStarting, theme: DefaultTheme()}
 	freezeClock(t, base)
 	c1 := r.badgeColor()
@@ -179,7 +179,7 @@ func TestBadgeColorAnimations(t *testing.T) {
 // TestAnimCmdScheduling: the frame tick is scheduled only when
 // animations are on AND something animated is visible.
 func TestAnimCmdScheduling(t *testing.T) {
-	cfg := &config.Config{Version: 1, Globals: config.Globals{Bin: "b", Host: "h", Port: 1}}
+	cfg := &config.Config{Version: 1, Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "b"}}, DefaultBinary: "default", Bin: "b", Host: "h", Port: 1}}
 	r := &RunMode{cfg: cfg, status: StatusReady} // idle
 	if cmd := r.animCmd(); cmd != nil {
 		t.Error("steady-state READY must not schedule the animation tick")

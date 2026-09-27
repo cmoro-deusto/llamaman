@@ -36,10 +36,14 @@ type Result struct {
 // reg is consulted first for canonical CLI form; unknown keys fall back
 // to the hard-coded short-form set (DESIGN.md §6.2). Unknown keys also
 // produce a warning in the returned Result.
-func Build(globals config.Globals, model config.Model, preset config.Preset, reg flags.Registry) (Result, error) {
+//
+// binPath is the resolved llama-server binary path (DESIGN §3.2a):
+// argv[0]. It is passed separately from globals because resolution may
+// select a named binaries entry rather than the legacy globals.Bin.
+func Build(globals config.Globals, model config.Model, preset config.Preset, reg flags.Registry, binPath string) (Result, error) {
 	overrides := overrideSet(preset.Params)
 
-	argv := []string{globals.Bin}
+	argv := []string{binPath}
 	switch {
 	case model.IsHF():
 		if !overrides["hf"] && !overrides["m"] {

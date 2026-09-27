@@ -14,7 +14,7 @@ func num(s string) json.Number { return json.Number(s) }
 // build is a shorthand that uses the fallback registry.
 func build(t *testing.T, g config.Globals, m config.Model, p config.Preset) Result {
 	t.Helper()
-	r, err := Build(g, m, p, nil)
+	r, err := Build(g, m, p, nil, g.Bin)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestBuildBooleanFalseOmitted(t *testing.T) {
 			{Key: "metrics", Value: false}, // omitted
 		},
 	}
-	got := build(t, config.Globals{Bin: "x", Host: "h", Port: 1}, config.Model{Alias: "a", Location: "l"}, preset)
+	got := build(t, config.Globals{Binaries: []config.Binary{{Name: "default", Path: "x"}}, DefaultBinary: "default", Bin: "x", Host: "h", Port: 1}, config.Model{Alias: "a", Location: "l"}, preset)
 	for _, a := range got.Argv {
 		if a == "--metrics" {
 			t.Fatalf("--metrics should be omitted when value=false; argv=%v", got.Argv)
@@ -115,7 +115,7 @@ func TestBuildPresetOverridesAutoAdded(t *testing.T) {
 		},
 	}
 	got := build(t,
-		config.Globals{Bin: "/x", Host: "127.0.0.1", Port: 9080},
+		config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/x"}}, DefaultBinary: "default", Bin: "/x", Host: "127.0.0.1", Port: 9080},
 		config.Model{Alias: "qwen", Location: "/m.gguf"},
 		preset,
 	)
@@ -134,7 +134,7 @@ func TestBuildPresetOverridesAutoAdded(t *testing.T) {
 
 func TestBuildHostAlwaysExplicit(t *testing.T) {
 	got := build(t,
-		config.Globals{Bin: "/x", Host: "127.0.0.1", Port: 8080},
+		config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/x"}}, DefaultBinary: "default", Bin: "/x", Host: "127.0.0.1", Port: 8080},
 		config.Model{Alias: "a", Location: "/l"},
 		config.Preset{},
 	)
@@ -150,7 +150,7 @@ func TestBuildOrderMatchesParamsSlice(t *testing.T) {
 			{Key: "a-first", Value: num("2")},
 		},
 	}
-	got := build(t, config.Globals{Bin: "x", Host: "h", Port: 1}, config.Model{Alias: "a", Location: "l"}, preset)
+	got := build(t, config.Globals{Binaries: []config.Binary{{Name: "default", Path: "x"}}, DefaultBinary: "default", Bin: "x", Host: "h", Port: 1}, config.Model{Alias: "a", Location: "l"}, preset)
 	zIdx, aIdx := indexOf(got.Argv, "--z-last"), indexOf(got.Argv, "--a-first")
 	if zIdx < 0 || aIdx < 0 || zIdx >= aIdx {
 		t.Fatalf("expected z-last before a-first; got %v", got.Argv)
@@ -163,7 +163,7 @@ func TestBuildRejectsUnsupportedValue(t *testing.T) {
 			{Key: "broken", Value: 42},
 		},
 	}
-	_, err := Build(config.Globals{Bin: "x", Host: "h", Port: 1}, config.Model{Alias: "a", Location: "l"}, preset, nil)
+	_, err := Build(config.Globals{Binaries: []config.Binary{{Name: "default", Path: "x"}}, DefaultBinary: "default", Bin: "x", Host: "h", Port: 1}, config.Model{Alias: "a", Location: "l"}, preset, nil, "x")
 	if err == nil {
 		t.Fatal("expected error for unsupported value type")
 	}
@@ -173,7 +173,7 @@ func TestBuildRejectsUnsupportedValue(t *testing.T) {
 // same auto-added position. `--alias`/`--host`/`--port` carry over.
 func TestBuildHFSourceUsesHFFlag(t *testing.T) {
 	got := build(t,
-		config.Globals{Bin: "/opt/llama.cpp/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/opt/llama.cpp/bin/llama-server"}}, DefaultBinary: "default", Bin: "/opt/llama.cpp/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		config.Model{Alias: "qwen-hf", HF: "Qwen/Qwen3-32B-GGUF:Q4_K_M"},
 		config.Preset{Name: "default", Params: config.Params{
 			{Key: "ngl", Value: num("99")},
@@ -200,7 +200,7 @@ func TestBuildHFSourceUsesHFFlag(t *testing.T) {
 // preset's value wins in its declared position.
 func TestBuildPresetCanOverrideHF(t *testing.T) {
 	got := build(t,
-		config.Globals{Bin: "x", Host: "h", Port: 1},
+		config.Globals{Binaries: []config.Binary{{Name: "default", Path: "x"}}, DefaultBinary: "default", Bin: "x", Host: "h", Port: 1},
 		config.Model{Alias: "a", HF: "default/repo:Q4_K_M"},
 		config.Preset{Params: config.Params{
 			{Key: "hf", Value: "different/repo:Q5_K_M"},
@@ -221,7 +221,7 @@ func TestBuildPresetCanOverrideHF(t *testing.T) {
 // `-m`, matching the v0.1.x behavior we don't want to regress.
 func TestBuildPresetMOverrideStillWorks(t *testing.T) {
 	got := build(t,
-		config.Globals{Bin: "x", Host: "h", Port: 1},
+		config.Globals{Binaries: []config.Binary{{Name: "default", Path: "x"}}, DefaultBinary: "default", Bin: "x", Host: "h", Port: 1},
 		config.Model{Alias: "a", Location: "/orig.gguf"},
 		config.Preset{Params: config.Params{
 			{Key: "m", Value: "/override.gguf"},
@@ -248,10 +248,10 @@ func TestBuildWarnsOnUnknownKey(t *testing.T) {
 		},
 	}
 	got, err := Build(
-		config.Globals{Bin: "x", Host: "h", Port: 1},
+		config.Globals{Binaries: []config.Binary{{Name: "default", Path: "x"}}, DefaultBinary: "default", Bin: "x", Host: "h", Port: 1},
 		config.Model{Alias: "a", Location: "l"},
 		preset,
-		reg,
+		reg, "x",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -275,10 +275,10 @@ func TestBuildUsesRegistryFormForAutoAddedFlags(t *testing.T) {
 		"port":  {Name: "port", Form: "--port", IsBool: false},
 	}
 	got, err := Build(
-		config.Globals{Bin: "x", Host: "h", Port: 1},
+		config.Globals{Binaries: []config.Binary{{Name: "default", Path: "x"}}, DefaultBinary: "default", Bin: "x", Host: "h", Port: 1},
 		config.Model{Alias: "a", Location: "/l"},
 		config.Preset{},
-		reg,
+		reg, "x",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -304,4 +304,28 @@ func indexOf(slice []string, s string) int {
 		}
 	}
 	return -1
+}
+
+func TestBuildUsesResolvedBinaryPathAsArgv0(t *testing.T) {
+	got, err := Build(
+		config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/old-default/llama-server"}}, DefaultBinary: "default", Bin: "/old-default/llama-server", Host: "127.0.0.1", Port: 9080},
+		config.Model{Alias: "a", Location: "/l"},
+		config.Preset{},
+		nil,
+		"/fork/llama-server",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Argv[0] != "/fork/llama-server" {
+		t.Errorf("argv[0] = %q, want the resolved binary path", got.Argv[0])
+	}
+}
+
+func TestRouterBuildUsesResolvedBinaryPathAsArgv0(t *testing.T) {
+	globals := config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/old-default/llama-server"}}, DefaultBinary: "default", Bin: "/old-default/llama-server", Host: "127.0.0.1", Port: 9080}
+	res := RouterBuild(globals, "/f.ini", nil, "/fork/llama-server")
+	if res.Argv[0] != "/fork/llama-server" {
+		t.Errorf("argv[0] = %q, want the resolved binary path", res.Argv[0])
+	}
 }

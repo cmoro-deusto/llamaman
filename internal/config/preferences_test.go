@@ -16,7 +16,7 @@ func TestPreferencesAbsentMeansDefaults(t *testing.T) {
 	path := filepath.Join(dir, "config.json")
 	cfg := &Config{
 		Version: 1,
-		Globals: Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: Globals{Binaries: []Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 	}
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
@@ -62,7 +62,7 @@ func TestPreferencesRoundTrip(t *testing.T) {
 	logOff := false
 	cfg := &Config{
 		Version: 1,
-		Globals: Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: Globals{Binaries: []Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Preferences: &Preferences{
 			Theme:      "nord",
 			Animations: &animOff,
@@ -104,7 +104,7 @@ func TestLogoEffectRoundTrip(t *testing.T) {
 	path := filepath.Join(dir, "config.json")
 	cfg := &Config{
 		Version: 1,
-		Globals: Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: Globals{Binaries: []Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Preferences: &Preferences{
 			Theme:      "nord", // set another pref so the object exists
 			LogoEffect: LogoEffectLoop,
@@ -134,7 +134,7 @@ func TestLogoEffectRoundTrip(t *testing.T) {
 func TestLogoEffectUnknownWarns(t *testing.T) {
 	cfg := &Config{
 		Version: 1,
-		Globals: Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: Globals{Binaries: []Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Preferences: &Preferences{
 			LogoEffect: "sideways",
 		},
@@ -163,7 +163,7 @@ func TestPreferencesExplicitTrueIsSerialized(t *testing.T) {
 	animOn := true
 	cfg := &Config{
 		Version: 1,
-		Globals: Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: Globals{Binaries: []Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Preferences: &Preferences{
 			Animations: &animOn,
 		},
@@ -215,7 +215,7 @@ func TestPreferencesLoadAccepted(t *testing.T) {
 func TestPreferencesValidateIsShapeOnly(t *testing.T) {
 	cfg := &Config{
 		Version: 1,
-		Globals: Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: Globals{Binaries: []Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Preferences: &Preferences{
 			Theme: "definitely-not-a-real-palette",
 		},
@@ -235,12 +235,12 @@ func TestPreferencesValidateIsShapeOnly(t *testing.T) {
 // indicator path: a preference change must show up in the marshaled
 // diff bytes.
 func TestMarshalForDiffIncludesPreferences(t *testing.T) {
-	before, err := MarshalForDiff(&Config{Version: 1, Globals: Globals{Bin: "b", Host: "h", Port: 1}})
+	before, err := MarshalForDiff(&Config{Version: 1, Globals: Globals{Binaries: []Binary{{Name: "default", Path: "b"}}, DefaultBinary: "default", Bin: "b", Host: "h", Port: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	animOff := false
-	after, err := MarshalForDiff(&Config{Version: 1, Globals: Globals{Bin: "b", Host: "h", Port: 1}, Preferences: &Preferences{Theme: "nord", Animations: &animOff}})
+	after, err := MarshalForDiff(&Config{Version: 1, Globals: Globals{Binaries: []Binary{{Name: "default", Path: "b"}}, DefaultBinary: "default", Bin: "b", Host: "h", Port: 1}, Preferences: &Preferences{Theme: "nord", Animations: &animOff}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestModelsDirAbsentMeansDefault(t *testing.T) {
 	path := filepath.Join(dir, "config.json")
 	cfg := &Config{
 		Version: 1,
-		Globals: Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: Globals{Binaries: []Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Preferences: &Preferences{
 			Theme: "nord", // set another pref so the object exists
 		},
@@ -304,7 +304,7 @@ func TestModelsDirRoundTrip(t *testing.T) {
 	path := filepath.Join(dir, "config.json")
 	cfg := &Config{
 		Version: 1,
-		Globals: Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: Globals{Binaries: []Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Preferences: &Preferences{
 			ModelsDir: "/opt/llama-models",
 		},
@@ -336,7 +336,7 @@ func TestDownloadConnectionsRoundTrip(t *testing.T) {
 	path := filepath.Join(dir, "config.json")
 	cfg := &Config{
 		Version:     1,
-		Globals:     Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals:     Globals{Binaries: []Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
 		Preferences: &Preferences{DownloadConnections: 8},
 	}
 	if err := Save(path, cfg); err != nil {

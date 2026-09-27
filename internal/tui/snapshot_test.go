@@ -23,7 +23,7 @@ import (
 // want to actually fork llama-server.
 type stubSpawner struct{ runningAlias string }
 
-func (s stubSpawner) Spawn(config.Model, config.Preset) (RunModeOpts, error) {
+func (s stubSpawner) Spawn(config.Model, config.Preset, string) (RunModeOpts, error) {
 	return RunModeOpts{}, errStubSpawn
 }
 func (s stubSpawner) SpawnRouter(string) (RunModeOpts, error) {
@@ -703,7 +703,7 @@ func TestSnapshotRunMode(t *testing.T) {
 	// Wait for the fakeserver to start and /props to succeed.
 	// Readiness now triggers on /props success, not log parsing.
 	// Feed log chunks and periodically retry /props until [READY].
-	deadline := time.After(3 * time.Second)
+	deadline := time.After(10 * time.Second)
 	for {
 		select {
 		case <-deadline:
@@ -728,7 +728,12 @@ func TestSnapshotRunMode(t *testing.T) {
 					}
 				}
 			}
-			if strings.Contains(stripANSI(root.View()), "[READY]") {
+			// Wait for both READY *and* the §15.4 load-progress window
+			// (2s min-visible after the last phase line) to close — the
+			// live band with Tokens/Prompt only renders once it does.
+			view := stripANSI(root.View())
+			if strings.Contains(view, "[READY]") &&
+				strings.Contains(view, "Tokens") && strings.Contains(view, "Prompt") {
 				break
 			}
 		}
@@ -756,7 +761,7 @@ func TestSnapshotRunMode(t *testing.T) {
 // feeling like a no-op.
 type failingSpawner struct{ msg string }
 
-func (f failingSpawner) Spawn(config.Model, config.Preset) (RunModeOpts, error) {
+func (f failingSpawner) Spawn(config.Model, config.Preset, string) (RunModeOpts, error) {
 	return RunModeOpts{}, failingSpawnError{f.msg}
 }
 func (f failingSpawner) SpawnRouter(string) (RunModeOpts, error) {
