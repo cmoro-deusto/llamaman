@@ -22,9 +22,11 @@ import (
 // it off. The registry is consulted for canonical flag forms; if the
 // running llama-server lacks --models-preset entirely, callers should
 // surface a version-gate error before reaching Spawn (see main.go).
-func RouterBuild(globals config.Globals, file string, reg flags.Registry, binPath string) Result {
-	return Result{Argv: []string{
-		binPath,
+//
+// bin is the resolved binary (§3.2a); see Build.
+func RouterBuild(globals config.Globals, file string, reg flags.Registry, bin config.Binary) Result {
+	return Result{Binary: bin, Argv: []string{
+		bin.Path,
 		flags.CanonicalForm("models-preset", reg), file,
 		flags.CanonicalForm("host", reg), globals.Host,
 		flags.CanonicalForm("port", reg), strconv.Itoa(globals.Port),

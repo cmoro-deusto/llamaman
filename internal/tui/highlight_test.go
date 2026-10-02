@@ -427,7 +427,7 @@ func TestRunModeAnchorsWordmarkSweep(t *testing.T) {
 		t.Skipf("fakeserver not built: %v", err)
 	}
 	logPath := filepath.Join(t.TempDir(), "llama.log")
-	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	proc, err := server.Spawn(fakeServerArgv(t, bin), logPath)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -344,3 +344,26 @@ func TestLoadExpandsBinariesPaths(t *testing.T) {
 		t.Errorf("path not expanded: %q", cfg.Globals.Binaries[0].Path)
 	}
 }
+
+func TestFindBinary(t *testing.T) {
+	g := resolveGlobals([]string{"default", "fork"}, "default")
+	tests := []struct {
+		name     string
+		wantOK   bool
+		wantPath string
+	}{
+		{"fork", true, "/bin/fork"},
+		{"default", true, "/bin/default"},
+		{"missing", false, ""},
+		{"", false, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, ok := g.FindBinary(tt.name)
+
+			if ok != tt.wantOK || b.Path != tt.wantPath {
+				t.Errorf("FindBinary(%q) = %+v, %v; want path %q, %v", tt.name, b, ok, tt.wantPath, tt.wantOK)
+			}
+		})
+	}
+}

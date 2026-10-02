@@ -1250,10 +1250,8 @@ func (r *RunMode) restartBinOverride() string {
 	if r.binaryName == "" || r.cfg == nil {
 		return ""
 	}
-	for _, b := range r.cfg.Globals.Binaries {
-		if b.Name == r.binaryName {
-			return r.binaryName
-		}
+	if _, ok := r.cfg.Globals.FindBinary(r.binaryName); ok {
+		return r.binaryName
 	}
 	return ""
 }

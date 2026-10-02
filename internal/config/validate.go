@@ -73,11 +73,6 @@ func Validate(cfg *Config) Issues {
 			Message: fmt.Sprintf("schema version %d not supported (expected %d)", cfg.Version, SchemaVersion)})
 	}
 
-	knownBinaries := make(map[string]bool, len(cfg.Globals.Binaries))
-	for _, b := range cfg.Globals.Binaries {
-		knownBinaries[b.Name] = true
-	}
-
 	out = append(out, validateGlobals(cfg.Globals)...)
 	out = append(out, validatePreferences(cfg.Prefs())...)
 
@@ -125,7 +120,7 @@ func Validate(cfg *Config) Issues {
 			}
 		}
 
-		out = append(out, validatePresets(i, m.Presets, knownBinaries)...)
+		out = append(out, validatePresets(i, m.Presets, cfg.Globals)...)
 	}
 	return out
 }
@@ -234,7 +229,7 @@ func validateGlobals(g Globals) Issues {
 	return out
 }
 
-func validatePresets(modelIdx int, presets []Preset, knownBinaries map[string]bool) Issues {
+func validatePresets(modelIdx int, presets []Preset, globals Globals) Issues {
 	var out Issues
 	nameSeen := make(map[string]int)
 	for i, p := range presets {
@@ -264,7 +259,7 @@ func validatePresets(modelIdx int, presets []Preset, knownBinaries map[string]bo
 				paramSeen[pr.Key] = j
 			}
 		}
-		if p.Binary != "" && !knownBinaries[p.Binary] {
+		if _, known := globals.FindBinary(p.Binary); p.Binary != "" && !known {
 			out = append(out, Issue{Severity: Warning,
 				Path:    fmt.Sprintf("models[%d].presets[%d].binary", modelIdx, i),
 				Message: fmt.Sprintf("binary %q names no globals.binaries entry; falling back to the default binary", p.Binary)})

@@ -101,6 +101,7 @@ func Import(f *File, existing []config.Model, reg flags.Registry) ([]config.Mode
 			Presets: []config.Preset{{
 				Name:        presetName,
 				Description: descriptionOf(s),
+				Binary:      commentValue(s, "; llamaman-binary:"),
 				Params:      params,
 			}},
 		}
@@ -158,9 +159,13 @@ func aliasOf(s *Section) (alias string, fromKey bool) {
 
 // descriptionOf extracts the preset description from the "; description:"
 // comment convention used by the exporter.
-func descriptionOf(s *Section) string {
+func descriptionOf(s *Section) string { return commentValue(s, "; description:") }
+
+// commentValue returns the trimmed value of the last section comment
+// starting with prefix (the exporter's "; key: value" convention), or "".
+func commentValue(s *Section, prefix string) string {
 	for i := len(s.Comment) - 1; i >= 0; i-- {
-		if rest, ok := strings.CutPrefix(s.Comment[i], "; description:"); ok {
+		if rest, ok := strings.CutPrefix(s.Comment[i], prefix); ok {
 			return strings.TrimSpace(rest)
 		}
 	}
@@ -173,14 +178,8 @@ func descriptionOf(s *Section) string {
 // alias unique (multi-preset models); without it, the alias key itself
 // is the model alias.
 func exportedModelAlias(s *Section) (string, bool) {
-	for i := len(s.Comment) - 1; i >= 0; i-- {
-		if rest, ok := strings.CutPrefix(s.Comment[i], "; llamaman-model:"); ok {
-			if alias := strings.TrimSpace(rest); alias != "" {
-				return alias, true
-			}
-		}
-	}
-	return "", false
+	alias := commentValue(s, "; llamaman-model:")
+	return alias, alias != ""
 }
 
 // importParams builds the ordered param list for one section: "[*]"

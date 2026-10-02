@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
+	"github.com/cmoro-deusto/llamaman/internal/flags"
 	"github.com/cmoro-deusto/llamaman/internal/modelsini"
 	"github.com/cmoro-deusto/llamaman/internal/server"
 )
@@ -55,7 +56,7 @@ func testConfig(t *testing.T) string {
 	t.Helper()
 	cfg := &config.Config{
 		Version: 1,
-		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/true"}}, DefaultBinary: "default", Bin: "/bin/true", Host: "127.0.0.1", Port: 9080},
+		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/true"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 		Models: []config.Model{
 			{
 				Alias:    "m",
@@ -154,7 +155,7 @@ func TestImportDispatchBeforeKong(t *testing.T) {
 	// runners have none — binary path is required otherwise).
 	if err := config.Save(cfgPath, &config.Config{
 		Version: config.SchemaVersion,
-		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/true"}}, DefaultBinary: "default", Bin: "/bin/true", Host: "127.0.0.1", Port: 9080},
+		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/true"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 	}); err != nil {
 		t.Fatalf("seed config: %v", err)
 	}
@@ -207,7 +208,7 @@ func liveSession(t *testing.T) *server.SessionManager {
 func TestDecideEntryNoArgsLandsOnMainWhenSessionRunning(t *testing.T) {
 	cfg := &config.Config{
 		Version: 1,
-		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 	}
 	opts, code := decideEntry(cfg, nil, liveSession(t), "", "", "")
 	if code != 0 {
@@ -223,7 +224,7 @@ func TestDecideEntryNoArgsLandsOnMainWhenSessionRunning(t *testing.T) {
 func TestDecideEntryAliasStillReattaches(t *testing.T) {
 	cfg := &config.Config{
 		Version: 1,
-		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 	}
 	opts, code := decideEntry(cfg, nil, liveSession(t), "alpha", "default", "")
 	if code != 0 {
@@ -674,5 +675,40 @@ func TestCompletionBinariesIncludeRelativePaths(t *testing.T) {
 		if !strings.Contains(s, filter) {
 			t.Errorf("%s completion does not use the binaries filter", name)
 		}
+	}
+}
+
+// Regression (review §2.8): the spawner resolves any binary's registry
+// for the config editor — the startup one for the default, a parsed one
+// for other builds — cached per path+mtime so a rebuild is re-read.
+func TestLiveSpawnerRegistryFor(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", dir)
+	fork := writeFakeServer(t, dir, "llama-server-fork")
+	startup := flags.Registry{"startup-only": {Name: "startup-only"}}
+	def := config.Binary{Name: "main", Path: filepath.Join(dir, "llama-server")}
+	l := &liveSpawner{cfg: &config.Config{}, defaultBin: def, registry: startup, registryReal: true}
+
+	gotDefault := l.RegistryFor(def)
+	gotFork := l.RegistryFor(config.Binary{Name: "fork", Path: fork})
+
+	if _, ok := gotDefault.Lookup("startup-only"); !ok {
+		t.Error("default binary must reuse the startup registry")
+	}
+	if _, ok := gotFork.Lookup("ctx-size"); !ok {
+		t.Errorf("fork registry not parsed from its --help (entries=%d)", len(gotFork))
+	}
+
+	// A rebuild (new mtime) whose --help is unreadable must not be
+	// served from the stale cache entry.
+	if err := os.WriteFile(fork, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(time.Hour)
+	if err := os.Chtimes(fork, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if _, real := l.registryForBinary(config.Binary{Name: "fork", Path: fork}); real {
+		t.Error("rebuilt binary served from the stale cache entry")
 	}
 }

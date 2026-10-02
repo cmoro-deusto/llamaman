@@ -126,6 +126,10 @@ type ConfigMode struct {
 	saved    *config.Config // last persisted snapshot (for diff)
 	work     *config.Config // editable copy
 	registry flags.Registry // optional, for fuzzy picker + type-aware values
+	// registryFor, when set, resolves the registry of a specific binary
+	// (§3.2a): flags are a property of the build a preset runs on, so
+	// the editor asks per preset instead of trusting the startup one.
+	registryFor func(config.Binary) flags.Registry
 
 	focus     ConfigFocus
 	modelIdx  int
@@ -189,6 +193,37 @@ func NewConfigMode(cfgPath string, original *config.Config, theme Theme) ConfigM
 // flow uses a fuzzy picker over its keys, and value forms become type-
 // aware (boolean toggle, numeric input, enum picker, text).
 func (c *ConfigMode) SetRegistry(r flags.Registry) { c.registry = r }
+
+// SetRegistryResolver attaches the per-binary registry lookup (§3.2a).
+// Without one, every preset uses the SetRegistry registry.
+func (c *ConfigMode) SetRegistryResolver(f func(config.Binary) flags.Registry) { c.registryFor = f }
+
+// activeRegistry is the registry of the binary the selected preset
+// resolves to (its pin, else the working config's default).
+func (c *ConfigMode) activeRegistry() flags.Registry {
+	pin := ""
+	if c.hasPreset() {
+		pin = c.work.Models[c.modelIdx].Presets[c.presetIdx].Binary
+	}
+	return c.registryForPin(pin)
+}
+
+// registryForPin resolves a preset pin ("" = default) against the
+// working config — so a default changed in this editor applies at once
+// — and returns that binary's registry, or the SetRegistry fallback.
+func (c *ConfigMode) registryForPin(pin string) flags.Registry {
+	if c.registryFor == nil {
+		return c.registry
+	}
+	bin, _ := c.work.Globals.ResolveBinary("", pin)
+	if bin.Path == "" {
+		return c.registry
+	}
+	if reg := c.registryFor(bin); reg != nil {
+		return reg
+	}
+	return c.registry
+}
 
 // SetHFCheckRunner attaches the §16.6 typed-repo check runner. Tests
 // inject a stub; root wires a real *hf.Client-backed adapter. nil
@@ -1290,7 +1325,7 @@ func (c *ConfigMode) pasteConfirmBody() string {
 		lines = append(lines, "(no extra flags)")
 	}
 	for _, p := range params {
-		flag := flags.CanonicalForm(p.Key, c.registry)
+		flag := flags.CanonicalForm(p.Key, c.registryForPin(""))
 		if b, ok := p.Value.(bool); ok {
 			if b {
 				lines = append(lines, "  "+flag)
@@ -1533,14 +1568,7 @@ func (c *ConfigMode) openEditPresetForm() tea.Cmd {
 		opts = append(opts, huh.NewOption(b.Name, b.Name))
 	}
 	if binPin != "" {
-		known := false
-		for _, b := range c.work.Globals.Binaries {
-			if b.Name == binPin {
-				known = true
-				break
-			}
-		}
-		if !known {
+		if _, known := c.work.Globals.FindBinary(binPin); !known {
 			opts = append(opts, huh.NewOption(binPin+" (missing)", binPin))
 		}
 	}
@@ -1662,7 +1690,8 @@ func clonePresetNameValidator(models []config.Model, target *int) func(string) e
 // so each row is highlightable and shows what the flag does.
 func (c *ConfigMode) openNewParamForm() tea.Cmd {
 	c.pendingKey = ""
-	if len(c.registry) == 0 {
+	reg := c.activeRegistry()
+	if len(reg) == 0 {
 		// No registry: fall back to a free-text huh.Input. applyForm's
 		// formNewParamPickKey branch advances to the value form.
 		c.formStaging = formStaging{paramKey: &c.pendingKey}
@@ -1674,7 +1703,7 @@ func (c *ConfigMode) openNewParamForm() tea.Cmd {
 		))
 		return c.installForm(form, formNewParamPickKey)
 	}
-	c.picker = newParamPicker(c.registry)
+	c.picker = newParamPicker(reg)
 	pw, ph := c.pickerSize()
 	c.picker.SetSize(pw, ph)
 	return nil
@@ -1702,7 +1731,7 @@ func (c *ConfigMode) openValueFormFor(key, initial string) tea.Cmd {
 	val := initial
 	c.formStaging = formStaging{paramKey: &key, paramVal: &val}
 
-	fi, _ := c.registry.Lookup(key)
+	fi, _ := c.activeRegistry().Lookup(key)
 	title := fmt.Sprintf("value for %s", fi.Form)
 	if fi.Form == "" {
 		title = fmt.Sprintf("value for --%s", key)
@@ -2060,7 +2089,7 @@ func (c *ConfigMode) applyForm() (tea.Cmd, bool) {
 			c.errorModal = "could not parse command line:\n\n" + terr.Error()
 			return nil, true
 		}
-		res, perr := cmdline.Parse(tokens, c.registry)
+		res, perr := cmdline.Parse(tokens, c.registryForPin(""))
 		c.paste = &res
 		if perr != nil {
 			c.errorModal = "command line has errors:\n\n" + perr.Error()
@@ -2428,10 +2457,11 @@ func (c *ConfigMode) renderParams() string {
 	}
 	params := c.work.Models[c.modelIdx].Presets[c.presetIdx].Params
 
+	reg := c.activeRegistry()
 	var unknownFlags []string
-	if len(c.registry) > 0 {
+	if len(reg) > 0 {
 		for _, p := range params {
-			if _, ok := c.registry.Lookup(p.Key); !ok {
+			if _, ok := reg.Lookup(p.Key); !ok {
 				unknownFlags = append(unknownFlags, p.Key)
 			}
 		}
@@ -2450,8 +2480,8 @@ func (c *ConfigMode) renderParams() string {
 				i == c.paramIdx,
 			)
 			line := keyVal
-			if len(c.registry) > 0 {
-				if _, ok := c.registry.Lookup(p.Key); !ok {
+			if len(reg) > 0 {
+				if _, ok := reg.Lookup(p.Key); !ok {
 					line += lipgloss.NewStyle().Foreground(c.theme.StatusStart).Render("  (?)")
 				}
 			}

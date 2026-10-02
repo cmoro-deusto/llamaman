@@ -525,7 +525,7 @@ func TestExportImportRoundTrip(t *testing.T) {
 						{Key: "temp", Value: json.Number("0.7")},
 						{Key: "no-mmap", Value: true},
 					}},
-					{Name: "fast", Description: "fast preset", Params: config.Params{
+					{Name: "fast", Description: "fast preset", Binary: "rocm", Params: config.Params{
 						{Key: "ngl", Value: json.Number("32")},
 						{Key: "ctx-size", Value: json.Number("4096")},
 						{Key: "flash-attn", Value: false},
@@ -535,7 +535,7 @@ func TestExportImportRoundTrip(t *testing.T) {
 			{
 				Alias: "gemma", HF: "org/repo:Q4_K_M",
 				Presets: []config.Preset{{
-					Name: "default", Description: "single preset",
+					Name: "default", Description: "single preset", Binary: "cuda",
 					Params: config.Params{{Key: "temp", Value: json.Number("0.3")}},
 				}},
 			},
@@ -560,6 +560,14 @@ func TestExportImportRoundTrip(t *testing.T) {
 	}
 	if models[0].Presets[0].Description != "balanced preset" {
 		t.Errorf("description lost: %q", models[0].Presets[0].Description)
+	}
+	// Binary pins (§3.2a) ride "; llamaman-binary:" comments: kept on
+	// pinned presets, absent on unpinned ones (review §2.10).
+	if got := []string{models[0].Presets[0].Binary, models[0].Presets[1].Binary, models[1].Presets[0].Binary}; got[0] != "" || got[1] != "rocm" || got[2] != "cuda" {
+		t.Errorf("binary pins after round trip = %q, want [\"\" rocm cuda]", got)
+	}
+	if !strings.Contains(ini1, "; llamaman-binary: rocm\n") {
+		t.Errorf("export lacks the pin comment:\n%s", ini1)
 	}
 
 	round := &config.Config{Version: config.SchemaVersion, Models: models}

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alecthomas/kong"
@@ -279,24 +280,62 @@ type liveSpawner struct {
 	registryReal bool
 	defaultBin   config.Binary
 	sessMgr      *server.SessionManager
+
+	// regMu guards regCache, the in-memory registry per non-default
+	// binary (key: path + mtime, so a rebuilt binary is re-read). The
+	// config editor resolves registries while rendering, so lookups
+	// must not re-run `--help` every frame.
+	regMu    sync.Mutex
+	regCache map[string]cachedRegistry
+}
+
+// cachedRegistry is one regCache entry.
+type cachedRegistry struct {
+	reg  flags.Registry
+	real bool
 }
 
 // registryFor resolves the binary a spawn will use (override → preset pin
-// → default) and returns its flag registry, falling back to the startup
-// registry when the resolved entry is the default one.
+// → default) and returns its flag registry (§3.2a).
 func (l *liveSpawner) registryFor(override, presetPin string) (flags.Registry, bool) {
 	bin, _ := l.cfg.Globals.ResolveBinary(override, presetPin)
+	return l.registryForBinary(bin)
+}
+
+// registryForBinary returns bin's flag registry: the startup registry
+// for the startup default, else bin's own (cached per path+mtime).
+func (l *liveSpawner) registryForBinary(bin config.Binary) (flags.Registry, bool) {
 	if bin.Path == "" || bin.Path == l.defaultBin.Path {
 		return l.registry, l.registryReal
+	}
+	key := bin.Path
+	if info, err := os.Stat(bin.Path); err == nil {
+		key += "@" + strconv.FormatInt(info.ModTime().UnixNano(), 10)
+	}
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
+	if c, ok := l.regCache[key]; ok {
+		return c.reg, c.real
 	}
 	reg, real := loadFlagRegistry(bin.Path)
 	if reg == nil {
 		// Loader init failed: borrow the startup registry for
 		// canonicalization, but never report it as real — it describes
 		// another build, so capability checks must not trust it.
-		return l.registry, false
+		reg, real = l.registry, false
 	}
+	if l.regCache == nil {
+		l.regCache = make(map[string]cachedRegistry)
+	}
+	l.regCache[key] = cachedRegistry{reg: reg, real: real}
 	return reg, real
+}
+
+// RegistryFor satisfies tui.RegistryResolver: the config editor asks for
+// the registry of the binary a preset resolves to (§3.2a).
+func (l *liveSpawner) RegistryFor(bin config.Binary) flags.Registry {
+	reg, _ := l.registryForBinary(bin)
+	return reg
 }
 
 // SetConfig satisfies tui.ConfigSetter: the TUI hands over each saved
@@ -329,7 +368,10 @@ func (l *liveSpawner) Reattach() (*tui.RunModeOpts, error) {
 	if err != nil || sess == nil {
 		return nil, err
 	}
-	return buildReattachOpts(l.cfg, l.registry, *sess, l.sessMgr)
+	// The session's recorded binary decides the registry (§3.2a); an
+	// unknown or empty name resolves to the default.
+	reg, _ := l.registryFor(sess.BinaryName, "")
+	return buildReattachOpts(l.cfg, reg, *sess, l.sessMgr)
 }
 
 func (l *liveSpawner) RunningAlias() (string, string, int) {
@@ -374,7 +416,7 @@ func acquireAndSpawn(cfg *config.Config, registry flags.Registry, sessMgr *serve
 		return nil, ErrBinaryPrereq{Underlying: err}
 	}
 
-	res, err := translate.Build(cfg.Globals, model, preset, registry, binary.Path)
+	res, err := translate.Build(cfg.Globals, model, preset, registry, binary)
 	if err != nil {
 		sessMgr.Unlock()
 		return nil, fmt.Errorf("build argv: %w", err)
@@ -402,7 +444,7 @@ func acquireAndSpawn(cfg *config.Config, registry flags.Registry, sessMgr *serve
 		StartedAt:  proc.Started,
 		Command:    res.Argv,
 		LogPath:    logPath,
-		BinaryName: binary.Name,
+		BinaryName: res.Binary.Name,
 	}
 	if err := sessMgr.WriteAndUnlock(&rec); err != nil {
 		// The child is alive but we couldn't persist; kill it to keep
@@ -422,7 +464,7 @@ func acquireAndSpawn(cfg *config.Config, registry flags.Registry, sessMgr *serve
 		Registry:   registry,
 		Fetcher:    fetcherFor(res.Argv, registry),
 		Version:    versionString(),
-		BinaryName: binary.Name,
+		BinaryName: res.Binary.Name,
 	}, nil
 }
 
@@ -464,7 +506,7 @@ func acquireAndSpawnRouter(cfg *config.Config, registry flags.Registry, registry
 		return buildReattachOpts(cfg, registry, *existing, sessMgr)
 	}
 
-	res := translate.RouterBuild(cfg.Globals, file, registry, routerBin.Path)
+	res := translate.RouterBuild(cfg.Globals, file, registry, routerBin)
 	if err := server.PortAvailable(cfg.Globals.Host, cfg.Globals.Port); err != nil {
 		sessMgr.Unlock()
 		return nil, ErrPortInUse{Underlying: err}
@@ -488,7 +530,7 @@ func acquireAndSpawnRouter(cfg *config.Config, registry flags.Registry, registry
 		StartedAt:  proc.Started,
 		Command:    res.Argv,
 		LogPath:    logPath,
-		BinaryName: routerBin.Name,
+		BinaryName: res.Binary.Name,
 	}
 	if err := sessMgr.WriteAndUnlock(&rec); err != nil {
 		proc.Stop(2 * time.Second)
@@ -504,7 +546,7 @@ func acquireAndSpawnRouter(cfg *config.Config, registry flags.Registry, registry
 		Registry:   registry,
 		Fetcher:    fetcherFor(res.Argv, registry),
 		Version:    versionString(),
-		BinaryName: routerBin.Name,
+		BinaryName: res.Binary.Name,
 	}, nil
 }
 
@@ -598,7 +640,7 @@ func buildReattachOpts(cfg *config.Config, registry flags.Registry, sess server.
 	// that build's registry so the header canonicalizes params the same
 	// way the live server does; fall back to the caller's when the entry
 	// is gone or unparseable.
-	if b, ok := findBinary(cfg, sess.BinaryName); ok {
+	if b, ok := cfg.Globals.FindBinary(sess.BinaryName); ok {
 		if reg, real := loadFlagRegistry(b.Path); real {
 			registry = reg
 		}
@@ -725,16 +767,6 @@ func checkBinaryRunnable(b config.Binary, source string) error {
 	return nil
 }
 
-// findBinary returns the named binaries entry (§3.2a).
-func findBinary(cfg *config.Config, name string) (config.Binary, bool) {
-	for _, b := range cfg.Globals.Binaries {
-		if b.Name == name {
-			return b, true
-		}
-	}
-	return config.Binary{}, false
-}
-
 // validateBinaryOverride rejects a --binary NAME that names no configured
 // entry. An empty name is always valid (no override). Called by every CLI
 // path that can launch llama-server, so a typo fails loudly instead of
@@ -743,7 +775,7 @@ func validateBinaryOverride(cfg *config.Config, name string) error {
 	if name == "" {
 		return nil
 	}
-	if _, ok := findBinary(cfg, name); ok {
+	if _, ok := cfg.Globals.FindBinary(name); ok {
 		return nil
 	}
 	names := make([]string, 0, len(cfg.Globals.Binaries))

@@ -116,13 +116,13 @@ One llamaman install routinely drives several llama.cpp builds: upstream mainlin
 - An `--binary` name naming an unknown entry is a **hard error** (exit 2) on every launch path, because the user asked for it explicitly.
 - A resolved binary that is missing or not executable aborts the launch before the fork with exit 3 (§4.4), naming the entry, the path, and why it was chosen.
 
-**Flag registry is per binary.** Short-vs-long flag forms, boolean detection, and the param picker's descriptions all come from `<bin> --help` (§6.2), so they are properties of the *selected* build, not of llamaman. The registry is parsed for the entry that will actually run, and the TUI refreshes it when a launch resolves to a different entry. Cached per path+mtime+hash so two builds sharing an mtime cannot collide.
+**Flag registry is per binary.** Short-vs-long flag forms, boolean detection, and the param picker's descriptions all come from `<bin> --help` (§6.2), so they are properties of the *selected* build, not of llamaman. The registry is resolved per entry everywhere it matters: a spawn canonicalizes its argv (and router mode checks `--models-preset` support) against the registry of the entry that will actually run; a reattach uses the session's recorded `binary_name`; the config editor's param picker, value forms, unknown-flag `(?)` markers and command-line paste use the registry of the selected preset's resolved entry (its pin, else the working config's default — so a default changed in the editor applies immediately). If an entry's `--help` cannot be read, the fallback short-form set is used and reported as not parsed, so capability checks never trust another build's flags. Parsed registries are cached on disk per path+mtime+hash (two builds sharing an mtime cannot collide) and in memory per path+mtime for the session, so a rebuilt binary is re-read.
 
 **Migration.** `globals.llama-server-bin` is read-compat only: on load, a config that has the legacy key and no `binaries[]` is migrated into a single entry named `default` (marked default), and the legacy key is cleared in memory so the next save writes only the new form. A config that carries *both* keys is left alone — `binaries[]` wins — but validation warns, because the legacy key is then dead weight.
 
 **Sessions.** `session.json.binary_name` records which entry spawned the session. It is written on every spawn and read on reattach, so the run header still shows which build is live after a restart of llamaman itself.
 
-**Router mode and pins.** A router run hosts every model in one process, so `presets[].binary` does not apply: the CLI `-i FILE` / TUI router entry resolves by override → default. `my-models.ini` has no field for a binary either, so an `export` → `import` round-trip drops pins (the config file keeps them).
+**Router mode and pins.** A router run hosts every model in one process, so `presets[].binary` does not apply: the CLI `-i FILE` / TUI router entry resolves by override → default. `my-models.ini` has no field for a binary, so export records a pin as a `; llamaman-binary: <name>` section comment (llama.cpp ignores comments; the file stays router-valid) and import restores it onto the preset — pins survive an `export` → `import` round trip. A restored pin naming an entry the target config lacks is the usual non-blocking unknown-pin validation warning.
 
 The TUI surfaces this in three places: the config-mode **binaries hub** (`b` — add/edit/delete/set-default, entry-targeted), the one-shot **quick-switch** (Shift+B in main and run mode; applies to the next spawn, including a restart), and the run header's `Bin:` cell (shown when the resolved entry is not the default).
 
@@ -912,7 +912,8 @@ grammar mirrors llama.cpp's own PEG parser in `common/preset.cpp`.
   additional presets on one model — this is what makes export of
   multi-preset models round-trip.
 - Descriptions are recovered from `; description: <text>` comments (the
-  exporter's convention).
+  exporter's convention); preset binary pins (§3.2a) from
+  `; llamaman-binary: <name>` comments.
 
 ### 13.3 Export mapping (config.json → INI)
 
@@ -922,7 +923,10 @@ grammar mirrors llama.cpp's own PEG parser in `common/preset.cpp`.
   is unambiguous regardless of the section name (which is decorative for
   llamaman round-trips and a model id for llama.cpp's router).
 - Preset descriptions become `; description:` comments — llama.cpp
-  rejects unknown keys, so this is the only lossless channel.
+  rejects unknown keys, so this is the only lossless channel. Preset
+  binary pins (§3.2a) ride the same channel as `; llamaman-binary:
+  <name>` (router mode itself ignores pins — one process serves every
+  section).
 - Bools are emitted explicitly (`true`/`false`); numbers as literals;
   strings raw. Lossy string values (whitespace, `;`/`#`, newlines) are
   emitted with a warning.

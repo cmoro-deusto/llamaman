@@ -143,6 +143,18 @@ type Globals struct {
 	ModelsFiles   []string `json:"models-files,omitempty"`
 }
 
+// FindBinary returns the binaries[] entry with the given name — the one
+// lookup every caller uses (resolution, CLI --binary validation, preset
+// pin validation, reattach, the TUI pickers).
+func (g Globals) FindBinary(name string) (Binary, bool) {
+	for _, b := range g.Binaries {
+		if b.Name == name {
+			return b, true
+		}
+	}
+	return Binary{}, false
+}
+
 // ResolveBinary returns the binary to launch with, per the DESIGN §3.2a
 // chain: override (CLI --binary or the TUI one-shot quick-switch) →
 // preset pin → default. Source reports why: "override", "preset", or
@@ -152,14 +164,7 @@ type Globals struct {
 // the legacy Bin is returned so the launch attempt fails with a path
 // named in the error.
 func (g Globals) ResolveBinary(override, presetPin string) (Binary, string) {
-	find := func(name string) (Binary, bool) {
-		for _, b := range g.Binaries {
-			if b.Name == name {
-				return b, true
-			}
-		}
-		return Binary{}, false
-	}
+	find := g.FindBinary
 	if override != "" {
 		if b, ok := find(override); ok {
 			return b, "override"

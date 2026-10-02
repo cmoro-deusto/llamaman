@@ -38,7 +38,6 @@ import (
 //   - Runes outside the BMP are kept only as wide letters (CJK Ext B+);
 //     math alphanumerics (𝛕) and other astral narrow runes are dropped.
 //
-//
 // Category rules cannot see context, and Unicode scatters runes that
 // merge into the previous character across categories (halfwidth kana
 // sound marks are letters, Thai SARA AM is a letter). So a final pass

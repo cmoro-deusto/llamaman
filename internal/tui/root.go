@@ -88,6 +88,25 @@ type ConfigSetter interface {
 	SetConfig(cfg *config.Config)
 }
 
+// RegistryResolver is optionally implemented by a Spawner that can parse
+// any binary's `--help` (§3.2a). The config editor uses it so a preset's
+// param picker, value forms and unknown-flag markers reflect the build
+// that preset runs on; without it, the startup registry is used.
+type RegistryResolver interface {
+	RegistryFor(bin config.Binary) flags.Registry
+}
+
+// newConfigMode builds a config editor wired to the root's registry and
+// (when the spawner offers one) the per-binary registry resolver.
+func (r *Root) newConfigMode(cfgPath string, cfg *config.Config) ConfigMode {
+	cm := NewConfigMode(cfgPath, cfg, r.theme)
+	cm.SetRegistry(r.registry)
+	if rr, ok := r.spawner.(RegistryResolver); ok {
+		cm.SetRegistryResolver(rr.RegistryFor)
+	}
+	return cm
+}
+
 // Root is the top-level Bubble Tea model. It owns each sub-model and
 // dispatches messages.
 type Root struct {
@@ -323,8 +342,7 @@ func (r *Root) handleFirstRunCompleted(msg FirstRunCompletedMsg) (tea.Model, tea
 	r.mainMode = NewMainMode(msg.Cfg, r.version, r.theme)
 	r.mainMode.SetCfgPath(r.cfgPath)
 	r.mainMode.SetSize(r.width, r.height)
-	cm := NewConfigMode(msg.CfgPath, msg.Cfg, r.theme)
-	cm.SetRegistry(r.registry)
+	cm := r.newConfigMode(msg.CfgPath, msg.Cfg)
 	cm.SetHFCheckRunner(r.hfCheckRunner())
 	cm.ShowFirstRunBanner()
 	cm.SetSize(r.width, r.height)
@@ -547,8 +565,7 @@ type configEntry struct {
 }
 
 func (r *Root) openConfig(entry configEntry) (tea.Model, tea.Cmd) {
-	cm := NewConfigMode(r.cfgPath, r.cfg, r.theme)
-	cm.SetRegistry(r.registry)
+	cm := r.newConfigMode(r.cfgPath, r.cfg)
 	cm.SetHFCheckRunner(r.hfCheckRunner())
 	cm.prefillHF = entry.prefillHF
 	cm.SetSize(r.width, r.height)

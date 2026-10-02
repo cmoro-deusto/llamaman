@@ -8,6 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/cmoro-deusto/llamaman/internal/config"
+	"github.com/cmoro-deusto/llamaman/internal/flags"
 	"github.com/cmoro-deusto/llamaman/internal/server"
 )
 
@@ -276,5 +277,63 @@ func TestRestartKeepsRunningBinary(t *testing.T) {
 				t.Fatalf("restart override=%q, want %q", spawn.BinaryOverride, tc.want)
 			}
 		})
+	}
+}
+
+// resolvingSpawner is a recordingSpawner that also resolves a distinct
+// one-flag registry per binary (§3.2a), named after the binary.
+type resolvingSpawner struct {
+	recordingSpawner
+}
+
+func (s *resolvingSpawner) RegistryFor(bin config.Binary) flags.Registry {
+	return flags.Registry{bin.Name + "-only": {Name: bin.Name + "-only", Form: "--" + bin.Name + "-only"}}
+}
+
+// Regression (review §2.8): the config editor used the startup registry
+// for every preset. A pinned preset must use its pin's build, an
+// unpinned one the working config's default — including a default
+// changed in this editor session.
+func TestConfigEditorRegistryFollowsPresetBinary(t *testing.T) {
+	cfg := twoBinaryConfig()
+	cfg.Models[0].Presets = []config.Preset{{Name: "default"}, {Name: "pinned", Binary: "fork"}}
+	root := NewRoot(cfg, filepath.Join(t.TempDir(), "c.json"), &resolvingSpawner{}, flags.Registry{"startup-only": {Name: "startup-only"}}, "v", nil)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 180, Height: 50}, keyMsg("c"))
+	cm := root.configMod
+	if cm == nil || cm.registryFor == nil {
+		t.Fatal("config editor not wired to the spawner's registry resolver")
+	}
+	has := func(key string) bool { _, ok := cm.activeRegistry().Lookup(key); return ok }
+
+	cm.modelIdx, cm.presetIdx = 0, 0
+	unpinnedDefault := has("main-only")
+	cm.presetIdx = 1
+	pinnedFork := has("fork-only")
+	cm.presetIdx = 0
+	cm.work.Globals.DefaultBinary = "fork"
+	followsEditedDefault := has("fork-only")
+
+	if !unpinnedDefault {
+		t.Error("unpinned preset did not use the default binary's registry")
+	}
+	if !pinnedFork {
+		t.Error("preset pinned to fork did not use fork's registry")
+	}
+	if !followsEditedDefault {
+		t.Error("unpinned preset ignored the default changed in the editor")
+	}
+}
+
+// Without a resolver (e.g. a spawner that cannot parse --help), the
+// editor keeps the startup registry.
+func TestConfigEditorRegistryWithoutResolver(t *testing.T) {
+	startup := flags.Registry{"startup-only": {Name: "startup-only"}}
+	root := NewRoot(twoBinaryConfig(), filepath.Join(t.TempDir(), "c.json"), &recordingSpawner{}, startup, "v", nil)
+	driveRoot(t, root, tea.WindowSizeMsg{Width: 180, Height: 50}, keyMsg("c"))
+
+	_, ok := root.configMod.activeRegistry().Lookup("startup-only")
+
+	if !ok {
+		t.Error("editor without a resolver must use the startup registry")
 	}
 }

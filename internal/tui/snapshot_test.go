@@ -2,9 +2,11 @@ package tui
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -667,7 +669,8 @@ func TestSnapshotRunMode(t *testing.T) {
 		t.Skipf("fakeserver not built: %v", err)
 	}
 	logPath := filepath.Join(t.TempDir(), "llama.log")
-	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	argv, port := fakeServerArgvPort(t, bin)
+	proc, err := server.Spawn(argv, logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -682,7 +685,7 @@ func TestSnapshotRunMode(t *testing.T) {
 		Preset:  preset,
 		Argv:    proc.Argv,
 		Process: proc,
-		Fetcher: llamaapi.NewClient("127.0.0.1", 9080),
+		Fetcher: llamaapi.NewClient("127.0.0.1", port),
 	}
 	root := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", &opts)
 
@@ -848,7 +851,7 @@ func TestRunModeDirectKillReturnsToMain(t *testing.T) {
 		t.Skipf("fakeserver not built: %v", err)
 	}
 	logPath := filepath.Join(t.TempDir(), "llama.log")
-	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	proc, err := server.Spawn(fakeServerArgv(t, bin), logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -895,7 +898,7 @@ func TestRunModeKillReturnsToMatchingMainMode(t *testing.T) {
 
 	t.Run("router session returns to router mode", func(t *testing.T) {
 		logPath := filepath.Join(t.TempDir(), "llama.log")
-		proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+		proc, err := server.Spawn(fakeServerArgv(t, bin), logPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -919,7 +922,7 @@ func TestRunModeKillReturnsToMatchingMainMode(t *testing.T) {
 
 	t.Run("single session returns to single mode", func(t *testing.T) {
 		logPath := filepath.Join(t.TempDir(), "llama.log")
-		proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+		proc, err := server.Spawn(fakeServerArgv(t, bin), logPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -954,7 +957,7 @@ func TestRunModeQuitPromptKillQuitsLlamaman(t *testing.T) {
 		t.Skipf("fakeserver not built: %v", err)
 	}
 	logPath := filepath.Join(t.TempDir(), "llama.log")
-	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	proc, err := server.Spawn(fakeServerArgv(t, bin), logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1001,7 +1004,7 @@ func TestRunModeEscDetachesToMain(t *testing.T) {
 		t.Skipf("fakeserver not built: %v", err)
 	}
 	logPath := filepath.Join(t.TempDir(), "llama.log")
-	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	proc, err := server.Spawn(fakeServerArgv(t, bin), logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1034,7 +1037,7 @@ func TestRunModeEscKeepsCrashViewWhenServerDead(t *testing.T) {
 		t.Skipf("fakeserver not built: %v", err)
 	}
 	logPath := filepath.Join(t.TempDir(), "llama.log")
-	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	proc, err := server.Spawn(fakeServerArgv(t, bin), logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1065,7 +1068,7 @@ func TestRunModeKillPromptCancel(t *testing.T) {
 		t.Skipf("fakeserver not built: %v", err)
 	}
 	logPath := filepath.Join(t.TempDir(), "llama.log")
-	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	proc, err := server.Spawn(fakeServerArgv(t, bin), logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1101,7 +1104,7 @@ func TestRunModeKDoesNotScrollViewport(t *testing.T) {
 		t.Skipf("fakeserver not built: %v", err)
 	}
 	logPath := filepath.Join(t.TempDir(), "llama.log")
-	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	proc, err := server.Spawn(fakeServerArgv(t, bin), logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1371,6 +1374,30 @@ func TestFirstRunWindowSizeDoesNotPanic(t *testing.T) {
 		sessionTickMsg{},
 		tea.WindowSizeMsg{Width: 80, Height: 24},
 	)
+}
+
+// fakeServerArgv builds the fakeserver argv on a free loopback port, so
+// integration tests never bind the default 9080 — the port a developer's
+// own llama-server (or a concurrent test package) is likely using.
+func fakeServerArgv(t *testing.T, bin string) []string {
+	t.Helper()
+	argv, _ := fakeServerArgvPort(t, bin)
+	return argv
+}
+
+// fakeServerArgvPort is fakeServerArgv that also returns the port, for
+// tests that talk to the fakeserver's HTTP API.
+func fakeServerArgvPort(t *testing.T, bin string) ([]string, int) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return []string{bin, "--ready-delay=20ms", "--port=" + strconv.Itoa(port)}, port
 }
 
 // repoRoot walks up from CWD until it finds go.mod.
