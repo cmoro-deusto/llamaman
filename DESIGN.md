@@ -1909,7 +1909,11 @@ name and type:
    file (repo = the first two `__` segments).
 4. Metadata — `*.etag` sidecars, `manifest=…` files, and the HF hub
    root files (`CACHEDIR.TAG`, `version.txt`, `.locks/`, written by
-   `huggingface_hub`) → recognized, skipped silently.
+   `huggingface_hub`) → recognized, skipped silently. Non-model HF hub
+   repos — directories named `datasets--…` or `spaces--…`, which
+   `huggingface_hub` writes into the same default cache root — are
+   likewise recognized and skipped silently: the Storage manager lists
+   models only, and these are a valid layout, not cache damage.
 5. Anything else → **unrecognized** → warning (tolerance strategy
    below).
 
@@ -2217,7 +2221,15 @@ s to view`).
   in-flight downloads, one pane, footer of actions — mirrors the
   router model-panel action-menu pattern (Enter → action menu).
 - Rendering groups: **(1) cache repos** (from `storage.Scan` grouped by
-  repo — each shows its quants + total size, `storage.HumanSize`-style),
+  repo — each shows its quants + total size, `storage.HumanSize`-style;
+  quants come from `hf.CachedQuants`, which adds on-disk
+  speculative-draft-named models — basename containing `mtp-`,
+  `eagle3-`, `dflash-`, `dspark-` — tagged `<TAG> (<kind>)`, e.g.
+  `Q4_K_M (mtp)`. `Quants` excludes them because llama.cpp's
+  `-hf repo:QUANT` never auto-picks them, but they are on disk (fetched
+  via `-hff <file>`), so the manager must show, size, and delete them.
+  The download picker and config-editor pickers keep using `Quants`:
+  a `(kind)` tag is never a valid `:quant` suffix),
   **(2) local config models** (each `location` file with on-disk size;
   missing files marked), **(3) in-flight downloads** (own state, §16.3
   progress), plus a **free-disk** line for the cache root's filesystem

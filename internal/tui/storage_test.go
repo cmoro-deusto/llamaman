@@ -908,3 +908,49 @@ func TestStorageCancelledNotShownAsDownloaded(t *testing.T) {
 		t.Errorf("cancelled downloads must not appear at all, got %q", r.mainMode.statusLine)
 	}
 }
+
+// Regression: a repo holding only draft-named models (e.g. *-mtp-Q4_K_M,
+// fetched with -hff) showed as "empty cache repo" with no size, and
+// huggingface_hub datasets in the shared cache root were flagged as
+// unrecognized. The manager lists models only, sized and tagged.
+func TestStorageListsDraftModelsAndSkipsDatasets(t *testing.T) {
+	cfg := sampleSnapshotConfig()
+	root := t.TempDir()
+	repoDir := filepath.Join(root, storage.RepoFolderNames("hotdogs/Qwen-MTP-GGUF")[0])
+	snap := filepath.Join(repoDir, "snapshots", "aa")
+	if err := os.MkdirAll(snap, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(snap, "Qwen-mtp-Q4_K_M.gguf"), []byte("mtp-model"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"datasets--org--clinical-notes", "spaces--org--demo"} {
+		if err := os.MkdirAll(filepath.Join(root, d, "snapshots"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg.Preferences = &config.Preferences{ModelsDir: root}
+	r := NewRoot(cfg, "/dev/null", stubSpawner{}, nil, "v0.0.0-test", nil)
+
+	driveRoot(t, r, tea.WindowSizeMsg{Width: 120, Height: 40}, keyMsg("s"))
+
+	sm := r.storage
+	var found bool
+	for _, e := range sm.entries {
+		if e.title == "hotdogs/Qwen-MTP-GGUF" {
+			found = true
+			if e.detail != "Q4_K_M (mtp)" || e.size != int64(len("mtp-model")) {
+				t.Errorf("repo row = %q / %d, want %q / %d", e.detail, e.size, "Q4_K_M (mtp)", len("mtp-model"))
+			}
+		}
+		if strings.Contains(e.title, "clinical") || strings.Contains(e.title, "demo") {
+			t.Errorf("non-model hub repo listed: %q", e.title)
+		}
+	}
+	if !found {
+		t.Fatal("draft-model repo not listed")
+	}
+	if strings.Contains(sm.flash, "unrecognized") {
+		t.Errorf("flash = %q, want no unrecognized-entry warning for datasets/spaces", sm.flash)
+	}
+}

@@ -58,6 +58,60 @@ func Quants(files []RepoFile) []QuantOption {
 	return out
 }
 
+// draftMarkers are the sidecarMarkers that name speculative-draft
+// models (as opposed to mmproj/imatrix, which are never models).
+var draftMarkers = []string{"mtp-", "eagle3-", "dflash-", "dspark-"}
+
+// draftKind returns the draft marker (without its trailing "-") a model
+// path carries, or "" when it carries none or is a non-model sidecar.
+func draftKind(p string) string {
+	base := strings.ToLower(filepath.Base(p))
+	if strings.Contains(base, "mmproj") || strings.Contains(base, "imatrix") {
+		return ""
+	}
+	for _, m := range draftMarkers {
+		if strings.Contains(base, m) {
+			return strings.TrimSuffix(m, "-")
+		}
+	}
+	return ""
+}
+
+// CachedQuants is Quants plus the speculative-draft-named models
+// (mtp-, eagle3-, dflash-, dspark-) present in files, tagged
+// "<TAG> (<kind>)" — e.g. "Q4_K_M (mtp)" — and listed after the
+// regular quants (DESIGN §16.4). For describing and deleting what is on
+// disk only: a "(kind)" tag is never a valid `:quant` suffix, so
+// download and config pickers keep using Quants.
+func CachedQuants(files []RepoFile) []QuantOption {
+	out := Quants(files)
+	groups := make(map[string][]RepoFile)
+	for _, f := range files {
+		if !isGGUF(f.Path) {
+			continue
+		}
+		if kind := draftKind(f.Path); kind != "" {
+			key := quantTag(f.Path) + " (" + kind + ")"
+			groups[key] = append(groups[key], f)
+		}
+	}
+	drafts := make([]QuantOption, 0, len(groups))
+	for tag, fs := range groups {
+		var size int64
+		for _, f := range fs {
+			size += f.Size
+		}
+		drafts = append(drafts, QuantOption{Tag: tag, Files: fs, Size: size})
+	}
+	sort.Slice(drafts, func(i, j int) bool {
+		if drafts[i].Size != drafts[j].Size {
+			return drafts[i].Size < drafts[j].Size
+		}
+		return drafts[i].Tag < drafts[j].Tag
+	})
+	return append(out, drafts...)
+}
+
 // HasMMProj reports whether the repo provides a multimodal projector
 // (informational only — llama.cpp downloads it alongside the model;
 // DESIGN §16.3, §3.8b). Detects both naming conventions llama.cpp

@@ -140,3 +140,44 @@ func quantTags(qs []QuantOption) []string {
 	}
 	return out
 }
+
+// TestCachedQuants: on-disk draft-named models (excluded from Quants,
+// since llama.cpp's -hf auto-pick skips them) are listed after the
+// regular quants as "<TAG> (<kind>)"; mmproj/imatrix stay excluded.
+func TestCachedQuants(t *testing.T) {
+	files := []RepoFile{
+		{Path: "snap/Qwen3.8-27B-IQ2_M.gguf", Size: 10},
+		{Path: "snap/Qwen3.8-27B-mtp-Q4_K_M.gguf", Size: 16},
+		{Path: "snap/Qwen3.8-27B-mtp-Q8_0.gguf", Size: 29},
+		{Path: "snap/eagle3-Q8_0.gguf", Size: 1},
+		{Path: "snap/mmproj-Qwen3.8-27B-mtp-F16.gguf", Size: 9},
+		{Path: "snap/Qwen3.8-27B-imatrix-cpu.gguf", Size: 2},
+		{Path: "snap/README.md", Size: 3},
+	}
+
+	got := CachedQuants(files)
+
+	want := []struct {
+		tag  string
+		size int64
+	}{
+		{"IQ2_M", 10},
+		{"Q8_0 (eagle3)", 1},
+		{"Q4_K_M (mtp)", 16},
+		{"Q8_0 (mtp)", 29},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("CachedQuants() = %+v, want %d options", got, len(want))
+	}
+	for i, w := range want {
+		if got[i].Tag != w.tag || got[i].Size != w.size {
+			t.Errorf("CachedQuants()[%d] = %s/%d, want %s/%d", i, got[i].Tag, got[i].Size, w.tag, w.size)
+		}
+	}
+	// The download/config pickers must still never offer draft files.
+	for _, q := range Quants(files) {
+		if q.Tag != "IQ2_M" {
+			t.Errorf("Quants() offered %q, want only IQ2_M", q.Tag)
+		}
+	}
+}
