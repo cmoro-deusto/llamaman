@@ -18,7 +18,7 @@ import (
 func pasteTestConfig() *config.Config {
 	return &config.Config{
 		Version: 1,
-		Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 		Models: []config.Model{
 			{Alias: "alpha", Location: "/m/alpha.gguf", Presets: []config.Preset{
 				{Name: "default", Params: config.Params{{Key: "ngl", Value: json.Number("99")}}},

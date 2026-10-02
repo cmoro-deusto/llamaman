@@ -126,9 +126,16 @@ func (f *FirstRunMode) finalizeGlobals() (*FirstRunMode, tea.Cmd) {
 	cfg := &config.Config{
 		Version: config.SchemaVersion,
 		Globals: config.Globals{
-			Bin:  strings.TrimSpace(f.bin),
-			Host: strings.TrimSpace(f.host),
-			Port: port,
+			// First-run seeds the binaries list (§3.2a) with a single
+			// "default" entry; more builds are added in the Binaries
+			// screen (c → b).
+			Binaries: []config.Binary{{
+				Name: config.DefaultBinaryName,
+				Path: strings.TrimSpace(f.bin),
+			}},
+			DefaultBinary: config.DefaultBinaryName,
+			Host:          strings.TrimSpace(f.host),
+			Port:          port,
 		},
 		Models: []config.Model{},
 	}

@@ -66,6 +66,32 @@ type MainMode struct {
 	presets     list.Model
 	routerFiles list.Model
 	showPresets bool // multi-preset pivot state
+
+	showBinSwitch bool // quick-switch picker visible
+	binSwitchIdx  int  // cursor inside the quick-switch picker
+
+	// binaryOverride is the §3.2a one-shot quick-switch choice: it wins
+	// over the preset pin/default for the next spawn, then Main clears
+	// it (RunRoot emits a spawnConsumedOverrideMsg via Root).
+	binaryOverride string
+}
+
+// SetBinaryOverride records a one-shot quick-switch choice (§3.2a).
+func (m *MainMode) SetBinaryOverride(name string) { m.binaryOverride = name }
+
+// BinaryOverride returns the pending one-shot override ("" = none).
+func (m MainMode) BinaryOverride() string { return m.binaryOverride }
+
+// ClearBinaryOverride consumes the override after a spawn.
+func (m *MainMode) ClearBinaryOverride() { m.binaryOverride = "" }
+
+// BinaryNames lists the configured binaries in order.
+func (m MainMode) BinaryNames() []string {
+	out := make([]string, 0, len(m.cfg.Globals.Binaries))
+	for _, b := range m.cfg.Globals.Binaries {
+		out = append(out, b.Name)
+	}
+	return out
 }
 
 // NewMainMode constructs the landing-screen model. theme is the
@@ -482,6 +508,9 @@ func (m MainMode) View() string {
 	if m.showHelp {
 		return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, m.renderHelp())
 	}
+	if m.showBinSwitch {
+		return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, m.renderBinSwitch())
+	}
 
 	wordmark := m.renderWordmark()
 
@@ -521,6 +550,33 @@ func (m MainMode) View() string {
 
 	body := lipgloss.JoinVertical(lipgloss.Center, parts...)
 	return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, body)
+}
+
+// renderBinSwitch draws the §3.2a one-shot binary quick-switch: a small
+// centered list of named binaries, default first-marked, enter picks.
+func (m MainMode) renderBinSwitch() string {
+	rows := []string{"binary for next spawn", ""}
+	for i, b := range m.cfg.Globals.Binaries {
+		cursor := "  "
+		name := b.Name
+		if i == m.binSwitchIdx {
+			cursor = "> "
+			name = "\x1b[7m" + name + "\x1b[0m"
+		}
+		def := ""
+		defName := m.cfg.Globals.DefaultBinary
+		if defName != "" && b.Name == defName {
+			def = " (default)"
+		}
+		rows = append(rows, fmt.Sprintf("%s%s%s", cursor, name, def))
+	}
+	rows = append(rows, "", "enter select · esc cancel")
+	box := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.theme.Accent).
+		Padding(0, 2).
+		Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
+	return box
 }
 
 // renderReattachBox is the single-entry screen shown while a session is
@@ -576,6 +632,9 @@ func (m MainMode) renderShortcuts() string {
 	parts = append(parts, shortcut("c", "configure", m.theme))
 	parts = append(parts, shortcut("s", "storage", m.theme))
 	parts = append(parts, shortcut("b", "browse", m.theme))
+	if len(m.cfg.Globals.Binaries) >= 2 {
+		parts = append(parts, shortcut("B", "binary", m.theme))
+	}
 	parts = append(parts, shortcut("p", "preferences", m.theme))
 	parts = append(parts, shortcut("t", "theme", m.theme))
 	parts = append(parts, shortcut("?", "help", m.theme))
@@ -666,12 +725,17 @@ func (m MainMode) renderHelp() string {
 		"c           open configuration mode",
 		"s           open storage manager (cache, downloads)",
 		"b           open Hugging Face browser (search, filters)",
+	}
+	if len(m.cfg.Globals.Binaries) >= 2 {
+		keys = append(keys, "Shift+B     switch llama-server binary for the next launch")
+	}
+	keys = append(keys,
 		"p           open preferences (theme, animations, models-dir)",
 		"t / Shift+t cycle theme (forward / backward)",
 		"a           attach to running session (only when one exists)",
 		"?           toggle this help",
 		"q / Ctrl+C  quit",
-	}
+	)
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(m.theme.Accent).
@@ -715,6 +779,30 @@ func (m MainMode) Update(msg tea.Msg) (MainMode, tea.Cmd) {
 
 func (m MainMode) update(msg tea.Msg) (MainMode, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok {
+		if m.showBinSwitch {
+			switch k.String() {
+			case "esc":
+				m.showBinSwitch = false
+				return m, nil
+			case "up", "k":
+				if m.binSwitchIdx > 0 {
+					m.binSwitchIdx--
+				}
+				return m, nil
+			case "down", "j":
+				if m.binSwitchIdx < len(m.cfg.Globals.Binaries)-1 {
+					m.binSwitchIdx++
+				}
+				return m, nil
+			case "enter":
+				if m.binSwitchIdx < len(m.cfg.Globals.Binaries) {
+					m.binaryOverride = m.cfg.Globals.Binaries[m.binSwitchIdx].Name
+				}
+				m.showBinSwitch = false
+				return m, nil
+			}
+			return m, nil
+		}
 		if m.showHelp {
 			m.showHelp = false
 			return m, nil
@@ -723,6 +811,15 @@ func (m MainMode) update(msg tea.Msg) (MainMode, tea.Cmd) {
 		case "?":
 			m.showHelp = true
 			return m, nil
+		case "B":
+			// §3.2a quick-switch: only when 2+ binaries exist; one entry
+			// needs no switch. Shift+B, not `b` — the browser owns the
+			// unshifted key in this view (Root.routeKey intercepts it
+			// before MainMode ever sees it).
+			if len(m.cfg.Globals.Binaries) >= 2 && !m.IsSessionRunning() {
+				m.showBinSwitch = !m.showBinSwitch
+				return m, nil
+			}
 		case "enter":
 			if m.IsSessionRunning() {
 				// Reattach screen: Enter attaches to the running session.
@@ -783,7 +880,7 @@ func (m MainMode) handleEnter() (MainMode, tea.Cmd) {
 			return m, nil
 		}
 		return m, func() tea.Msg {
-			return RouterSpawnRequestMsg{File: it.path}
+			return RouterSpawnRequestMsg{File: it.path, BinaryOverride: m.binaryOverride}
 		}
 	}
 	if m.showPresets {
@@ -793,7 +890,7 @@ func (m MainMode) handleEnter() (MainMode, tea.Cmd) {
 			return m, nil
 		}
 		return m, func() tea.Msg {
-			return SpawnRequestMsg{Model: parent.model, Preset: it.preset}
+			return SpawnRequestMsg{Model: parent.model, Preset: it.preset, BinaryOverride: m.binaryOverride}
 		}
 	}
 	it, ok := m.models.SelectedItem().(modelItem)
@@ -803,11 +900,11 @@ func (m MainMode) handleEnter() (MainMode, tea.Cmd) {
 	switch len(it.model.Presets) {
 	case 0:
 		return m, func() tea.Msg {
-			return SpawnRequestMsg{Model: it.model, Preset: config.Preset{Name: "default"}}
+			return SpawnRequestMsg{Model: it.model, Preset: config.Preset{Name: "default"}, BinaryOverride: m.binaryOverride}
 		}
 	case 1:
 		return m, func() tea.Msg {
-			return SpawnRequestMsg{Model: it.model, Preset: it.model.Presets[0]}
+			return SpawnRequestMsg{Model: it.model, Preset: it.model.Presets[0], BinaryOverride: m.binaryOverride}
 		}
 	default:
 		m.showPresets = true

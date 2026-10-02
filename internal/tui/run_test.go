@@ -1873,7 +1873,7 @@ func TestRunHeaderShowsNAWhenServerVersionMissing(t *testing.T) {
 // viewport content (in addition to the top box's). Catches regressions
 // that would silently drop the log-side border.
 func TestRunModeLogFrameRendersWithBorder(t *testing.T) {
-	cfg := &config.Config{Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
+	cfg := &config.Config{Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080}}
 	r := &RunMode{
 		cfg:           cfg,
 		model:         config.Model{Alias: "alpha"},
@@ -2036,7 +2036,7 @@ func TestHardwarePanelOmitsFanWhenUnavailable(t *testing.T) {
 // (1) View() always returns exactly r.height lines and (2) no
 // individual line exceeds r.width visual cols.
 func TestViewHeightStableAndNoLineExceedsWidth(t *testing.T) {
-	cfg := &config.Config{Globals: config.Globals{Bin: "/usr/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
+	cfg := &config.Config{Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/usr/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080}}
 	r := &RunMode{
 		cfg:           cfg,
 		model:         config.Model{Alias: "alpha"},
@@ -2804,7 +2804,7 @@ func TestRunModeReattachSkipsLoadWindow(t *testing.T) {
 		t.Skipf("fakeserver not built: %v", err)
 	}
 	logPath := filepath.Join(t.TempDir(), "llama.log")
-	proc, err := server.Spawn([]string{bin, "--ready-delay=20ms"}, logPath)
+	proc, err := server.Spawn(fakeServerArgv(t, bin), logPath)
 	if err != nil {
 		t.Fatal(err)
 	}

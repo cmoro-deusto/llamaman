@@ -24,9 +24,15 @@ import (
 // into its own builder (state lives on the instance, which is created
 // fresh per render).
 type cardRenderer struct {
-	theme  Theme
-	buf    strings.Builder
-	styles []func(string) string
+	theme Theme
+	buf   strings.Builder
+	// styles is the stack of active inline styles. write composes them
+	// into ONE lipgloss style and renders the plain text once: rendering
+	// already-styled text through another style corrupts it (lipgloss
+	// underlines rune by rune, splitting the inner style's escape
+	// sequences — owner report: bold link text in a card table shifted
+	// every panel border).
+	styles []lipgloss.Style
 	// linkURL is set while inside a Link/AutoLink node. The OSC 8
 	// hyperlink must wrap the FULLY styled text (outermost) — a lipgloss
 	// style applied after it (e.g. a heading wrapping the link) would
@@ -87,7 +93,7 @@ func (r *cardRenderer) renderParagraph(_ util.BufWriter, _ []byte, _ ast.Node, e
 func (r *cardRenderer) renderHeading(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
 		r.buf.WriteString("\n") // blank before a heading (sections-only)
-		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true).Render(s) })
+		r.push(lipgloss.NewStyle().Foreground(r.theme.Accent).Bold(true))
 	} else {
 		r.pop()
 		r.buf.WriteString("\n\n") // blank after a heading
@@ -114,7 +120,7 @@ func (r *cardRenderer) renderText(_ util.BufWriter, source []byte, n ast.Node, e
 
 func (r *cardRenderer) renderCodeSpan(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
-		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Muted).Render(s) })
+		r.push(lipgloss.NewStyle().Foreground(r.theme.Muted))
 	} else {
 		r.pop()
 	}
@@ -138,9 +144,9 @@ func (r *cardRenderer) renderCodeBlock(_ util.BufWriter, source []byte, n ast.No
 func (r *cardRenderer) renderEmphasis(_ util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
 		if n.(*ast.Emphasis).Level == 2 {
-			r.push(func(s string) string { return lipgloss.NewStyle().Bold(true).Render(s) })
+			r.push(lipgloss.NewStyle().Bold(true))
 		} else {
-			r.push(func(s string) string { return lipgloss.NewStyle().Italic(true).Render(s) })
+			r.push(lipgloss.NewStyle().Italic(true))
 		}
 	} else {
 		r.pop()
@@ -151,7 +157,7 @@ func (r *cardRenderer) renderEmphasis(_ util.BufWriter, _ []byte, n ast.Node, en
 func (r *cardRenderer) renderLink(_ util.BufWriter, source []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
 		r.linkURL = string(n.(*ast.Link).Destination)
-		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Accent).Underline(true).Render(s) })
+		r.push(lipgloss.NewStyle().Foreground(r.theme.Accent).Underline(true))
 	} else {
 		r.linkURL = ""
 		r.pop()
@@ -162,7 +168,7 @@ func (r *cardRenderer) renderLink(_ util.BufWriter, source []byte, n ast.Node, e
 func (r *cardRenderer) renderImage(_ util.BufWriter, _ []byte, _ ast.Node, entering bool) (ast.WalkStatus, error) {
 	// Alt text in Muted; the image itself cannot render in a TUI.
 	if entering {
-		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Muted).Render(s) })
+		r.push(lipgloss.NewStyle().Foreground(r.theme.Muted))
 	} else {
 		r.pop()
 	}
@@ -172,7 +178,7 @@ func (r *cardRenderer) renderImage(_ util.BufWriter, _ []byte, _ ast.Node, enter
 func (r *cardRenderer) renderAutoLink(w util.BufWriter, source []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
 		r.linkURL = string(n.(*ast.AutoLink).URL(source))
-		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Accent).Underline(true).Render(s) })
+		r.push(lipgloss.NewStyle().Foreground(r.theme.Accent).Underline(true))
 		r.write(r.linkURL)
 		r.pop()
 		r.linkURL = ""
@@ -208,7 +214,7 @@ func (r *cardRenderer) renderListItem(_ util.BufWriter, _ []byte, _ ast.Node, en
 func (r *cardRenderer) renderBlockquote(_ util.BufWriter, _ []byte, n ast.Node, entering bool) (ast.WalkStatus, error) {
 	if entering {
 		r.write("▍ ") // prefix once; the muted style covers the chunks
-		r.push(func(s string) string { return lipgloss.NewStyle().Foreground(r.theme.Muted).Render(s) })
+		r.push(lipgloss.NewStyle().Foreground(r.theme.Muted))
 	} else {
 		r.pop()
 		// Consecutive quoted lines are separate Blockquote nodes in
@@ -274,7 +280,7 @@ func (r *cardRenderer) renderTaskCheckBox(_ util.BufWriter, _ []byte, n ast.Node
 
 // ---- style stack + entry point ----
 
-func (r *cardRenderer) push(f func(string) string) { r.styles = append(r.styles, f) }
+func (r *cardRenderer) push(st lipgloss.Style) { r.styles = append(r.styles, st) }
 func (r *cardRenderer) pop() {
 	if len(r.styles) > 0 {
 		r.styles = r.styles[:len(r.styles)-1]
@@ -282,8 +288,14 @@ func (r *cardRenderer) pop() {
 }
 
 func (r *cardRenderer) write(s string) {
-	for i := len(r.styles) - 1; i >= 0; i-- {
-		s = r.styles[i](s)
+	if n := len(r.styles); n > 0 {
+		// Innermost wins: start from it and inherit only the
+		// properties it leaves unset from each enclosing style.
+		st := r.styles[n-1]
+		for i := n - 2; i >= 0; i-- {
+			st = st.Inherit(r.styles[i])
+		}
+		s = st.Render(s)
 	}
 	// Outermost: no style may wrap (and mangle) the OSC 8 sequence.
 	if r.linkURL != "" {
@@ -292,51 +304,11 @@ func (r *cardRenderer) write(s string) {
 	r.buf.WriteString(s)
 }
 
-// stripWidthAmbiguous removes runes whose display width is
-// terminal-dependent (emoji-presentation characters, mathematical
-// alphanumerics, and format controls) and neutralizes control
-// characters. A README's ✨, ⚡, ♥, 𝛕 etc. render at width 2 in
-// emoji-aware terminals while lipgloss counts 1 — the cursor drifts,
-// lines wrap, and the whole view overlaps (owner report: the layout
-// broke when a card with emoji loaded after pressing 's'; tmux
-// reproduced a clean screen because its font renders them width 1).
-// C0/C1 controls are worse: the terminal EXECUTES them instead of
-// printing them — a literal VT moves the cursor down a row, CR returns
-// to column 0, a tab jumps to the next tab stop (width 0 in runewidth
-// but N in the terminal) — so a single one in a table cell garbles the
-// whole panel (owner report: the unsloth/Muse-Glimmer-30B-GGUF
-// benchmark-table header carries a literal VT after "30B"; the layout
-// broke after a few PgDn pages). They become spaces (card authors use
-// them as separators). Width-2 CJK is kept (runewidth and terminals
-// agree on 2, so it is consistent).
-func stripWidthAmbiguous(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r >= 0x2600 && r <= 0x27BF: // Misc Symbols, Dingbats (⚡♥⚖⚠✨…)
-		case r >= 0x2B00 && r <= 0x2BFF: // Misc Symbols and Arrows (⬇…)
-		case r >= 0x1D400 && r <= 0x1D7FF: // Math Alphanumeric Symbols (𝛕…)
-		case r >= 0x1F000 && r <= 0x1FAFF: // Emoji blocks
-		case r >= 0xFE00 && r <= 0xFE0F: // Variation Selectors (VS16 forces emoji)
-		case r == 0x200D || r == 0x200E || r == 0x200F: // ZWJ + bidi marks
-		case r >= 0x2060 && r <= 0x206F: // invisible format chars
-		case r == 0x2028 || r == 0x2029: // line/paragraph separators (variable-width tofu)
-		case r == '\n': // structural newline the markdown parser needs
-			b.WriteRune(r)
-		case r < 0x20 || (r >= 0x7F && r <= 0x9F): // C0/C1 controls → one space
-			b.WriteByte(' ')
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
 // renderCardMarkdown parses and renders markdown into styled card
 // lines. Returns nil on parse/render failure (the caller shows its
 // friendly absence note).
 func renderCardMarkdown(theme Theme, src []byte) []string {
-	src = []byte(stripWidthAmbiguous(string(src)))
+	src = []byte(termSafe(string(src), true))
 	cr := &cardRenderer{theme: theme}
 	md := goldmark.New(
 		goldmark.WithExtensions(extension.GFM),

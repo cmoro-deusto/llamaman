@@ -5,13 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/cmoro-deusto/llamaman/internal/paths"
 )
 
-// Load reads a config file from disk, decodes it, and applies path expansion
-// to globals.llama-server-bin and every model location. Unknown schema
-// versions are a hard error per DESIGN.md §3.2.
+// Load reads a config file from disk, decodes it, applies path expansion
+// to every binaries[].path and model location, and migrates the legacy
+// globals.llama-server-bin key into globals.binaries (DESIGN §3.2a).
+// Unknown schema versions are a hard error per DESIGN.md §3.2.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -28,7 +30,22 @@ func Load(path string) (*Config, error) {
 	if cfg.Version != SchemaVersion {
 		return nil, fmt.Errorf("parse config %s: unsupported schema version %d (expected %d)", path, cfg.Version, SchemaVersion)
 	}
-
+	// Load-time migration (DESIGN §3.2a): a legacy config with only
+	// globals.llama-server-bin becomes one binaries entry named
+	// "default", marked default. Bin is cleared so the next Save writes
+	// only the new form.
+	if len(cfg.Globals.Binaries) == 0 && strings.TrimSpace(cfg.Globals.Bin) != "" {
+		cfg.Globals.Binaries = []Binary{{Name: DefaultBinaryName, Path: cfg.Globals.Bin}}
+		cfg.Globals.DefaultBinary = DefaultBinaryName
+		cfg.Globals.Bin = ""
+	}
+	for i := range cfg.Globals.Binaries {
+		expanded, err := paths.ExpandPath(cfg.Globals.Binaries[i].Path)
+		if err != nil {
+			return nil, fmt.Errorf("expand globals.binaries[%d].path: %w", i, err)
+		}
+		cfg.Globals.Binaries[i].Path = expanded
+	}
 	if cfg.Globals.Bin, err = paths.ExpandPath(cfg.Globals.Bin); err != nil {
 		return nil, fmt.Errorf("expand globals.llama-server-bin: %w", err)
 	}

@@ -214,7 +214,7 @@ func TestModelFormLocalPickerFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := &config.Config{Version: 1, Globals: config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
+	cfg := &config.Config{Version: 1, Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080}}
 	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceLocal)
 
 	// ctrl+o opens the filepicker; start dir falls back to HOME.
@@ -256,7 +256,7 @@ func TestModelFormLocalPickerFlow(t *testing.T) {
 func TestModelFormPickerEscCancels(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	cfg := &config.Config{Version: 1, Globals: config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
+	cfg := &config.Config{Version: 1, Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080}}
 	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceLocal)
 	c = drive(t, c, tea.KeyMsg{Type: tea.KeyCtrlO})
 	if c.modelPicker == nil {
@@ -282,7 +282,7 @@ func TestModelFormPickerDisabledFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, "notes.txt"), []byte("y"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.Config{Version: 1, Globals: config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
+	cfg := &config.Config{Version: 1, Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080}}
 	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceLocal)
 	c = drive(t, c, tea.KeyMsg{Type: tea.KeyCtrlO})
 	c = drive(t, c, tea.KeyMsg{Type: tea.KeyEnter})
@@ -306,7 +306,7 @@ func TestModelFormHFRepoPickerFlow(t *testing.T) {
 
 	cfg := &config.Config{
 		Version:     1,
-		Globals:     config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals:     config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 		Preferences: &config.Preferences{ModelsDir: root},
 	}
 	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceHF)
@@ -353,7 +353,7 @@ func TestModelFormHFMultiQuantPrefill(t *testing.T) {
 	mkHubRepo(t, root, "Qwen/Qwen3-32B-GGUF", "model-Q4_K_M.gguf", "model-Q8_0.gguf")
 	cfg := &config.Config{
 		Version:     1,
-		Globals:     config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals:     config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 		Preferences: &config.Preferences{ModelsDir: root},
 	}
 	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceHF)
@@ -375,7 +375,7 @@ func TestModelFormHFNewRepoRow(t *testing.T) {
 	mkHubRepo(t, root, "Qwen/Qwen3-32B-GGUF", "model-Q4_K_M.gguf")
 	cfg := &config.Config{
 		Version:     1,
-		Globals:     config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals:     config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 		Preferences: &config.Preferences{ModelsDir: root},
 	}
 	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceHF)
@@ -411,7 +411,7 @@ func TestModelFormPickerDirNavigation(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, "sub", "inner.gguf"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.Config{Version: 1, Globals: config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
+	cfg := &config.Config{Version: 1, Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080}}
 	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceLocal)
 	c = drive(t, c, tea.KeyMsg{Type: tea.KeyCtrlO})
 	if c.modelPicker == nil {
@@ -470,7 +470,7 @@ func TestModelFormHFRepoFilterResetsNewRepoRow(t *testing.T) {
 	mkHubRepo(t, root, "Beta/Second", "model-Q4_K_M.gguf")
 	cfg := &config.Config{
 		Version:     1,
-		Globals:     config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals:     config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 		Preferences: &config.Preferences{ModelsDir: root},
 	}
 	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceHF)
@@ -514,7 +514,7 @@ func TestModelFormPickerHiddenFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, ".hidden.gguf"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.Config{Version: 1, Globals: config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080}}
+	cfg := &config.Config{Version: 1, Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080}}
 	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceLocal)
 	c = drive(t, c, tea.KeyMsg{Type: tea.KeyCtrlO})
 	if c.modelPicker == nil {
@@ -561,7 +561,7 @@ func TestModelFormHFWideList(t *testing.T) {
 		"model-Q4_K_S.gguf", "model-Q4_K_M.gguf")
 	cfg := &config.Config{
 		Version:     1,
-		Globals:     config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals:     config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 		Preferences: &config.Preferences{ModelsDir: root},
 	}
 	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceHF)
@@ -597,7 +597,7 @@ func TestModelFormHFFixedBoxWidth(t *testing.T) {
 	mkHubRepo(t, root, "Beta/Second", "model-Q4_K_M.gguf")
 	cfg := &config.Config{
 		Version:     1,
-		Globals:     config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals:     config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 		Preferences: &config.Preferences{ModelsDir: root},
 	}
 	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceHF)
@@ -634,7 +634,7 @@ func TestModelFormHFEmptyCacheSkipsPicker(t *testing.T) {
 	root := t.TempDir()
 	cfg := &config.Config{
 		Version:     1,
-		Globals:     config.Globals{Bin: "/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals:     config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 		Preferences: &config.Preferences{ModelsDir: root},
 	}
 	c := openModelFormToValue(t, newModelFormConfig(t, cfg), sourceHF)

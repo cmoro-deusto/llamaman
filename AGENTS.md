@@ -13,7 +13,7 @@ CLI entry → config load/validate/save → flag registry → translate → serv
 
 - `main.go` boots Kong CLI parsing, decides entry mode, injects `tui.Spawner`.
 - `internal/config` loads XDG config `~/.config/llamaman/config.json`, expands `~/$VAR`, validates, saves atomically with one rolling `.bak` (`save.go`).
-- `internal/flags` parses `llama-server --help`, builds registry, caches by binary mtime, falls back to hard-coded set.
+- `internal/flags` parses `llama-server --help`, builds registry, caches by binary path+mtime, falls back to hard-coded set.
 - `internal/translate` converts Config → argv preserving param order, handles preset overrides and router mode (`--models-preset` from a `my-models.ini`).
 - `internal/server` spawns `llama-server` via `setsid(2)`, tracks PID in `session.json` protected by `flock`, tails logs via `fsnotify`, supports adopt/stop/reattach.
 - `internal/tui` Root Bubble Tea model dispatches Main/Run/Config/FirstRun/Settings/Storage/Browser modes. Async via `tea.Cmd` + goroutines for spawn wait and log tail.
@@ -66,10 +66,11 @@ go test ./...
 CLI synopsis:
 ```
 llamaman [flags] [<alias> [<preset>]]
-  -l, --list            List configured models and router sources
-  -p, --presets         Print presets for <alias>
+  -l, --list            List configured models, router sources, and named binaries
+  -p, --presets         Print presets (with resolved binary) for <alias>
   -c, --config PATH     Alternate config file
   -i, --ini PATH        Run a my-models.ini file in router mode (--models-preset)
+      --binary NAME     Launch with the named globals.binaries entry (one-shot)
       --completion SH   Print completion script (bash, zsh, fish)
       --version         Print version
   llamaman import FILE        Import a my-models.ini file into config

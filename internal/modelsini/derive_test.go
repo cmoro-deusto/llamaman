@@ -49,7 +49,7 @@ func TestEffectiveModelsFiles(t *testing.T) {
 func testDerivedCfg() *config.Config {
 	return &config.Config{
 		Version: 1,
-		Globals: config.Globals{Bin: "/bin/true", Host: "127.0.0.1", Port: 9080},
+		Globals: config.Globals{Binaries: []config.Binary{{Name: "default", Path: "/bin/true"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 		Models: []config.Model{{
 			Alias: "m", Location: "/m.gguf",
 			Presets: []config.Preset{{

@@ -75,6 +75,14 @@ type RunMode struct {
 	loadPhaseUntil time.Time
 	loadPartial    string
 
+	// §3.2a named-binary state: the entry this session runs on (header
+	// badge) and the quick-switch overlay (open flag + cursor +
+	// one-shot pending override consumed by the next spawn/restart).
+	binaryName         string
+	binSwitchOpen      bool
+	binSwitchIdx       int
+	pendingBinOverride string
+
 	// Animation event timestamps (§15.5): one-shot effects fade from
 	// these; smooth bars ease between polls.
 	readyAt     time.Time
@@ -142,16 +150,16 @@ type RunMode struct {
 	keys          Keymap
 	theme         Theme
 
-	showQuit      bool   // quit prompt overlay active
-	showHelp      bool   // help overlay active
-	showInfo      bool   // i-info overlay active (model + preset detail)
-	copyResult    string // when non-empty, a centered "command copied" modal is shown; Enter/Esc dismisses
+	showQuit      bool     // quit prompt overlay active
+	showHelp      bool     // help overlay active
+	showInfo      bool     // i-info overlay active (model + preset detail)
+	copyResult    string   // when non-empty, a centered "command copied" modal is shown; Enter/Esc dismisses
 	copyCmdLines  []string // no-clipboard failure: one-param-per-line launch command block (\-continued)
 	copyScroll    int      // scroll offset (lines) into copyCmdLines when the block overflows
 	copyDragHeld  bool     // a left-button drag is in progress over the copy dialog
-	restartPrompt bool   // r-confirm overlay
-	killPrompt    bool   // k-confirm overlay
-	unloadPrompt  bool   // router u-confirm overlay
+	restartPrompt bool     // r-confirm overlay
+	killPrompt    bool     // k-confirm overlay
+	unloadPrompt  bool     // router u-confirm overlay
 	flash         string
 	flashGen      int // guards flash auto-dismissal (older ticks can't clear newer flashes)
 
@@ -249,6 +257,7 @@ type RunModeOpts struct {
 	Registry   flags.Registry         // optional; used by the header to canonicalize param keys
 	Fetcher    Fetcher                // optional; nil disables the live ctx-size /props fetch
 	Version    string                 // llamaman build version (main.versionString); wide-mode header
+	BinaryName string                 // named binaries entry used (§3.2a); shown in the header
 }
 
 // NewRunMode wires a RunMode around an already-spawned (or adopted)
@@ -296,7 +305,8 @@ func NewRunMode(opts RunModeOpts, theme Theme) (*RunMode, tea.Cmd, error) {
 		keys:                   DefaultKeymap(),
 		theme:                  theme,
 		searchInput:            ti,
-		serverVersion:          loadServerVersion(opts.Cfg.Globals.Bin),
+		serverVersion:          loadServerVersion(serverBinFromArgv(opts)),
+		binaryName:             opts.BinaryName,
 		version:                opts.Version,
 		fetcher:                opts.Fetcher,
 		metricsAvailable:       true,
@@ -806,6 +816,15 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 		}
 		switch m.String() {
 		case "up", "down":
+			if r.binSwitchOpen {
+				if m.String() == "up" && r.binSwitchIdx > 0 {
+					r.binSwitchIdx--
+				}
+				if m.String() == "down" && r.binSwitchIdx < len(r.cfg.Globals.Binaries)-1 {
+					r.binSwitchIdx++
+				}
+				return r, nil
+			}
 			// Models panel focused: move the selection. Otherwise fall
 			// through to the viewport (log scrolling).
 			if r.routerFile != "" && r.routerPanelActive {
@@ -817,12 +836,17 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 				return r, nil
 			}
 		case "esc":
-			// Layered Esc: close the action menu, then the router stats
-			// panel (back to the model list), then clear any applied
-			// search query, then detach to Main — the server keeps
-			// running and llamaman stays open (DESIGN §15.2). The final
-			// detach layer only fires while the session is live; a dead
-			// server keeps the crash view in control.
+			// Layered Esc: close the binary quick-switch, then the action
+			// menu, then the router stats panel (back to the model list),
+			// then clear any applied search query, then detach to Main —
+			// the server keeps running and llamaman stays open (DESIGN
+			// §15.2). The final detach layer only fires while the session
+			// is live; a dead server keeps the crash view in control.
+			if r.binSwitchOpen {
+				r.binSwitchOpen = false
+				r.binSwitchIdx = 0
+				return r, nil
+			}
 			if r.routerFile != "" && r.routerMenu {
 				r.routerMenu = false
 				return r, nil
@@ -865,6 +889,17 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			}
 			return r, nil
 		case "enter":
+			// §3.2a quick-switch: pick the highlighted binary as the
+			// one-shot override for the next spawn from this screen.
+			if r.binSwitchOpen {
+				if r.binSwitchIdx < len(r.cfg.Globals.Binaries) {
+					r.pendingBinOverride = r.cfg.Globals.Binaries[r.binSwitchIdx].Name
+					r.binSwitchOpen = false
+					return r, r.setFlash("next spawn uses " + r.pendingBinOverride)
+				}
+				r.binSwitchOpen = false
+				return r, nil
+			}
 			// Models panel: open the action menu for the selection.
 			// Silent no-op in the log panel.
 			if r.routerFile != "" && r.routerPanelActive && r.routerFocus != "" {
@@ -971,6 +1006,18 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 				return r, nil
 			}
 			r.viewport.HalfPageUp()
+			return r, nil
+		case "B":
+			// §3.2a quick-switch. Shift+B, not `b`: the unshifted key stays
+			// vim page-up here (and the browser over in main mode).
+			if r.routerPanelActive {
+				return r, nil
+			}
+			if len(r.cfg.Globals.Binaries) >= 2 {
+				r.binSwitchIdx = 0
+				r.binSwitchOpen = true
+				return r, nil
+			}
 			return r, nil
 		case "c":
 			r.copyCommand()
@@ -1164,9 +1211,11 @@ func (r *RunMode) handleSearchInput(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 	return r, cmd
 }
 
-// requestRestart kills the current process and emits a SpawnRequestMsg
-// for the same (model, preset). The root will route it back through the
-// spawner to start fresh.
+// requestRestart kills the current process and emits a spawn request for
+// the same target — RouterSpawnRequestMsg for a router session, otherwise
+// SpawnRequestMsg for the same (model, preset). The pending binary
+// override (§3.2a) rides along so a quick-switch survives the restart.
+// The root routes it back through the spawner to start fresh.
 func (r *RunMode) requestRestart() tea.Cmd {
 	if r.fetchCancel != nil {
 		r.fetchCancel()
@@ -1178,7 +1227,33 @@ func (r *RunMode) requestRestart() tea.Cmd {
 		_ = r.sessionMgr.Clear()
 	}
 	model, preset := r.model, r.preset
-	return func() tea.Msg { return SpawnRequestMsg{Model: model, Preset: preset} }
+	routerFile, override := r.routerFile, r.restartBinOverride()
+	if routerFile != "" {
+		return func() tea.Msg {
+			return RouterSpawnRequestMsg{File: routerFile, BinaryOverride: override}
+		}
+	}
+	return func() tea.Msg {
+		return SpawnRequestMsg{Model: model, Preset: preset, BinaryOverride: override}
+	}
+}
+
+// restartBinOverride is the binary a restart should use: a pending
+// quick-switch wins; otherwise the binary the session is running now, so
+// a --binary launch or main-screen quick-switch survives `r` (§3.2a).
+// A running name no longer in binaries[] yields "" (pin/default chain)
+// rather than an "unknown binary" spawn error.
+func (r *RunMode) restartBinOverride() string {
+	if r.pendingBinOverride != "" {
+		return r.pendingBinOverride
+	}
+	if r.binaryName == "" || r.cfg == nil {
+		return ""
+	}
+	if _, ok := r.cfg.Globals.FindBinary(r.binaryName); ok {
+		return r.binaryName
+	}
+	return ""
 }
 
 // copyCommand pushes the launch argv onto the clipboard via wl-copy then
@@ -1661,6 +1736,8 @@ func (r *RunMode) View() string {
 		out = overlayCenter(bg, r.renderUnloadPrompt(), r.width, r.height)
 	case r.routerMenu:
 		out = overlayCenter(bg, r.renderRouterMenu(), r.width, r.height)
+	case r.binSwitchOpen:
+		out = overlayCenter(bg, r.renderBinSwitch(), r.width, r.height)
 	case r.showHelp:
 		out = overlayCenter(bg, r.renderHelp(), r.width, r.height)
 	case r.showInfo:
@@ -1884,6 +1961,7 @@ func (r *RunMode) renderCopyNoClipboard() string {
 	rows = append(rows, footer)
 	return strings.Join(rows, "\n")
 }
+
 // dismissCopyResult closes the copy modal and clears its transient state.
 func (r *RunMode) dismissCopyResult() {
 	r.copyResult = ""
@@ -2122,25 +2200,30 @@ func (r *RunMode) renderHelp() string {
 		{"c", "copy launch command to clipboard"},
 		{"i", "show model & preset details"},
 		{"tab", "router mode: switch panel ↑/↓ target (log ↔ models)"},
-		{"", ""},
-		{"— log panel —", ""},
-		{"↑ / ↓", "scroll"},
-		{"/", "search (live highlights; Enter applies, Esc cancels)"},
-		{"n / N", "next / previous match"},
-		{"g / G", "jump to top / bottom"},
-		{"space / b", "page down / up"},
-		{"d", "router mode: toggle proxy-log denoise (default on)"},
-		{"", ""},
-		{"— models panel —", "router mode only"},
-		{"↑ / ↓", "move selection"},
-		{"Enter", "action menu (Load/Unload/Stats/Info)"},
-		{"s", "show selected model's stats (Esc back)"},
-		{"l / u", "load / unload the selected model (u confirms)"},
-		{"p", "toggle ini-only filter (hide cache leftovers)"},
-		{"", ""},
-		{"Esc", "layered: close menu → close stats → clear search"},
-		{"?", "toggle this help"},
 	}
+	if len(r.cfg.Globals.Binaries) >= 2 {
+		rows = append(rows, entry{"Shift+B", "switch llama-server binary (next spawn)"})
+	}
+	rows = append(rows,
+		entry{"", ""},
+		entry{"— log panel —", ""},
+		entry{"↑ / ↓", "scroll"},
+		entry{"/", "search (live highlights; Enter applies, Esc cancels)"},
+		entry{"n / N", "next / previous match"},
+		entry{"g / G", "jump to top / bottom"},
+		entry{"space / b", "page down / up"},
+		entry{"d", "router mode: toggle proxy-log denoise (default on)"},
+		entry{"", ""},
+		entry{"— models panel —", "router mode only"},
+		entry{"↑ / ↓", "move selection"},
+		entry{"Enter", "action menu (Load/Unload/Stats/Info)"},
+		entry{"s", "show selected model's stats (Esc back)"},
+		entry{"l / u", "load / unload the selected model (u confirms)"},
+		entry{"p", "toggle ini-only filter (hide cache leftovers)"},
+		entry{"", ""},
+		entry{"Esc", "layered: close menu → close stats → clear search"},
+		entry{"?", "toggle this help"},
+	)
 	keyW := 0
 	for _, e := range rows {
 		if w := lipgloss.Width(e.key); w > keyW {
@@ -2279,6 +2362,31 @@ const (
 // that they should widen the terminal. No word wrap; no graceful
 // per-column degradation.
 
+// renderBinSwitch draws the §3.2a run-mode quick-switch: a small overlay
+// listing the named binaries; enter picks the one-shot override.
+func (r *RunMode) renderBinSwitch() string {
+	rows := []string{"binary for next spawn", ""}
+	for i, b := range r.cfg.Globals.Binaries {
+		cursor := "  "
+		name := b.Name
+		if i == r.binSwitchIdx {
+			cursor = "> "
+			name = "\x1b[7m" + name + "\x1b[0m"
+		}
+		def := ""
+		if r.cfg.Globals.DefaultBinary != "" && b.Name == r.cfg.Globals.DefaultBinary {
+			def = " (default)"
+		}
+		rows = append(rows, fmt.Sprintf("%s%s%s", cursor, name, def))
+	}
+	rows = append(rows, "", "enter select · esc cancel")
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(r.theme.Accent).
+		Padding(0, 2).
+		Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
+}
+
 // renderHeader composes the top strip and (in wide mode) the live
 // band into a single header block. Two states (DESIGN.md §7.4):
 // width ≥ wordmarkMinWidth → wordmark + 3×2 identity + live band;
@@ -2312,11 +2420,15 @@ func (r *RunMode) renderTopStrip() string {
 			statusBadge(r.statusLabel(), r.badgeColor()),
 		}
 	} else {
+		binCell := ""
+		if r.binaryName != "" && r.binaryName != config.DefaultBinaryName {
+			binCell = subtle.Render("Bin:") + " " + accent.Render(r.binaryName)
+		}
 		cells = []string{
 			subtle.Render("Alias:") + " " + accent.Render(r.model.Alias),
 			subtle.Render("Server:") + " " + serverVersionOrNA(r.serverVersion),
 			subtle.Render("Context Size:") + " " + ctxSizeDisplay(r.liveCtxSize, params) + "  " + subtle.Render(fmt.Sprintf("(%d reqs)", int(r.decodeTotal))),
-			subtle.Render("Preset:") + " " + accent.Render(presetNameOrDash(r.preset)),
+			subtle.Render("Preset:") + " " + accent.Render(presetNameOrDash(r.preset)) + binCell,
 			subtle.Render("Uptime:") + " " + formatUptime(time.Since(r.proc.Started)),
 			statusBadge(r.statusLabel(), r.badgeColor()),
 		}
@@ -4133,6 +4245,16 @@ func presetNameOrDash(p config.Preset) string {
 	return p.Name
 }
 
+// serverBinFromArgv returns the resolved binary path (argv[0]) from the
+// opts — the §3.2a resolution picked it; the legacy globals.Bin may be
+// stale (read-compat only).
+func serverBinFromArgv(opts RunModeOpts) string {
+	if len(opts.Argv) > 0 {
+		return opts.Argv[0]
+	}
+	return opts.Cfg.Globals.Bin
+}
+
 // loadServerVersion runs `<bin> --version` and parses its output for
 // the line beginning with "version:" (llama.cpp's --version writes a
 // few setup lines plus a single `version: <build> (<hash>)` line).
@@ -4148,7 +4270,12 @@ func loadServerVersion(bin string) string {
 	if strings.TrimSpace(bin) == "" {
 		return ""
 	}
-	out, err := exec.Command(bin, "--version").CombinedOutput()
+	// Bound the subprocess: --version is a local print on any real
+	// build, but a binary that doesn't exit on the flag (llamaman-
+	// fakeserver) would otherwise hang run-mode construction.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "--version").CombinedOutput()
 	if err != nil && len(out) == 0 {
 		return ""
 	}

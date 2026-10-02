@@ -52,6 +52,10 @@ func DetectLayout(name string, isDir bool) Layout {
 		return LayoutHFHub
 	case isDir && name == ".locks": // hub lock-file directory
 		return LayoutMeta
+	case isDir && isNonModelHubRepo(name):
+		// datasets--… / spaces--…: huggingface_hub shares this cache
+		// root; valid, but not models — skipped silently (§16.1 rule 4).
+		return LayoutMeta
 	case isDir:
 		if _, _, ok := splitLegacyFolder(name); ok {
 			return LayoutLegacyFolder
@@ -71,6 +75,21 @@ func DetectLayout(name string, isDir bool) Layout {
 		return LayoutMeta
 	}
 	return LayoutUnknown
+}
+
+// nonModelHubPrefixes are the huggingface_hub repo-type folder prefixes
+// other than models-- (datasets and spaces share the default hub cache).
+var nonModelHubPrefixes = []string{"datasets--", "spaces--"}
+
+// isNonModelHubRepo reports whether name is a datasets--/spaces-- hub
+// repo folder.
+func isNonModelHubRepo(name string) bool {
+	for _, p := range nonModelHubPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // validHubRepo reports whether a models--… name converts to a valid repo

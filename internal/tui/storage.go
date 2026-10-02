@@ -222,7 +222,7 @@ func (s *StorageMode) rebuild() {
 		fs := byRepo[repo]
 		var total int64
 		var quants []string
-		for _, q := range hf.Quants(repoFiles(fs)) {
+		for _, q := range hf.CachedQuants(repoFiles(fs)) {
 			total += q.Size
 			quants = append(quants, q.Tag)
 		}
@@ -606,7 +606,7 @@ func (s *StorageMode) deleteCacheQuants(repo string, quants []string) error {
 	}
 	removed := 0
 	for _, f := range files {
-		for _, q := range hf.Quants([]hf.RepoFile{{Path: f.Path, Size: f.Size}}) {
+		for _, q := range hf.CachedQuants([]hf.RepoFile{{Path: f.Path, Size: f.Size}}) {
 			if want[q.Tag] {
 				if err := os.Remove(f.Path); err == nil {
 					removed++
@@ -855,7 +855,7 @@ func (s *StorageMode) openDeleteScopeMenu(repo string) tea.Cmd {
 		huh.NewOption("delete all files", "all"),
 	}
 	files, _ := storage.Lookup(s.root, repo)
-	quants := hf.Quants(repoFiles(files))
+	quants := hf.CachedQuants(repoFiles(files))
 	for _, q := range quants {
 		opts = append(opts, huh.NewOption(
 			fmt.Sprintf("%s — %s", q.Tag, hf.HumanSize(q.Size)), q.Tag))
@@ -872,7 +872,7 @@ func (s *StorageMode) openDeleteScopeMenu(repo string) tea.Cmd {
 // openQuantDeletePicker multi-selects the cached quants of a repo.
 func (s *StorageMode) openQuantDeletePicker(repo string) tea.Cmd {
 	files, _ := storage.Lookup(s.root, repo)
-	quants := hf.Quants(repoFiles(files))
+	quants := hf.CachedQuants(repoFiles(files))
 	s.quantDelVal = nil
 	opts := make([]huh.Option[string], 0, len(quants))
 	for _, q := range quants {

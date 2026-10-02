@@ -18,7 +18,9 @@ import (
 //     unambiguous regardless of the section name (which is decorative for
 //     llamaman round-trips and a model id for llama.cpp's router).
 //   - Preset descriptions become "; description: <text>" comments, the
-//     only lossless channel llama.cpp's strict key table allows.
+//     only lossless channel llama.cpp's strict key table allows; preset
+//     binary pins ride the same channel as "; llamaman-binary: <name>"
+//     (DESIGN §3.2a — router mode ignores them, round trips keep them).
 //   - Bools are emitted explicitly ("true"/"false"), numbers as their
 //     literal, strings raw. Lossy string values (whitespace, ';'/'#',
 //     newlines — all destructive under llama.cpp's parser) produce
@@ -38,6 +40,9 @@ func Export(cfg *config.Config) (*File, []string) {
 				for _, line := range strings.Split(preset.Description, "\n") {
 					s.Comment = append(s.Comment, "; description: "+line)
 				}
+			}
+			if preset.Binary != "" {
+				s.Comment = append(s.Comment, "; llamaman-binary: "+preset.Binary)
 			}
 			if model.IsHF() {
 				s.Set("hf", model.HF)

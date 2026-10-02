@@ -49,7 +49,12 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
 {
   "version": 1,
   "globals": {
-    "llama-server-bin": "/usr/local/bin/llama-server",
+    "binaries": [             // one entry per llama-server build (§3.2a)
+      { "name": "mainline", "path": "/usr/local/bin/llama-server" },
+      { "name": "rocm", "path": "/opt/rocm/llama-server", "note": "branch with the AMD patches" }
+    ],
+    "default-binary": "mainline",  // optional; absent = first entry
+    "llama-server-bin": "/usr/local/bin/llama-server",  // legacy, read-compat only (§3.2a)
     "ip_address": "127.0.0.1",
     "port": 9080
   },
@@ -95,11 +100,39 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
 - `presets` may be empty `[]`.
 - `params` is an object; iteration order **must** be preserved (see §6.4).
 
+### 3.2a Named binaries
+
+One llamaman install routinely drives several llama.cpp builds: upstream mainline, a fork with extra samplers, a ROCm build, an old pinned build that still supports a model. `globals.binaries` makes each build a named entry that models, presets, and the CLI can reference.
+
+- `binaries` is an ordered array of `{ "name", "path", "note"? }`.
+  - `name` is the user-facing identifier, unique across the array (duplicate → validation error).
+  - `path` is expanded with `~`/`$VAR` at load time (§3.3). Missing or non-executable → **warning**, not blocking.
+- `default-binary` names the entry used when nothing else pins one. Absent → the first entry. A name that matches no entry → warning, and resolution falls back to the first entry.
+- `models[].presets[].binary` optionally pins a preset to an entry. This is the only per-launch pin: the binary is a property of *how* a model is launched, not of the model itself.
+
+**Resolution order** (implemented by `config.Globals.ResolveBinary`, the single source of truth for "which binary runs"): `override` (CLI `--binary NAME` or the TUI quick-switch, one-shot) → preset pin → default entry. The function also returns why it chose what it chose (`"override" | "preset" | "default"`), which the CLI, the TUI header, and the session record all use:
+
+- A preset pin naming an unknown entry warns and falls through to the default (launching must not fail because a config drifted).
+- An `--binary` name naming an unknown entry is a **hard error** (exit 2) on every launch path, because the user asked for it explicitly.
+- A resolved binary that is missing or not executable aborts the launch before the fork with exit 3 (§4.4), naming the entry, the path, and why it was chosen.
+
+**Flag registry is per binary.** Short-vs-long flag forms, boolean detection, and the param picker's descriptions all come from `<bin> --help` (§6.2), so they are properties of the *selected* build, not of llamaman. The registry is resolved per entry everywhere it matters: a spawn canonicalizes its argv (and router mode checks `--models-preset` support) against the registry of the entry that will actually run; a reattach uses the session's recorded `binary_name`; the config editor's param picker, value forms, unknown-flag `(?)` markers and command-line paste use the registry of the selected preset's resolved entry (its pin, else the working config's default — so a default changed in the editor applies immediately). If an entry's `--help` cannot be read, the fallback short-form set is used and reported as not parsed, so capability checks never trust another build's flags. Parsed registries are cached on disk per path+mtime+hash (two builds sharing an mtime cannot collide) and in memory per path+mtime for the session, so a rebuilt binary is re-read.
+
+**Migration.** `globals.llama-server-bin` is read-compat only: on load, a config that has the legacy key and no `binaries[]` is migrated into a single entry named `default` (marked default), and the legacy key is cleared in memory so the next save writes only the new form. A config that carries *both* keys is left alone — `binaries[]` wins — but validation warns, because the legacy key is then dead weight.
+
+**Sessions.** `session.json.binary_name` records which entry spawned the session. It is written on every spawn and read on reattach, so the run header still shows which build is live after a restart of llamaman itself.
+
+**Router mode and pins.** A router run hosts every model in one process, so `presets[].binary` does not apply: the CLI `-i FILE` / TUI router entry resolves by override → default. `my-models.ini` has no field for a binary, so export records a pin as a `; llamaman-binary: <name>` section comment (llama.cpp ignores comments; the file stays router-valid) and import restores it onto the preset — pins survive an `export` → `import` round trip. A restored pin naming an entry the target config lacks is the usual non-blocking unknown-pin validation warning.
+
+The TUI surfaces this in three places: the config-mode **binaries hub** (`b` — add/edit/delete/set-default, entry-targeted), the one-shot **quick-switch** (Shift+B in main and run mode; applies to the next spawn, including a restart), and the run header's `Bin:` cell (shown when the resolved entry is not the default).
+
 ### 3.3 Path expansion
 
 Applied at config-load time to:
-- `globals.llama-server-bin`
+- `globals.binaries[].path` (§3.2a)
+- `globals.llama-server-bin` (legacy key, migrated at load — §3.2a)
 - every `models[].location`
+- `globals.models-files[]`
 - `preferences.models-dir` (Release 2, §16.1)
 
 Expansions:
@@ -125,7 +158,9 @@ Resolved values are used for all subsequent operations and error messages.
   - Each model has exactly one of `location` / `hf` set; both empty or both filled → error.
   - `hf` (when set) matches `^[\w.-]+/[\w.-]+(?::[\w.-]+)?$` (i.e., `org/repo[:quant]`) → error if not. No network reachability check; llama-server surfaces unreachable repos at launch.
 - `models[].location` not existing on disk → warning, not blocking.
-- `globals.llama-server-bin` not existing or not executable → warning, not blocking.
+- `globals.binaries[].path` not existing or not executable → warning, not blocking (§3.2a). A resolved binary that is missing at launch time is a hard stop (exit 3, §4.4).
+- `presets[].binary` naming an entry that does not exist → warning, not blocking (resolution falls back to the default).
+- `globals.llama-server-bin` alongside `globals.binaries` → warning: the legacy key is ignored (§3.2a).
 - Unknown param keys → warning, not blocking (consistent with §6.5).
 
 ---
@@ -149,6 +184,8 @@ llamaman export [<path>] [-c PATH]
 | `-l` | `--list` | List configured models, one per line: `<alias>\t(<source>)\t<n> presets[\t(running)]`. `<source>` is `local` or `hf`. Plain stdout, exit 0. |
 | `-p` | `--presets` | With a following `<alias>`, print that model's presets to stdout. Exit 0. |
 | `-c` | `--config` | Path to alternate config file. |
+| `-i` | `--ini` | Run a my-models.ini file in router mode (`llama-server --models-preset`); works without a config file. |
+| | `--binary` | `--binary NAME` launches with the named `globals.binaries` entry (§3.2a). One-shot: it wins over the preset pin and the default for this launch only. An unknown name is a config error (exit 2) on every launch path, including `-i`. |
 | | `--completion` | Takes `bash`, `zsh`, or `fish`; prints completion script to stdout, exit 0. |
 
 Subcommands (dispatched before the positional dispatch table; see §13):
@@ -282,7 +319,7 @@ In every spawn command, in this order:
 
 ### 6.2 Short vs long form inference
 
-On `llamaman` startup (and whenever the binary's mtime changes), parse `llama-server --help` and build a map `{name → canonical_form}`. Cache it at `$XDG_CACHE_HOME/llamaman/flags-<bin-mtime>.json`.
+Per llama-server binary (§3.2a): parse `<bin> --help` and build a map `{name → canonical_form}` for the entry that will actually run. Cache it at `$XDG_CACHE_HOME/llamaman/flags-<path-hash>-<bin-mtime>.json` — keyed by absolute path *and* mtime, so two configured builds cannot share an entry even when their mtimes coincide.
 
 If the binary is missing or its `--help` cannot be parsed, fall back to:
 - Single-dash for keys in this hard-coded set: `m, n, c, t, s, b, h, p, ngl, ctk, ctv, fa, np, cb, hf, hff, hft, hfr, hfd, hfv`.
@@ -650,7 +687,7 @@ Triggered when no config file exists at the default location and `-c` was not gi
 
 1. **Modal**: "No configuration found. llamaman will guide you through setup. [Enter] begin / [q] quit." Quit → exit 0 (intentional, not an error).
 2. **Globals form** (mandatory, auto-opened, same layout as `g` form), prefilled:
-   - `llama-server-bin`: autodetected. Order: `which llama-server` → `/usr/local/bin/llama-server` → `/usr/local/llama.cpp/bin/llama-server` → `/opt/llama.cpp/bin/llama-server`. If nothing found, field is empty + inline warning.
+   - `llama-server` binary: autodetected. Order: `which llama-server` → `/usr/local/bin/llama-server` → `/usr/local/llama.cpp/bin/llama-server` → `/opt/llama.cpp/bin/llama-server`. If nothing found, field is empty + inline warning. Saved as a single `binaries[]` entry named `default` (marked default) — §3.2a; more builds are added later in the Binaries hub (`c` → `b`).
    - `host`: `127.0.0.1`.
    - `port`: `9080`.
    - Cancel → "Quit setup? Config will not be saved. (y/N)".
@@ -875,7 +912,8 @@ grammar mirrors llama.cpp's own PEG parser in `common/preset.cpp`.
   additional presets on one model — this is what makes export of
   multi-preset models round-trip.
 - Descriptions are recovered from `; description: <text>` comments (the
-  exporter's convention).
+  exporter's convention); preset binary pins (§3.2a) from
+  `; llamaman-binary: <name>` comments.
 
 ### 13.3 Export mapping (config.json → INI)
 
@@ -885,7 +923,10 @@ grammar mirrors llama.cpp's own PEG parser in `common/preset.cpp`.
   is unambiguous regardless of the section name (which is decorative for
   llamaman round-trips and a model id for llama.cpp's router).
 - Preset descriptions become `; description:` comments — llama.cpp
-  rejects unknown keys, so this is the only lossless channel.
+  rejects unknown keys, so this is the only lossless channel. Preset
+  binary pins (§3.2a) ride the same channel as `; llamaman-binary:
+  <name>` (router mode itself ignores pins — one process serves every
+  section).
 - Bools are emitted explicitly (`true`/`false`); numbers as literals;
   strings raw. Lossy string values (whitespace, `;`/`#`, newlines) are
   emitted with a warning.
@@ -1872,7 +1913,11 @@ name and type:
    file (repo = the first two `__` segments).
 4. Metadata — `*.etag` sidecars, `manifest=…` files, and the HF hub
    root files (`CACHEDIR.TAG`, `version.txt`, `.locks/`, written by
-   `huggingface_hub`) → recognized, skipped silently.
+   `huggingface_hub`) → recognized, skipped silently. Non-model HF hub
+   repos — directories named `datasets--…` or `spaces--…`, which
+   `huggingface_hub` writes into the same default cache root — are
+   likewise recognized and skipped silently: the Storage manager lists
+   models only, and these are a valid layout, not cache damage.
 5. Anything else → **unrecognized** → warning (tolerance strategy
    below).
 
@@ -2180,7 +2225,15 @@ s to view`).
   in-flight downloads, one pane, footer of actions — mirrors the
   router model-panel action-menu pattern (Enter → action menu).
 - Rendering groups: **(1) cache repos** (from `storage.Scan` grouped by
-  repo — each shows its quants + total size, `storage.HumanSize`-style),
+  repo — each shows its quants + total size, `storage.HumanSize`-style;
+  quants come from `hf.CachedQuants`, which adds on-disk
+  speculative-draft-named models — basename containing `mtp-`,
+  `eagle3-`, `dflash-`, `dspark-` — tagged `<TAG> (<kind>)`, e.g.
+  `Q4_K_M (mtp)`. `Quants` excludes them because llama.cpp's
+  `-hf repo:QUANT` never auto-picks them, but they are on disk (fetched
+  via `-hff <file>`), so the manager must show, size, and delete them.
+  The download picker and config-editor pickers keep using `Quants`:
+  a `(kind)` tag is never a valid `:quant` suffix),
   **(2) local config models** (each `location` file with on-disk size;
   missing files marked), **(3) in-flight downloads** (own state, §16.3
   progress), plus a **free-disk** line for the cache root's filesystem
@@ -2986,27 +3039,49 @@ lists the top GGUF repos by the current sort (the placeholder reads
      transformation** — a style applied after it (e.g. a heading
      wrapping the link) would mangle the escape sequence and kill
      ctrl+click (owner report: the Guide! link inside the unsloth
-     card's heading). **Emoji-capable runes are stripped** — READMEs
-     carry ✨/⚡/♥+VS16 etc. that render at width 2 in emoji-aware
-     terminals while runewidth counts 1; the cursor drifts, lines wrap,
-     and the whole view overlaps (owner report: the layout broke when
-     the unsloth Qwen3-Coder card loaded after 's'; tmux rendered it
-     clean because its font uses width 1). `stripWidthAmbiguous`
-     removes the emoji-capable ranges + variation selectors + format
-     controls from card text and result descriptions (width-2 CJK is
-     kept — runewidth and terminals agree there), and the browser's own
-     icons use width-safe glyphs (↓ ♥\ufe0e © ▲ instead of ⬇ ♥ ⚖ ⚠).
-     **Control runes are neutralized too** — the terminal EXECUTES C0/C1
-     controls instead of printing them (a literal VT in a table cell
-     moves the cursor down a row; CR returns to column 0; a tab jumps
-     to the next tab stop, width 0 in runewidth but N on screen), so a
-     single one garbles the whole panel (owner report: the
-     unsloth/Muse-Glimmer-30B-GGUF benchmark-table header carries a
-     literal VT after "30B" — the layout broke after a few PgDn pages;
-     the same card's 𝛕3-Bench names are math-alphanumeric symbols,
-     U+1D400–U+1D7FF, the same ambiguous-width class as emoji, so that
-     block is stripped as well). They become spaces (card authors use
-     them as separators); \n survives for the parser. **The panel never
+     card's heading). **Inline styles are composed, never nested** — the
+     renderer keeps a stack of lipgloss styles and renders each text
+     run ONCE with their composition (innermost wins, `Inherit` fills
+     the rest). Rendering already-styled text through another style
+     corrupts it: lipgloss underlines rune by rune, so a link style
+     over bold text split the bold escape into a lone ESC plus literal
+     `[1m`, and terminals measured the debris differently — every
+     panel border shifted (owner report: the top trending card's
+     `[**file.gguf**](…)` table). **Terminal-safe text** — every
+     Hugging Face string the browser renders (card markdown source,
+     result rows, repo id, base model, license, task) passes
+     `termSafe`/`termSafeLine` (`internal/tui/termsafe.go`), an
+     ALLOWLIST by Unicode category that keeps only runes whose width
+     every terminal agrees on. It replaced the old `stripWidthAmbiguous`
+     blocklist, which grew one owner report at a time (emoji ✨/⚡/♥+VS16
+     drifting the cursor; a literal VT in the
+     unsloth/Muse-Glimmer-30B-GGUF table moving it down a row; 𝛕
+     math alphanumerics). Rules: C0/C1 controls and every space
+     separator → one space (the terminal executes controls), `\n`
+     kept only for the markdown source; all combining marks (M —
+     spacing marks merge into the previous cluster under
+     grapheme-aware terminals but take a column under wcwidth),
+     format chars (Cf: ZWJ, bidi, variation selectors are Mn), private
+     use (Nerd Font glyphs), unassigned and Hangul conjoining jamo
+     dropped; wide runes kept only as letters/digits/punctuation (CJK
+     — every terminal agrees on 2), so wide symbols (emoji) go; the
+     narrow emoji-capable blocks (Misc Symbols, Dingbats, Misc Symbols
+     and Arrows) go; astral runes kept only as wide letters (CJK
+     Ext B+). Category rules cannot see context, and Unicode scatters
+     runes that merge into the previous character across categories
+     (halfwidth kana sound marks and Thai SARA AM are letters), so a
+     final pass splits the text into grapheme clusters and keeps only
+     the first rune of any cluster whose grapheme width differs from
+     its wcwidth sum. The browser's own icons use width-safe glyphs (↓ ♥\ufe0e
+     © ▲ instead of ⬇ ♥ ⚖ ⚠). **Guarded by invariants, not examples**
+     (`termsafe_test.go`): every rendered card/browser line may contain
+     only SGR and OSC 8 escapes, no stray control byte, and must
+     measure the same under grapheme and wcwidth width models (the two
+     models terminals implement); the browser view with hostile data in
+     every field must keep every line the terminal's width. Two native
+     Go fuzz targets (`FuzzTermSafe`, `FuzzCardMarkdown`) check the same
+     invariants on arbitrary input; their findings are committed under
+     `internal/tui/testdata/fuzz/` as regression seeds. **The panel never
      re-styles card lines** — the
      renderer bakes a Subtle base color into plain text, and
      cardPanelLines passes the lines through untouched, because a

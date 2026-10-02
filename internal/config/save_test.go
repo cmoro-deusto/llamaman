@@ -11,7 +11,7 @@ import (
 func sampleCfg() *Config {
 	return &Config{
 		Version: 1,
-		Globals: Globals{Bin: "/usr/local/bin/llama-server", Host: "127.0.0.1", Port: 9080},
+		Globals: Globals{Binaries: []Binary{{Name: "default", Path: "/usr/local/bin/llama-server"}}, DefaultBinary: "default", Host: "127.0.0.1", Port: 9080},
 		Models: []Model{{
 			Alias: "qwen", Location: "/m.gguf",
 			Presets: []Preset{{

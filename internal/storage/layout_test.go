@@ -49,6 +49,9 @@ func TestDetectLayout(t *testing.T) {
 		{"CACHEDIR.TAG", false, LayoutMeta},
 		{"version.txt", false, LayoutMeta},
 		{".locks", true, LayoutMeta},
+		// non-model HF hub repos (huggingface_hub), skipped silently
+		{"datasets--AGBonnet--augmented-clinical-notes", true, LayoutMeta},
+		{"spaces--org--demo", true, LayoutMeta},
 		{"CACHEDIR.TAG", true, LayoutUnknown}, // a dir named CACHEDIR.TAG is not standard
 		{".locks", false, LayoutUnknown},      // a file named .locks is not standard
 		// rule 5: everything else → unknown

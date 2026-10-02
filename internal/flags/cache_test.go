@@ -66,6 +66,50 @@ func TestCacheRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCachePathDistinguishesSameMtimeDifferentPaths(t *testing.T) {
+	l1 := &Loader{BinPath: "/a/llama-server", CacheDir: t.TempDir()}
+	l2 := &Loader{BinPath: "/b/llama-server", CacheDir: l1.CacheDir}
+	mt := time.Unix(1700000000, 0)
+	if l1.cachePath(mt) == l2.cachePath(mt) {
+		t.Fatal("two different binaries with the same mtime must not share a cache file")
+	}
+	// Same path twice → same name (cache hit).
+	l3 := &Loader{BinPath: "/a/llama-server", CacheDir: l1.CacheDir}
+	if l1.cachePath(mt) != l3.cachePath(mt) {
+		t.Fatal("same path + mtime must map to the same cache file")
+	}
+}
+
+// The pre-§3.2a cache names carried only the mtime, so the current code can
+// never read them again. Writing a new entry must sweep those leftovers
+// while leaving other binaries' (hashed) entries and foreign files alone.
+func TestWriteCachePrunesLegacyNames(t *testing.T) {
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, "flags-1700000000000000000.json")
+	current := filepath.Join(dir, "flags-0123456789abcdef-1700000000000000000.json")
+	hashedSibling := filepath.Join(dir, "flags-ffffffffffffffff-1700000000000000001.json")
+	foreign := filepath.Join(dir, "keep-me.json")
+	allDigitsHash := filepath.Join(dir, "flags-0123456789abcdef-1700000000000000002.json")
+	for _, p := range []string{legacy, hashedSibling, foreign, allDigitsHash} {
+		if err := os.WriteFile(p, []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := writeCache(current, Registry{"threads": {Name: "threads", Form: "--threads"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Errorf("legacy (mtime-only) cache file survived: %v", err)
+	}
+	for _, p := range []string{current, hashedSibling, foreign, allDigitsHash} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("prune removed %s: %v", filepath.Base(p), err)
+		}
+	}
+}
+
 func repoRoot(t *testing.T) string {
 	t.Helper()
 	dir, err := filepath.Abs(".")

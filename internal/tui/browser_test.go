@@ -284,8 +284,8 @@ func TestBrowserHandoffToDownload(t *testing.T) {
 	if d.repo != "org/cachedrepo" || d.quant != "Q4_K_M" {
 		t.Errorf("download = %s:%s, want org/cachedrepo:Q4_K_M", d.repo, d.quant)
 	}
-	if len(eng.calls) != 1 || eng.calls[0] != "Download org/cachedrepo Q4_K_M" {
-		t.Errorf("engine calls = %v", eng.calls)
+	if calls := eng.Calls(); len(calls) != 1 || calls[0] != "Download org/cachedrepo Q4_K_M" {
+		t.Errorf("engine calls = %v", calls)
 	}
 }
 

@@ -16,6 +16,10 @@ import (
 type Result struct {
 	Argv     []string
 	Warnings []string
+	// Binary is the binaries[] entry argv[0] came from. Callers record
+	// it (session.json binary_name, the run header) from here, so the
+	// recorded name and the launched path cannot disagree (§3.2a).
+	Binary config.Binary
 }
 
 // Build produces the argv vector for a llama-server launch.
@@ -36,10 +40,15 @@ type Result struct {
 // reg is consulted first for canonical CLI form; unknown keys fall back
 // to the hard-coded short-form set (DESIGN.md §6.2). Unknown keys also
 // produce a warning in the returned Result.
-func Build(globals config.Globals, model config.Model, preset config.Preset, reg flags.Registry) (Result, error) {
+//
+// bin is the resolved llama-server binary (DESIGN §3.2a): its Path is
+// argv[0] and it is returned as Result.Binary. It is passed separately
+// from globals because resolution (override → preset pin → default)
+// happens in the caller.
+func Build(globals config.Globals, model config.Model, preset config.Preset, reg flags.Registry, bin config.Binary) (Result, error) {
 	overrides := overrideSet(preset.Params)
 
-	argv := []string{globals.Bin}
+	argv := []string{bin.Path}
 	switch {
 	case model.IsHF():
 		if !overrides["hf"] && !overrides["m"] {
@@ -72,7 +81,7 @@ func Build(globals config.Globals, model config.Model, preset config.Preset, reg
 	if !overrides["port"] {
 		argv = append(argv, flags.CanonicalForm("port", reg), strconv.Itoa(globals.Port))
 	}
-	return Result{Argv: argv, Warnings: warnings}, nil
+	return Result{Argv: argv, Warnings: warnings, Binary: bin}, nil
 }
 
 func overrideSet(params config.Params) map[string]bool {

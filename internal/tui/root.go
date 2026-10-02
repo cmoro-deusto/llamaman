@@ -31,8 +31,14 @@ const (
 // SpawnRequestMsg asks the root to spawn llama-server for (Model, Preset)
 // and transition to run mode. Main mode emits this on Enter.
 type SpawnRequestMsg struct {
-	Model  config.Model
+	Model config.Model
+	// Preset is the chosen launch preset. Its Binary pin (§3.2a)
+	// participates in resolution.
 	Preset config.Preset
+	// BinaryOverride is the one-shot quick-switch override (§3.2a):
+	// the named binary wins over the preset pin and default for this
+	// spawn only. Empty = no override.
+	BinaryOverride string
 }
 
 // RouterSpawnRequestMsg asks the root to spawn llama-server in router
@@ -40,6 +46,9 @@ type SpawnRequestMsg struct {
 // file). Main mode's Router view emits this on Enter.
 type RouterSpawnRequestMsg struct {
 	File string
+	// BinaryOverride mirrors SpawnRequestMsg.BinaryOverride (§3.2a):
+	// the one-shot quick-switch name, empty when nothing is pinned.
+	BinaryOverride string
 }
 
 // returnToMainMsg is dispatched when the user backs out of run mode.
@@ -53,10 +62,14 @@ type reattachRequestMsg struct{}
 // handle on its own (translate, session lock, fork/exec). main.go
 // implements this; the TUI only knows it can ask for a launched Process.
 type Spawner interface {
-	Spawn(model config.Model, preset config.Preset) (RunModeOpts, error)
+	// Spawn launches llama-server for (model, preset). binaryOverride is
+	// the one-shot quick-switch name (§3.2a); empty = preset pin/default.
+	Spawn(model config.Model, preset config.Preset, binaryOverride string) (RunModeOpts, error)
 	// SpawnRouter launches llama-server in router mode for a my-models.ini
 	// file (one process hosting every model in the file).
-	SpawnRouter(file string) (RunModeOpts, error)
+	// binaryOverride is the one-shot quick-switch name (§3.2a); empty =
+	// default binary.
+	SpawnRouter(file, binaryOverride string) (RunModeOpts, error)
 	// Reattach inspects session.json. If a session is live, returns
 	// RunModeOpts that adopt it. Returns (nil, nil) when no session is
 	// running. Errors propagate to the caller's error path.
@@ -65,6 +78,33 @@ type Spawner interface {
 	// (if any), used by main mode for the inline list's `(running)`
 	// marker and the "▶ Detached" line. Empty string when no session.
 	RunningAlias() (alias, preset string, port int)
+}
+
+// ConfigSetter is optionally implemented by a Spawner that resolves
+// launches against its own config pointer (binaries[], preset pins —
+// §3.2a). Root hands it every replacement config so spawns see edits
+// made in the config editor without a restart.
+type ConfigSetter interface {
+	SetConfig(cfg *config.Config)
+}
+
+// RegistryResolver is optionally implemented by a Spawner that can parse
+// any binary's `--help` (§3.2a). The config editor uses it so a preset's
+// param picker, value forms and unknown-flag markers reflect the build
+// that preset runs on; without it, the startup registry is used.
+type RegistryResolver interface {
+	RegistryFor(bin config.Binary) flags.Registry
+}
+
+// newConfigMode builds a config editor wired to the root's registry and
+// (when the spawner offers one) the per-binary registry resolver.
+func (r *Root) newConfigMode(cfgPath string, cfg *config.Config) ConfigMode {
+	cm := NewConfigMode(cfgPath, cfg, r.theme)
+	cm.SetRegistry(r.registry)
+	if rr, ok := r.spawner.(RegistryResolver); ok {
+		cm.SetRegistryResolver(rr.RegistryFor)
+	}
+	return cm
 }
 
 // Root is the top-level Bubble Tea model. It owns each sub-model and
@@ -145,6 +185,13 @@ func NewRoot(cfg *config.Config, cfgPath string, spawner Spawner, registry flags
 // when a fresh config has just been written and the parsed-help flow
 // runs only afterward.
 func (r *Root) SetRegistry(reg flags.Registry) { r.registry = reg }
+
+// SeedBinaryOverride plants a one-shot binary override (§3.2a) on the
+// landing screen. main.go uses it for `llamaman --binary NAME` without a
+// positional alias, so the flag still governs the launch the user makes
+// from the TUI instead of being dropped. It is consumed by the next
+// spawn, like a quick-switch choice.
+func (r *Root) SeedBinaryOverride(name string) { r.mainMode.SetBinaryOverride(name) }
 
 func (r *Root) Init() tea.Cmd {
 	if r.firstRun != nil {
@@ -279,15 +326,23 @@ func (r *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return r.forward(msg)
 }
 
+// setCfg replaces the in-memory config and forwards it to the spawner
+// when it tracks one (ConfigSetter).
+func (r *Root) setCfg(cfg *config.Config) {
+	r.cfg = cfg
+	if cs, ok := r.spawner.(ConfigSetter); ok {
+		cs.SetConfig(cfg)
+	}
+}
+
 func (r *Root) handleFirstRunCompleted(msg FirstRunCompletedMsg) (tea.Model, tea.Cmd) {
-	r.cfg = msg.Cfg
+	r.setCfg(msg.Cfg)
 	r.cfgPath = msg.CfgPath
 	r.firstRun = nil
 	r.mainMode = NewMainMode(msg.Cfg, r.version, r.theme)
 	r.mainMode.SetCfgPath(r.cfgPath)
 	r.mainMode.SetSize(r.width, r.height)
-	cm := NewConfigMode(msg.CfgPath, msg.Cfg, r.theme)
-	cm.SetRegistry(r.registry)
+	cm := r.newConfigMode(msg.CfgPath, msg.Cfg)
 	cm.SetHFCheckRunner(r.hfCheckRunner())
 	cm.ShowFirstRunBanner()
 	cm.SetSize(r.width, r.height)
@@ -434,7 +489,15 @@ func (r *Root) handleSpawn(msg SpawnRequestMsg) (tea.Model, tea.Cmd) {
 		r.flashSpawnError(errSpawnerMissing)
 		return r, nil
 	}
-	opts, err := r.spawner.Spawn(msg.Model, msg.Preset)
+	// The one-shot §3.2a override lives on MainMode: consume it on the
+	// next spawn regardless of success so it can't silently leak to a
+	// later launch.
+	override := msg.BinaryOverride
+	if override == "" {
+		override = r.mainMode.BinaryOverride()
+	}
+	r.mainMode.ClearBinaryOverride()
+	opts, err := r.spawner.Spawn(msg.Model, msg.Preset, override)
 	if err != nil {
 		r.flashSpawnError(err)
 		return r, nil
@@ -444,12 +507,19 @@ func (r *Root) handleSpawn(msg SpawnRequestMsg) (tea.Model, tea.Cmd) {
 
 // handleRouterSpawn mirrors handleSpawn for RouterSpawnRequestMsg: it
 // asks the spawner to launch router mode and transitions to run mode.
+// The one-shot override is consumed here too, so a quick-switch applies
+// to router launches exactly like single-model ones.
 func (r *Root) handleRouterSpawn(msg RouterSpawnRequestMsg) (tea.Model, tea.Cmd) {
 	if r.spawner == nil {
 		r.flashSpawnError(errSpawnerMissing)
 		return r, nil
 	}
-	opts, err := r.spawner.SpawnRouter(msg.File)
+	override := msg.BinaryOverride
+	if override == "" {
+		override = r.mainMode.BinaryOverride()
+	}
+	r.mainMode.ClearBinaryOverride()
+	opts, err := r.spawner.SpawnRouter(msg.File, override)
 	if err != nil {
 		r.flashSpawnError(err)
 		return r, nil
@@ -495,8 +565,7 @@ type configEntry struct {
 }
 
 func (r *Root) openConfig(entry configEntry) (tea.Model, tea.Cmd) {
-	cm := NewConfigMode(r.cfgPath, r.cfg, r.theme)
-	cm.SetRegistry(r.registry)
+	cm := r.newConfigMode(r.cfgPath, r.cfg)
 	cm.SetHFCheckRunner(r.hfCheckRunner())
 	cm.prefillHF = entry.prefillHF
 	cm.SetSize(r.width, r.height)
@@ -580,7 +649,7 @@ func (r *Root) applyConfigChanges() {
 	}
 	saved := r.configMod.Saved()
 	if saved != nil {
-		r.cfg = saved
+		r.setCfg(saved)
 		r.mainMode.SetCfg(saved)
 		r.mainMode.SetSize(r.width, r.height)
 	}

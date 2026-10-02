@@ -297,6 +297,7 @@ If **no** models are configured (e.g. immediately after first-run setup), the li
 | `Esc` | Back out of the preset sub-list to the model list |
 | `s` | Storage & Downloads manager |
 | `b` | Hugging Face browser |
+| `Shift+B` | Binary quick-switch — pick the `llama-server` build for the next launch (only when 2+ `globals.binaries` entries exist) |
 | `c` | Configuration mode |
 | `p` | Preferences (theme, animations, log colours, models dir) |
 | `t` / `T` | Cycle the theme forward / backward |
@@ -352,6 +353,7 @@ Status state machine: `starting → ready → exited|error`. `ready` is detected
 | `n` / `N` | Next / previous match |
 | `g` / `G` | Jump to top / bottom |
 | `Space` / `b` | Page down / up |
+| `Shift+B` | Binary quick-switch — pick the `llama-server` build for the next spawn (restart with `r` to apply; only when 2+ `globals.binaries` entries exist) |
 | `↑` / `↓` / wheel | Scroll one line — `j`/`k` are deliberately not bound here so `k` is free for kill |
 | `?` | Help overlay |
 
@@ -403,7 +405,8 @@ A three-pane master/detail editor:
 | `c` | Duplicate (models and presets, within the same parent) |
 | `k` | Clone preset to another model (Presets pane only — opens a target-model select + new-name input) |
 | `d` | Delete (with confirm where lossy) |
-| `g` | Open the Globals form (binary path, host, port) |
+| `g` | Open the Globals form (host, port, models files) |
+| `b` | Open the Binaries hub (add / edit / delete / set-default the named `llama-server` builds) |
 | `s` | Save (atomic, with `.bak`) |
 | `Esc` | Back. With unsaved changes, prompts Save / Discard / Cancel |
 | `?` | Help overlay |
@@ -479,7 +482,12 @@ The config file is JSON at `${XDG_CONFIG_HOME:-~/.config}/llamaman/config.json` 
   "version":  1,                                  // integer, REQUIRED, must be 1 (unknown → exit 2)
 
   "globals": {
-    "llama-server-bin": "<absolute path>",        // REQUIRED, ~ and $VAR expanded at load; warn-only if missing/non-exec
+    "binaries": [                                 // REQUIRED (unless the legacy key below is set): one entry per llama-server build
+      {"name": "mainline", "path": "<absolute path>", "note": "optional free-form"},
+      {"name": "rocm",     "path": "/opt/rocm/llama-server"}
+    ],
+    "default-binary":   "mainline",               // OPTIONAL; the entry used when nothing pins one (absent → first entry)
+    "llama-server-bin": "<absolute path>",        // legacy single-binary key: migrated into binaries[] as "default" on load
     "ip_address":       "<IPv4 | IPv6 | host>",   // REQUIRED, format-validated
     "port":             <integer 1..65535>,        // REQUIRED
     "models-files":     ["<path to my-models.ini>"]  // OPTIONAL router sources; unset → derived <config-dir>/models.ini
@@ -495,6 +503,7 @@ The config file is JSON at `${XDG_CONFIG_HOME:-~/.config}/llamaman/config.json` 
         {
           "preset":      "<string>",              // REQUIRED, unique within this model
           "description": "<string>",              // optional, free-form
+          "binary":      "<name>",                // OPTIONAL pin to a globals.binaries entry (absent → default-binary)
           "params": {                             // object; KEY ORDER PRESERVED on disk and in argv
             "<flag-name>": <bool | number | string>
           }
@@ -508,7 +517,9 @@ The config file is JSON at `${XDG_CONFIG_HOME:-~/.config}/llamaman/config.json` 
 Field-by-field:
 
 - **`version`**. Integer, must be `1` (the only version that has ever shipped). Unknown values are a hard error today (exit 2). Schema evolution within v1 is additive — new optional fields are added in place; reading a newer config with an older binary errors out (`json: unknown field`). When a future release introduces `version: 2` or higher, llamaman will migrate older configs automatically on load (keeping a `.bak`); the value of this field is what the migration step keys off.
-- **`globals.llama-server-bin`**. Absolute path to the `llama-server` binary. Leading `~` is expanded to `$HOME`; `$VAR` and `${VAR}` are looked up in the environment (unset variables are left literal so typos surface). Validation warns (does not block) if the path doesn't exist or isn't executable.
+- **`globals.binaries`**. One entry per `llama-server` build you want to run — mainline, a fork, a ROCm build, an old pinned build. Each entry is `{ "name", "path", "note"? }`; `name` is referenced by `presets[].binary` and by `--binary NAME`. Paths get the same `~`/`$VAR` expansion as model locations, and validation warns (does not block) if a path is missing or not executable. Names must be unique. **Resolution order at launch**: `--binary NAME` / TUI quick-switch (Shift+B, one-shot) → `presets[].binary` → `globals.default-binary` → first entry. A preset pin naming an unknown entry warns and falls back to the default; an unknown `--binary` name is a hard error (exit 2); a resolved binary that is missing at launch aborts with exit 3.
+- **`globals.default-binary`**. Name of the entry used when nothing else pins one. Absent → the first entry.
+- **`globals.llama-server-bin`**. Legacy single-binary key, kept for read-compat. On load, a config that has it and no `binaries[]` is migrated into a single entry named `default` (and the next save writes only the new form). If both keys are present, `binaries[]` wins and validation warns that the legacy key is ignored.
 - **`globals.ip_address`**. Listen address passed as `--host`. Accepts IPv4 (`127.0.0.1`), IPv6 (`::1`), bracketed IPv6, or hostnames. **Always** emitted explicitly — no implicit `localhost`.
 - **`globals.port`**. TCP port, integer in `[1, 65535]`. A port-availability precheck runs before spawn; if the port is bound, the TUI surfaces a modal (`(g)oto globals / (p)reset port / (c)ancel`) and CLI launches exit `4`.
 - **`models[].alias`**. The user-visible name used in `llamaman <alias>` and in the TUI lists. Case-sensitive; must be unique across the array. Also passed to `llama-server` as `--alias <alias>` so it shows up in completions metadata.
@@ -516,6 +527,7 @@ Field-by-field:
 - **`models[].presets`**. Array; may be empty (`[]`). An alias with zero presets is launchable from main mode and runs with only the auto-added flags.
 - **`presets[].preset`**. Preset name. Unique within a model, case-sensitive. The "default" preset (literal name `default`) is what `llamaman <alias>` picks when no preset is given on the CLI; if no `default` exists and the model has exactly one preset, that one is used.
 - **`presets[].description`**. Free-form, displayed in the config-mode preset pane. No length cap; one line renders cleanly, multi-line is preserved.
+- **`presets[].binary`**. Optional pin to a `globals.binaries` entry, so one model can run on different builds from different presets (e.g. `fast` on the ROCm build, `compat` on a pinned older one). Absent → `globals.default-binary`. Renaming an entry in the TUI carries its pins along; deleting one leaves the pins in place (validation warns, and the launch falls back to the default).
 - **`presets[].params`**. JSON object whose **key order is preserved** end-to-end (custom marshal/unmarshal under the hood). The order you write the keys in is the order they appear on the `llama-server` command line. Numeric values are stored as `json.Number` so `0.0` round-trips as `0.0`, not `0`. Object or array values are a config-load error. See [Parameter translation](#parameter-translation) for how each value type maps to argv.
 
 ## Parameter translation
@@ -674,10 +686,10 @@ The current scope is deliberately tight. The following are not in the box today:
 
 ### `llama-server binary not found`
 
-llamaman couldn't autodetect the binary, or the path in `globals.llama-server-bin` doesn't exist / isn't executable.
+llamaman couldn't autodetect the binary, or the resolved `globals.binaries` entry's path doesn't exist / isn't executable. The error names the entry, the path, and why it was chosen (override, preset pin, or default).
 
 - Run `which llama-server`. If empty, install or build llama.cpp first.
-- If the binary is in a non-standard location, open configuration mode (`llamaman` → `c` → `g`) and point `llama-server binary` at the absolute path.
+- If the binary is in a non-standard location, open configuration mode (`llamaman` → `c` → `b`) and point the entry at the absolute path, or add a new entry.
 - Permissions: `chmod +x` the binary if needed.
 
 ### `Port already in use`
@@ -750,7 +762,7 @@ Not currently. llamaman binds a single `host:port` per session and the `flock` o
 
 ### Does it work with Vulkan / ROCm / CUDA / Metal builds of `llama-server`?
 
-Yes — llamaman shells out to whatever `llama-server` binary you point `globals.llama-server-bin` at. The backend (CPU, CUDA, ROCm, Vulkan, Metal once macOS support lands) is decided at llama.cpp build time; llamaman is agnostic.
+Yes — llamaman shells out to whatever `llama-server` binary a `globals.binaries` entry (or a preset pin / `--binary NAME`) points at. The backend (CPU, CUDA, ROCm, Vulkan, Metal once macOS support lands) is decided at llama.cpp build time; llamaman is agnostic. Configure several builds side by side and switch between them per launch.
 
 ### Will my old configs work after a llamaman update?
 

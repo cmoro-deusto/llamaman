@@ -120,7 +120,7 @@ func Validate(cfg *Config) Issues {
 			}
 		}
 
-		out = append(out, validatePresets(i, m.Presets)...)
+		out = append(out, validatePresets(i, m.Presets, cfg.Globals)...)
 	}
 	return out
 }
@@ -164,17 +164,46 @@ func validatePreferences(p Preferences) Issues {
 
 func validateGlobals(g Globals) Issues {
 	var out Issues
-	if strings.TrimSpace(g.Bin) == "" {
-		out = append(out, Issue{Severity: Error, Path: "globals.llama-server-bin",
-			Message: "binary path is required"})
-	} else if info, err := os.Stat(g.Bin); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			out = append(out, Issue{Severity: Warning, Path: "globals.llama-server-bin",
-				Message: fmt.Sprintf("binary does not exist: %s", g.Bin)})
-		}
-	} else if info.Mode()&0o111 == 0 {
+	if len(g.Binaries) == 0 {
+		// Load migrates a legacy Bin into Binaries, so reaching here with
+		// both empty means there is no binary to run anything (§3.5).
+		out = append(out, Issue{Severity: Error, Path: "globals.binaries",
+			Message: "at least one llama-server binary is required"})
+	}
+	if strings.TrimSpace(g.Bin) != "" && len(g.Binaries) > 0 {
+		// Migration only rewrites a legacy-only config, so the key can
+		// legitimately coexist with binaries[] — but nothing reads it
+		// then (DESIGN §3.2a). Say so instead of ignoring the edit.
 		out = append(out, Issue{Severity: Warning, Path: "globals.llama-server-bin",
-			Message: "binary is not executable"})
+			Message: "ignored: globals.binaries is set, so this legacy key has no effect"})
+	}
+	seen := make(map[string]bool, len(g.Binaries))
+	for i, b := range g.Binaries {
+		path := fmt.Sprintf("globals.binaries[%d]", i)
+		if strings.TrimSpace(b.Name) == "" {
+			out = append(out, Issue{Severity: Error, Path: path + ".name",
+				Message: "binary name is required"})
+		} else if seen[b.Name] {
+			out = append(out, Issue{Severity: Error, Path: path + ".name",
+				Message: fmt.Sprintf("duplicate binary name %q", b.Name)})
+		}
+		seen[b.Name] = true
+		if strings.TrimSpace(b.Path) == "" {
+			out = append(out, Issue{Severity: Error, Path: path + ".path",
+				Message: "binary path is required"})
+		} else if info, err := os.Stat(b.Path); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				out = append(out, Issue{Severity: Warning, Path: path + ".path",
+					Message: fmt.Sprintf("binary %q does not exist: %s", b.Name, b.Path)})
+			}
+		} else if info.Mode()&0o111 == 0 {
+			out = append(out, Issue{Severity: Warning, Path: path + ".path",
+				Message: fmt.Sprintf("binary %q is not executable", b.Name)})
+		}
+	}
+	if g.DefaultBinary != "" && !seen[g.DefaultBinary] {
+		out = append(out, Issue{Severity: Warning, Path: "globals.default-binary",
+			Message: fmt.Sprintf("default binary %q names no entry; falling back to the first entry", g.DefaultBinary)})
 	}
 	if !ValidHost(g.Host) {
 		out = append(out, Issue{Severity: Error, Path: "globals.ip_address",
@@ -200,7 +229,7 @@ func validateGlobals(g Globals) Issues {
 	return out
 }
 
-func validatePresets(modelIdx int, presets []Preset) Issues {
+func validatePresets(modelIdx int, presets []Preset, globals Globals) Issues {
 	var out Issues
 	nameSeen := make(map[string]int)
 	for i, p := range presets {
@@ -229,6 +258,11 @@ func validatePresets(modelIdx int, presets []Preset) Issues {
 			} else {
 				paramSeen[pr.Key] = j
 			}
+		}
+		if _, known := globals.FindBinary(p.Binary); p.Binary != "" && !known {
+			out = append(out, Issue{Severity: Warning,
+				Path:    fmt.Sprintf("models[%d].presets[%d].binary", modelIdx, i),
+				Message: fmt.Sprintf("binary %q names no globals.binaries entry; falling back to the default binary", p.Binary)})
 		}
 	}
 	return out
