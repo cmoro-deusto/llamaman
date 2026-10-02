@@ -903,7 +903,7 @@ type resultItem struct {
 	res hf.SearchResult
 }
 
-func (i resultItem) Title() string       { return i.res.ID }
+func (i resultItem) Title() string       { return termSafeLine(i.res.ID) }
 func (i resultItem) Description() string { return describeResult(i.res) }
 func (i resultItem) FilterValue() string { return i.res.ID }
 
@@ -1022,9 +1022,9 @@ func describeResult(r hf.SearchResult) string {
 	if lic := licenseOf(r); lic != "" {
 		parts = append(parts, "license: "+lic)
 	}
-	// Tags can carry emoji-capable runes; strip them so result rows
-	// never break the terminal's width accounting either.
-	return stripWidthAmbiguous(strings.Join(parts, " · "))
+	// Tags are external text: termSafe keeps result rows inside the
+	// terminal's width accounting.
+	return termSafeLine(strings.Join(parts, " · "))
 }
 
 // humanCount renders a compact count: 743450 → "743k", 1700 → "1.7k".
@@ -1255,9 +1255,11 @@ func (s *BrowserMode) infoLines(inner int) []string {
 		return lines
 	}
 	m := s.selected
-	lines = append(lines, accent(m.ID))
+	// Every HF-sourced field passes termSafeLine (§16.7 terminal-safe
+	// text) — the panel borders depend on their widths.
+	lines = append(lines, accent(termSafeLine(m.ID)))
 	p, hasP := paramCountOf(*m)
-	bm := baseModelOf(*m)
+	bm := termSafeLine(baseModelOf(*m))
 	switch {
 	case hasP:
 		line := good(humanB(p) + " params")
@@ -1278,7 +1280,7 @@ func (s *BrowserMode) infoLines(inner int) []string {
 	lines = append(lines, accent("♥︎ "+strconv.FormatInt(m.Likes, 10))+" "+muted("likes"))
 	// License row; the non-commercial warning folds in as a ▲ marker so
 	// the panel keeps its fixed row count.
-	lic := licenseOf(*m)
+	lic := termSafeLine(licenseOf(*m))
 	if nonCommercialLicense(*m) != "" {
 		lic += " ▲"
 	}
@@ -1286,7 +1288,7 @@ func (s *BrowserMode) infoLines(inner int) []string {
 	// Task row; the mmproj note folds in. ALWAYS present (blank when
 	// missing) — the panel is exactly 7 rows (owner round), otherwise
 	// the quants/card panels below shift when a repo lacks a task.
-	task := m.PipelineTag
+	task := termSafeLine(m.PipelineTag)
 	if s.mmproj {
 		if task != "" {
 			task += " · mmproj"

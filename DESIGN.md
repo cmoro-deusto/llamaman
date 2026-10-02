@@ -3035,27 +3035,49 @@ lists the top GGUF repos by the current sort (the placeholder reads
      transformation** — a style applied after it (e.g. a heading
      wrapping the link) would mangle the escape sequence and kill
      ctrl+click (owner report: the Guide! link inside the unsloth
-     card's heading). **Emoji-capable runes are stripped** — READMEs
-     carry ✨/⚡/♥+VS16 etc. that render at width 2 in emoji-aware
-     terminals while runewidth counts 1; the cursor drifts, lines wrap,
-     and the whole view overlaps (owner report: the layout broke when
-     the unsloth Qwen3-Coder card loaded after 's'; tmux rendered it
-     clean because its font uses width 1). `stripWidthAmbiguous`
-     removes the emoji-capable ranges + variation selectors + format
-     controls from card text and result descriptions (width-2 CJK is
-     kept — runewidth and terminals agree there), and the browser's own
-     icons use width-safe glyphs (↓ ♥\ufe0e © ▲ instead of ⬇ ♥ ⚖ ⚠).
-     **Control runes are neutralized too** — the terminal EXECUTES C0/C1
-     controls instead of printing them (a literal VT in a table cell
-     moves the cursor down a row; CR returns to column 0; a tab jumps
-     to the next tab stop, width 0 in runewidth but N on screen), so a
-     single one garbles the whole panel (owner report: the
-     unsloth/Muse-Glimmer-30B-GGUF benchmark-table header carries a
-     literal VT after "30B" — the layout broke after a few PgDn pages;
-     the same card's 𝛕3-Bench names are math-alphanumeric symbols,
-     U+1D400–U+1D7FF, the same ambiguous-width class as emoji, so that
-     block is stripped as well). They become spaces (card authors use
-     them as separators); \n survives for the parser. **The panel never
+     card's heading). **Inline styles are composed, never nested** — the
+     renderer keeps a stack of lipgloss styles and renders each text
+     run ONCE with their composition (innermost wins, `Inherit` fills
+     the rest). Rendering already-styled text through another style
+     corrupts it: lipgloss underlines rune by rune, so a link style
+     over bold text split the bold escape into a lone ESC plus literal
+     `[1m`, and terminals measured the debris differently — every
+     panel border shifted (owner report: the top trending card's
+     `[**file.gguf**](…)` table). **Terminal-safe text** — every
+     Hugging Face string the browser renders (card markdown source,
+     result rows, repo id, base model, license, task) passes
+     `termSafe`/`termSafeLine` (`internal/tui/termsafe.go`), an
+     ALLOWLIST by Unicode category that keeps only runes whose width
+     every terminal agrees on. It replaced the old `stripWidthAmbiguous`
+     blocklist, which grew one owner report at a time (emoji ✨/⚡/♥+VS16
+     drifting the cursor; a literal VT in the
+     unsloth/Muse-Glimmer-30B-GGUF table moving it down a row; 𝛕
+     math alphanumerics). Rules: C0/C1 controls and every space
+     separator → one space (the terminal executes controls), `\n`
+     kept only for the markdown source; all combining marks (M —
+     spacing marks merge into the previous cluster under
+     grapheme-aware terminals but take a column under wcwidth),
+     format chars (Cf: ZWJ, bidi, variation selectors are Mn), private
+     use (Nerd Font glyphs), unassigned and Hangul conjoining jamo
+     dropped; wide runes kept only as letters/digits/punctuation (CJK
+     — every terminal agrees on 2), so wide symbols (emoji) go; the
+     narrow emoji-capable blocks (Misc Symbols, Dingbats, Misc Symbols
+     and Arrows) go; astral runes kept only as wide letters (CJK
+     Ext B+). Category rules cannot see context, and Unicode scatters
+     runes that merge into the previous character across categories
+     (halfwidth kana sound marks and Thai SARA AM are letters), so a
+     final pass splits the text into grapheme clusters and keeps only
+     the first rune of any cluster whose grapheme width differs from
+     its wcwidth sum. The browser's own icons use width-safe glyphs (↓ ♥\ufe0e
+     © ▲ instead of ⬇ ♥ ⚖ ⚠). **Guarded by invariants, not examples**
+     (`termsafe_test.go`): every rendered card/browser line may contain
+     only SGR and OSC 8 escapes, no stray control byte, and must
+     measure the same under grapheme and wcwidth width models (the two
+     models terminals implement); the browser view with hostile data in
+     every field must keep every line the terminal's width. Two native
+     Go fuzz targets (`FuzzTermSafe`, `FuzzCardMarkdown`) check the same
+     invariants on arbitrary input; their findings are committed under
+     `internal/tui/testdata/fuzz/` as regression seeds. **The panel never
      re-styles card lines** — the
      renderer bakes a Subtle base color into plain text, and
      cardPanelLines passes the lines through untouched, because a
