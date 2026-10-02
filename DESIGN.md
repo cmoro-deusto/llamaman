@@ -49,7 +49,12 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
 {
   "version": 1,
   "globals": {
-    "llama-server-bin": "/usr/local/bin/llama-server",
+    "binaries": [             // one entry per llama-server build (§3.2a)
+      { "name": "mainline", "path": "/usr/local/bin/llama-server" },
+      { "name": "rocm", "path": "/opt/rocm/llama-server", "note": "branch with the AMD patches" }
+    ],
+    "default-binary": "mainline",  // optional; absent = first entry
+    "llama-server-bin": "/usr/local/bin/llama-server",  // legacy, read-compat only (§3.2a)
     "ip_address": "127.0.0.1",
     "port": 9080
   },
@@ -95,11 +100,39 @@ No subcommand framework (Kong handles the flat CLI surface). No logger framework
 - `presets` may be empty `[]`.
 - `params` is an object; iteration order **must** be preserved (see §6.4).
 
+### 3.2a Named binaries
+
+One llamaman install routinely drives several llama.cpp builds: upstream mainline, a fork with extra samplers, a ROCm build, an old pinned build that still supports a model. `globals.binaries` makes each build a named entry that models, presets, and the CLI can reference.
+
+- `binaries` is an ordered array of `{ "name", "path", "note"? }`.
+  - `name` is the user-facing identifier, unique across the array (duplicate → validation error).
+  - `path` is expanded with `~`/`$VAR` at load time (§3.3). Missing or non-executable → **warning**, not blocking.
+- `default-binary` names the entry used when nothing else pins one. Absent → the first entry. A name that matches no entry → warning, and resolution falls back to the first entry.
+- `models[].presets[].binary` optionally pins a preset to an entry. This is the only per-launch pin: the binary is a property of *how* a model is launched, not of the model itself.
+
+**Resolution order** (implemented by `config.Globals.ResolveBinary`, the single source of truth for "which binary runs"): `override` (CLI `--binary NAME` or the TUI quick-switch, one-shot) → preset pin → default entry. The function also returns why it chose what it chose (`"override" | "preset" | "default"`), which the CLI, the TUI header, and the session record all use:
+
+- A preset pin naming an unknown entry warns and falls through to the default (launching must not fail because a config drifted).
+- An `--binary` name naming an unknown entry is a **hard error** (exit 2) on every launch path, because the user asked for it explicitly.
+- A resolved binary that is missing or not executable aborts the launch before the fork with exit 3 (§4.4), naming the entry, the path, and why it was chosen.
+
+**Flag registry is per binary.** Short-vs-long flag forms, boolean detection, and the param picker's descriptions all come from `<bin> --help` (§6.2), so they are properties of the *selected* build, not of llamaman. The registry is parsed for the entry that will actually run, and the TUI refreshes it when a launch resolves to a different entry. Cached per path+mtime+hash so two builds sharing an mtime cannot collide.
+
+**Migration.** `globals.llama-server-bin` is read-compat only: on load, a config that has the legacy key and no `binaries[]` is migrated into a single entry named `default` (marked default), and the legacy key is cleared in memory so the next save writes only the new form. A config that carries *both* keys is left alone — `binaries[]` wins — but validation warns, because the legacy key is then dead weight.
+
+**Sessions.** `session.json.binary_name` records which entry spawned the session. It is written on every spawn and read on reattach, so the run header still shows which build is live after a restart of llamaman itself.
+
+**Router mode and pins.** A router run hosts every model in one process, so `presets[].binary` does not apply: the CLI `-i FILE` / TUI router entry resolves by override → default. `my-models.ini` has no field for a binary either, so an `export` → `import` round-trip drops pins (the config file keeps them).
+
+The TUI surfaces this in three places: the config-mode **binaries hub** (`b` — add/edit/delete/set-default, entry-targeted), the one-shot **quick-switch** (Shift+B in main and run mode; applies to the next spawn, including a restart), and the run header's `Bin:` cell (shown when the resolved entry is not the default).
+
 ### 3.3 Path expansion
 
 Applied at config-load time to:
-- `globals.llama-server-bin`
+- `globals.binaries[].path` (§3.2a)
+- `globals.llama-server-bin` (legacy key, migrated at load — §3.2a)
 - every `models[].location`
+- `globals.models-files[]`
 - `preferences.models-dir` (Release 2, §16.1)
 
 Expansions:
@@ -125,7 +158,9 @@ Resolved values are used for all subsequent operations and error messages.
   - Each model has exactly one of `location` / `hf` set; both empty or both filled → error.
   - `hf` (when set) matches `^[\w.-]+/[\w.-]+(?::[\w.-]+)?$` (i.e., `org/repo[:quant]`) → error if not. No network reachability check; llama-server surfaces unreachable repos at launch.
 - `models[].location` not existing on disk → warning, not blocking.
-- `globals.llama-server-bin` not existing or not executable → warning, not blocking.
+- `globals.binaries[].path` not existing or not executable → warning, not blocking (§3.2a). A resolved binary that is missing at launch time is a hard stop (exit 3, §4.4).
+- `presets[].binary` naming an entry that does not exist → warning, not blocking (resolution falls back to the default).
+- `globals.llama-server-bin` alongside `globals.binaries` → warning: the legacy key is ignored (§3.2a).
 - Unknown param keys → warning, not blocking (consistent with §6.5).
 
 ---
@@ -149,6 +184,8 @@ llamaman export [<path>] [-c PATH]
 | `-l` | `--list` | List configured models, one per line: `<alias>\t(<source>)\t<n> presets[\t(running)]`. `<source>` is `local` or `hf`. Plain stdout, exit 0. |
 | `-p` | `--presets` | With a following `<alias>`, print that model's presets to stdout. Exit 0. |
 | `-c` | `--config` | Path to alternate config file. |
+| `-i` | `--ini` | Run a my-models.ini file in router mode (`llama-server --models-preset`); works without a config file. |
+| | `--binary` | `--binary NAME` launches with the named `globals.binaries` entry (§3.2a). One-shot: it wins over the preset pin and the default for this launch only. An unknown name is a config error (exit 2) on every launch path, including `-i`. |
 | | `--completion` | Takes `bash`, `zsh`, or `fish`; prints completion script to stdout, exit 0. |
 
 Subcommands (dispatched before the positional dispatch table; see §13):
@@ -282,7 +319,7 @@ In every spawn command, in this order:
 
 ### 6.2 Short vs long form inference
 
-On `llamaman` startup (and whenever the binary's mtime changes), parse `llama-server --help` and build a map `{name → canonical_form}`. Cache it at `$XDG_CACHE_HOME/llamaman/flags-<bin-mtime>.json`.
+Per llama-server binary (§3.2a): parse `<bin> --help` and build a map `{name → canonical_form}` for the entry that will actually run. Cache it at `$XDG_CACHE_HOME/llamaman/flags-<path-hash>-<bin-mtime>.json` — keyed by absolute path *and* mtime, so two configured builds cannot share an entry even when their mtimes coincide.
 
 If the binary is missing or its `--help` cannot be parsed, fall back to:
 - Single-dash for keys in this hard-coded set: `m, n, c, t, s, b, h, p, ngl, ctk, ctv, fa, np, cb, hf, hff, hft, hfr, hfd, hfv`.
@@ -650,7 +687,7 @@ Triggered when no config file exists at the default location and `-c` was not gi
 
 1. **Modal**: "No configuration found. llamaman will guide you through setup. [Enter] begin / [q] quit." Quit → exit 0 (intentional, not an error).
 2. **Globals form** (mandatory, auto-opened, same layout as `g` form), prefilled:
-   - `llama-server-bin`: autodetected. Order: `which llama-server` → `/usr/local/bin/llama-server` → `/usr/local/llama.cpp/bin/llama-server` → `/opt/llama.cpp/bin/llama-server`. If nothing found, field is empty + inline warning.
+   - `llama-server` binary: autodetected. Order: `which llama-server` → `/usr/local/bin/llama-server` → `/usr/local/llama.cpp/bin/llama-server` → `/opt/llama.cpp/bin/llama-server`. If nothing found, field is empty + inline warning. Saved as a single `binaries[]` entry named `default` (marked default) — §3.2a; more builds are added later in the Binaries hub (`c` → `b`).
    - `host`: `127.0.0.1`.
    - `port`: `9080`.
    - Cancel → "Quit setup? Config will not be saved. (y/N)".

@@ -26,7 +26,7 @@ type stubSpawner struct{ runningAlias string }
 func (s stubSpawner) Spawn(config.Model, config.Preset, string) (RunModeOpts, error) {
 	return RunModeOpts{}, errStubSpawn
 }
-func (s stubSpawner) SpawnRouter(string) (RunModeOpts, error) {
+func (s stubSpawner) SpawnRouter(string, string) (RunModeOpts, error) {
 	return RunModeOpts{}, errStubSpawn
 }
 func (s stubSpawner) Reattach() (*RunModeOpts, error) { return nil, nil }
@@ -764,7 +764,7 @@ type failingSpawner struct{ msg string }
 func (f failingSpawner) Spawn(config.Model, config.Preset, string) (RunModeOpts, error) {
 	return RunModeOpts{}, failingSpawnError{f.msg}
 }
-func (f failingSpawner) SpawnRouter(string) (RunModeOpts, error) {
+func (f failingSpawner) SpawnRouter(string, string) (RunModeOpts, error) {
 	return RunModeOpts{}, failingSpawnError{f.msg}
 }
 func (failingSpawner) Reattach() (*RunModeOpts, error)     { return nil, nil }

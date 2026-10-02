@@ -112,7 +112,7 @@ func run() int {
 	// `-i <file>` runs a my-models.ini in router mode. It works without a
 	// config (default globals) and skips the first-run flow.
 	if cli.Ini != "" {
-		return runRouterCLI(cli.Ini, cli.Config)
+		return runRouterCLI(cli.Ini, cli.Config, cli.Binary)
 	}
 
 	switch {
@@ -141,19 +141,16 @@ func run() int {
 
 	// --binary NAME: an unknown name is a hard error (exit 2) before
 	// anything else runs (DESIGN §3.2a).
-	if cli.Binary != "" {
-		if _, ok := findBinary(cfg, cli.Binary); !ok {
-			names := make([]string, 0, len(cfg.Globals.Binaries))
-			for _, b := range cfg.Globals.Binaries {
-				names = append(names, b.Name)
-			}
-			fmt.Fprintf(os.Stderr, "unknown binary %q (configured: %s)\n",
-				cli.Binary, strings.Join(names, ", "))
-			return exitConfigErr
-		}
+	if err := validateBinaryOverride(cfg, cli.Binary); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return exitConfigErr
 	}
 
-	registry, registryReal := loadFlagRegistry(cfg.Globals.Bin)
+	// The startup registry describes the default binaries[] entry; the
+	// legacy globals.llama-server-bin is cleared by the load-time
+	// migration, so it can never be the source (§3.2a).
+	defBin, _ := cfg.Globals.ResolveBinary("", "")
+	registry, registryReal := loadFlagRegistry(defBin.Path)
 
 	sessMgr, err := server.NewSessionManager()
 	if err != nil {
@@ -166,7 +163,15 @@ func run() int {
 		return code
 	}
 
-	root := tui.NewRoot(cfg, cfgPath, &liveSpawner{cfg: cfg, registry: registry, registryReal: registryReal, sessMgr: sessMgr}, registry, versionString(), initialRun)
+	root := tui.NewRoot(cfg, cfgPath, &liveSpawner{cfg: cfg, defaultBin: defBin, registry: registry, registryReal: registryReal, sessMgr: sessMgr}, registry, versionString(), initialRun)
+	// `--binary NAME` with no positional alias lands on the landing screen
+	// instead of spawning: seed the one-shot override so the launch made
+	// from there honours the flag instead of silently dropping it. With an
+	// alias the override already applied to that spawn — don't let it
+	// linger into the next one.
+	if initialRun == nil {
+		root.SeedBinaryOverride(cli.Binary)
+	}
 	if _, err := tea.NewProgram(root, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "tui:", err)
 		return exitGeneric
@@ -227,6 +232,12 @@ func decideEntry(cfg *config.Config, registry flags.Registry, sessMgr *server.Se
 			fmt.Fprintln(os.Stderr, pErr.Underlying)
 			return nil, exitPortInUse
 		}
+		var bErr ErrBinaryPrereq
+		if errors.As(err, &bErr) {
+			// DESIGN §4.4: a missing binary is a prerequisite failure.
+			fmt.Fprintln(os.Stderr, bErr.Underlying)
+			return nil, exitPrereqErr
+		}
 		fmt.Fprintln(os.Stderr, "spawn:", err)
 		return nil, exitGeneric
 	}
@@ -243,29 +254,70 @@ type ErrPortInUse struct {
 func (e ErrPortInUse) Error() string { return e.Underlying.Error() }
 func (e ErrPortInUse) Unwrap() error { return e.Underlying }
 
+// ErrBinaryPrereq is returned when the resolved llama-server binary is
+// missing or not executable. DESIGN §4.4 assigns exit code 3 to missing
+// execution prerequisites; the CLI paths translate it (the TUI surfaces
+// the message in its flash).
+type ErrBinaryPrereq struct {
+	Underlying error
+}
+
+func (e ErrBinaryPrereq) Error() string { return e.Underlying.Error() }
+func (e ErrBinaryPrereq) Unwrap() error { return e.Underlying }
+
 // liveSpawner satisfies tui.Spawner. Spawn does the fork+session-write
 // dance; Reattach + RunningAlias expose live session state to the TUI's
 // main and selection screens.
 type liveSpawner struct {
-	cfg          *config.Config
+	cfg *config.Config
+	// registry/registryReal describe defaultBin's --help output, loaded
+	// once at startup. Spawns that resolve to another binaries[] entry
+	// load that entry's registry instead (§3.2a). defaultBin stays the
+	// startup default even after SetConfig: it names the binary that
+	// registry describes, not the config's current default.
 	registry     flags.Registry
-	registryReal bool // true when registry came from parsed --help output
+	registryReal bool
+	defaultBin   config.Binary
 	sessMgr      *server.SessionManager
-	// binaryOverride is the one-shot quick-switch override made in the
-	// TUI (§3.2a); empty means use the preset pin / default.
-	binaryOverride string
 }
 
+// registryFor resolves the binary a spawn will use (override → preset pin
+// → default) and returns its flag registry, falling back to the startup
+// registry when the resolved entry is the default one.
+func (l *liveSpawner) registryFor(override, presetPin string) (flags.Registry, bool) {
+	bin, _ := l.cfg.Globals.ResolveBinary(override, presetPin)
+	if bin.Path == "" || bin.Path == l.defaultBin.Path {
+		return l.registry, l.registryReal
+	}
+	reg, real := loadFlagRegistry(bin.Path)
+	if reg == nil {
+		// Loader init failed: borrow the startup registry for
+		// canonicalization, but never report it as real — it describes
+		// another build, so capability checks must not trust it.
+		return l.registry, false
+	}
+	return reg, real
+}
+
+// SetConfig satisfies tui.ConfigSetter: the TUI hands over each saved
+// config so binaries[] and preset pins edited in the config screen
+// resolve on the next spawn.
+func (l *liveSpawner) SetConfig(cfg *config.Config) { l.cfg = cfg }
+
 func (l *liveSpawner) Spawn(model config.Model, preset config.Preset, binaryOverride string) (tui.RunModeOpts, error) {
-	opts, err := acquireAndSpawn(l.cfg, l.registry, l.sessMgr, model, preset, l.binaryOverride)
+	// Canonicalize against the binary that will actually run, not the
+	// startup default: a preset pin or override may pick another build.
+	reg, _ := l.registryFor(binaryOverride, preset.Binary)
+	opts, err := acquireAndSpawn(l.cfg, reg, l.sessMgr, model, preset, binaryOverride)
 	if err != nil {
 		return tui.RunModeOpts{}, err
 	}
 	return *opts, nil
 }
 
-func (l *liveSpawner) SpawnRouter(file string) (tui.RunModeOpts, error) {
-	opts, err := acquireAndSpawnRouter(l.cfg, l.registry, l.registryReal, l.sessMgr, file, l.binaryOverride)
+func (l *liveSpawner) SpawnRouter(file, binaryOverride string) (tui.RunModeOpts, error) {
+	reg, real := l.registryFor(binaryOverride, "")
+	opts, err := acquireAndSpawnRouter(l.cfg, reg, real, l.sessMgr, file, binaryOverride)
 	if err != nil {
 		return tui.RunModeOpts{}, err
 	}
@@ -319,7 +371,7 @@ func acquireAndSpawn(cfg *config.Config, registry flags.Registry, sessMgr *serve
 	}
 	if err := checkBinaryRunnable(binary, binSource); err != nil {
 		sessMgr.Unlock()
-		return nil, err
+		return nil, ErrBinaryPrereq{Underlying: err}
 	}
 
 	res, err := translate.Build(cfg.Globals, model, preset, registry, binary.Path)
@@ -370,6 +422,7 @@ func acquireAndSpawn(cfg *config.Config, registry flags.Registry, sessMgr *serve
 		Registry:   registry,
 		Fetcher:    fetcherFor(res.Argv, registry),
 		Version:    versionString(),
+		BinaryName: binary.Name,
 	}, nil
 }
 
@@ -394,7 +447,7 @@ func acquireAndSpawnRouter(cfg *config.Config, registry flags.Registry, registry
 		return nil, fmt.Errorf("unknown binary %q", binaryOverride)
 	}
 	if err := checkBinaryRunnable(routerBin, binSource); err != nil {
-		return nil, err
+		return nil, ErrBinaryPrereq{Underlying: err}
 	}
 	if registryReal {
 		if _, ok := registry.Lookup("models-preset"); !ok {
@@ -451,13 +504,16 @@ func acquireAndSpawnRouter(cfg *config.Config, registry flags.Registry, registry
 		Registry:   registry,
 		Fetcher:    fetcherFor(res.Argv, registry),
 		Version:    versionString(),
+		BinaryName: routerBin.Name,
 	}, nil
 }
 
 // runRouterCLI implements `llamaman -i <file>`: it loads the config (or
 // uses default globals when none exists), spawns router mode, and drops
-// straight into run mode.
-func runRouterCLI(file, cfgOverride string) int {
+// straight into run mode. binaryOverride is the CLI --binary name; an
+// unknown name is rejected here rather than silently ignored (the -i
+// path returns before run()'s shared check).
+func runRouterCLI(file, cfgOverride, binaryOverride string) int {
 	cfg := &config.Config{Version: config.SchemaVersion, Globals: defaultGlobals()}
 	cfgPath := cfgOverride
 	if cfgPath == "" {
@@ -475,15 +531,20 @@ func runRouterCLI(file, cfgOverride string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return exitConfigErr
 	}
+	if err := validateBinaryOverride(cfg, binaryOverride); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return exitConfigErr
+	}
 
-	registry, registryReal := loadFlagRegistry(cfg.Globals.Bin)
+	defBin, _ := cfg.Globals.ResolveBinary("", "")
+	registry, registryReal := loadFlagRegistry(defBin.Path)
 	sessMgr, err := server.NewSessionManager()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "session manager:", err)
 		return exitGeneric
 	}
 
-	opts, err := acquireAndSpawnRouter(cfg, registry, registryReal, sessMgr, file, "")
+	opts, err := acquireAndSpawnRouter(cfg, registry, registryReal, sessMgr, file, binaryOverride)
 	if err != nil {
 		if errors.Is(err, server.ErrAnotherStarter) {
 			fmt.Fprintln(os.Stderr, "Another llamaman is already running")
@@ -494,11 +555,16 @@ func runRouterCLI(file, cfgOverride string) int {
 			fmt.Fprintln(os.Stderr, pErr.Underlying)
 			return exitPortInUse
 		}
+		var bErr ErrBinaryPrereq
+		if errors.As(err, &bErr) {
+			fmt.Fprintln(os.Stderr, bErr.Underlying)
+			return exitPrereqErr
+		}
 		fmt.Fprintln(os.Stderr, "spawn:", err)
 		return exitGeneric
 	}
 
-	root := tui.NewRoot(cfg, cfgPath, &liveSpawner{cfg: cfg, registry: registry, registryReal: registryReal, sessMgr: sessMgr}, registry, versionString(), opts)
+	root := tui.NewRoot(cfg, cfgPath, &liveSpawner{cfg: cfg, defaultBin: defBin, registry: registry, registryReal: registryReal, sessMgr: sessMgr}, registry, versionString(), opts)
 	if _, err := tea.NewProgram(root, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "tui:", err)
 		return exitGeneric
@@ -528,6 +594,15 @@ func fetcherFor(argv []string, registry flags.Registry) tui.Fetcher {
 // which is acceptable for v1. Router-kind sessions carry the models-file
 // path instead (RouterFile), leaving model/preset empty.
 func buildReattachOpts(cfg *config.Config, registry flags.Registry, sess server.Session, sessMgr *server.SessionManager) (*tui.RunModeOpts, error) {
+	// The session records which named binary it runs on (§3.2a). Prefer
+	// that build's registry so the header canonicalizes params the same
+	// way the live server does; fall back to the caller's when the entry
+	// is gone or unparseable.
+	if b, ok := findBinary(cfg, sess.BinaryName); ok {
+		if reg, real := loadFlagRegistry(b.Path); real {
+			registry = reg
+		}
+	}
 	if sess.IsRouter() {
 		return &tui.RunModeOpts{
 			Cfg:        cfg,
@@ -539,6 +614,7 @@ func buildReattachOpts(cfg *config.Config, registry flags.Registry, sess server.
 			Fetcher:    fetcherFor(sess.Command, registry),
 			Version:    versionString(),
 			Reattach:   true,
+			BinaryName: sess.BinaryName,
 		}, nil
 	}
 	model, _ := findModel(cfg, sess.Alias)
@@ -566,6 +642,7 @@ func buildReattachOpts(cfg *config.Config, registry flags.Registry, sess server.
 		Fetcher:    fetcherFor(sess.Command, registry),
 		Version:    versionString(),
 		Reattach:   true,
+		BinaryName: sess.BinaryName,
 	}, nil
 }
 
@@ -656,6 +733,27 @@ func findBinary(cfg *config.Config, name string) (config.Binary, bool) {
 		}
 	}
 	return config.Binary{}, false
+}
+
+// validateBinaryOverride rejects a --binary NAME that names no configured
+// entry. An empty name is always valid (no override). Called by every CLI
+// path that can launch llama-server, so a typo fails loudly instead of
+// quietly falling back to the default build.
+func validateBinaryOverride(cfg *config.Config, name string) error {
+	if name == "" {
+		return nil
+	}
+	if _, ok := findBinary(cfg, name); ok {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Globals.Binaries))
+	for _, b := range cfg.Globals.Binaries {
+		names = append(names, b.Name)
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("unknown binary %q (no globals.binaries entries configured)", name)
+	}
+	return fmt.Errorf("unknown binary %q (configured: %s)", name, strings.Join(names, ", "))
 }
 
 // loadFlagRegistry parses `<bin> --help` (or returns the cached registry),
@@ -897,7 +995,8 @@ func runImport(file, cfgOverride string) int {
 		}
 	}
 
-	reg, _ := loadFlagRegistry(cfg.Globals.Bin)
+	defBin, _ := cfg.Globals.ResolveBinary("", "")
+	reg, _ := loadFlagRegistry(defBin.Path)
 	imported, warnings := modelsini.Import(f, cfg.Models, reg)
 	for _, w := range warnings {
 		fmt.Fprintln(os.Stderr, "warn:", w)
@@ -967,7 +1066,10 @@ func runExport(path, cfgOverride string) int {
 
 // defaultGlobals is used when import has to bootstrap a config that does
 // not exist yet. It mirrors the first-run defaults (DESIGN.md §8): the
-// autodetected binary and a loopback listen address.
+// autodetected binary as a single "default" binaries[] entry, and a
+// loopback listen address. It must emit the new schema shape — an empty
+// binaries[] fails validation (§3.5), and Load's legacy-key migration
+// never runs on an in-memory config.
 func defaultGlobals() config.Globals {
 	bin := ""
 	if p, err := exec.LookPath("llama-server"); err == nil {
@@ -984,7 +1086,12 @@ func defaultGlobals() config.Globals {
 			}
 		}
 	}
-	return config.Globals{Bin: bin, Host: "127.0.0.1", Port: 9080}
+	return config.Globals{
+		Binaries:      []config.Binary{{Name: config.DefaultBinaryName, Path: bin}},
+		DefaultBinary: config.DefaultBinaryName,
+		Host:          "127.0.0.1",
+		Port:          9080,
+	}
 }
 
 // runCompletion implements --completion bash|zsh|fish. Kong v1's

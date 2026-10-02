@@ -1005,11 +1005,19 @@ func (r *RunMode) Update(msg tea.Msg) (*RunMode, tea.Cmd) {
 			if r.routerPanelActive {
 				return r, nil
 			}
+			r.viewport.HalfPageUp()
+			return r, nil
+		case "B":
+			// §3.2a quick-switch. Shift+B, not `b`: the unshifted key stays
+			// vim page-up here (and the browser over in main mode).
+			if r.routerPanelActive {
+				return r, nil
+			}
 			if len(r.cfg.Globals.Binaries) >= 2 {
+				r.binSwitchIdx = 0
 				r.binSwitchOpen = true
 				return r, nil
 			}
-			r.viewport.HalfPageUp()
 			return r, nil
 		case "c":
 			r.copyCommand()
@@ -1203,9 +1211,11 @@ func (r *RunMode) handleSearchInput(m tea.KeyMsg) (*RunMode, tea.Cmd) {
 	return r, cmd
 }
 
-// requestRestart kills the current process and emits a SpawnRequestMsg
-// for the same (model, preset). The root will route it back through the
-// spawner to start fresh.
+// requestRestart kills the current process and emits a spawn request for
+// the same target — RouterSpawnRequestMsg for a router session, otherwise
+// SpawnRequestMsg for the same (model, preset). The pending binary
+// override (§3.2a) rides along so a quick-switch survives the restart.
+// The root routes it back through the spawner to start fresh.
 func (r *RunMode) requestRestart() tea.Cmd {
 	if r.fetchCancel != nil {
 		r.fetchCancel()
@@ -1217,9 +1227,35 @@ func (r *RunMode) requestRestart() tea.Cmd {
 		_ = r.sessionMgr.Clear()
 	}
 	model, preset := r.model, r.preset
-	return func() tea.Msg {
-		return SpawnRequestMsg{Model: model, Preset: preset, BinaryOverride: r.pendingBinOverride}
+	routerFile, override := r.routerFile, r.restartBinOverride()
+	if routerFile != "" {
+		return func() tea.Msg {
+			return RouterSpawnRequestMsg{File: routerFile, BinaryOverride: override}
+		}
 	}
+	return func() tea.Msg {
+		return SpawnRequestMsg{Model: model, Preset: preset, BinaryOverride: override}
+	}
+}
+
+// restartBinOverride is the binary a restart should use: a pending
+// quick-switch wins; otherwise the binary the session is running now, so
+// a --binary launch or main-screen quick-switch survives `r` (§3.2a).
+// A running name no longer in binaries[] yields "" (pin/default chain)
+// rather than an "unknown binary" spawn error.
+func (r *RunMode) restartBinOverride() string {
+	if r.pendingBinOverride != "" {
+		return r.pendingBinOverride
+	}
+	if r.binaryName == "" || r.cfg == nil {
+		return ""
+	}
+	for _, b := range r.cfg.Globals.Binaries {
+		if b.Name == r.binaryName {
+			return r.binaryName
+		}
+	}
+	return ""
 }
 
 // copyCommand pushes the launch argv onto the clipboard via wl-copy then
@@ -2166,25 +2202,30 @@ func (r *RunMode) renderHelp() string {
 		{"c", "copy launch command to clipboard"},
 		{"i", "show model & preset details"},
 		{"tab", "router mode: switch panel ↑/↓ target (log ↔ models)"},
-		{"", ""},
-		{"— log panel —", ""},
-		{"↑ / ↓", "scroll"},
-		{"/", "search (live highlights; Enter applies, Esc cancels)"},
-		{"n / N", "next / previous match"},
-		{"g / G", "jump to top / bottom"},
-		{"space / b", "page down / up"},
-		{"d", "router mode: toggle proxy-log denoise (default on)"},
-		{"", ""},
-		{"— models panel —", "router mode only"},
-		{"↑ / ↓", "move selection"},
-		{"Enter", "action menu (Load/Unload/Stats/Info)"},
-		{"s", "show selected model's stats (Esc back)"},
-		{"l / u", "load / unload the selected model (u confirms)"},
-		{"p", "toggle ini-only filter (hide cache leftovers)"},
-		{"", ""},
-		{"Esc", "layered: close menu → close stats → clear search"},
-		{"?", "toggle this help"},
 	}
+	if len(r.cfg.Globals.Binaries) >= 2 {
+		rows = append(rows, entry{"Shift+B", "switch llama-server binary (next spawn)"})
+	}
+	rows = append(rows,
+		entry{"", ""},
+		entry{"— log panel —", ""},
+		entry{"↑ / ↓", "scroll"},
+		entry{"/", "search (live highlights; Enter applies, Esc cancels)"},
+		entry{"n / N", "next / previous match"},
+		entry{"g / G", "jump to top / bottom"},
+		entry{"space / b", "page down / up"},
+		entry{"d", "router mode: toggle proxy-log denoise (default on)"},
+		entry{"", ""},
+		entry{"— models panel —", "router mode only"},
+		entry{"↑ / ↓", "move selection"},
+		entry{"Enter", "action menu (Load/Unload/Stats/Info)"},
+		entry{"s", "show selected model's stats (Esc back)"},
+		entry{"l / u", "load / unload the selected model (u confirms)"},
+		entry{"p", "toggle ini-only filter (hide cache leftovers)"},
+		entry{"", ""},
+		entry{"Esc", "layered: close menu → close stats → clear search"},
+		entry{"?", "toggle this help"},
+	)
 	keyW := 0
 	for _, e := range rows {
 		if w := lipgloss.Width(e.key); w > keyW {

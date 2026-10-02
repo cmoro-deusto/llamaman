@@ -175,6 +175,13 @@ func validateGlobals(g Globals) Issues {
 		out = append(out, Issue{Severity: Error, Path: "globals.binaries",
 			Message: "at least one llama-server binary is required"})
 	}
+	if strings.TrimSpace(g.Bin) != "" && len(g.Binaries) > 0 {
+		// Migration only rewrites a legacy-only config, so the key can
+		// legitimately coexist with binaries[] — but nothing reads it
+		// then (DESIGN §3.2a). Say so instead of ignoring the edit.
+		out = append(out, Issue{Severity: Warning, Path: "globals.llama-server-bin",
+			Message: "ignored: globals.binaries is set, so this legacy key has no effect"})
+	}
 	seen := make(map[string]bool, len(g.Binaries))
 	for i, b := range g.Binaries {
 		path := fmt.Sprintf("globals.binaries[%d]", i)

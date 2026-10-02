@@ -632,6 +632,9 @@ func (m MainMode) renderShortcuts() string {
 	parts = append(parts, shortcut("c", "configure", m.theme))
 	parts = append(parts, shortcut("s", "storage", m.theme))
 	parts = append(parts, shortcut("b", "browse", m.theme))
+	if len(m.cfg.Globals.Binaries) >= 2 {
+		parts = append(parts, shortcut("B", "binary", m.theme))
+	}
 	parts = append(parts, shortcut("p", "preferences", m.theme))
 	parts = append(parts, shortcut("t", "theme", m.theme))
 	parts = append(parts, shortcut("?", "help", m.theme))
@@ -722,12 +725,17 @@ func (m MainMode) renderHelp() string {
 		"c           open configuration mode",
 		"s           open storage manager (cache, downloads)",
 		"b           open Hugging Face browser (search, filters)",
+	}
+	if len(m.cfg.Globals.Binaries) >= 2 {
+		keys = append(keys, "Shift+B     switch llama-server binary for the next launch")
+	}
+	keys = append(keys,
 		"p           open preferences (theme, animations, models-dir)",
 		"t / Shift+t cycle theme (forward / backward)",
 		"a           attach to running session (only when one exists)",
 		"?           toggle this help",
 		"q / Ctrl+C  quit",
-	}
+	)
 	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(m.theme.Accent).
@@ -803,10 +811,11 @@ func (m MainMode) update(msg tea.Msg) (MainMode, tea.Cmd) {
 		case "?":
 			m.showHelp = true
 			return m, nil
-		case "b":
+		case "B":
 			// §3.2a quick-switch: only when 2+ binaries exist; one entry
-			// needs no switch and the browser is not reachable from the
-			// reattach/pivot states anyway.
+			// needs no switch. Shift+B, not `b` — the browser owns the
+			// unshifted key in this view (Root.routeKey intercepts it
+			// before MainMode ever sees it).
 			if len(m.cfg.Globals.Binaries) >= 2 && !m.IsSessionRunning() {
 				m.showBinSwitch = !m.showBinSwitch
 				return m, nil
@@ -871,7 +880,7 @@ func (m MainMode) handleEnter() (MainMode, tea.Cmd) {
 			return m, nil
 		}
 		return m, func() tea.Msg {
-			return RouterSpawnRequestMsg{File: it.path}
+			return RouterSpawnRequestMsg{File: it.path, BinaryOverride: m.binaryOverride}
 		}
 	}
 	if m.showPresets {

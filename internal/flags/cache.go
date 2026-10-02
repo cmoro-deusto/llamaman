@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cmoro-deusto/llamaman/internal/paths"
@@ -121,7 +123,38 @@ func writeCache(path string, reg Registry) error {
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	pruneLegacyCaches(filepath.Dir(path), path)
+	return nil
+}
+
+// pruneLegacyCaches deletes pre-§3.2a cache files, whose names carried only
+// the binary mtime (`flags-<mtime>.json`). The current scheme always
+// includes a path hash, so those files can never be read again — they are
+// pure litter that would otherwise live in the cache dir forever. Refresh
+// failures are ignored: the cache is an optimization, never a requirement.
+func pruneLegacyCaches(dir, current string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "flags-") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		mid := strings.TrimSuffix(strings.TrimPrefix(name, "flags-"), ".json")
+		if _, err := strconv.ParseInt(mid, 10, 64); err != nil {
+			continue // hashed (current) or foreign name
+		}
+		full := filepath.Join(dir, name)
+		if full == current {
+			continue
+		}
+		_ = os.Remove(full)
+	}
 }
 
 // fallbackRegistry materializes the hard-coded short-form set into a
