@@ -14,7 +14,7 @@ require (
 	github.com/muesli/termenv v0.16.0
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/yuin/goldmark v1.8.5
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.49.0
 )
 
 require (
